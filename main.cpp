@@ -829,8 +829,8 @@ static void comp_union(uint64_t idx,uint32_t a,uint32_t b){
  for(;;){
   const uint32_t w=s^COMP_IDENT,ra=comp_root(w,a),rb=comp_root(w,b);
   if(ra==rb)return;
-  const uint32_t lo=min(ra,rb),hi=max(ra,rb);uint32_t w2=w;
-  for(uint32_t x=hi;x<8;++x)if(comp_root(w,x)==hi)w2=(w2&~(7u<<(3*x)))|(lo<<(3*x)); // members of hi's group are >= hi
+  // Every field that holds hi gets lo, all eight at once: `eq` has the lowest bit of each such field.
+  const uint32_t lo=min(ra,rb),hi=max(ra,rb),F=0x249249u,x=w^(hi*F),eq=~(x|(x>>1)|(x>>2))&F,w2=w^((hi^lo)*eq);
   if(c.compare_exchange_weak(s,w2^COMP_IDENT,memory_order_relaxed))return;
  }
 }
@@ -1140,7 +1140,7 @@ static inline __attribute__((always_inline)) void cslot_commit(CSlot& s,uint64_t
 // dense alias 0-7 of the same index. IDs of a complex index resolve through the ID table like general IDs.
 static uint64_t* denseComplex=nullptr; // limI bits, zero-filled; allocated when dense.events or dense.clicks
 static inline __attribute__((always_inline)) bool dense_complex(uint64_t idx){return (denseComplex[idx>>6]>>(idx&63))&1;}
-static inline void dense_set_complex(uint64_t idx){__atomic_fetch_or(&denseComplex[idx>>6],1ull<<(idx&63),__ATOMIC_RELAXED);}
+static inline bool dense_set_complex(uint64_t idx){return (__atomic_fetch_or(&denseComplex[idx>>6],1ull<<(idx&63),__ATOMIC_RELAXED)>>(idx&63))&1;} // returns whether it was set already
 // Decodes a user ID text: true if it is canonical 'u' + base 36 with a user index below the limit (any alias).
 static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32_t& alias){
  uint64_t y;
@@ -1389,6 +1389,52 @@ SS_V3I bool parse36x2_v3(const char* sa,unsigned na,const char* sb,unsigned nb,u
  return (bool)_mm_testz_si128(bad,bad);
 }
 static inline __attribute__((always_inline)) bool parse36x2_ok(uint64_t y,unsigned m){return y-MIN36[m]<=SPAN36[m];}
+// ---- Links stage helpers ----
+// The two IDs of a link line as dense user IDs: da / db say whether each is one (canonical 'u' + base 36,
+// user index below the limit; any alias), ia / ib and aa / ab are their user indexes and aliases.
+struct LinkDense{uint64_t ia,ib;uint32_t aa,ab;bool da,db;};
+static void link_dense_base(const char* s0,size_t l0,const char* s1,size_t l1,LinkDense& r){
+ r.da=dense_decode_user(s0,l0,r.ia,r.aa);r.db=dense_decode_user(s1,l1,r.ib,r.ab);
+}
+// The same answer with both texts decoded in one vector pass (the usual line: two dense IDs).
+SS_V3 static void link_dense_v3(const char* s0,size_t l0,const char* s1,size_t l1,LinkDense& r){
+ uint64_t ya=0,yb=0;unsigned ma,mb;bool da=false,db=false;
+ if(__builtin_expect(parse36x2_v3(s0+1,(unsigned)min<size_t>(l0-1,9),s1+1,(unsigned)min<size_t>(l1-1,9),ya,yb,ma,mb),1)){da=s0[0]=='u'&&parse36x2_ok(ya,ma);db=s1[0]=='u'&&parse36x2_ok(yb,mb);}
+ else{da=s0[0]=='u'&&parse36_v3(s0+1,(unsigned)min<size_t>(l0-1,9),ya);db=s1[0]=='u'&&parse36_v3(s1+1,(unsigned)min<size_t>(l1-1,9),yb);}
+ const uint64_t na=dn::index_of(ya,dense.ku),nb=dn::index_of(yb,dense.ku);
+ r.ia=na>>dn::GEN_ALIAS_BITS;r.aa=(uint32_t)(na&((1u<<dn::GEN_ALIAS_BITS)-1));r.da=da&&r.ia<dense.limI;
+ r.ib=nb>>dn::GEN_ALIAS_BITS;r.ab=(uint32_t)(nb&((1u<<dn::GEN_ALIAS_BITS)-1));r.db=db&&r.ib<dense.limI;
+}
+// One link line starting at p: its two fields, and where the next line starts. False if the line does not
+// have exactly two non-empty fields (it is skipped). The usual shape, under 32 bytes with one comma and
+// each field bare or wrapped in quotes, is cut from two 16-byte compares; the general splitter decides everything else.
+static inline __attribute__((always_inline)) bool link_split(const char* p,const char* end,string_view* f,const char*& next){
+ if(end-p>=32){
+  const __m128i vnl=_mm_set1_epi8('\n'),vc=_mm_set1_epi8(','),vq=_mm_set1_epi8('"');
+  const __m128i x0=_mm_loadu_si128((const __m128i*)p),x1=_mm_loadu_si128((const __m128i*)(p+16));
+  const uint32_t mnl=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vnl))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vnl))<<16);
+  if(mnl){
+   const unsigned L=(unsigned)__builtin_ctz(mnl);const uint32_t keep=(1u<<L)-1;
+   const uint32_t mc=((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vc))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vc))<<16))&keep;
+   const uint32_t mq=((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vq))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vq))<<16))&keep;
+   if(mc&&!(mc&(mc-1))){
+    // One comma. Quotes may only wrap a whole field: q0 / q1 say whether each field starts with one,
+    // and then it must also end with one and no other quote may be in the line.
+    const unsigned P=(unsigned)__builtin_ctz(mc);
+    const uint32_t q0=mq&1u,q1=(mq>>(P+1))&1u;
+    const uint32_t want=q0|(q0<<(P-1+(P==0)))|(q1<<(P+1))|(q1<<(L-1+(L==0)));
+    if(__builtin_expect(mq==want&&P>=2*q0&&L-P-1>=2*q1,1)){
+     next=p+L+1;
+     f[0]=string_view(p+q0,P-2*q0);f[1]=string_view(p+P+1+q1,L-P-1-2*q1);
+     return P>2*q0&&L-P-1>2*q1;
+    }
+   }
+  }
+ }
+ const char* comma[2];int ncomma,nquote;const char* lineEnd;
+ next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
+ return take_fields(p,lineEnd,comma,ncomma,nquote,2,f)&&!f[0].empty()&&!f[1].empty();
+}
 // A pushed record that still needs its user: the packed user key, its table slot, and the record.
 // A bucket is only ever grown right after the waiting records have been finished (see the capacity
 // checks), so `rec` cannot be left pointing into storage that has moved.
@@ -1851,49 +1897,91 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(getenv("SS_STATS"))cerr<<"STATS dense keys "<<dense.ke<<" "<<dense.ku<<" "<<dense.kc<<" limits "<<dense.limE<<" "<<dense.limC<<" "<<dense.limI<<"\n";
  __mark("KEYS");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
- vector<Chunk> linkChunks;uint64_t linkLines=0;
+ vector<Chunk> linkChunks;uint64_t linkLines=0,linkBytes=0,linkFileCount=0;
  for(const Mapped& m:map_files(csv_files(data/"links"),linkFiles)){if(!m.len)continue;
   ++linkLines; // a last line without '\n'
+  linkBytes+=m.len;++linkFileCount;
   for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
- // Dense user IDs: this pass also marks every user index that a link line ties to anything but another
- // alias 0-7 of the same index ("complex"); such an index keeps the general route for all its IDs.
- // A line is simple if both IDs are dense user IDs with aliases 0-7 of one index.
- const bool denseLinks=dense.events||dense.clicks;
- #pragma omp parallel for num_threads(T) schedule(dynamic,1) reduction(+:linkLines)
- for(size_t c=0;c<linkChunks.size();++c){const Chunk& ck=linkChunks[c];linkLines+=count_newlines(ck.base+ck.from,min(ck.to,ck.len)-ck.from);
-  if(!denseLinks||ck.from>=ck.len)continue;
-  const char* const end=ck.base+ck.len;
-  const char* nl=(const char*)memchr(ck.from?ck.base+ck.from-1:ck.base,'\n',ck.from?ck.len-(ck.from-1):ck.len);
-  if(!nl)continue;
-  const char* const lim=ck.base+min(ck.to,ck.len);
-  for(const char* p=nl+1;p<lim;){
-   const char* comma[2];int ncomma,nquote;const char* lineEnd;string_view f[2];
-   const char* next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
-   if(take_fields(p,lineEnd,comma,ncomma,nquote,2,f)&&!f[0].empty()&&!f[1].empty()){
-    uint64_t ia=0,ib=0;uint32_t aa=0,ab=0;
-    const bool da=dense_decode_user(f[0].data(),f[0].size(),ia,aa),db=dense_decode_user(f[1].data(),f[1].size(),ib,ab);
-    if(!(da&&db&&ia==ib&&aa<8&&ab<8)){if(da)dense_set_complex(ia);if(db)dense_set_complex(ib);}
-   }
-   p=next;
-  }
- }
  static const bool idBlocks=!getenv("SS_NOIDBLOCKS"); // measuring switch: per-thread ID blocks in the links stage
- // Every link line names at most two IDs; with ID blocks each thread may leave part of its last block unused.
- const uint64_t maxLinked=2*linkLines+(idBlocks?(uint64_t)T*KeyTable::ID_BLOCK:0);
- __mark("LINKMAP");
  // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
  // If a dataset has more, the extra ones take the thread-private fallback path (slower, still exact).
  uint64_t maxNew64=(estEvents+estClicks)/28+4096;
  if(const char* v=getenv("SS_TEST_MAXNEW"))maxNew64=strtoull(v,nullptr,10); // tests force the fallback path with a tiny value
- if(maxLinked+maxNew64>=0x60000000u)throw runtime_error("Too many IDs");
- const uint32_t maxIds=(uint32_t)(maxLinked+maxNew64);
- // Table numbers must stay below DENSE_USER for the dense user route; otherwise it is off for this run.
- // (SS_DENSE_USERS=0 turns it off as a whole: the links stage and the parse stage have to agree.)
- {const char* v=getenv("SS_DENSE_USERS");denseUsers=denseLinks&&maxIds<DENSE_USER&&(dense.limI<<dn::ALIAS_BITS)<=DENSE_USER&&!(v&&v[0]=='0');}
+ // Dense users are decided before any line is read. Table numbers must stay below DENSE_USER; a link
+ // line has at least four bytes, which bounds the IDs the files can name without counting lines.
+ // (SS_DENSE_USERS=0 turns the route off as a whole: the links stage and the parse stage have to agree.)
+ const bool denseLinks=dense.events||dense.clicks;
+ {const char* v=getenv("SS_DENSE_USERS");
+  const uint64_t idBound=2*(linkBytes/4+linkFileCount)+(uint64_t)T*KeyTable::ID_BLOCK+maxNew64;
+  denseUsers=denseLinks&&idBound<DENSE_USER&&(dense.limI<<dn::ALIAS_BITS)<=DENSE_USER&&!(v&&v[0]=='0');}
  if(denseUsers)denseComp=(atomic<uint32_t>*)map_huge((dense.limI+1)*sizeof(uint32_t));
  dparse.users=denseUsers;
  if(!denseUsers)dparse.events=dparse.clicks=false; // the record loops decode both IDs of a line together
  cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<"\n";
+ // First pass over the link files.
+ // Without dense users it only counts lines (the table and the union-find arrays are sized by them).
+ // With dense users it is the only pass that reads the files: a "simple" line - two dense user IDs
+ // with aliases 0-7 of one user index - is applied to that index's alias word at once; every other
+ // line marks the dense indexes it names complex and is kept (its two fields) for the ID table.
+ // A complex index keeps the general route for all its IDs, so the simple lines already applied to its
+ // word have to reach the table too: they are replayed from the word afterwards (same groups).
+ struct LinkGen{const char* a;const char* b;uint32_t la,lb;};
+ struct alignas(64) LinkOut{vector<LinkGen> gen;vector<uint32_t> cplx;uint32_t maxIdx=0;};
+ vector<LinkOut> lout(denseUsers?T:0);
+ {
+  bool v3=__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("popcnt")&&__builtin_cpu_supports("lzcnt");
+  if(const char* isa=getenv("SS_ISA"))if(string_view(isa)=="sse2")v3=false;
+  void (*const link_dense)(const char*,size_t,const char*,size_t,LinkDense&)=v3?link_dense_v3:link_dense_base;
+  #pragma omp parallel for num_threads(T) schedule(dynamic,1) reduction(+:linkLines)
+  for(size_t c=0;c<linkChunks.size();++c){const Chunk& ck=linkChunks[c];
+   if(!denseUsers){linkLines+=count_newlines(ck.base+ck.from,min(ck.to,ck.len)-ck.from);continue;}
+   if(ck.from>=ck.len)continue;
+   const char* const end=ck.base+ck.len;
+   const char* nl=(const char*)memchr(ck.from?ck.base+ck.from-1:ck.base,'\n',ck.from?ck.len-(ck.from-1):ck.len);
+   if(!nl)continue;
+   const char* const lim=ck.base+min(ck.to,ck.len);
+   LinkOut& out=lout[omp_get_thread_num()];
+   // Simple lines wait in a small batch so that their index's word is in the cache when it is changed.
+   static constexpr int SB=8;
+   struct Simple{uint32_t idx,aa,ab;} sb[SB];int ns=0;uint32_t maxIdx=out.maxIdx;
+   const auto apply=[&]{for(int i=0;i<ns;++i)comp_union(sb[i].idx,sb[i].aa,sb[i].ab);ns=0;};
+   for(const char* p=nl+1;p<lim;){
+    string_view f[2];const char* next;
+    const bool ok=link_split(p,end,f,next);
+    p=next;
+    if(!ok)continue;
+    LinkDense r;link_dense(f[0].data(),f[0].size(),f[1].data(),f[1].size(),r);
+    if(r.da&&r.db&&r.ia==r.ib&&r.aa<8&&r.ab<8){
+     maxIdx=max(maxIdx,(uint32_t)r.ia);
+     if(r.aa!=r.ab){__builtin_prefetch(&denseComp[r.ia],1,1);sb[ns++]={(uint32_t)r.ia,r.aa,r.ab};if(ns==SB)apply();}
+     continue;
+    }
+    // Whoever turns an index's bit on notes the index for the replay (so each index is noted once).
+    if(r.da&&!dense_set_complex(r.ia))out.cplx.push_back((uint32_t)r.ia);
+    if(r.db&&!dense_set_complex(r.ib))out.cplx.push_back((uint32_t)r.ib);
+    out.gen.push_back({f[0].data(),f[1].data(),(uint32_t)f[0].size(),(uint32_t)f[1].size()});
+   }
+   apply();out.maxIdx=maxIdx;
+  }
+ }
+ // The pairs to replay: for every complex index, each alias that the simple lines put into a group
+ // with a smaller one. (Indexes the test switch marked complex were never noted; they are looked up here.)
+ struct Replay{uint32_t idx;uint8_t a,b;};
+ vector<Replay> replay;uint64_t genLines=0;
+ if(denseUsers){
+  const auto add_index=[&](uint32_t idx){const uint32_t w=denseComp[idx].load(memory_order_relaxed)^COMP_IDENT;
+   for(uint32_t a=1;a<8;++a){const uint32_t r=comp_root(w,a);if(r!=a)replay.push_back({idx,(uint8_t)a,(uint8_t)r});}};
+  uint32_t maxIdx=0;
+  for(const LinkOut& o:lout){genLines+=o.gen.size();maxIdx=max(maxIdx,o.maxIdx);for(uint32_t idx:o.cplx)add_index(idx);}
+  if(const char* v=getenv("SS_TEST_COMPLEX")){const uint64_t n=max<uint64_t>(1,strtoull(v,nullptr,10));
+   for(uint64_t i=0;i<=maxIdx&&i<dense.limI;i+=n)add_index((uint32_t)i);}
+  linkLines=genLines+replay.size(); // the lines that go through the table
+ }
+ // Every such line names at most two IDs; with ID blocks each thread may leave part of its last block unused.
+ const uint64_t maxLinked=2*linkLines+(idBlocks?(uint64_t)T*KeyTable::ID_BLOCK:0);
+ __mark("LINKMAP");
+ if(maxLinked+maxNew64>=0x60000000u)throw runtime_error("Too many IDs");
+ const uint32_t maxIds=(uint32_t)(maxLinked+maxNew64);
  // Table size. Link files usually repeat IDs, so the table is sized for three quarters of the IDs the
  // link lines could name plus all allowed new ones, at 62% full. After the links stage the limit for
  // new IDs is set from the linked IDs actually seen; even if every link ID was different the table then
@@ -1916,7 +2004,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  };
  // best[r]: the ID with the byte-wise smallest name seen so far in root r's group.
  atomic<uint32_t>* const best=(atomic<uint32_t>*)map_huge((maxLinked+1)*sizeof(uint32_t));
- atomic<size_t> nextLink{0};uint64_t idHoles=0;
+ atomic<size_t> nextLink{0},nextReplay{0};uint64_t idHoles=0;
+ size_t maxGenList=0;for(const LinkOut& o:lout)maxGenList=max(maxGenList,o.gen.size());
  __mark("LINKSETUP");
  #pragma omp parallel num_threads(T) reduction(+:idHoles)
  {
@@ -1925,7 +2014,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   // Lines are handled in small batches so the table slots of a batch, and then the parent entries of
   // its IDs, are on their way into the cache before they are needed.
   static constexpr int LB=16;
-  struct LinkPend{string_view f[2];uint64_t k0[2];uint32_t k1[2];uint32_t j[2];}; // k1 == 0: key too long to pack
+  struct LinkPend{string_view f[2];uint64_t k0[2];uint32_t k1[2];uint32_t j[2];char txt[2][16];}; // k1 == 0: key too long to pack; txt: the text of a replayed ID
   LinkPend pend[LB];uint32_t ida[LB],idb[LB];
   const size_t tmask=tab.mask;KeyTable::IdBlock blk;
   auto id_of=[&](const LinkPend& q,int k)->uint32_t{ // cannot be full: the table holds every ID the link lines can name
@@ -1951,7 +2040,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     }
    }
   };
-  for(;;){
+  const auto push_pair=[&](int& nb){ // pend[nb].f[0..1] are set: hash them, ask for their table slots, resolve full batches
+   LinkPend& q=pend[nb];
+   for(int k=0;k<2;++k){
+    if(KeyTable::pack(q.f[k],q.k0[k],q.k1[k])){q.j[k]=(uint32_t)(KeyTable::hash_packed(q.k0[k],q.k1[k])&tmask);__builtin_prefetch(&tab.slots[q.j[k]],1,1);}
+    else q.k1[k]=0;
+   }
+   if(++nb==LB){resolve(nb);nb=0;}
+  };
+  if(!denseUsers)for(;;){
    size_t c=nextLink.fetch_add(1,memory_order_relaxed);if(c>=linkChunks.size())break;
    const Chunk& ck=linkChunks[c];
    // Every data line that begins in [from,to), as in for_lines; exactly two non-empty fields or the line is skipped.
@@ -1961,43 +2058,33 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(!nl)continue;
    const char* const lim=ck.base+min(ck.to,ck.len);
    int nb=0;
-   const __m128i vnl=_mm_set1_epi8('\n'),vc=_mm_set1_epi8(','),vq=_mm_set1_epi8('"');
    for(const char* p=nl+1;p<lim;){
-    LinkPend& q=pend[nb];const char* next;bool ok,done=false;
-    // Usual shape: a line of under 32 bytes with one comma and no quote, cut from two 16-byte compares.
-    if(end-p>=32){
-     const __m128i x0=_mm_loadu_si128((const __m128i*)p),x1=_mm_loadu_si128((const __m128i*)(p+16));
-     const uint32_t mnl=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vnl))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vnl))<<16);
-     if(mnl){
-      const unsigned L=(unsigned)__builtin_ctz(mnl);const uint32_t keep=(1u<<L)-1;
-      const uint32_t mc=((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vc))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vc))<<16))&keep;
-      const uint32_t mq=((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vq))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vq))<<16))&keep;
-      if(!mq&&mc&&!(mc&(mc-1))){
-       const unsigned P=(unsigned)__builtin_ctz(mc);
-       done=true;next=p+L+1;ok=P>0&&P+1<L; // both IDs non-empty
-       q.f[0]=string_view(p,P);q.f[1]=string_view(p+P+1,L-P-1);
-      }
-     }
-    }
-    if(!done){ // anything else: the general splitter decides
-     const char* comma[2];int ncomma,nquote;const char* lineEnd;
-     next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
-     ok=take_fields(p,lineEnd,comma,ncomma,nquote,2,q.f)&&!q.f[0].empty()&&!q.f[1].empty();
-    }
-    if(ok&&denseUsers){ // a simple line of an index that is not complex only groups aliases of that index
-     uint64_t ia=0,ib=0;uint32_t aa=0,ab=0;
-     if(dense_decode_user(q.f[0].data(),q.f[0].size(),ia,aa)&&dense_decode_user(q.f[1].data(),q.f[1].size(),ib,ab)&&ia==ib&&aa<8&&ab<8&&!dense_complex(ia)){
-      comp_union(ia,aa,ab);ok=false; // done: this line does not go through the table
-     }
-    }
-    if(ok){
-     for(int k=0;k<2;++k){
-      if(KeyTable::pack(q.f[k],q.k0[k],q.k1[k])){q.j[k]=(uint32_t)(KeyTable::hash_packed(q.k0[k],q.k1[k])&tmask);__builtin_prefetch(&tab.slots[q.j[k]],1,1);}
-      else q.k1[k]=0;
-     }
-     if(++nb==LB){resolve(nb);nb=0;}
-    }
+    const char* next;
+    if(link_split(p,end,pend[nb].f,next))push_pair(nb);
     p=next;
+   }
+   resolve(nb);
+  }
+  else{
+   // With dense users: the lines the first pass kept, a piece of one thread's list at a time, then the replayed pairs.
+   static constexpr size_t PIECE=2048;
+   int nb=0;
+   for(;;){
+    const size_t w=nextLink.fetch_add(1,memory_order_relaxed);
+    const size_t t=w%(size_t)T,from=(w/(size_t)T)*PIECE; // piece `from` of thread t's list
+    if(from>=maxGenList)break;
+    const vector<LinkGen>& g=lout[t].gen;
+    for(size_t i=from,e=min(g.size(),from+PIECE);i<e;++i){
+     pend[nb].f[0]=string_view(g[i].a,g[i].la);pend[nb].f[1]=string_view(g[i].b,g[i].lb);push_pair(nb);
+    }
+   }
+   for(;;){
+    const size_t from=nextReplay.fetch_add(PIECE,memory_order_relaxed);if(from>=replay.size())break;
+    for(size_t i=from,e=min(replay.size(),from+PIECE);i<e;++i){
+     const Replay& rp=replay[i];LinkPend& q=pend[nb];
+     for(int k=0;k<2;++k){const size_t n=text36_fast('u',dn::value_of(((uint64_t)rp.idx<<dn::GEN_ALIAS_BITS)|(k?rp.b:rp.a),dense.ku),q.txt[k]);q.f[k]=string_view(q.txt[k],n);}
+     push_pair(nb);
+    }
    }
    resolve(nb);
   }
@@ -2341,14 +2428,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
   return u;
  };
- // Test switch SS_TEST_SLOTFILL=1: the dedup below puts every surviving event / click whose ID is dense
- // into the slot arrays instead of the person lists, the way the parser will; the DENSE stage then
- // reads them. (Invalid winners get no slot here; nothing needs them.)
- static const bool slotFill=getenv("SS_TEST_SLOTFILL")!=nullptr;
- if(slotFill){
-  if(dense.events&&!denseEv)denseEv=(ESlot*)map_huge((dense.limE+1)*sizeof(ESlot));
-  if(dense.clicks&&!denseCl)denseCl=(CSlot*)map_huge((dense.limC+1)*sizeof(CSlot));
- }
  const bool slotMode=denseEv||denseCl;
  if(slotMode)denseInfo=(DInfo*)map_huge(((size_t)denseMaxIdx.load()+2)*sizeof(DInfo));
  uint64_t parsedEvents=0,parsedClicks=0;
@@ -2379,15 +2458,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
  uint64_t stEvN=0,stEvDisp=0,stEvMax=0,stEvFalse=0,stClN=0,stClDisp=0,stClMax=0,stClFalse=0; // SS_STATS (the two "False" counts are always kept: they cost nothing)
- uint64_t fillEndE=0,fillEndC=0; // SS_TEST_SLOTFILL: one past the highest counters put into slots
- #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks,stEvN,stEvDisp,stEvFalse,stClN,stClDisp,stClFalse) reduction(max:stEvMax,stClMax,fillEndE,fillEndC)
+ #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks,stEvN,stEvDisp,stEvFalse,stClN,stClDisp,stClFalse) reduction(max:stEvMax,stClMax)
  {
   const int tid=omp_get_thread_num();
-  const bool fillEv=slotFill&&denseEv,fillCl=slotFill&&denseCl;
   // With slots in use, a dense user whose row goes through the general lists is marked: the reader
   // then leaves all of that user index to the general lane.
   DInfo* const markInfo=slotMode?denseInfo:nullptr;
-  auto slot_event=[](const char* id,uint64_t& ve)->bool{size_t n=0;while(id[n]!=','&&id[n]!='"')++n;return dense_counter(id,n,'e',dense.ke,dense.limE,ve);};
   EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();HugePool& pool=surv[tid].pool;
   // Slot = tag<<ib | (record number+1), 0 = empty; ib bits are enough for the bucket's record count.
   // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
@@ -2439,12 +2515,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
         const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi;
         if(notEarlier)goto next_event;
-        if(o.k){
-         uint64_t ove;
-         if(fillEv&&slot_event(o.id,ove))denseEv[ove].k.store(0,memory_order_relaxed); // the copy in the slot lost
-         else{const uint32_t ou=person_of(o.user,ot);
-          Ev* const gone=myEv[ou>>pshift].at_mark(emitted[og]);gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
-        }
+        if(o.k){const uint32_t ou=person_of(o.user,ot);
+         Ev* const gone=myEv[ou>>pshift].at_mark(emitted[og]);gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
        ++stEvFalse; // same tag, other ID
@@ -2455,13 +2527,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       const uint64_t rk=r->k;
       if(rk){
-       if(__builtin_expect(fillEv,0)){uint64_t ve;
-        if(slot_event(r->id,ve)){
-         ESlot& sl=denseEv[ve];sl.k.store(rk,memory_order_relaxed);sl.user=r->user;sl.cat=r->cat;sl.thread=(uint16_t)t;
-         fillEndE=max(fillEndE,ve+1);
-         goto next_event;
-        }
-       }
        // user, cat and the tag bits sit in the record as the event's second word does (person, cat, unused).
        uint64_t w;memcpy(&w,(const void*)&r->user,8);
        if((uint32_t)w&(LOCAL_USER|DENSE_USER)){
@@ -2520,13 +2585,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(++j==cap)j=0;
      }
      S[j]=tg|g1;
-     if(__builtin_expect(fillCl,0)){uint64_t kcn;
-      if(dense_counter(r->id,r->idlen,'k',dense.kc,dense.limC,kcn)){
-       CSlot& sl=denseCl[kcn];sl.key=r->key;sl.user=r->user;sl.present=(uint32_t)t+1;
-       fillEndC=max(fillEndC,kcn+1);
-       goto next_click;
-      }
-     }
      {
       const uint32_t u=person_of(r->user,t);
       if(markInfo&&(r->user&DENSE_USER))markInfo[(r->user&~DENSE_USER)>>dn::ALIAS_BITS].general.store(1,memory_order_relaxed);
@@ -2556,8 +2614,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Rows of dense users are only counted: per user index the first and last counter, how many, and
  // which aliases (a user's rows sit next to each other, so the index's entry is updated once per run).
  // Rows of all other users go to the general person lists right here.
- if(fillEndE)dense_note_end(denseEvEnd,(uint32_t)fillEndE);
- if(fillEndC)dense_note_end(denseClEnd,(uint32_t)fillEndC);
  const size_t evEnd=denseEv?denseEvEnd.load():0,clEnd=denseCl?denseClEnd.load():0;
  const bool slots=evEnd||clEnd;
  static constexpr size_t ECH=size_t(1)<<15,CCH=size_t(1)<<16,ICH=512; // slots / user indexes per piece of work
