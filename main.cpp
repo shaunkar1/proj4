@@ -386,12 +386,6 @@ static string hexstr(string_view s){static constexpr char h[]="0123456789ABCDEF"
 // Switches for measuring on the target machine; all default to the fast setting.
 // Measured on the scoring machine: huge pages help, bulk pre-faulting and the side-thread unmap do not.
 static bool optHuge=true,optPrefault=false,optAsyncFree=false;
-// SS_STATS: per-thread clocks of the reader stages (see the "STATS dense threads" line). optThrStats is set once, before any thread works.
-static bool optThrStats=false;
-static thread_local double tlGrowWall=0;static thread_local uint32_t tlGrowCalls=0;
-static inline double now_s(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;}
-static inline double thr_cpu_s(){timespec t;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;}
-struct alignas(128) ThrStat{double in=0,cIn=0,first=-1,cFirst=0,last=0,cLast=0,out=0,cOut=0,wWall=0,wMax=0,wCpu=0,oWall=0,gWall=0,endWall=0;uint32_t wCalls=0,gCalls=0;};
 // A fresh anonymous mapping of at least `bytes`: zero-filled, touched lazily, 2 MB aligned and (unless
 // SS_NOHUGE) advised for huge pages, so first touches cost one fault per 2 MB. The whole mapping
 // (for munmap) is reported through rawBase/rawLen when asked for.
@@ -414,9 +408,7 @@ struct HugePool{
  __attribute__((noinline,cold)) void grow(size_t bytes){
   const size_t huge=size_t(2)<<20;
   const size_t want=(max(bytes,cur?next:first)+huge-1)&~(huge-1);
-  const double t0=optThrStats?now_s():0;
   cur=(char*)map_huge(want);lim=cur+want;
-  if(optThrStats){tlGrowWall+=now_s()-t0;++tlGrowCalls;}
  }
  void* take(size_t bytes){
   bytes=(bytes+63)&~size_t(63);
@@ -956,39 +948,18 @@ struct Thrift{
  void open_elem(){stack.push_back(last);last=0;}
  void close(){o.push_back(0);last=stack.back();stack.pop_back();}
 };
-// Output switches for measuring (both off by default; the files' bytes are the same either way):
-//  SS_OUTOPEN=early  both output folders, every thread's user_daily part file and the campaign_daily file are
-//                    created (and their first four bytes written) by a helper thread while the input is parsed;
-//                    a worker takes its open file at its first row group. Files of threads that
-//                    never write a row are removed again after the last stage.
-//  SS_OUTWRITE=end   a file's row groups are kept in memory (one copy) and written by one writev when the file
-//                    is closed, instead of one writev per row group in the middle of the index loop.
-static bool optOutEarly=false,optOutEnd=false;
 struct PqFile{
  struct Chunk{int64_t offset,size,nvalues;};
  struct Group{int64_t rows,bytes;vector<Chunk> cols;};
  int fd=-1;int64_t pos=0,rows=0;vector<PqCol> cols;vector<Group> groups;string buf;
- bool defer=false;vector<string> held; // SS_OUTWRITE=end: everything not yet written
  bool is_open()const{return fd>=0;}
- void writev_all(vector<struct iovec>& iov){
-  size_t k=0;
-  while(k<iov.size()){
-   ssize_t w=::writev(fd,iov.data()+k,(int)min<size_t>(iov.size()-k,64));
-   if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}
-   size_t left=(size_t)w;
-   while(k<iov.size()&&left>=iov[k].iov_len){left-=iov[k].iov_len;++k;}
-   if(left){iov[k].iov_base=(char*)iov[k].iov_base+left;iov[k].iov_len-=left;}
-  }
- }
- void adopt(int f,vector<PqCol> c){cols=std::move(c);fd=f;defer=optOutEnd;pos=4;} // f: a fresh file open for writing that holds "PAR1" already
  void write_all(const char* p,size_t n){
-  if(defer){held.emplace_back(p,n);return;}
   while(n){ssize_t w=::write(fd,p,n);if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}p+=w;n-=(size_t)w;}
  }
  void open(const fs::path& path,vector<PqCol> c){
   cols=std::move(c);fd=::open(path.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
   if(fd<0)throw runtime_error("Cannot create "+path.string());
-  defer=optOutEnd;write_all("PAR1",4);pos=4;
+  write_all("PAR1",4);pos=4;
  }
  // bodies[i] is the finished page body of column i: optional definition levels, then PLAIN values.
  // The bodies are written from where they are (writev); only the small page headers are built here.
@@ -1011,8 +982,14 @@ struct PqFile{
    iov.push_back({(void*)(buf.data()+hoff[i]),hoff[i+1]-hoff[i]});
    if(!bodies[i].empty())iov.push_back({(void*)bodies[i].data(),bodies[i].size()});
   }
-  if(defer){size_t tot=0;for(const auto& v:iov)tot+=v.iov_len;string keep;keep.reserve(tot);for(const auto& v:iov)keep.append((const char*)v.iov_base,v.iov_len);held.push_back(std::move(keep));}
-  else writev_all(iov);
+  size_t k=0;
+  while(k<iov.size()){
+   ssize_t w=::writev(fd,iov.data()+k,(int)min<size_t>(iov.size()-k,64));
+   if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}
+   size_t left=(size_t)w;
+   while(k<iov.size()&&left>=iov[k].iov_len){left-=iov[k].iov_len;++k;}
+   if(left){iov[k].iov_base=(char*)iov[k].iov_base+left;iov[k].iov_len-=left;}
+  }
   pos=at;rows+=nrows;groups.push_back(std::move(g));
  }
  void close(){
@@ -1047,8 +1024,6 @@ struct PqFile{
   buf.push_back(0);
   put_le32(buf,(uint32_t)buf.size());buf.append("PAR1",4);
   write_all(buf.data(),buf.size());
-  if(defer){defer=false;vector<struct iovec> iov;iov.reserve(held.size());for(const string& h:held)if(!h.empty())iov.push_back({(void*)h.data(),h.size()});
-   writev_all(iov);held.clear();held.shrink_to_fit();}
   if(::close(fd)!=0)throw runtime_error("Parquet close failed");
   fd=-1;
  }
@@ -1296,11 +1271,6 @@ static constexpr uint32_t DENSE_USER_RAW=0xC0000000u;
 // empty, without reading it; any other state falls into the same loop. Fewer instructions for a first copy, a
 // second locked instruction for every later copy.
 static inline __attribute__((always_inline)) void eslot_commit(ESlot& s,uint64_t kk,uint64_t uct,int64_t ingest,uint64_t spare=0){
-#ifdef SS_ABL_NOCOMMIT /* DIAGNOSTIC ONLY: measures the parse stage without the slot write (wrong output) */
- (void)s;(void)kk;(void)uct;(void)ingest;(void)spare;return;
-#elif defined(SS_ABL_NOLOCK) /* DIAGNOSTIC ONLY: an empty slot is written with plain stores (not safe between threads) */
- if(s.k.load(memory_order_relaxed)==0){memcpy((char*)&s+offsetof(ESlot,user),&uct,8);s.ingest=ingest;s.spare=spare;s.k.store(kk,memory_order_relaxed);return;}
-#endif
 #ifdef SS_CAS_FIRST
  uint64_t cur=0;
  if(__builtin_expect(s.k.compare_exchange_strong(cur,ESLOT_BUSY,memory_order_acquire,memory_order_relaxed),1)){
@@ -3948,8 +3918,489 @@ static_assert(offsetof(Cl8Out,kend)==offsetof(Cl8Out,umax)+4);
 static_assert(sizeof(vcl::DateEnt)==sizeof(DateMemo3)&&offsetof(vcl::DateEnt,k)==offsetof(DateMemo3,k)&&offsetof(vcl::DateEnt,cc)==offsetof(DateMemo3,cc)&&offsetof(vcl::DateEnt,ms)==offsetof(DateMemo3,ms));
 static_assert(vcl::MASK40==dn::MASK&&vcl::I1==dn::I1&&vcl::I2==dn::I2&&vcl::DAYMS==DAY);
 static_assert(vcl::CL_GEN_ALIAS_BITS==dn::GEN_ALIAS_BITS&&vcl::CL_ALIAS_BITS==dn::ALIAS_BITS&&vcl::DENSE_USER_BIT==DENSE_USER&&sizeof(CSlot)==(1u<<vcl::CSLOT_SHIFT));
+// Version 2 of the click kernel (namespace vcl2, /home/claude/vert/cl8_paste2.h pasted unchanged): no gather instructions
+// and no date memo; the dates it decides are the year-months of the run's click window (ClConst.d from make_dates_cl).
+// It is the default kernel of the cl8 loop; SS_CL8=1 picks version 1 above (same loop, same results).
+// ---- cl8 VERSION 2: eight click lines per call (vertical AVX-512, no gather instructions, no date memo). Generated from
+// ---- /home/claude/vert/vert.h + vert_cl.h by mkpaste_cl2.py; contract in BATCH.md ("cl8 version 2"). Tested as this exact
+// ---- text by vert_cl_test2 -DVERT_CL_PASTE. Do not edit here: change vert_cl.h and regenerate.
+// ---- Caller: vcl2::ClConst cc{lp.kc, lp.limC, lp.ku, dense.limI, denseComplex, lp.clickStart, lp.wlen, nullptr};
+// ----         cc.d = vcl2::make_dates_cl(lp.clickStart, window_end, window_start);   then exactly as namespace vcl (version 1).
+namespace vcl2{
+#ifndef VERT_T5
+#define VERT_T5 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512cd,avx2,bmi,bmi2,lzcnt,popcnt")))
+#endif
+static constexpr uint64_t MASK40=(1ull<<40)-1;
+static constexpr uint64_t M1=0x9E3779B97F4Bull&MASK40,M2=0xD6E8FEB86659ull&MASK40;
+static constexpr uint64_t inv40(uint64_t a){uint64_t x=a;for(int i=0;i<6;++i)x*=2-a*x;return x&MASK40;}
+static constexpr uint64_t I1=inv40(M1),I2=inv40(M2);
+static_assert(((M1*I1)&MASK40)==1&&((M2*I2)&MASK40)==1);
+static constexpr int64_t DAYMS=86400000LL;
+static constexpr uint64_t ESLOT_INVALID_K=2,EV_PURCHASE_BIT=1ull<<24,RAW_USER=0xC0000000u,PRICE_MAX=10000000; // main.cpp: ESLOT_INVALID, EV_PURCHASE, DENSE_USER_RAW, price_value's limit
+static inline uint64_t index_of_ref(uint64_t y,uint64_t key){uint64_t m=(y*I2)&MASK40;m=m^(m>>17)^(m>>34);return ((m^key)*I1)&MASK40;}
+static inline unsigned id8_ref(const uint64_t* w,const uint64_t* n,uint64_t key,uint64_t limit,uint64_t* ctr){
+ unsigned acc=0;
+ for(int i=0;i<8;++i){
+  ctr[i]=0;
+  const uint64_t len=n[i];
+  if(len-1u>7u)continue;
+  unsigned char s[8];memcpy(s,&w[i],8);
+  if(s[0]=='0'&&len>1)continue;
+  uint64_t v=0;bool ok=true;
+  for(uint64_t j=0;j<len;++j){unsigned d=s[j]-(unsigned)'0';if(d>9){d=s[j]-(unsigned)'a';if(d>25){ok=false;break;}d+=10;}v=v*36+d;}
+  if(!ok||v>MASK40)continue;
+  const uint64_t c=index_of_ref(v,key);
+  if(c<limit){ctr[i]=c;acc|=1u<<i;}
+ }
+ return acc;
+}
+static constexpr uint64_t VKT[]={
+ /* 0*/ (uint64_t)(64),
+ /* 1*/ (uint64_t)(uint8_t)(0x30)*0x0101010101010101ULL,
+ /* 2*/ (uint64_t)(uint8_t)('0')*0x0101010101010101ULL,
+ /* 3*/ (uint64_t)(uint8_t)('a')*0x0101010101010101ULL,
+ /* 4*/ (uint64_t)(uint8_t)(9)*0x0101010101010101ULL,
+ /* 5*/ (uint64_t)(uint8_t)(25)*0x0101010101010101ULL,
+ /* 6*/ (uint64_t)(uint8_t)((char)(10-'a'))*0x0101010101010101ULL,
+ /* 7*/ (uint64_t)(uint16_t)(0x0124)*0x0001000100010001ULL,
+ /* 8*/ (uint64_t)(uint32_t)(0x00010510)*0x0000000100000001ULL,
+ /* 9*/ (uint64_t)(1679616),
+ /*10*/ (uint64_t)(1),
+ /*11*/ (uint64_t)(7),
+ /*12*/ (uint64_t)(MASK40),
+ /*13*/ (uint64_t)(I2),
+ /*14*/ (uint64_t)(I1),
+ /*15*/ (uint64_t)(0x0000000030540000ULL),
+ /*16*/ (uint64_t)(0xFFFFFFFF0200FFFFULL),
+ /*17*/ (uint64_t)(0x0030303A30303A30ULL),
+ /*18*/ (uint64_t)(0xFF09050009050009ULL),
+ /*19*/ (uint64_t)(0x0000000064000000ULL),
+ /*20*/ (uint64_t)(0x0000000001680000ULL),
+ /*21*/ (uint64_t)(0x00010A00010A0001ULL),
+ /*22*/ (uint64_t)(0x00010001003C0E10ULL),
+ /*23*/ (uint64_t)(1000),
+ /*24*/ (uint64_t)(86400000),
+ /*25*/ (uint64_t)(0x010A010A010A010AULL),
+ /*26*/ (uint64_t)(0x0001006400010064ULL),
+ /*27*/ (uint64_t)(0x010A010A01000000ULL),
+ /*28*/ (uint64_t)(0x0001006400010000ULL),
+ /*29*/ (uint64_t)(10000),
+ /*30*/ (uint64_t)(100000),
+ /*31*/ (uint64_t)(0x30303A3030000000ULL),
+ /*32*/ (uint64_t)(0x0905000902FFFFFFULL),
+ /*33*/ (uint64_t)(0x010A00010A000000ULL),
+ /*34*/ (uint64_t)(0x0001003C003C0000ULL),
+ /*35*/ (uint64_t)(60000),
+ /*36*/ (uint64_t)(0x40),
+ /*37*/ (uint64_t)(0x3C),
+ /*38*/ (uint64_t)(0x0F03),
+ /*39*/ (uint64_t)(0xFFFFFFFFULL),
+ /*40*/ (uint64_t)(0xFFFF),
+ /*41*/ (uint64_t)(4),
+ /*42*/ (uint64_t)(0x77656976ULL),
+ /*43*/ (uint64_t)(0x74726163ULL),
+ /*44*/ (uint64_t)(8),
+ /*45*/ (uint64_t)(0x6573616863727570ULL),
+ /*46*/ (uint64_t)(2),
+ /*47*/ (uint64_t)(3),
+ /*48*/ (uint64_t)('Z'),
+ /*49*/ (uint64_t)('+'),
+ /*50*/ (uint64_t)('-'),
+ /*51*/ (uint64_t)(20),
+ /*52*/ (uint64_t)(25),
+ /*53*/ (uint64_t)(13),
+ /*54*/ (uint64_t)(DAYMS),
+ /*55*/ (uint64_t)(uint8_t)(',')*0x0101010101010101ULL,
+ /*56*/ (uint64_t)(uint8_t)('"')*0x0101010101010101ULL,
+ /*57*/ (uint64_t)(-1),
+ /*58*/ (uint64_t)(63),
+ /*59*/ (uint64_t)(16),
+ /*60*/ (uint64_t)(0xFF),
+ /*61*/ (uint64_t)('e'),
+ /*62*/ (uint64_t)('u'),
+ /*63*/ (uint64_t)(9),
+ /*64*/ (uint64_t)(12),
+ /*65*/ (uint64_t)(5),
+ /*66*/ (uint64_t)(17),
+ /*67*/ (uint64_t)(PRICE_MAX-1),
+ /*68*/ (uint64_t)(EV_PURCHASE_BIT),
+ /*69*/ (uint64_t)(ESLOT_INVALID_K),
+ /*70*/ (uint64_t)(RAW_USER),
+ /*71*/ (uint64_t)(0x3030),
+ /*72*/ (uint64_t)(0xFFFFFFFFFFFF0909ULL),
+ /*73*/ (uint64_t)(0x010A),
+ /*74*/ (uint64_t)(128),
+};
+#ifndef VERT_K64
+#define VERT_K64 0
+#endif
+#if VERT_K64
+struct VKWide{alignas(64) uint64_t w[sizeof(VKT)/sizeof(VKT[0])*8];constexpr VKWide():w{}{for(unsigned i=0;i<sizeof(VKT)/sizeof(VKT[0]);++i)for(unsigned j=0;j<8;++j)w[8*i+j]=VKT[i];}};
+static constexpr VKWide VKW{};
+static inline __attribute__((always_inline)) const uint64_t* vk_ptr(){const uint64_t* p=VKW.w;__asm__("":"+r"(p));return p;}
+#define VERT_K5(i) _mm512_load_si512((const void*)(VK+8*(i)))
+#else
+static inline __attribute__((always_inline)) const uint64_t* vk_ptr(){const uint64_t* p=VKT;__asm__("":"+r"(p));return p;}
+#define VERT_K5(i) _mm512_set1_epi64((long long)VK[i])
+#endif
+struct DateEnt{uint64_t k;uint32_t cc;uint32_t pad;int64_t ms;};
+static_assert(sizeof(DateEnt)==24);
+static constexpr unsigned ND=4; // version 4: at most this many year-months have dates the kernel accepts
+struct EvDates{uint64_t pfx[ND];uint64_t base[ND];uint64_t dim[ND];uint64_t n;}; // "YYYY-MM-" as 8 bytes, ms of day 1 at 00:00Z, days of the month; n used (0: no date is accepted)
+static inline unsigned char byte_of(uint64_t w,unsigned i){return (unsigned char)(w>>(8*i));}
+static inline bool tod_ref(uint64_t w1,uint64_t w2,uint64_t& ms){
+ if(byte_of(w1,2)!='T'||byte_of(w2,1)!=':'||byte_of(w2,4)!=':')return false;
+ const unsigned ht=byte_of(w1,3)-(unsigned)'0',hu=byte_of(w2,0)-(unsigned)'0',mt=byte_of(w2,2)-(unsigned)'0',mu=byte_of(w2,3)-(unsigned)'0',st=byte_of(w2,5)-(unsigned)'0',su=byte_of(w2,6)-(unsigned)'0';
+ if(ht>2||hu>9||mt>5||mu>9||st>5||su>9)return false;
+ const uint64_t v=(uint64_t)(((ht*10+hu)*60+mt*10+mu)*60+st*10+su)*1000;
+ if(v>=86400000ULL)return false;
+ ms=v;return true;
+}
+static inline bool epoch_ref(uint64_t w0,uint64_t w1,uint64_t& ms){
+ uint64_t hi=0,lo=0;
+ for(unsigned i=0;i<8;++i){const unsigned d=byte_of(w0,i)-(unsigned)'0';if(d>9)return false;hi=hi*10+d;}
+ for(unsigned i=0;i<8;++i){const unsigned d=byte_of(w1,i)-(unsigned)'0';if(d>9)return false;if(i>=3)lo=lo*10+d;}
+ ms=hi*100000+lo;return true;
+}
+static inline bool off_ref(uint64_t w2,uint64_t w3,int64_t& delta){
+ const unsigned char sg=byte_of(w2,7);
+ if((sg!='+'&&sg!='-')||byte_of(w3,5)!=':')return false;
+ const unsigned o1=byte_of(w3,3)-(unsigned)'0',o2=byte_of(w3,4)-(unsigned)'0',o3=byte_of(w3,6)-(unsigned)'0',o4=byte_of(w3,7)-(unsigned)'0';
+ if(o1>9||o2>9||o3>9||o4>9)return false;
+ const unsigned oh=o1*10+o2,om=o3*10+o4;
+ if(oh>23||om>59)return false; // (ts_v3 says "not a timestamp" here; the kernels simply refuse the row)
+ const int64_t off=(int64_t)(oh*60+om)*60000LL;
+ delta=sg=='-'?off:-off;return true;
+}
+#define VERT_C5(x) _mm512_set1_epi64((long long)(x))
+#define VERT_LD5(p) _mm512_loadu_si512((const void*)(p))
+VERT_T5 static inline __m512i tod8k_v5(__m512i a,__m512i b,__mmask8& ok){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i va=_mm512_sub_epi8(a,VERT_K5(15)),la=VERT_K5(16);
+ const __m512i vb=_mm512_sub_epi8(b,VERT_K5(17)),lb=VERT_K5(18);
+ const __m512i pa=_mm512_madd_epi16(_mm512_maddubs_epi16(va,VERT_K5(19)),VERT_K5(20));
+ const __m512i pb=_mm512_madd_epi16(_mm512_maddubs_epi16(vb,VERT_K5(21)),VERT_K5(22));
+ const __m512i s=_mm512_add_epi32(pa,pb);
+ const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(s,_mm512_srli_epi64(s,32)),VERT_K5(23));
+ ok=_mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(va,la),la),_mm512_max_epu8(vb,lb),lb),ms,VERT_K5(24));
+ return ms;
+}
+VERT_T5 static inline __m512i epoch8k_v5(__m512i w0,__m512i w1,__mmask8& ok){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i z=VERT_K5(2),nine=VERT_K5(4);
+ const __m512i v0=_mm512_sub_epi8(w0,z),v1=_mm512_sub_epi8(w1,z);
+ ok=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v0,nine),nine),_mm512_max_epu8(v1,nine),nine);
+ const __m512i p0=_mm512_madd_epi16(_mm512_maddubs_epi16(v0,VERT_K5(25)),VERT_K5(26));
+ const __m512i p1=_mm512_madd_epi16(_mm512_maddubs_epi16(v1,VERT_K5(27)),VERT_K5(28));
+ const __m512i tenk=VERT_K5(29);
+ const __m512i hi=_mm512_add_epi64(_mm512_mul_epu32(p0,tenk),_mm512_srli_epi64(p0,32));
+ const __m512i lo=_mm512_add_epi64(_mm512_mul_epu32(p1,tenk),_mm512_srli_epi64(p1,32));
+ return _mm512_add_epi64(_mm512_mul_epu32(hi,VERT_K5(30)),lo);
+}
+VERT_T5 static inline __m512i off8k_v5(__m512i w3,__mmask8& ok){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i v=_mm512_sub_epi8(w3,VERT_K5(31)),l=VERT_K5(32);
+ const __m512i p=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_K5(33)),VERT_K5(34));
+ const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(p,_mm512_srli_epi64(p,32)),VERT_K5(35));
+ ok=_mm512_mask_cmplt_epu64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,l),l),ms,VERT_K5(24));
+ return ms;
+}
+static inline uint64_t ld8_ref(const char* p){uint64_t w;memcpy(&w,p,8);return w;}
+static inline void masks_ref(const char* p,uint64_t& c,uint64_t& q){c=0;q=0;for(int i=0;i<64;++i){c|=(uint64_t)(p[i]==',')<<i;q|=(uint64_t)(p[i]=='"')<<i;}}
+static inline unsigned tz_ref(uint64_t x){return x?(unsigned)__builtin_ctzll(x):64u;}
+static inline uint64_t blsr_ref(uint64_t x){return x&(x-1);}
+static inline bool day4_ref(uint64_t w0,uint64_t w1,const EvDates& d,uint64_t& dayms){
+ const unsigned a=byte_of(w1,0)-(unsigned)'0',b=byte_of(w1,1)-(unsigned)'0';
+ if(a>9||b>9)return false;
+ const uint64_t t=(uint64_t)(a*10+b)-1; // day - 1 (day 0 wraps and fails the test below)
+ for(uint64_t j=0;j<d.n&&j<ND;++j)if(w0==d.pfx[j]){if(t>=d.dim[j])return false;dayms=d.base[j]+t*(uint64_t)DAYMS;return true;}
+ return false;
+}
+VERT_T5 static inline __m512i day4k_v5(__m512i w0,__m512i w1,const EvDates& d,__mmask8& hit){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i vd=_mm512_sub_epi8(w1,VERT_K5(71)),lim=VERT_K5(72);
+ const __m512i t=_mm512_sub_epi64(_mm512_maddubs_epi16(vd,VERT_K5(73)),VERT_K5(10)); // day - 1 (bytes 2..7 are multiplied by 0)
+ __m512i base=_mm512_setzero_si512(),dim=_mm512_setzero_si512();                      // no prefix: dim 0, nothing is below it
+ const uint64_t n=d.n<ND?d.n:ND;
+ for(uint64_t j=0;j<n;++j){
+  const __mmask8 m=_mm512_cmpeq_epi64_mask(w0,_mm512_set1_epi64((long long)d.pfx[j]));
+  base=_mm512_mask_mov_epi64(base,m,_mm512_set1_epi64((long long)d.base[j]));
+  dim=_mm512_mask_mov_epi64(dim,m,_mm512_set1_epi64((long long)d.dim[j]));
+ }
+ hit=_mm512_mask_cmplt_epu64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(vd,lim),lim),t,dim); // two digits, 1 <= day <= days of the month
+ return _mm512_add_epi64(base,_mm512_mul_epu32(t,VERT_K5(24)));
+}
+VERT_T5 static inline __attribute__((always_inline)) void ld16x8_v5(const uint64_t* a,long off,__m512i& lo,__m512i& hi){
+ #define VERT_X5(i) _mm_loadu_si128((const __m128i*)((const char*)a[i]+off))
+ __m512i e=_mm512_castsi128_si512(VERT_X5(0)),q=_mm512_castsi128_si512(VERT_X5(1));
+ e=_mm512_inserti32x4(e,VERT_X5(2),1);q=_mm512_inserti32x4(q,VERT_X5(3),1);
+ e=_mm512_inserti32x4(e,VERT_X5(4),2);q=_mm512_inserti32x4(q,VERT_X5(5),2);
+ e=_mm512_inserti32x4(e,VERT_X5(6),3);q=_mm512_inserti32x4(q,VERT_X5(7),3);
+ #undef VERT_X5
+ lo=_mm512_unpacklo_epi64(e,q);hi=_mm512_unpackhi_epi64(e,q);
+}
+VERT_T5 static inline __attribute__((always_inline)) void ld16x8p_v5(const char* const* a,__m512i& lo,__m512i& hi){
+ #define VERT_X5(i) _mm_loadu_si128((const __m128i*)a[i])
+ __m512i e=_mm512_castsi128_si512(VERT_X5(0)),q=_mm512_castsi128_si512(VERT_X5(1));
+ e=_mm512_inserti32x4(e,VERT_X5(2),1);q=_mm512_inserti32x4(q,VERT_X5(3),1);
+ e=_mm512_inserti32x4(e,VERT_X5(4),2);q=_mm512_inserti32x4(q,VERT_X5(5),2);
+ e=_mm512_inserti32x4(e,VERT_X5(6),3);q=_mm512_inserti32x4(q,VERT_X5(7),3);
+ #undef VERT_X5
+ lo=_mm512_unpacklo_epi64(e,q);hi=_mm512_unpackhi_epi64(e,q);
+}
+static constexpr unsigned CL_GEN_ALIAS_BITS=9,CL_ALIAS_BITS=3; // main.cpp: dn::GEN_ALIAS_BITS, dn::ALIAS_BITS
+static constexpr uint64_t DENSE_USER_BIT=0x40000000u;          // main.cpp: DENSE_USER
+static constexpr unsigned CSLOT_SHIFT=4;                       // main.cpp: sizeof(CSlot) == 16
+struct ClConst{uint64_t kc,limC,ku,limI;const uint64_t* cplx;int64_t clickStart;uint64_t wlen;const DateEnt* memo;EvDates d={};}; // memo: version 1 only; d (= make_dates_cl(...)): version 2 only
+struct alignas(64) Cl8Scan{uint64_t c[8],q[8];};
+struct alignas(64) Cl8Out{
+ uint64_t kcn[8];     // idok rows: click counter
+ uint64_t so[8];      // idok rows: kcn << 4 (byte offset of the CSlot)
+ uint64_t ckh[8];     // ok rows: (ts - clickStart) << 16; the caller ORs (uint16_t)campaign index
+ uint64_t user[8];    // ok rows: DENSE_USER | index << 3 | alias
+ const char* sc[8];uint64_t lc[8]; // ok rows: campaign_id content (quotes stripped)
+ uint32_t umax,kend;  // over the ok rows: largest user, largest (uint32_t)kcn + 1 (0 if there is no ok row)
+ uint8_t ok;          // bit i: the caller looks the campaign up and commits (see the contract)
+ uint8_t drop;        // bit i: click_line_v3 drops the line without doing anything; never together with ok
+ uint8_t idok;        // bit i: kcn[i] is the counter of a dense click_id on a line click_line_v3 decodes (ok implies idok)
+};
+static inline bool id1_ref(uint64_t w,uint64_t n,uint64_t key,uint64_t limit,uint64_t& ctr){
+ uint64_t out[8];const uint64_t ws[8]={w,w,w,w,w,w,w,w},ns[8]={n,n,n,n,n,n,n,n};
+ if(!(id8_ref(ws,ns,key,limit,out)&1))return false;
+ ctr=out[0];return true;
+}
+static const uint64_t VKC[]={
+ /*0*/ (uint64_t)('k'),
+ /*1*/ (uint64_t)(((1u<<CL_GEN_ALIAS_BITS)-1)&~((1u<<CL_ALIAS_BITS)-1)), // alias bits that must be zero (alias < 8)
+ /*2*/ (uint64_t)((1u<<CL_ALIAS_BITS)-1),
+ /*3*/ (uint64_t)(0xFFFFFFFFu),
+ /*4*/ (uint64_t)(DENSE_USER_BIT),
+ /*5*/ (uint64_t)(0xFF),
+};
+static inline __attribute__((always_inline)) const uint64_t* vkc_ptr(){const uint64_t* p=VKC;__asm__("":"+r"(p));return p;}
+VERT_T5 static inline __m512i cid8k_v5(__m512i W,__m512i N,uint64_t key,uint64_t limit,__mmask8& okOut){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i n8=_mm512_slli_epi64(N,3);
+ const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(W,_mm512_sub_epi64(VERT_K5(0),n8)),_mm512_srlv_epi64(VERT_K5(1),n8));
+ const __m512i t=_mm512_sub_epi8(x,VERT_K5(2)),u=_mm512_sub_epi8(x,VERT_K5(3));
+ const __m512i bad=_mm512_min_epu8(_mm512_subs_epu8(t,VERT_K5(4)),_mm512_subs_epu8(u,VERT_K5(5)));
+ const __m512i d=_mm512_min_epu8(t,_mm512_add_epi8(x,VERT_K5(6)));
+ const __m512i p2=_mm512_maddubs_epi16(d,VERT_K5(7));
+ const __m512i p4=_mm512_madd_epi16(p2,VERT_K5(8));
+ const __m512i val=_mm512_add_epi64(_mm512_mul_epu32(p4,VERT_K5(9)),_mm512_srli_epi64(p4,32));
+ const __m512i min36=_mm512_permutexvar_epi64(N,_mm512_setr_epi64(78364164096LL,0,36,1296,46656,1679616,60466176,2176782336LL)); // MIN36[n] by the low three bits of n
+ __mmask8 ok=_mm512_testn_epi64_mask(bad,bad);
+ ok=_mm512_mask_cmpge_epu64_mask(ok,val,min36);
+ ok=_mm512_mask_cmple_epu64_mask(ok,val,VERT_K5(12));
+ const __m512i mask=VERT_K5(12);
+ __m512i m=_mm512_and_si512(_mm512_mullo_epi64(val,VERT_K5(13)),mask);
+ m=_mm512_ternarylogic_epi64(m,_mm512_srli_epi64(m,17),_mm512_srli_epi64(m,34),0x96);
+ m=_mm512_xor_si512(m,_mm512_set1_epi64((long long)key));
+ const __m512i c=_mm512_and_si512(_mm512_mullo_epi64(m,VERT_K5(14)),mask);
+ okOut=_mm512_mask_cmplt_epu64_mask(ok,c,_mm512_set1_epi64((long long)limit));return c;
+}
+VERT_T5 static inline void cscan8_v5(const char* const* ls,Cl8Scan& s){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i vc=VERT_K5(55),vq=VERT_K5(56);
+ for(int i=0;i<8;++i){
+  const __m512i x=_mm512_loadu_si512((const void*)ls[i]);
+  s.c[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));s.q[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq));
+ }
+}
+static inline EvDates make_dates_cl(int64_t click_start,int64_t window_end,int64_t window_start){
+ EvDates r={};
+ if(window_end<click_start)return r;
+ const int64_t ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38)); // as run() sets it: date3's range rule
+ const auto fl=[](int64_t a){return a>=0?a/DAYMS:-((-a+DAYMS-1)/DAYMS);};
+ int64_t ly=-1;unsigned lm=0;
+ for(int64_t day=fl(click_start)-3;day<=fl(window_end)+3&&r.n<ND;++day){
+  const int64_t z=day+719468;const int64_t era=(z>=0?z:z-146096)/146097;const unsigned doe=(unsigned)(z-era*146097);
+  const unsigned yoe=(doe-doe/1460+doe/36524-doe/146096)/365;int64_t y=(int64_t)yoe+era*400;
+  const unsigned doy=doe-(365*yoe+yoe/4-yoe/100),mp=(5*doy+2)/153,d=doy-(153*mp+2)/5+1,m=mp<10?mp+3:mp-9;y+=m<=2;
+  if(y<0||y>9999)continue;
+  if(y==ly&&m==lm)continue;
+  ly=y;lm=m;
+  static constexpr unsigned mlen[13]={0,31,28,31,30,31,30,31,31,30,31,30,31};
+  const unsigned dim=mlen[m]+((m==2&&((y%4==0&&y%100!=0)||y%400==0))?1u:0u);
+  const int64_t first=(day-(int64_t)(d-1))*DAYMS,last=first+(int64_t)(dim-1)*DAYMS; // day 1 and the last day of this month
+  if(first<ingestBase||(uint64_t)last-(uint64_t)ingestBase>=((1ull<<39)-1)-(uint64_t)DAYMS)continue;
+  unsigned char t[8];
+  t[0]=(unsigned char)('0'+y/1000);t[1]=(unsigned char)('0'+y/100%10);t[2]=(unsigned char)('0'+y/10%10);t[3]=(unsigned char)('0'+y%10);t[4]='-';
+  t[5]=(unsigned char)('0'+m/10);t[6]=(unsigned char)('0'+m%10);t[7]='-';
+  uint64_t w;memcpy(&w,t,8);
+  r.pfx[r.n]=w;r.base[r.n]=(uint64_t)first;r.dim[r.n]=dim;++r.n;
+ }
+ return r;
+}
+static inline void cl8_ref(const char* const* ls,const char* const* nx,const ClConst& c,Cl8Out& o){
+ unsigned okm=0,idm=0,drm=0;uint32_t umax=0,kend=0;
+ for(int i=0;i<8;++i){
+  o.kcn[i]=o.so[i]=o.ckh[i]=o.user[i]=o.lc[i]=0;o.sc[i]=ls[i];
+  const char* const p=ls[i];const char* const nl=nx[i]-1;
+  uint64_t cm,qa;masks_ref(p,cm,qa);
+  // structure, as click_line_v3 (DREC form: the newline is known)
+  const uint64_t L=(uint64_t)(nl-p),nbit=1ull<<(L&63),keep=nbit-1;
+  const uint64_t d=cm&keep,q=qa&keep;
+  const uint64_t st=(d<<1)|1,en=d|nbit;
+  const uint64_t sq=q&st,op=(sq+~en)&en,err=op^((q&~st)<<1);
+  if((err|(uint64_t)(__builtin_popcountll(d)^3)|(L>>6))!=0)continue;      // not well-formed: the row code passes it on
+  uint64_t B=st+sq,E=en-(op>>1);
+  const unsigned z0=(unsigned)(q&1);
+  const char* const s0=p+z0;const unsigned l0=tz_ref(E)-z0;
+  B=blsr_ref(B);E=blsr_ref(E);
+  const unsigned b1=tz_ref(B),l1=tz_ref(E)-b1;
+  B=blsr_ref(B);E=blsr_ref(E);
+  const unsigned b2=tz_ref(B),l2=tz_ref(E)-b2;
+  B=blsr_ref(B);E=blsr_ref(E);
+  const unsigned b3=tz_ref(B),l3=tz_ref(E)-b3;
+  o.sc[i]=p+b2;o.lc[i]=l2;
+  if(l0==0||l1==0){drm|=1u<<i;continue;}                                   // dropped before anything is decoded
+  uint64_t kcn=0,uc=0;bool dCl=false,uD=false;uint32_t code=0;
+  if(s0[0]=='k'&&id1_ref(ld8_ref(s0+1),(uint64_t)l0-1,c.kc,c.limC,kcn)){dCl=true;o.kcn[i]=kcn;o.so[i]=kcn<<CSLOT_SHIFT;idm|=1u<<i;}
+  if(p[b1]=='u'&&id1_ref(ld8_ref(p+b1+1),(uint64_t)l1-1,c.ku,MASK40+1,uc)){ // dense_user_code
+   const uint64_t idx=uc>>CL_GEN_ALIAS_BITS,alias=uc&((1u<<CL_GEN_ALIAS_BITS)-1);
+   if(alias<(1u<<CL_ALIAS_BITS)&&idx<c.limI&&!((c.cplx[idx>>6]>>(idx&63))&1)){uD=true;code=(uint32_t)DENSE_USER_BIT|(uint32_t)((idx<<CL_ALIAS_BITS)|alias);}
+  }
+  // ts: the three fast forms of ts_v3; anything else is left to the row code
+  const char* const s3=p+b3;
+  int64_t ts;
+  if(l3==13){uint64_t v;if(!epoch_ref(ld8_ref(s3),ld8_ref(s3+5),v))continue;ts=(int64_t)v;}
+  else if(l3==20||l3==25){
+   const uint64_t t0=ld8_ref(s3),t1=ld8_ref(s3+8),t2=ld8_ref(s3+12);
+   uint64_t tods,days;
+   if(!tod_ref(t1,t2,tods)||!day4_ref(t0,t1,c.d,days))continue;
+   ts=(int64_t)(days+tods);
+   if(l3==20){if(byte_of(t2,7)!='Z')continue;}
+   else{int64_t delta;if(!off_ref(t2,ld8_ref(s3+17),delta))continue;ts+=delta;}
+  }else continue;
+  const uint64_t trel=(uint64_t)ts-(uint64_t)c.clickStart;
+  if(trel>=c.wlen){drm|=1u<<i;continue;}                                   // outside the click window: dropped
+  if(!dCl||!uD)continue;                                                   // bucket record / ID table: the row code's business
+  okm|=1u<<i;o.ckh[i]=trel<<16;o.user[i]=code;
+  if(code>umax)umax=code;
+  if((uint32_t)kcn+1>kend)kend=(uint32_t)kcn+1;
+ }
+ o.ok=(uint8_t)okm;o.drop=(uint8_t)drm;o.idok=(uint8_t)idm;o.umax=umax;o.kend=kend;
+}
+VERT_T5 static inline void cdec8_v5(const char* const* ls,const char* const* nx,const Cl8Scan& s,const ClConst& c,Cl8Out& o){
+ const uint64_t* const VK=vk_ptr();const uint64_t* const VC=vkc_ptr();
+ const __m512i one=VERT_K5(10),ones=VERT_K5(57),c63=VERT_K5(58),c64=VERT_K5(0);
+ #define VERT_TZ5(x,xm) _mm512_sub_epi64(c63,_mm512_lzcnt_epi64(_mm512_xor_si512(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
+ #define VERT_KC5(i) _mm512_set1_epi64((long long)VC[i])
+ const __m512i P=VERT_LD5(ls),NL=_mm512_add_epi64(VERT_LD5(nx),ones);
+ const __m512i Cm=_mm512_load_si512((const void*)s.c),Qm=_mm512_load_si512((const void*)s.q);
+ // structure: the bytes before the newline, three commas, quote rules (the text of cdec8t_v5)
+ const __m512i L=_mm512_sub_epi64(NL,P),nbit=_mm512_sllv_epi64(one,L),keep=_mm512_add_epi64(nbit,ones); // (a line of 64+ bytes gives nbit = 0: it fails the length test below whatever the masks are)
+ const __m512i d=_mm512_and_si512(Cm,keep),qb=_mm512_and_si512(Qm,keep);
+ const __m512i st=_mm512_or_si512(_mm512_slli_epi64(d,1),one),en=_mm512_or_si512(d,nbit);
+ const __m512i sq=_mm512_and_si512(qb,st),op=_mm512_and_si512(_mm512_add_epi64(_mm512_sub_epi64(sq,en),ones),en);
+ const __m512i err=_mm512_xor_si512(op,_mm512_slli_epi64(_mm512_andnot_si512(st,qb),1));
+ const __m512i u0=_mm512_add_epi64(d,ones),d0=VERT_TZ5(d,u0),dA=_mm512_and_si512(d,u0);
+ const __m512i u1=_mm512_add_epi64(dA,ones),d1=VERT_TZ5(dA,u1),dB=_mm512_and_si512(dA,u1);
+ const __m512i u2=_mm512_add_epi64(dB,ones),d2=VERT_TZ5(dB,u2),dR=_mm512_and_si512(dB,u2);
+ const __m512i errAll=_mm512_or_si512(err,dR);                                  // a quote error, or a fourth comma before the newline
+ // fields: a quoted field starts one later and is two shorter
+ const __m512i z0=_mm512_and_si512(qb,one),l0=_mm512_sub_epi64(d0,_mm512_add_epi64(z0,z0));
+ const __m512i a1=_mm512_add_epi64(d0,one),z1=_mm512_and_si512(_mm512_srlv_epi64(qb,a1),one),o1=_mm512_add_epi64(a1,z1),l1=_mm512_sub_epi64(_mm512_sub_epi64(d1,o1),z1);
+ const __m512i a2=_mm512_add_epi64(d1,one),z2=_mm512_and_si512(_mm512_srlv_epi64(qb,a2),one),o2=_mm512_add_epi64(a2,z2),l2=_mm512_sub_epi64(_mm512_sub_epi64(d2,o2),z2);
+ const __m512i a3=_mm512_add_epi64(d2,one),z3=_mm512_and_si512(_mm512_srlv_epi64(qb,a3),one),o3=_mm512_add_epi64(a3,z3),l3=_mm512_sub_epi64(_mm512_sub_epi64(L,o3),z3);
+ __mmask8 sok=_mm512_testn_epi64_mask(errAll,errAll);
+ sok=_mm512_mask_test_epi64_mask(sok,dB,dB);                                    // at least three commas
+ sok=_mm512_mask_cmplt_epu64_mask(sok,L,c64);                                   // newline inside the window (L >> 6 == 0)
+ const __mmask8 nz=_mm512_mask_test_epi64_mask(_mm512_mask_test_epi64_mask(sok,l0,l0),l1,l1); // well-formed, click_id and user_id not empty
+ const __mmask8 dropE=_kandn_mask8(nz,sok);                                     // well-formed with an empty ID
+ const __m512i lowbyte=VERT_K5(60);
+ // ---- operand fetch without gathers (user and ts start at most 65 bytes into the line: every load stays below line start + 96) ----
+ alignas(64) uint64_t AD[16];
+ _mm512_store_si512((void*)AD,_mm512_add_epi64(P,o1));_mm512_store_si512((void*)(AD+8),_mm512_add_epi64(P,o3));
+ const uint64_t* ad=AD;__asm__("":"+r"(ad)::"memory"); // the reads below are scalar loads from memory, not extracts from the vectors
+ __m512i LO,HI,U0,U1,ts0,tsh,ts2,tsx;
+ ld16x8p_v5(ls,LO,HI);           // line bytes 0..15 (click_id)
+ ld16x8_v5(ad,0,U0,U1);          // user: letter + the 15 bytes after it
+ ld16x8_v5(ad+8,0,ts0,tsh);      // ts bytes 0..15
+ ld16x8_v5(ad+8,12,ts2,tsx);     // ts bytes 12..27
+ // click_id: 'k' + K1 with kc, counter < limC (letter = line byte z0, digits = line bytes z0+1 .. z0+8)
+ const __m512i z8=_mm512_slli_epi64(z0,3),i8=_mm512_add_epi64(z8,VERT_K5(44));
+ const __m512i E0=_mm512_srlv_epi64(LO,z8);
+ const __m512i IDW=_mm512_or_si512(_mm512_srlv_epi64(LO,i8),_mm512_sllv_epi64(HI,_mm512_sub_epi64(c64,i8)));
+ __mmask8 idok;const __m512i kcn=cid8k_v5(IDW,_mm512_sub_epi64(l0,one),c.kc,c.limC,idok);
+ idok=_kand_mask8(nz,_mm512_mask_cmpeq_epi64_mask(idok,_mm512_and_si512(E0,lowbyte),VERT_KC5(0)));
+ // user_id: 'u' + K1 with ku, then dense_user_code: alias < 8, index < limI, not complex
+ const uint64_t limU=(c.limI<(1ull<<(40-CL_GEN_ALIAS_BITS))?c.limI:(1ull<<(40-CL_GEN_ALIAS_BITS)))<<CL_GEN_ALIAS_BITS; // index < limI  <=>  counter < limI << 9 (a counter is below 2^40)
+ const __m512i UW=_mm512_or_si512(_mm512_srli_epi64(U0,8),_mm512_slli_epi64(U1,56)); // the 8 bytes after the letter
+ __mmask8 uok;const __m512i uc=cid8k_v5(UW,_mm512_sub_epi64(l1,one),c.ku,limU,uok);
+ uok=_mm512_mask_cmpeq_epi64_mask(uok,_mm512_and_si512(U0,lowbyte),VERT_K5(62));
+ uok=_mm512_mask_testn_epi64_mask(uok,uc,VERT_KC5(1));
+ if(!_kortestz_mask8_u8(uok,uok)){ // the complex bit, in general registers; only when some row is a candidate (then word 0 exists)
+  alignas(64) uint64_t IX[8];
+  _mm512_store_si512((void*)IX,_mm512_maskz_srli_epi64(uok,uc,CL_GEN_ALIAS_BITS)); // the user index; 0 for a row that is not a candidate
+  const uint64_t* ix=IX;__asm__("":"+r"(ix)::"memory");
+  const uint64_t* const cp=c.cplx;unsigned cb=0;
+  for(int i=0;i<8;++i){uint64_t x=ix[i];__asm__("":"+r"(x));cb|=(unsigned)((cp[x>>6]>>(x&63))&1)<<i;} // (the empty asm keeps the loop in general registers: the compiler would vectorize it)
+  uok=_kandn_mask8((__mmask8)cb,uok);
+ }
+ const __mmask8 okIU=_kand_mask8(idok,uok);
+ __m512i user=_mm512_ternarylogic_epi64(VERT_KC5(2),uc,_mm512_srli_epi64(uc,CL_GEN_ALIAS_BITS-CL_ALIAS_BITS),0xCA);                      // index << 3 | alias (alias < 8)
+ user=_mm512_ternarylogic_epi64(user,VERT_KC5(3),VERT_KC5(4),0xEA);                                                                      // DENSE_USER | (uint32_t)...
+ // ts: 20 (Z), 13 (digits), 25 (offset), as in ev8
+ const __mmask8 is13=_mm512_cmpeq_epi64_mask(l3,VERT_K5(53));
+ const __m512i ts1=_mm512_mask_or_epi64(tsh,is13,_mm512_srli_epi64(ts0,40),_mm512_slli_epi64(tsh,24)); // bytes 8..15, for 13 digits bytes 5..12
+ const __m512i ts3=_mm512_or_si512(_mm512_srli_epi64(ts2,40),_mm512_slli_epi64(tsx,24));               // bytes 17..24
+ __mmask8 oks,hits,okoff,okep;
+ const __m512i days=day4k_v5(ts0,ts1,c.d,hits);
+ const __m512i tods=tod8k_v5(ts1,ts2,oks);
+ const __mmask8 dt=_kand_mask8(oks,hits);                                       // valid time of day and known date
+ const __m512i ep=epoch8k_v5(ts0,ts1,okep);
+ const __m512i base=_mm512_mask_mov_epi64(_mm512_add_epi64(days,tods),is13,ep);
+ const __mmask8 t13=_kand_mask8(is13,okep);
+ const __m512i b19=_mm512_srli_epi64(ts2,56);
+ const __mmask8 tokA=_kor_mask8(t13,_mm512_mask_cmpeq_epi64_mask(_mm512_mask_cmpeq_epi64_mask(dt,l3,VERT_K5(51)),b19,VERT_K5(48))); // 13 digits, or 20 bytes ending in 'Z'
+ const __m512i off=off8k_v5(ts3,okoff);
+ const __mmask8 o25=_kand_mask8(dt,_mm512_mask_cmpeq_epi64_mask(okoff,l3,VERT_K5(52)));                                             // 25 bytes with a valid offset
+ const __mmask8 p25=_mm512_mask_cmpeq_epi64_mask(o25,b19,VERT_K5(49));
+ __m512i ts=_mm512_mask_sub_epi64(base,p25,base,off);
+ const __mmask8 m25=_mm512_mask_cmpeq_epi64_mask(o25,b19,VERT_K5(50));
+ ts=_mm512_mask_add_epi64(ts,m25,ts,off);
+ // ts decided by the kernel: 13 digits, or (valid time and known date) and (Z form, or offset form with a valid offset)
+ const __mmask8 tsk=_kand_mask8(nz,_kor_mask8(tokA,_kor_mask8(p25,m25)));
+ const __m512i trel=_mm512_sub_epi64(ts,VERT_C5(c.clickStart));
+ const __mmask8 inw=_mm512_mask_cmplt_epu64_mask(tsk,trel,VERT_C5(c.wlen));
+ const __mmask8 ok=_kand_mask8(inw,okIU);
+ const __mmask8 drop=_kor_mask8(dropE,_kandn_mask8(inw,tsk));                   // an empty ID, or ts outside the window
+ _mm512_store_si512((void*)o.kcn,kcn);_mm512_store_si512((void*)o.so,_mm512_slli_epi64(kcn,CSLOT_SHIFT));
+ _mm512_store_si512((void*)o.ckh,_mm512_slli_epi64(trel,16));
+ _mm512_store_si512((void*)o.user,user);
+ _mm512_store_si512((void*)o.sc,_mm512_add_epi64(P,o2));_mm512_store_si512((void*)o.lc,l2);
+ // maxima over the ok rows, both in one pass of 32-bit lanes: low dword = user, high dword = (uint32_t)kcn + 1
+ {const __m512i pk=_mm512_maskz_or_epi64(ok,user,_mm512_slli_epi64(_mm512_add_epi64(kcn,one),32));
+  const __m256i m4=_mm256_max_epu32(_mm512_castsi512_si256(pk),_mm512_extracti64x4_epi64(pk,1));
+  __m128i m2=_mm_max_epu32(_mm256_castsi256_si128(m4),_mm256_extracti128_si256(m4,1));
+  m2=_mm_max_epu32(m2,_mm_unpackhi_epi64(m2,m2));
+  _mm_storel_epi64((__m128i*)(void*)&o.umax,m2);}
+ o.ok=(uint8_t)ok;o.drop=(uint8_t)drop;o.idok=(uint8_t)idok;
+ #undef VERT_KC5
+ #undef VERT_TZ5
+}
+VERT_T5 static inline void cl8_v5(const char* const* ls,const char* const* nx,const ClConst& c,Cl8Out& o){
+ Cl8Scan s;cscan8_v5(ls,s);cdec8_v5(ls,nx,s,c,o);
+}
+static_assert(offsetof(Cl8Out,kend)==offsetof(Cl8Out,umax)+4);
+#undef VERT_C5
+#undef VERT_LD5
+#undef VERT_K5
+} // namespace vcl2
+static_assert(vcl2::MASK40==dn::MASK&&vcl2::I1==dn::I1&&vcl2::I2==dn::I2&&vcl2::DAYMS==DAY);
+static_assert(vcl2::CL_GEN_ALIAS_BITS==dn::GEN_ALIAS_BITS&&vcl2::CL_ALIAS_BITS==dn::ALIAS_BITS&&vcl2::DENSE_USER_BIT==DENSE_USER&&sizeof(CSlot)==(1u<<vcl2::CSLOT_SHIFT));
 static inline void cl8_scan_none(const char* const*,vcl::Cl8Scan&){}
 [[gnu::noinline]] static void cl8_dec_ref(const char* const* ls,const char* const* nx,const vcl::Cl8Scan&,const vcl::ClConst& c,vcl::Cl8Out& o){vcl::cl8_ref(ls,nx,c,o);}
+static inline void cl8_scan_none2(const char* const*,vcl2::Cl8Scan&){}
+[[gnu::noinline]] static void cl8_dec_ref2(const char* const* ls,const char* const* nx,const vcl2::Cl8Scan&,const vcl2::ClConst& c,vcl2::Cl8Out& o){vcl2::cl8_ref(ls,nx,c,o);}
+// The constants of a loop call for either kernel version. Version 2 gets the months of the run's own click window:
+// without `d` it would leave every row with a date-form ts to the line code.
+#define SS_CL8_CONST1(lp_) vcl::ClConst{lp_.kc,lp_.limC,lp_.ku,dense.limI,denseComplex,lp_.clickStart,lp_.wlen,(const vcl::DateEnt*)lp_.memo}
+static inline vcl2::ClConst cl8_const2(uint64_t kc,uint64_t limC,uint64_t ku,uint64_t limI,const uint64_t* cplx,int64_t clickStart,uint64_t wlen){
+ vcl2::ClConst cc{kc,limC,ku,limI,cplx,clickStart,wlen,nullptr};cc.d=vcl2::make_dates_cl(clickStart,window_end,window_start);return cc;}
+#define SS_CL8_CONST2(lp_) cl8_const2(lp_.kc,lp_.limC,lp_.ku,dense.limI,denseComplex,lp_.clickStart,lp_.wlen)
 #define SS_CL8_SLOT(O_,i_) (*(CSlot*)((char*)lp.cl+O_.so[i_]))
 // One ok row: the row code's campaign lookup; a campaign that is not found drops the row without a trace.
 #define SS_CL8_ROW(O_,i_) {uint64_t k0_;uint32_t k1_;const string_view camp_(O_.sc[i_],(size_t)O_.lc[i_]); \
@@ -3957,7 +4408,7 @@ static inline void cl8_scan_none(const char* const*,vcl::Cl8Scan&){}
    if(__builtin_expect(ci_!=KeyTable::NONE,1)){found_|=1u<<(i_);cslot_commit(SS_CL8_SLOT(O_,i_),O_.ckh[i_]|(uint16_t)ci_,(uint32_t)O_.user[i_],lp.tid);}}
 // Finishing the first N rows of a group in line order. The maxima of the group (umax, kend) cover all its ok rows:
 // they are used only if every ok row was committed, otherwise the committed rows are taken one by one.
-#define SS_CL8_FINISH(O,LS,NX,N,MASKS) {const vcl::Cl8Out& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
+#define SS_CL8_FINISH(O,LS,NX,N,MASKS) {const auto& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
   const unsigned ok_=O_.ok&((1u<<n_)-1);unsigned found_=0; \
   if(__builtin_expect(ok_==0xFFu,1)){SS_CL8_ROW(O_,0) SS_CL8_ROW(O_,1) SS_CL8_ROW(O_,2) SS_CL8_ROW(O_,3) SS_CL8_ROW(O_,4) SS_CL8_ROW(O_,5) SS_CL8_ROW(O_,6) SS_CL8_ROW(O_,7)} \
   else for(unsigned i_=0;i_<n_;++i_){ \
@@ -3969,15 +4420,15 @@ static inline void cl8_scan_none(const char* const*,vcl::Cl8Scan&){}
 // The line index and the three groups under way (N scanned, D decoded and its slots asked for, F finished) are those
 // of SS_EVENT_LOOP_EV8; see there. A short last group is filled up with the pointer behind its last line (a row with
 // nx == ls is never ok, drop or idok; the row masks cut it off as well).
-#define SS_CLICK_LOOP_CL8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC) \
+#define SS_CLICK_LOOP_CL8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC,VNS,CCONST) \
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
  ClLoop lp_(tl,tab,camps,PC,end,clickStart);lp_.ahead=0;const ClLoop& lp=lp_; /* no ring: a slow row writes its slot at the end of its line, a group after the kernel asked for it */ \
  PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CRing* const ring=nullptr;unsigned rpos=0;uint64_t rows=0,slow=0; \
  const char* ls[EV8_BLOCK+64+64];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
- const vcl::ClConst cc{lp.kc,lp.limC,lp.ku,dense.limI,denseComplex,lp.clickStart,lp.wlen,(const vcl::DateEnt*)lp.memo}; \
- vcl::Cl8Out out[2];vcl::Cl8Scan sc[2];const char* tls[9]; \
+ const VNS::ClConst cc=CCONST(lp); \
+ VNS::Cl8Out out[2];VNS::Cl8Scan sc[2];const char* tls[9]; \
  const char* const* gl[3]={ls,ls,ls};unsigned gn[3]={0,0,0}; /* lines (the next line of row i is [i+1]) and number of rows of N, D, F */ \
  unsigned iN=0,iD=1,iF=2,sN=0,oD=0;bool more=true; /* sc[sN]: N's scan, sc[sN^1]: D's; out[oD]: D's results, out[oD^1]: F's */ \
  while(more||gn[iD]||gn[iF]){ \
@@ -3990,7 +4441,11 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
      if(gn[iF]){gl[iF]-=s_;}} \
     while(m-pos<8&&scan<end&&ls[m]<lim){ \
      const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
-     do{uint64_t x_=NLMASK(scan);while(x_){ls[++m]=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);}scan+=64;}while(scan<stop);} \
+     const char** w_=ls+m; /* the first two newlines of a window are stored without a branch (click lines are shorter than a window: one or two per window; a missing one stores a value past the last entry, never read); a third one is rare */ \
+     do{uint64_t x_=NLMASK(scan);const uint64_t y_=_blsr_u64(x_);w_[1]=scan+_tzcnt_u64(x_)+1;w_[2]=scan+_tzcnt_u64(y_)+1;w_+=(x_!=0)+(y_!=0);x_=_blsr_u64(y_); \
+      while(__builtin_expect(x_!=0,0)){*++w_=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);} \
+      scan+=64;}while(scan<stop); \
+     m=(size_t)(w_-ls);} \
    } \
    if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[iN]=ls+pos;} \
    else{ /* the last lines of the chunk: a short group */ \
@@ -4003,7 +4458,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
   } \
   gn[iN]=n; \
   if(gn[iD]){ \
-   vcl::Cl8Out& o_=out[oD];const unsigned nd_=gn[iD]; \
+   VNS::Cl8Out& o_=out[oD];const unsigned nd_=gn[iD]; \
    DEC(gl[iD],gl[iD]+1,sc[sN^1],cc,o_); \
    if(__builtin_expect((nd_==8)&(o_.idok==0xFFu),1)){SS_CL8_PF(o_,0) SS_CL8_PF(o_,1) SS_CL8_PF(o_,2) SS_CL8_PF(o_,3) SS_CL8_PF(o_,4) SS_CL8_PF(o_,5) SS_CL8_PF(o_,6) SS_CL8_PF(o_,7)} \
    else for(unsigned x_=o_.idok&((1u<<nd_)-1);x_;x_&=x_-1)SS_CL8_PF(o_,__builtin_ctz(x_)) \
@@ -4014,9 +4469,13 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  if(pos==m&&ls[m]<lim)line_general<4>(ls[m],end,general); /* the last line has no newline */ \
  tl.denseMax=max(tl.denseMax,dmax);tl.clEnd=max(tl.clEnd,send);tl.cl8Rows+=rows;tl.cl8Slow+=slow; \
 }
-SS_CLICK_LOOP_CL8(clicks_avx2_c8,SS_V3,win_masks_avx2,nl_mask_avx2,cl8_scan_none,cl8_dec_ref)
-SS_CLICK_LOOP_CL8(clicks_avx512z_c8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vcl::cscan8_v5,vcl::cdec8_v5)
-SS_CLICK_LOOP_CL8(clicks_avx512y_c8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vcl::cscan8_v5,vcl::cdec8_v5)
+// _c8 = kernel version 2 (default), _c8v1 = version 1 (SS_CL8=1, for comparing the two from one binary).
+SS_CLICK_LOOP_CL8(clicks_avx2_c8,SS_V3,win_masks_avx2,nl_mask_avx2,cl8_scan_none2,cl8_dec_ref2,vcl2,SS_CL8_CONST2)
+SS_CLICK_LOOP_CL8(clicks_avx512z_c8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vcl2::cscan8_v5,vcl2::cdec8_v5,vcl2,SS_CL8_CONST2)
+SS_CLICK_LOOP_CL8(clicks_avx512y_c8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vcl2::cscan8_v5,vcl2::cdec8_v5,vcl2,SS_CL8_CONST2)
+SS_CLICK_LOOP_CL8(clicks_avx2_c8v1,SS_V3,win_masks_avx2,nl_mask_avx2,cl8_scan_none,cl8_dec_ref,vcl,SS_CL8_CONST1)
+SS_CLICK_LOOP_CL8(clicks_avx512z_c8v1,SS_V5,win_masks_avx512z,nl_mask_avx512z,vcl::cscan8_v5,vcl::cdec8_v5,vcl,SS_CL8_CONST1)
+SS_CLICK_LOOP_CL8(clicks_avx512y_c8v1,SS_V5,win_masks_avx512y,nl_mask_avx512y,vcl::cscan8_v5,vcl::cdec8_v5,vcl,SS_CL8_CONST1)
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  // With SS_STATS=1 every TIME line is followed by a CPU line: processor time (all threads, user+system) of that stage.
@@ -4025,22 +4484,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  double __cpu0=__cpu_now();
  // ... and by a SYS line (system CPU of the whole process in that stage, seconds) and a FLT line (minor page faults).
  // SYS/FLT EXITPREP at the very end cover what runs after the last mark.
- // ... and a CSW line: context switches of the whole process in the stage, voluntary (a thread went to sleep: futex,
- // lock or I/O wait) and involuntary (a thread was taken off its processor).
- auto __ru_now=[](double& sys,long& flt,long& vol,long& invol){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;vol=r.ru_nvcsw;invol=r.ru_nivcsw;};
- double __sys0=0;long __flt0=0,__vol0=0,__inv0=0;if(__cpuLines)__ru_now(__sys0,__flt0,__vol0,__inv0);
- auto __sysflt=[&](const char* label){double s;long f,v,iv;__ru_now(s,f,v,iv);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\nCSW "<<label<<" "<<v-__vol0<<" "<<iv-__inv0<<"\n";__sys0=s;__flt0=f;__vol0=v;__inv0=iv;};
+ auto __ru_now=[](double& sys,long& flt){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;};
+ double __sys0=0;long __flt0=0;if(__cpuLines)__ru_now(__sys0,__flt0);
+ auto __sysflt=[&](const char* label){double s;long f;__ru_now(s,f);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\n";__sys0=s;__flt0=f;};
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
  if(const char* v=getenv("SS_FILEALIGN")){const string_view w(v);optFileAlign=w=="2m"?1:w=="2m+huge"?2:0;}
- if(const char* v=getenv("SS_OUTOPEN"))optOutEarly=string_view(v)=="early";
- if(const char* v=getenv("SS_OUTWRITE"))optOutEnd=string_view(v)=="end";
  if(const char* v=getenv("SS_FILEADVISE")){const string_view w(v);optFileAdvise=w=="random"?1:w=="seq"?2:0;}
  if(const char* v=getenv("SS_POPULATE")){const string_view w(v);optPopulate=w=="ahead"?1:w=="all"?2:w.substr(0,2)=="bg"?3:0;
   if(optPopulate==3&&w.size()>2){const int n=atoi(v+2);if(n>=1&&n<=64)optPopulateBg=n;}}
  if(__cpuLines)cerr<<"STATS kernel switches: SS_FILEALIGN="<<(optFileAlign==2?"2m+huge":optFileAlign?"2m":"off")<<" SS_POPULATE="<<(optPopulate==1?"ahead":optPopulate==2?"all":optPopulate==3?"bg"+to_string(optPopulateBg):string("off"))
-  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" SS_OUTOPEN="<<(optOutEarly?"early":"off")<<" SS_OUTWRITE="<<(optOutEnd?"end":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
+  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
@@ -4075,16 +4530,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(size_t c=0;c<chunks.size();++c)populate_chunk(c);
  }
  __mark("MAP");
- struct EarlyOut{vector<int> fd;int campFd=-1;bool dirs=false;atomic<bool> done{false};};
- shared_ptr<EarlyOut> earlyOut;
- if(optOutEarly){earlyOut=make_shared<EarlyOut>();earlyOut->fd.assign((size_t)T,-1);
-  thread([eo=earlyOut,dir=output/"user_daily",cdir=output/"campaign_daily",T]{
-   std::error_code ec,ec2;fs::create_directories(dir,ec);fs::create_directories(cdir,ec2);eo->dirs=!ec&&!ec2;
-   {int f=::open((cdir/"part-00000.parquet").c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);if(f>=0&&::write(f,"PAR1",4)!=4){::close(f);f=-1;}eo->campFd=f;}
-   for(int t=0;t<T;++t){char name[32];snprintf(name,sizeof name,"part-%05d.parquet",t);int f=::open((dir/name).c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
-    if(f>=0&&::write(f,"PAR1",4)!=4){::close(f);f=-1;} // the file's first four bytes go out here too; on any failure the worker creates the file itself
-    eo->fd[(size_t)t]=f;}
-   eo->done.store(true,memory_order_release);}).detach();}
  if(optPopulate==3)for(int i=0;i<optPopulateBg;++i)thread([&chunks,populate_chunk]{ // chunks outlives the threads' work: they stop before PARSE ends and the process leaves through _exit
   for(;;){if(populateStop.load(memory_order_relaxed))break;const size_t c=populateNext.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;populate_chunk(c);}}).detach();
  // ---- Dense IDs: find the generator's keys from the first lines of one event file and one click file. ----
@@ -4449,9 +4894,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // The same for click files (vcl::cl8, SS_CLICK_LOOP_CL8; dense click records in slot form): the default on a CPU
  // with the kernel's extensions, with the avx512z masks when no SS_ISA is given. Any SS_CLICKS value other than cl8,
  // SS_ISA=avx2 or SS_DENSE_AHEAD (which asks for the ring of the old loop) keeps the click loop with the line index.
+ // SS_CL8=1: the cl8 loop runs kernel version 1 (gathers, date memo) instead of version 2. Same output.
+ const bool cl8V1=getenv("SS_CL8")&&string_view(getenv("SS_CL8"))=="1";
  const bool cl8Auto=hasE8&&dparse.clicks&&!dparse.bucket&&!getenv("SS_CLICKS")&&!getenv("SS_DENSE_AHEAD")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
-  <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":" events: ev8 kernel v4"):"")<<(cl8Auto?" clicks: cl8 kernel":"")<<"\n";
+  <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":" events: ev8 kernel v4"):"")<<(cl8Auto?(cl8V1?" clicks: cl8 kernel v1":" clicks: cl8 kernel v2"):"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -4581,10 +5028,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const bool drec=ck.click?dparse.clicks:dparse.events;
    const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
    const bool cl8Use=(dparse.cl8&&(isaUse==ISA_AVX2||hasE8))||(cl8Auto&&isaUse!=ISA_AVX2); // as ev8Use
-   if(ck.click&&drec&&cl8Auto&&isaUse==ISA_AVX2){clicks_avx512z_c8(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);continue;} // the default on an AVX-512 CPU
+   if(ck.click&&drec&&cl8Auto&&isaUse==ISA_AVX2){if(cl8V1)clicks_avx512z_c8v1(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);else clicks_avx512z_c8(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);continue;} // the default on an AVX-512 CPU
    if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){if(ev8V3)events_avx512z_e8v3(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);else events_avx512z_e8(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);continue;} // the default on an AVX-512 CPU
    #define SS_RUN_LOOPS(ISA) \
-    if(ck.click){if(drec&&cl8Use)clicks_##ISA##_c8(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
+    if(ck.click){if(drec&&cl8Use&&cl8V1)clicks_##ISA##_c8v1(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
+     else if(drec&&cl8Use)clicks_##ISA##_c8(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else clicks_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);} \
@@ -5187,27 +5635,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   __mark("DENSE1");
  }
  const size_t idxEnd=slots&&denseUsers?(size_t)denseMaxIdx.load()+1:0;
- optThrStats=stats;
- const double thrS0=stats?now_s():0; // start of the DENSE stage's serial lead-in
- double thrR0=0,thrA0=0,thrSingle=0; // parallel region start; AGGREGATE start; serial part at the end of DENSE
- vector<ThrStat> dstat(stats?T:0),astat(stats?T:0);
- // One line per stage, all times in ms. min/max/sum are over the threads.
- const auto thr_line=[&](const char* name,const vector<ThrStat>& v,double t0,double serialPre,double serialEnd){
-  double fMin=1e9,fMax=0,lMin=1e9,lMax=0,wMin=1e9,wMax=0,wSum=0,cLoop=0,wr=0,wrMax=0,wrCpu=0,op=0,gr=0,tMin=1e9,tMax=0,cAll=0,en=0;unsigned wc=0,gc=0,idle=0;
-  for(const ThrStat& x:v){
-   if(x.first<0){++idle;cAll+=x.cOut-x.cIn;wr+=x.wWall;wrCpu+=x.wCpu;wc+=x.wCalls;op+=x.oWall;gr+=x.gWall;gc+=x.gCalls;en+=x.endWall;continue;}
-   const double f=x.first-t0,l=x.last-t0,w=x.last-x.first,tl=x.out-x.last;
-   fMin=min(fMin,f);fMax=max(fMax,f);lMin=min(lMin,l);lMax=max(lMax,l);wMin=min(wMin,w);wMax=max(wMax,w);wSum+=w;cLoop+=x.cLast-x.cFirst;
-   wr+=x.wWall;wrMax=max(wrMax,x.wMax);wrCpu+=x.wCpu;wc+=x.wCalls;op+=x.oWall;gr+=x.gWall;gc+=x.gCalls;tMin=min(tMin,tl);tMax=max(tMax,tl);cAll+=x.cOut-x.cIn;en+=x.endWall;
-  }
-  if(idle==v.size())fMin=lMin=wMin=tMin=0;
-  char b[640];snprintf(b,sizeof b,"STATS %s threads: n %zu noloop %u serial_pre %.2f first_start %.2f %.2f last_end %.2f %.2f loop_wall %.2f %.2f %.2f loop_cpu %.2f write_wall %.2f write_max %.2f write_cpu %.2f write_calls %u open_wall %.2f grow_wall %.2f grow_calls %u tail_wall %.2f %.2f end_wall %.2f serial_end %.2f thread_cpu %.2f\n",
-   name,v.size(),idle,serialPre*1e3,fMin*1e3,fMax*1e3,lMin*1e3,lMax*1e3,wMin*1e3,wMax*1e3,wSum*1e3,cLoop*1e3,wr*1e3,wrMax*1e3,wrCpu*1e3,wc,op*1e3,gr*1e3,gc,tMin*1e3,tMax*1e3,en*1e3,serialEnd*1e3,cAll*1e3);
-  cerr<<b;};
  uint64_t deferLoE=UINT64_MAX,deferHiE=0,deferLoC=UINT64_MAX,deferHiC=0; // counter ranges holding the rows of deferred indexes
  // ---- Per person bucket: order, sessionize, attribute. Each thread writes its own Parquet file. ----
- if(earlyOut)while(!earlyOut->done.load(memory_order_acquire))this_thread::yield(); // SS_OUTOPEN=early: long done in practice
- if(!(earlyOut&&earlyOut->dirs)){fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");}
+ fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");
  const bool debugCsv=getenv("SS_DEBUG_CSV")!=nullptr; // unit tests read these hex rows from SCRATCH_DIR
  const size_t ncamp=campaigns.size();
  const int64_t firstday=divfloor(window_start,DAY);
@@ -5273,16 +5703,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(evBase&&evEnd)slot_pieces(evBase,(size_t)denseEvEnd.load()<<evShift);
   if(denseCl&&clEnd)slot_pieces((const char*)denseCl,(size_t)denseClEnd.load()*sizeof(CSlot));
  }
- if(stats)thrR0=now_s();
  #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9])
  {
   const int tid=omp_get_thread_num();
-  ThrStat thrNone;ThrStat* cur=stats?&dstat[tid]:&thrNone; // the stage this thread is in
-  double grow0=tlGrowWall;uint32_t growN0=tlGrowCalls;
-  if(stats){cur->in=now_s();cur->cIn=thr_cpu_s();}
-  const auto thr_chunk_in=[&]{if(__builtin_expect(stats,0)&&cur->first<0){cur->first=cur->last=now_s();cur->cFirst=cur->cLast=thr_cpu_s();}};
-  const auto thr_chunk_out=[&]{if(__builtin_expect(stats,0)){cur->last=now_s();cur->cLast=thr_cpu_s();}};
-  const auto thr_stage_out=[&]{cur->out=now_s();cur->cOut=thr_cpu_s();cur->gWall=tlGrowWall-grow0;cur->gCalls=tlGrowCalls-growN0;grow0=tlGrowWall;growN0=tlGrowCalls;};
   #pragma omp for schedule(static,1) nowait
   for(size_t i=0;i<unmapFirst.size();++i)munmap(unmapFirst[i].first,unmapFirst[i].second);
   // Per-thread campaign totals, laid out [day][campaign].
@@ -5293,10 +5716,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp+1);size_t nact=0; // active: one free place after a full list (see the fast lane's large click sets)
   vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
   PqFile file;
-  auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);
-   const int efd=earlyOut&&(size_t)tid<earlyOut->fd.size()?earlyOut->fd[(size_t)tid]:-1; // each worker touches only its own entry
-   if(efd>=0){earlyOut->fd[(size_t)tid]=-1;file.adopt(efd,userCols);}
-   else file.open(output/"user_daily"/name,userCols);};
+  auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
   // Row buffers. A person adds at most ndays rows and the buffers are flushed between persons,
   // so the fixed-width columns never need a capacity check.
   static constexpr size_t FLUSH=50000;
@@ -5316,14 +5736,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    catbody.clear();
    string head;put_varint(head,(groups<<1)|1);
    put_le32(catbody,(uint32_t)(head.size()+groups));catbody+=head;catbody.append((const char*)catbits,groups);catbody+=catv;
-   const double w0=stats?now_s():0,c0=stats?thr_cpu_s():0;
    if(!file.is_open())open_file();
-   const double w1=stats?now_s():0;
    file.row_group((int64_t)n,{string_view(uidp,uidLen),string_view((const char*)dayp,n*4),
     narrow?string_view((const char*)sess32p,n*4):string_view((const char*)sessp,n*8),
     narrow?string_view((const char*)evs32p,n*4):string_view((const char*)evsp,n*8),
     string_view((const char*)revp,n*8),catbody});
-   if(stats){const double w2=now_s();cur->oWall+=w1-w0;cur->wWall+=w2-w1;cur->wMax=max(cur->wMax,w2-w1);cur->wCpu+=thr_cpu_s()-c0;++cur->wCalls;}
    memset(catbits,0,groups);catv.clear();uidLen=0;nrows=0;
   };
   Scratch<Ev> bufA,bufB;Scratch<Click> bufC,bufD;
@@ -5466,7 +5883,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
    for(size_t i0=0;i0<idxEnd;i0+=ICH){
     const size_t i1=min(idxEnd,i0+ICH);
-    thr_chunk_in();
     for(size_t ix=i0;ix<i1;++ix){
      DInfo& f=info[ix];
      const uint32_t ec=f.ec.load(memory_order_relaxed),cc=f.cc.load(memory_order_relaxed);
@@ -5709,7 +6125,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        if(sl.present&&d<8){hand_click(myCl,pool,txt,sl.key,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),(uint32_t)c);++rdHandCl;}}
      }
     }
-    thr_chunk_out();
    }
    // ---- DENSE stage, part 3: the rows of the deferred indexes, in one sweep. ----
    #pragma omp for schedule(dynamic,1) nowait
@@ -5726,26 +6141,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      if(sl.present&&(u&DENSE_USER)){const uint32_t d=u&~DENSE_USER;
       if(info[d>>dn::ALIAS_BITS].state.load(memory_order_relaxed)==DSTATE_DEFER){hand_click(myCl,pool,txt,sl.key,dBase+(d^((comp[d>>3].load(memory_order_relaxed)>>(3*(d&7)))&7)),(uint32_t)c);++rdHandCl;}}}
    }
-   if(stats){ // every thread closes its DENSE record before one of them prints the line
-    thr_stage_out();
-    #pragma omp barrier
-   }
    // The general lists are complete now: size the buffers of the rest of this stage by them.
    #pragma omp single
    {
-    const double thrSg0=stats?now_s():0;
     if(slots){
      maxEvPerson=0;maxClPerson=0;
      for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
       maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
      size_pools();
-     if(stats){thrSingle=now_s()-thrSg0;thr_line("dense",dstat,thrR0,thrR0-thrS0,thrSingle);}
      __mark("DENSE");
     }
-    if(stats)thrA0=now_s();
    }
   }
-  if(stats){cur=&astat[tid];cur->in=now_s();cur->cIn=thr_cpu_s();} // from here on: the AGGREGATE stage
   bufA.reserve(maxEvPerson);bufB.reserve(maxEvPerson);bufC.reserve(maxClPerson);bufD.reserve(maxClPerson);
   if(cellPass)cellBuf.reserve(maxEvPerson+2);
   Cell* const cells=cellBuf.p;
@@ -5754,7 +6161,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t nE=0,nC=0;
    for(int t=0;t<T;++t){nE+=surv[t].ev[up].size();nC+=surv[t].cl[up].size();}
    if(!nE)continue;
-   thr_chunk_in();thr_chunk_out();
    const uint32_t base=up<nA?(uint32_t)(up<<shA):denseBase+(uint32_t)((up-nA)<<shB),W=up<nA?WA:WB;
    if(SMALL_BUCKET&&nE<=max<size_t>(SMALL_BUCKET,W/2)){
     // Few rows for the bucket's width: sort them by person and time and go person by person, so the
@@ -5964,20 +6370,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     nact=0;
     if(nrows>=FLUSH)flush_rows();
    }
-   thr_chunk_out();
   }
-  const double thrE0=stats?now_s():0;
   // Every row is in the output buffers now (names are copied there): nothing points into an input file.
   #pragma omp for schedule(static,1) nowait
   for(size_t i=0;i<unmapLast.size();++i)munmap(unmapLast[i].first,unmapLast[i].second);
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
   if(file.is_open())file.close();
-  if(stats){thr_stage_out();cur->endWall=cur->out-thrE0;}
  }
- if(stats)thr_line("aggregate",astat,thrA0?thrA0:thrR0,0,0);
- if(earlyOut)for(size_t t=0;t<earlyOut->fd.size();++t)if(earlyOut->fd[t]>=0){ // a file no worker wrote to: it must not stay behind empty
-  ::close(earlyOut->fd[t]);earlyOut->fd[t]=-1;char name[32];snprintf(name,sizeof name,"part-%05d.parquet",(int)t);::unlink((output/"user_daily"/name).c_str());}
  vector<Totals> campTotals(ncamp*(size_t)ndays);
  for(const Totals* tt:threadTotals)if(tt)for(size_t i=0;i<ncells;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
  for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=0;i<ncells;++i)campTotals[i].assists+=ta[i];
@@ -5997,10 +6397,8 @@ __mark("AGGREGATE");
    if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
   }
   PqFile f;
-  const vector<PqCol> campCols={{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
-   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}};
-  if(earlyOut&&earlyOut->campFd>=0){f.adopt(earlyOut->campFd,campCols);earlyOut->campFd=-1;}
-  else f.open(output/"campaign_daily"/"part-00000.parquet",campCols);
+  f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
+   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});
   if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
   f.close();
   if(debugCsv){

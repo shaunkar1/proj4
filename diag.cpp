@@ -395,22 +395,37 @@ int main(){
  #define V3 {"SS_EV8","3"}
  #define ST {"SS_STATS","1"}
  #define PO {"SS_DENSE_DUMP","-"}
- for(int r=0;r<3;++r){
-  add("B",1,{N8});add("v3",1,{N8,V3});add("O",1,{N8});add("Os",1,{N8,ST});add("Oe",1,{N8,{"SS_OUTOPEN","early"}});add("Ow",1,{N8,{"SS_OUTWRITE","end"}});
-  add("pB",1,{N8,PO});add("pN",1,{N8,PO},"core-n");add("pK",1,{N8,PO},"core-k");
-  add("h",1,{N8},"core-h");
-  add("pb",1,{N8,{"OMP_PROC_BIND","true"}});add("wa",1,{N8,{"OMP_WAIT_POLICY","active"}});add("pbwa",1,{N8,{"OMP_PROC_BIND","true"},{"OMP_WAIT_POLICY","active"}});
+ for(int r=0;r<4;++r){
+  add("B",1,{N8});add("c60",1,{N8},"core-b");add("cl1",1,{N8,{"SS_CL8","1"}});add("ix",1,{N8,{"SS_CLICKS","ix"}});
+  add("pB",1,{N8,PO});add("p60",1,{N8,PO},"core-b");add("Bs",1,{N8,ST});
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hv3",1,{N8,V3},"",true);add("HO",1,{N8},"",true);add("HOs",1,{N8,ST},"",true);add("HOe",1,{N8,{"SS_OUTOPEN","early"}},"",true);
-  add("HpB",1,{N8,PO},"",true);add("HpN",1,{N8,PO},"core-n",true);add("HpK",1,{N8,PO},"core-k",true);add("Hpbwa",1,{N8,{"OMP_PROC_BIND","true"},{"OMP_WAIT_POLICY","active"}},"",true);add("Hh",1,{N8},"core-h",true);}
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H60",1,{N8},"core-b",true);add("Hcl1",1,{N8,{"SS_CL8","1"}},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;
   if(v.label[0]=='O'||(v.label[0]=='H'&&v.label.size()>1&&v.label[1]=='O')){const string ro=string(outdir)+"/zz_tmp";pipeline(v.label,v.hugeSet?H:B,ro,v.env,v.bin);error_code ec;fs::remove_all(ro,ec);}
   else pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
+ // Floors: 8 threads over every byte of the 20M replica's event and click files (page cache is warm by now).
+ string floorText;
+ if(timeleft(10)){
+  vector<pair<string,off_t>> files;for(const char* sub:{"events","clicks"})for(auto& f:fs::directory_iterator(big/sub)){struct stat st;if(stat(f.path().c_str(),&st)==0)files.push_back({f.path().string(),st.st_size});}
+  sort(files.begin(),files.end(),[](auto& x,auto& y){return x.second>y.second;});
+  for(int mode=0;mode<3;++mode){double best=1e9;uint64_t tot=0;
+   for(int rep=0;rep<3;++rep){atomic<size_t> next{0};atomic<uint64_t> bytes{0},sum{0};
+    double t=par(8,[&](int){for(;;){size_t j=next.fetch_add(1);if(j>=files.size())break;int fd=open(files[j].first.c_str(),O_RDONLY);if(fd<0)continue;const off_t n=files[j].second;
+      if(n){const char* b=(const char*)mmap(nullptr,n,PROT_READ,MAP_PRIVATE,fd,0);if(b!=MAP_FAILED){madvise((void*)b,n,MADV_HUGEPAGE);uint64_t s2=0;
+        if(mode==0){for(off_t k=0;k<n;k+=4096)s2+=(unsigned char)b[k];}
+        else if(mode==1){for(off_t k=0;k<n;k+=64)s2+=(unsigned char)b[k];}
+        else{const char* q=b;const char* e=b+n;while((q=(const char*)memchr(q,'\n',(size_t)(e-q)))){++s2;++q;}}
+        sum+=s2;bytes+=n;munmap((void*)b,n);}}
+      close(fd);}});
+    if(t<best)best=t;tot=bytes;(void)sum;}
+   char one[96];snprintf(one,sizeof one,"%s %.0f ms ",mode==0?"floor: map+touch a byte per 4K":mode==1?"per 64 B":"count newlines (all bytes)",best*1e3);floorText+=one;
+   if(mode==2){snprintf(one,sizeof one,"(%.2f GB) ",tot/1e9);floorText+=one;}}
+  fprintf(stderr,"DIAG %s\n",floorText.c_str());}
  // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
  string eqText="eq60 not run";
  if(timeleft(40)){
@@ -420,11 +435,10 @@ int main(){
     munmap((void*)b,st.st_size);}
    close(fd);unlink(pth.c_str());return true;};
   uint64_t ur[3]={0,0,0},us_[3]={0,0,0},cr[3]={0,0,0},cs[3]={0,0,0};bool ok[3]={false,false,false};
-  for(int i=0;i<3;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
-   if(i==2)env.push_back({"SS_EV8","3"});pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+  for(int i=0;i<2;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
+   pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c60 (kernel v4) dense %s (u%llu c%llu), c60 kernel v3 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0],
-   same(2)?"SAME":"DIFF",(unsigned long long)ur[2],(unsigned long long)cr[2]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
+  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c62 (click kernel v2) dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
   if(fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
@@ -459,11 +473,11 @@ int main(){
    string y;bool skip=false;size_t i=0;while(i<x.size()){size_t e=x.find(' ',i);if(e==string::npos)e=x.size();const string tok=x.substr(i,e-i);i=e+1;if(tok.empty())continue;
     const bool name=isalpha((unsigned char)tok[0]);if(name)skip=(tok=="n"||tok=="nl"||tok=="se"||tok=="ew"||tok=="wc"||tok=="gn"||tok=="tc"||tok=="le");if(!skip){if(!y.empty())y+=' ';y+=tok;}}
    return y;};
-  a+=eqText+" | wPRYXAW/us/exit: "+fmt("v4","B","wPRYXAWusE")+fmt("v3","v3","wPRXus")+fmt("v4->/output","O","wPRYXAWusE")+fmt("outopen-early","Oe","wXAW")+fmt("outwrite-end","Ow","wXAW")+fmt("bind","pb","wPX")+fmt("spin","wa","wPX")+fmt("bind+spin","pbwa","wPXus")+fmt("march=cascadelake","h","wPRXAus");
-  a+="| parse-only P/us: "+fmt("base","pB","Pus")+fmt("nolock","pN","Pus")+fmt("nocommit","pK","Pus")+fmt("60x base","HpB","Pus")+fmt("60x nolock","HpN","Pus")+fmt("60x nocommit","HpK","Pus");
-  c+="60x wPRYXAW/us/exit: "+fmt("v4","HB","wPRYXAWusE")+fmt("v3","Hv3","wPRX")+fmt("v4->/output","HO","wPRYXAWusE")+fmt("outopen-early","HOe","wXAW")+fmt("bind+spin","Hpbwa","wPX")+fmt("march=cascadelake","Hh","wPRXA");
-  {const RunResult* r=get("Os#0");if(r)c+="| DENSE threads 20M->/output:"+squeeze(r->dth)+" csw "+r->csw+" "+fmt("w/sysX/cpuX","Os","wzx");}
-  {const RunResult* r=get("HOs#0");if(r)c+="| 60x:"+squeeze(r->dth)+" csw "+r->csw+" "+fmt("w/sysX/cpuX","HOs","wzx");}
+  auto allw=[&](const string& name,const string& grp)->string{string o=name+"=";bool first=true;for(auto& r:results){if(r.rc!=0||r.label.compare(0,grp.size()+1,grp+"#")!=0)continue;if(!first)o+=",";first=false;o+=to_string((long)(r.wall*1e3+0.5));}return o+" ";};
+  a+=eqText+" | 20M wall of every run: "+allw("c62","B")+allw("c60","c60")+allw("c62-cl8v1","cl1")+allw("c62-oldclicks","ix");
+  a+="| min wPRYXAW/us: "+fmt("c62","B","wPRYXAWus")+fmt("c60","c60","wPRYXAWus")+fmt("cl8v1","cl1","wPRXus")+fmt("oldclicks","ix","wPRXus")+"| parse-only P/us: "+fmt("c62","pB","Pus")+fmt("c60","p60","Pus");
+  a+="| c62 small stages MAP/KEYS/LINK+FLATTEN/DEDUP/DENSE1/WRITE/exit: "+fmt("","Bs","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","Bs","pqxa")+"| "+floorText;
+  c+="60M wall of every run: "+allw("c62","HB")+allw("c60","H60")+allw("c62-cl8v1","Hcl1")+"| min wPRYXAW/us: "+fmt("c62","HB","wPRYXAWus")+fmt("c60","H60","wPRYXAWus")+fmt("cl8v1","Hcl1","wPRX");
   c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
