@@ -278,6 +278,9 @@ int main(){
   {"big n8 nohuge noprefault",{{"NCPU","8"},{"SS_NOHUGE","1"},{"SS_NOPREFAULT","1"}}},
   {"big n8 noasyncfree",{{"NCPU","8"},{"SS_NOASYNCFREE","1"}}},
   {"big n4",{{"NCPU","4"}}},{"big n2",{{"NCPU","2"}}},{"big n1",{{"NCPU","1"}}},{"big n16",{{"NCPU","16"}}},
+  {"big n8 procbind",{{"NCPU","8"},{"OMP_PROC_BIND","true"}}},
+  {"big n8 activewait",{{"NCPU","8"},{"OMP_WAIT_POLICY","active"}}},
+  {"big n8 procbind activewait",{{"NCPU","8"},{"OMP_PROC_BIND","true"},{"OMP_WAIT_POLICY","active"}}},
   {"big n8 default #4",{{"NCPU","8"}}}};
  for(const Var& v:vars){if(!timeleft(12))break;pipeline(v.label,B,od(),v.env);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -305,10 +308,16 @@ int main(){
    // assisted: kernel major*1000+minor
    int kmaj=0,kmin=0;sscanf(gKernel.c_str(),"%d.%d",&kmaj,&kmin);
    row("machine",cpu,gAff*1000LL+code(gThp)*100+code(gDefrag)*10+(gPopulateRc==0?1:0),gFlags,(int64_t)(gMemsetGBs*1000)*1000000LL+(int64_t)(gTouchUsPage*1000),kmaj*1000LL+kmin);}
+  {RunResult n1=best("big n1");auto g=[&](const char* k){auto it=n1.t.find(k);return it==n1.t.end()?0.0:it->second;};
+   char text[96];snprintf(text,sizeof text,"n1 L%.0f P%.0f D%.0f A%.0f ms",(g("MAP")+g("LINKREAD")+g("FLATTEN")+g("LINKS"))*1e3,g("PARSE")*1e3,g("DEDUP")*1e3,g("AGGREGATE")*1e3);
+   row("wall us n1 n4 n2 n16",text,us(n1.wall),us(best("big n4").wall),us(best("big n2").wall),us(best("big n16").wall));}
+  {char text[96];snprintf(text,sizeof text,"tch8 %.0f/%.0f/%.0f/%.0f ms",gTouch8[0]*1e3,gTouch8[1]*1e3,gTouch8[2]*1e3,gTouch8[3]*1e3);
+   // first touch of 1.5GB with 8 threads: plain / huge pages / populate / huge+populate
+   row("wall us nohuge nopref sse2 nofree",text,us(best("big n8 nohuge").wall),us(best("big n8 noprefault").wall),us(best("big n8 sse2").wall),us(best("big n8 noasyncfree").wall));}
+  {char text[96];snprintf(text,sizeof text,"spin %.0f/%.0f/%.0f ms",gSpin[0]*1e3,gSpin[1]*1e3,gSpin[2]*1e3);
+   row("wall us bind active both dev",text,us(best("big n8 procbind").wall),us(best("big n8 activewait").wall),us(best("big n8 procbind activewait").wall),us(best("dev n8").wall));}
   run_row("big n1",best("big n1"));
   run_row("big n4",best("big n4"));
-  // first touch of 1.5GB with 8 threads: plain, huge pages, populate, huge+populate (us)
-  row("touch 1.5GB 8thr us",gKernel,us(gTouch8[0]),us(gTouch8[1]),us(gTouch8[2]),us(gTouch8[3]));
   run_row("big n8 nohuge",best("big n8 nohuge"));
   run_row("big n8 noprefault",best("big n8 noprefault"));
   run_row("big n8 sse2",best("big n8 sse2"));
@@ -316,10 +325,10 @@ int main(){
   run_row("big n16",best("big n16"));
   run_row("big n8 noasyncfree",best("big n8 noasyncfree"));
   run_row("dev n8 best",best("dev n8"));
-  // spin 1/4/8 threads (us, ideal equal) and replica write time (us)
-  row("spin 1/4/8 thr us, replica us",gFs,us(gSpin[0]),us(gSpin[1]),us(gSpin[2]),us(gReplicaSec));
-  // /data read through mmap, MB/s first and second pass; munmap 1.5GB plain and huge (us)
-  row("read MB/s p0 p1, munmap us",gThp.substr(0,40),(int64_t)(gReadGBs[0]*1000),(int64_t)(gReadGBs[1]*1000),us(gMunmap[0]),us(gMunmap[1]));
+  row("replica us, read MB/s p0 p1",gFs,us(gReplicaSec),(int64_t)(gReadGBs[0]*1000),(int64_t)(gReadGBs[1]*1000),0);
+  row("munmap 1.5GB us plain huge",gThp.substr(0,30),us(gMunmap[0]),us(gMunmap[1]),us(gMunmap[2]),us(gMunmap[3]));
+  row("kernel",gKernel.substr(0,30),0,0,0,0);
+  row("thp defrag",gDefrag.substr(0,30),0,0,0,0);
   for(auto& r:results)run_row("run "+r.label.substr(0,24),r);
   PqFile f;
   f.open(fs::path(outdir)/"campaign_daily"/"part-00099.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
