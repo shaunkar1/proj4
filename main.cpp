@@ -856,6 +856,8 @@ static inline uint64_t order36(uint64_t y){
  const unsigned n=1+(y>=36u)+(y>=1296u)+(y>=46656u)+(y>=1679616u)+(y>=60466176u)+(y>=2176782336ull)+(y>=78364164096ull);
  return y*POW36[8-n]*16+n;
 }
+// SPREAD3[m]: bit 3j is set where bit j of m is set (an alias mask laid over the 3-bit group fields of a denseComp word).
+static constexpr array<uint32_t,256> SPREAD3=[]{array<uint32_t,256> a{};for(unsigned m=0;m<256;++m){uint32_t v=0;for(unsigned j=0;j<8;++j)if((m>>j)&1)v|=1u<<(3*j);a[m]=v;}return a;}();
 // SPREAD8[m]: byte j is 1 where bit j of m is set (eight one-byte counters bumped by one add).
 static constexpr array<uint64_t,256> SPREAD8=[]{array<uint64_t,256> a{};for(unsigned m=0;m<256;++m){uint64_t v=0;for(unsigned j=0;j<8;++j)if((m>>j)&1)v|=1ull<<(8*j);a[m]=v;}return a;}();
 static inline size_t text36_fast(char letter,uint64_t y,char* out){
@@ -1762,6 +1764,32 @@ struct RawCtx{
  }
  void set_table(uint64_t sp,uint32_t len,uint32_t code){Entry& m=memo[at(sp)];m.raw=sp;m.user=DENSE_USER_RAW|len;m.code=code;}
 };
+// Sorts m distinct keys "click time << 32 | position" (m > 1, times below 2^32). A person's clicks are
+// spread over the days before and inside the window, so one counting pass on the leading bits of the
+// time (two buckets per key or more) leaves most keys alone in their bucket and an insertion pass
+// finishes with few moves. If the times are bunched after all (a bucket with more than clickSortMax
+// keys), std::sort does it. tmp: room for m keys; cnt: room for CLICK_SORT_BUCKETS + 1 counters.
+static constexpr unsigned CLICK_SORT_BITS=13;static constexpr size_t CLICK_SORT_BUCKETS=size_t(1)<<CLICK_SORT_BITS;
+static const uint32_t clickSortMax=[]{const char* v=getenv("SS_TEST_SORTMAX");return v?(uint32_t)strtoul(v,nullptr,10):16u;}(); // tests: 0 = always std::sort, 1 = on any shared bucket
+[[gnu::noinline]] static void click_key_sort(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){
+ uint64_t mn=a[0],mx=a[0];
+ for(size_t i=1;i<m;++i){mn=min(mn,a[i]);mx=max(mx,a[i]);}
+ const uint64_t t0=mn>>32,range=(mx>>32)-t0;
+ const unsigned lb=min<unsigned>((unsigned)bit_width(m-1)+1,CLICK_SORT_BITS),rb=(unsigned)bit_width(range),sh=rb>lb?rb-lb:0;
+ const size_t B=(size_t)(range>>sh)+1; // buckets in use, at most 1 << lb
+ memset(cnt,0,(B+1)*sizeof(uint32_t));
+ uint32_t most=0;
+ for(size_t i=0;i<m;++i){const uint32_t c=++cnt[(((a[i]>>32)-t0)>>sh)+1];most=max(most,c);}
+ if(__builtin_expect(most>clickSortMax,0)){sort(a,a+m);return;}
+ for(size_t b=1;b<B;++b)cnt[b]+=cnt[b-1]; // cnt[b]: where bucket b starts
+ for(size_t i=0;i<m;++i){const uint64_t k=a[i];tmp[cnt[((k>>32)-t0)>>sh]++]=k;}
+ a[0]=tmp[0];
+ for(size_t i=1;i<m;++i){ // keys only move inside their bucket
+  const uint64_t k=tmp[i];size_t j=i;
+  while(j>0&&a[j-1]>k){a[j]=a[j-1];--j;}
+  a[j]=k;
+ }
+}
 // Where one thread puts the session lists of the runs it reads (blocks of its pool) and a run's purchases.
 struct SessArena{uint64_t* cur=nullptr;uint64_t* end=nullptr;vector<uint64_t> pur;};
 // The event sweep of the counters [lo,hi) of an event slot array (stride 1 << evShift bytes, layout ESmall
@@ -3341,11 +3369,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   const uint32_t d=person-denseBase,root=d&7;const uint64_t idx=d>>3;
   const uint32_t stored=denseComp[idx].load(memory_order_relaxed);
   if(__builtin_expect(stored==0,1))return text36_fast('u',dn::value_of((idx<<dn::GEN_ALIAS_BITS)|root,dense.ku),buf); // nothing grouped under this index
-  const uint32_t w=stored^COMP_IDENT;uint64_t best=~0ull,bestV=0;
-  for(uint32_t a=root;a<8;++a)if(comp_root(w,a)==root){ // the root is its group's smallest alias
+  // The members of the root's group: the fields of the word that hold the root (bit 3a for alias a).
+  const uint32_t x=(stored^COMP_IDENT)^(root*0x249249u);uint32_t members=~(x|(x>>1)|(x>>2))&0x249249u;
+  uint64_t best=~0ull,bestV=0;
+  do{
+   const uint32_t a=(uint32_t)__builtin_ctz(members)/3u;members&=members-1;
    const uint64_t v=dn::value_of((idx<<dn::GEN_ALIAS_BITS)|a,dense.ku),key=order36(v);
-   if(key<best){best=key;bestV=v;}
-  }
+   const uint64_t lt=0-(uint64_t)(key<best);bestV^=(bestV^v)&lt;best^=(best^key)&lt; // (masks: the compiler makes a branch of a ?: here)
+  }while(members);
   return text36_fast('u',bestV,buf);
  };
  auto name_of=[&](uint32_t person)->string_view{
@@ -3827,7 +3858,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   HugePool& pool=surv[tid].pool;
   Totals* const tot=(Totals*)pool.take(ncells*sizeof(Totals));threadTotals[tid]=tot;
   uint64_t* const assists=(uint64_t*)pool.take(ncells*sizeof(uint64_t));threadAssists[tid]=assists;
-  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp);size_t nact=0;
+  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp+1);size_t nact=0; // active: one free place after a full list (see the fast lane's large click sets)
   vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
   PqFile file;
   auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
@@ -3980,7 +4011,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
    // One index's sessions (start time; number of its rows before the session) and purchases
    // (session<<40 | category<<24 | price), written by the walk over its event slots.
-   Scratch<uint64_t> sessTs,purBuf,clickKeys;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;fastC2.pool=&pool;
+   Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;fastC2.pool=&pool;
+   uint32_t* const sortCnt=(uint32_t*)pool.take((CLICK_SORT_BUCKETS+1)*sizeof(uint32_t)); // click_key_sort's counters
    vector<uint8_t> lastOfV(ncamp+1,0xFF);uint8_t* const lastOf=lastOfV.data(); // small click sets: last position of a campaign
    // The 32-bit click arithmetic below counts times from the window start (clicks: -7 days and up), so
    // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
@@ -4050,7 +4082,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(__builtin_expect(n!=ec||m!=cc,0)){fprintf(stderr,"ERROR dense slots changed under the reader\n");_exit(1);}
       // One person: every alias in use has the same smallest alias of its group.
       const uint32_t a0=(uint32_t)__builtin_ctz(mask|0x100u);root=a0^((stored>>(3*a0))&7);
-      if(mask&(mask-1))for(uint32_t a=a0+1;a<8;++a)if(((mask>>a)&1)&&(a^((stored>>(3*a))&7))!=root){fast=false;why=6;}
+      // (The group fields of all eight aliases against the root at once; SPREAD3 puts the aliases in use on the fields.)
+      {const uint32_t x=(stored^COMP_IDENT)^(root*0x249249u),differs=(x|(x>>1)|(x>>2))&0x249249u;
+       if(differs&SPREAD3[mask&255u]){fast=false;why=6;}}
      }
      if(fast){
       const uint32_t person=dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|root);
@@ -4080,7 +4114,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       alignas(16) int32_t cts[16];uint16_t ccamp[16],credit[17];uint16_t dupMask[17];size_t nvec=0;uint64_t cntLo=0,cntHi=0;
       if(mode==SMALL){
        uint64_t keys[16];
-       for(size_t i=0;i<m;++i){const uint64_t key=((C[i].key>>16)<<32)|i;size_t j=i;while(j>0&&keys[j-1]>key){keys[j]=keys[j-1];--j;}keys[j]=key;}
+       // In time order, clicks of one moment by position, without a data-dependent branch: the place of a
+       // click is the number of clicks with an earlier time (counted for all sixteen places at once, one
+       // click after the other) plus the number of clicks of the same moment placed before it.
+       {alignas(16) int32_t tm[16];alignas(16) uint8_t rnk[16];uint8_t taken[16];
+        for(size_t i=0;i<16;++i)tm[i]=INT32_MAX; // later than every click: times from the window start stay below it
+        for(size_t i=0;i<m;++i)tm[i]=(int32_t)((int64_t)(C[i].key>>16)-WEEK);
+        const __m128i T0=_mm_load_si128((const __m128i*)tm),T1=_mm_load_si128((const __m128i*)(tm+4)),T2=_mm_load_si128((const __m128i*)(tm+8)),T3=_mm_load_si128((const __m128i*)(tm+12));
+        __m128i acc=_mm_setzero_si128();
+        for(size_t j=0;j<m;++j){const __m128i b=_mm_set1_epi32(tm[j]); // one byte per place: all ones where that click is later than click j
+         acc=_mm_sub_epi8(acc,_mm_packs_epi16(_mm_packs_epi32(_mm_cmpgt_epi32(T0,b),_mm_cmpgt_epi32(T1,b)),_mm_packs_epi32(_mm_cmpgt_epi32(T2,b),_mm_cmpgt_epi32(T3,b))));}
+        _mm_store_si128((__m128i*)rnk,acc);memset(taken,0,16);
+        for(size_t i=0;i<m;++i){const unsigned r=rnk[i];keys[r+taken[r]++]=((C[i].key>>16)<<32)|i;}}
        // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
        for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
         const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
@@ -4114,7 +4159,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        else{
         for(size_t i=0;i<m;++i)keys[i]=((C[i].key>>16)<<32)|i;
-        sort(keys,keys+m);
+        click_key_sort(keys,m,clickKeys2.get(m),sortCnt);
         for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
          const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
          const uint64_t key=keys[i];size_t j=i;
@@ -4166,8 +4211,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        else if(mode==LARGE){
         const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
-        while(add<ce&&add->key<addLim){const uint16_t c=(uint16_t)add->key;if(fr[c]++==0){pos[c]=(uint32_t)na;act[na++]=c;}++add;}
-        while(expire<add&&expire->key<expLim){const uint16_t c=(uint16_t)expire->key;if(--fr[c]==0){const uint32_t at=pos[c];const uint16_t back=act[--na];act[at]=back;pos[back]=at;}++expire;}
+        // Whether a click is the first (last) of its campaign in the window is as good as random, so the
+        // list of active campaigns is kept without a branch on it: a write that must not happen goes to the
+        // free place after the list (act has one place more than there are campaigns) or rewrites what is there.
+        while(add<ce&&add->key<addLim){
+         const uint16_t c=(uint16_t)add->key;const uint32_t f=fr[c],isNew=f==0,p=pos[c];
+         fr[c]=f+1;act[na]=c;pos[c]=p^((p^(uint32_t)na)&(0u-isNew));na+=isNew;++add;} // (masks, not ?: - the compiler makes branches of those)
+        while(expire<add&&expire->key<expLim){
+         const uint16_t c=(uint16_t)expire->key;const uint32_t f=fr[c]-1,gone=f==0;
+         fr[c]=f;na-=gone;
+         const uint16_t back=act[na];const uint32_t at=(uint32_t)na^(((uint32_t)na^pos[c])&(0u-gone)),pb=pos[back];
+         act[at]=back;pos[back]=pb^((pb^at)&(0u-gone));++expire;}
         if(add>expire)credited=(uint16_t)add[-1].key;
         uint64_t* const arow=assists+(size_t)d*ncamp;
         #pragma GCC unroll 4
