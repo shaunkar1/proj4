@@ -804,6 +804,7 @@ struct alignas(64) ThreadState{
  uint64_t slotWaits=0; // eslotWaits of this thread
  uint64_t cl8Rows=0,cl8Slow=0; // cl8 click loop: lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
+ uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
  string dumpRows; // SS_DENSE_DUMP only
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
@@ -1162,8 +1163,17 @@ static_assert(offsetof(ESlot,user)==8&&offsetof(ESlot,cat)==12&&offsetof(ESlot,t
 // this into another pass over the slots has to do exactly that, before tab.end_parallel() if table IDs can
 // still be new. Only slots with a valid event (k >= PR_KBIAS) carry a user at all.
 static constexpr uint32_t DENSE_USER_RAW=0xC0000000u;
+// -DSS_CAS_FIRST (measuring option, off by default): the lock is first tried on the assumption that the slot is
+// empty, without reading it; any other state falls into the same loop. Fewer instructions for a first copy, a
+// second locked instruction for every later copy.
 static inline __attribute__((always_inline)) void eslot_commit(ESlot& s,uint64_t kk,uint64_t uct,int64_t ingest,uint64_t spare=0){
+#ifdef SS_CAS_FIRST
+ uint64_t cur=0;
+ if(__builtin_expect(s.k.compare_exchange_strong(cur,ESLOT_BUSY,memory_order_acquire,memory_order_relaxed),1)){
+  memcpy((char*)&s+offsetof(ESlot,user),&uct,8);s.ingest=ingest;s.spare=spare;s.k.store(kk,memory_order_release);return;}
+#else
  uint64_t cur=s.k.load(memory_order_relaxed);
+#endif
  for(;;){
   if(__builtin_expect(cur==ESLOT_BUSY,0)){++eslotWaits;_mm_pause();cur=s.k.load(memory_order_relaxed);continue;}
   if(__builtin_expect(!s.k.compare_exchange_weak(cur,ESLOT_BUSY,memory_order_acquire,memory_order_relaxed),0)){++eslotWaits;continue;} // cur is reloaded
@@ -2594,8 +2604,8 @@ static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
 // goes into vmx (the low halves of four 64-bit lanes; fastAny says that vmx holds anything).
 #define SS_EV8_SLOT(O_,i_) (*(ESlot*)((char*)lp.ev+O_.so[i_]))
 #define SS_EV8_COMMIT(O_,i_) eslot_commit(SS_EV8_SLOT(O_,i_),O_.kk[i_],O_.uct[i_],(int64_t)O_.ingest[i_],O_.uw[i_]);
-#define SS_EV8_FINISH(O,LS,NX,N,MASKS) {vert::Ev8Out& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
-  const unsigned ok_=O_.ok&((1u<<n_)-1); \
+#define SS_EV8_FINISH(O,LS,NX,N,SLOW) {vert::Ev8Out& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
+  const unsigned ok_=O_.ok&((1u<<n_)-1);rows+=n_; \
   for(unsigned m_=O_.pur&ok_;m_;m_&=m_-1){const unsigned i_=(unsigned)__builtin_ctz(m_); \
    const uint32_t ci_=products.find(string_view(O_.s5[i_],(size_t)O_.l5[i_]));O_.uct[i_]|=(uint64_t)(ci_==KeyTable::NONE?0u:(unsigned)(uint16_t)ci_)<<32;} \
   if(__builtin_expect(ok_==0xFFu,1)){ \
@@ -2603,9 +2613,7 @@ static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
    SS_EV8_COMMIT(O_,0) SS_EV8_COMMIT(O_,1) SS_EV8_COMMIT(O_,2) SS_EV8_COMMIT(O_,3) SS_EV8_COMMIT(O_,4) SS_EV8_COMMIT(O_,5) SS_EV8_COMMIT(O_,6) SS_EV8_COMMIT(O_,7) \
   }else for(unsigned i_=0;i_<n_;++i_){ \
    if((ok_>>i_)&1){send=max(send,(uint32_t)O_.ve[i_]+1);SS_EV8_COMMIT(O_,i_)} \
-   else{const char* const q_=L_[i_];const uint32_t pre_=((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:event_pre_v3(q_,lp); \
-    const WinMasks w1_=MASKS(q_);const char* const bb_=event_window2(q_,w1_.c); \
-    event_line_v3<true,true>(q_,bb_,w1_,MASKS(bb_),X_[i_]-1,pre_,lp,pend,pp,dmax,send,ring,rpos,general);}} }
+   else SLOW(L_[i_],X_[i_]-1,((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:NOPRE,lp,dmax,send,general);} }
 // The line index of this loop. ls[pos..m]: the starts of the lines not yet in a group; ls[pos..m-1] have their
 // newline (ls[i+1]-1), the line at ls[m] not yet (the index has not got that far, or the file ends without
 // one). Three groups are under way at any time, each one step further than the next:
@@ -2617,50 +2625,63 @@ static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
 // always the scan of exactly its lines.
 static constexpr size_t EV8_BLOCK=4096; // bytes indexed at a time
 #define SS_EV8_PF(O_,i_) __builtin_prefetch(&SS_EV8_SLOT(O_,i_),1,3);
+// NAME_slow: a row the kernel did not decide goes through the line code, kept out of the loop so that the loop
+// stays small (`have` = the kernel's counter, or NOPRE = no claim: then the line's ID is decoded here).
 #define SS_EVENT_LOOP_EV8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC) \
+template<class GEN> TARGET [[gnu::noinline]] static void NAME##_slow(const char* const q,const char* const nl,const uint32_t have,const EvLoop& lp,uint32_t& dmax,uint32_t& send,GEN&& general){ \
+ PendUser pend[1]={};PendUser* pp=pend;unsigned rpos=0; /* no pending batch, no ring in the dense-record line code */ \
+ ++lp.tl.ev8Slow; \
+ const uint32_t pre=have!=NOPRE?have:event_pre_v3(q,lp); \
+ const WinMasks w1=MASKS(q);const char* const bb=event_window2(q,w1.c); \
+ event_line_v3<true,true>(q,bb,w1,MASKS(bb),nl,pre,lp,pend,pp,dmax,send,(ERing*)nullptr,rpos,general); \
+} \
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
- const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;ERing* const ring=nullptr;unsigned rpos=0; /* no pending batch, no ring here */ \
+ const EvLoop lp(tl,tab,products,PE,end);uint32_t dmax=0;uint32_t send=0; \
  const char* ls[EV8_BLOCK+64+64];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
  const vert::EvConst ec{lp.ke,lp.limE,lp.wstart,lp.wlen,(const vert::DateEnt*)lp.memo,lp.tid48}; \
  vert::Ev8Out out[2];vert::Ev8Scan sc[2];const char* tls[8];const char* tnx[8]; \
- const char* const* gl[3]={ls,ls,ls};const char* const* gx[3]={ls,ls,ls};unsigned gn[3]={0,0,0}; /* lines, next lines and number of rows of N, D, F */ \
- unsigned iN=0,iD=1,iF=2,sN=0,oD=0;bool more=true; /* sc[sN]: N's scan, sc[sN^1]: D's; out[oD]: D's results, out[oD^1]: F's */ \
- __m256i vmx=_mm256_setzero_si256();bool fastAny=false; \
- while(more||gn[iD]||gn[iF]){ \
+ const char* const* lN=ls;const char* const* xN=ls;const char* const* lD=ls;const char* const* xD=ls;const char* const* lF=ls;const char* const* xF=ls; /* lines and next lines of N, D, F */ \
+ unsigned nD=0,nF=0;vert::Ev8Scan* sN=&sc[0];vert::Ev8Scan* sD=&sc[1];vert::Ev8Out* oD=&out[0];vert::Ev8Out* oF=&out[1];bool more=true; /* rows of D and F; N's and D's scan; D's and F's results */ \
+ __m256i vmx=_mm256_setzero_si256();bool fastAny=false;uint64_t rows=0; \
+ while(more||nD||nF){ \
   unsigned n=0; \
   if(more){ \
    if(pos+8>m){ /* fewer than eight whole lines known: what is still needed moves to the front and the index goes on */ \
-    const size_t s_=pos-(gn[iD]?8:0)-(gn[iF]?8:0); \
+    const size_t s_=pos-(nD?8:0)-(nF?8:0); \
     if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_; \
-     if(gn[iD]){gl[iD]-=s_;gx[iD]-=s_;} if(gn[iF]){gl[iF]-=s_;gx[iF]-=s_;}} \
+     if(nD){lD-=s_;xD-=s_;} if(nF){lF-=s_;xF-=s_;}} \
     while(m-pos<8&&scan<end&&ls[m]<lim){ \
      const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
-     do{uint64_t x_=NLMASK(scan);while(x_){ls[++m]=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);}scan+=64;}while(scan<stop);} \
+     const char** w_=ls+m; /* the first newline of a window is stored without a branch (no newline: a value past the last entry, never read); a second one is rare */ \
+     do{uint64_t x_=NLMASK(scan);w_[1]=scan+_tzcnt_u64(x_)+1;w_+=(x_!=0);x_=_blsr_u64(x_); \
+      while(__builtin_expect(x_!=0,0)){*++w_=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);} \
+      scan+=64;}while(scan<stop); \
+     m=(size_t)(w_-ls);} \
    } \
-   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[iN]=ls+pos;gx[iN]=ls+pos+1;} \
+   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;lN=ls+pos;xN=ls+pos+1;} \
    else{ /* the last lines of the chunk: a short group, filled up with copies of its last line (results not used) */ \
     more=false; \
     while(pos+n<m&&ls[pos+n]<lim)++n; \
-    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}gl[iN]=tls;gx[iN]=tnx;} \
+    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}lN=tls;xN=tnx;} \
    } \
    pos+=n; \
-   if(n)SCAN(gl[iN],sc[sN]); \
+   if(n)SCAN(lN,*sN); \
   } \
-  gn[iN]=n; \
-  if(gn[iD]){ \
-   vert::Ev8Out& o_=out[oD];const unsigned nd_=gn[iD]; \
-   DEC(gl[iD],gx[iD],sc[sN^1],ec,o_); \
-   if(__builtin_expect((nd_==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
-   else for(unsigned x_=o_.idok&((1u<<nd_)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
+  if(nD){ \
+   vert::Ev8Out& o_=*oD; \
+   DEC(lD,xD,*sD,ec,o_); \
+   if(__builtin_expect((nD==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&((1u<<nD)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
   } \
-  if(gn[iF])SS_EV8_FINISH(out[oD^1],gl[iF],gx[iF],gn[iF],MASKS) \
-  {const unsigned t_=iF;iF=iD;iD=iN;iN=t_;sN^=1;oD^=1;} \
+  if(nF)SS_EV8_FINISH(*oF,lF,xF,nF,NAME##_slow) \
+  lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=n; /* D becomes F, N becomes D */ \
+  {vert::Ev8Scan* const t_=sN;sN=sD;sD=t_;vert::Ev8Out* const u_=oD;oD=oF;oF=u_;} \
  } \
  if(pos==m&&ls[m]<lim)line_general<7>(ls[m],end,general); /* the last line has no newline */ \
  if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
- tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send); \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send);tl.ev8Rows+=rows; \
 }
 SS_EVENT_LOOP_EV8(events_avx2_e8,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_scan_none,ev8_dec_ref)
 SS_EVENT_LOOP_EV8(events_avx512z_e8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::scan8_v5,vert::dec8_v5)
@@ -3904,7 +3925,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
   cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";
   uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
-  if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";}
+  if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";
+  uint64_t er=0,es=0;for(int t=0;t<T;++t){er+=tls[t].ev8Rows;es+=tls[t].ev8Slow;}
+  if(er)cerr<<"STATS ev8 loop: rows "<<er<<" left to the line code "<<es<<"\n";}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
  if(dumpDir){
   // Test only (fuzz/dense_check.py): rows-T.txt = what the general handlers saw (raw texts, written above),
