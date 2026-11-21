@@ -3025,6 +3025,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     o+=best==0?string("NULL"):hexstr(catnames[top]);o+='\n';
    }
   };
+  // The rows of one person in one go (the fast lane; its names are always of the fixed kind).
+  struct RowOut{uint64_t rev,best;int day;uint32_t sess,evs;uint16_t top;};
+  auto put_rows=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&catv,&dbg,&catnames,dayp,revp,sess32p,evs32p,sessp,evsp,catbits,narrow,debugCsv,firstday,tid]
+   (const NameRef& nm,const RowOut* R,size_t k){
+   const size_t room=k*((size_t)nm.L+4)+64;
+   if(uidCap-uidLen<room)grow_uid(room);
+   size_t r=nrows;char* o=uidp+uidLen;
+   for(size_t i=0;i<k;++i,++r){const RowOut& x=R[i];
+    memcpy(o,&nm.L,4);memcpy(o+4,nm.p,16);o+=4+nm.L;
+    dayp[r]=(int32_t)(firstday+x.day);revp[r]=(int64_t)x.rev;
+    if(narrow){sess32p[r]=(int32_t)x.sess;evs32p[r]=(int32_t)x.evs;}else{sessp[r]=(int64_t)x.sess;evsp[r]=(int64_t)x.evs;}
+    if(__builtin_expect(x.best!=0,0)){catbits[r>>3]|=(uint8_t)(1u<<(r&7));put_bytes(catv,catnames[x.top]);}
+    if(debugCsv){string& t=dbg[tid];
+     t+=hexstr(string_view(nm.p,nm.L));t+=',';t+=to_string(firstday+x.day);t+=',';t+=to_string(x.sess);t+=',';t+=to_string(x.evs);t+=',';t+=to_string(x.rev);t+=',';
+     t+=x.best==0?string("NULL"):hexstr(catnames[x.top]);t+='\n';
+    }
+   }
+   uidLen=(size_t)(o-uidp);nrows=r;
+  };
   // All rows and campaign totals of one person. E[0..ne): the person's events in time order (ne > 0; the
   // order of events with the same time does not matter). cb..ce: the person's clicks in click_before order.
   // The rules are those of the cell loop below: a session starts at the first event and after every gap
@@ -3093,6 +3112,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
    const bool smallClicksOk=(uint64_t)(window_end-window_start)<0x7fffffffull&&!getenv("SS_TEST_NOSMALLCLICKS");
    uint32_t* const fr=freq.data();uint32_t* const pos=positions.data();uint16_t* const act=active.data();
+   vector<RowOut> rowsOut((size_t)ndays+2);
    const atomic<uint32_t>* const comp=denseComp;const uint32_t dBase=denseBase;
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
    for(size_t i0=0;i0<idxEnd;i0+=ICH){
@@ -3119,19 +3139,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      int why=5; // why the index is handed over, if it is
      if(noFastN&&ix%noFastN==0){if(fast)why=7;fast=false;}
      size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;
-     uint64_t* sTs=nullptr;uint32_t* sOrd=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0;
+     const uint64_t* SL=nullptr;uint64_t* mySL=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0; // SL: session entries "start << 24 | rows before", then the row count
      // The sweep's session list, if the index is one run of rows in time order.
      const uint64_t* const sweepList=f.multi.load(memory_order_relaxed)?nullptr:f.sess.load(memory_order_relaxed);
      const uint32_t sweepNs=f.ns.load(memory_order_relaxed);
      const bool listed=ec&&sweepList&&!(sweepNs>>31);
+     if(fast&&ec>=(1u<<24)){fast=false;why=5;} // too many rows for a session entry: the general lane takes the index
      if(fast){
       uint32_t mask=0;
-      sTs=sessTs.get((size_t)ec+2);sOrd=sessOrd.get((size_t)ec+2);
-      if(listed){
-       ns=sweepNs;n=ec;mask=f.amask.load(memory_order_relaxed);
-       for(size_t i=0;i<=ns;++i){const uint64_t e=sweepList[i];sTs[i]=e>>24;sOrd[i]=(uint32_t)(e&0xFFFFFFu);}
-       pur=sweepList+ns+1;
-      }
+      if(listed){ns=sweepNs;n=ec;mask=f.amask.load(memory_order_relaxed);SL=sweepList;pur=sweepList+ns+1;}
+      else{mySL=sessTs.get((size_t)ec+2);SL=mySL;}
       // Otherwise (several runs, or a row out of order) walk the index's stretch of event slots here
       // the way the sweep does, skipping other people's slots; `disorder` says whether a row was out of order.
       uint64_t* const myPur=listed?nullptr:purBuf.get((size_t)ec+2);size_t np=0;
@@ -3142,16 +3159,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        mask|=1u<<(u&7);
        const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
        disorder|=step>>63;
-       sTs[ns]=ts;sOrd[ns]=(uint32_t)n;ns+=step>(uint64_t)GAP;last=ts;
+       mySL[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
        if(__builtin_expect((k&EV_PURCHASE)!=0,0))myPur[np++]=((uint64_t)(ns-1)<<40)|((uint64_t)sl.cat<<24)|(k&EV_PRICE);
        ++n;
       }
-      if(!listed){myPur[np]=~0ull;pur=myPur;}
+      if(!listed){mySL[ns]=n;myPur[np]=~0ull;pur=myPur;}
       C=fastC.get((size_t)cc+1);
       for(size_t c=cf;c<cl;++c){
        const CSlot& sl=denseCl[c];const uint32_t u=sl.user;
-       C[m].key=sl.key;C[m].user=u;C[m].ctr=(uint32_t)c;
        const uint32_t ok=(uint32_t)(sl.present!=0)&(uint32_t)((u^code)<8);
+       _mm_storeu_si128((__m128i*)(void*)(C+m),_mm_loadu_si128((const __m128i*)(const void*)&sl));C[m].ctr=(uint32_t)c; // key and user as they are
        mask|=ok<<(u&7);m+=ok;
       }
       if(__builtin_expect(n!=ec||m!=cc,0)){fprintf(stderr,"ERROR dense slots changed under the reader\n");_exit(1);}
@@ -3168,15 +3185,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         if(sl.k>=PR_KBIAS&&(sl.user^code)<8){E[q].k=sl.k-PR_KBIAS;E[q].person=person;E[q].cat=sl.cat;E[q].pad=0;++q;}}
        ev_time_sort(E,E+n);
        uint64_t* const sortedPur=purBuf.get((size_t)ec+2);size_t np=0;
+       if(!mySL){mySL=sessTs.get((size_t)ec+2);}
+       SL=mySL;
        ns=0;uint64_t last=0-(uint64_t)(GAP+1);
        for(size_t i=0;i<n;++i){
         const uint64_t k=E[i].k,ts=k>>EV_TS,step=ts-last;
-        sTs[ns]=ts;sOrd[ns]=(uint32_t)i;ns+=step>(uint64_t)GAP;last=ts;
+        mySL[ns]=(ts<<24)|i;ns+=step>(uint64_t)GAP;last=ts;
         if(k&EV_PURCHASE)sortedPur[np++]=((uint64_t)(ns-1)<<40)|((uint64_t)E[i].cat<<24)|(k&EV_PRICE);
        }
-       sortedPur[np]=~0ull;pur=sortedPur;
+       mySL[ns]=n;sortedPur[np]=~0ull;pur=sortedPur;
       }
-      sOrd[ns]=(uint32_t)n;
       // The person's clicks. A small set (most are) is put in order once and kept as plain arrays: a
       // session then finds the clicks of its seven days with one vector compare, the credited campaign
       // is that of the last one, and the assists are counted in one byte per click (bumped only for the
@@ -3235,19 +3253,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       char tmp[16];const NameRef nm=person_name(person,tmp);
       const FClick *add=C,*expire=C,*const ce=C+m;size_t na=0;
       int currentday=-1;uint64_t dsess=0,drev=0;uint32_t rowStart=0;size_t pi=0;
+      RowOut* const R=rowsOut.data();size_t nr=0;
+      const auto close_row=[&](uint32_t evs){ // the finished row with its top category; written out after the person's last session
+       RowOut& o=R[nr++];o.day=currentday;o.sess=(uint32_t)dsess;o.evs=evs;o.rev=drev;o.best=0;o.top=0;
+       if(__builtin_expect(!touched.empty(),0)){
+        uint16_t top=0;uint64_t best=0;
+        for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
+        touched.clear();o.best=best;o.top=top;
+       }};
       const auto count_assists=[&](int day){ // the row's byte counters into the totals
        if(!(cntLo|cntHi))return;
        uint64_t* const arow=assists+(size_t)day*ncamp;
        for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));
        cntLo=0;cntHi=0;};
       for(size_t sn=0;sn<ns;++sn){
-       const uint64_t ts=sTs[sn];const int d=(int)((ts+dayOff)/(uint64_t)DAY);
+       const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);const int d=(int)((ts+dayOff)/(uint64_t)DAY);
        if(d!=currentday){
         if(currentday>=0){
          if(mode==SMALL)count_assists(currentday);
-         put_row(nm,currentday,dsess,sOrd[sn]-rowStart,drev);dsess=0;drev=0;
+         close_row(ord-rowStart);dsess=0;drev=0;
         }
-        currentday=d;rowStart=sOrd[sn];
+        currentday=d;rowStart=ord;
        }
        ++dsess;
        uint16_t credited=organic;
@@ -3282,7 +3308,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
       }
       if(mode==SMALL)count_assists(currentday);
-      put_row(nm,currentday,dsess,(uint32_t)n-rowStart,drev);
+      close_row((uint32_t)n-rowStart);
+      put_rows(nm,R,nr);
       for(size_t q=0;q<na;++q)fr[act[q]]=0;
       num_sessions+=ns;
       if(nrows>=FLUSH)flush_rows();
