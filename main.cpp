@@ -349,7 +349,8 @@ static string json_string(const string& s,const string& key){
 }
 static string hexstr(string_view s){static constexpr char h[]="0123456789ABCDEF";string r; r.resize(s.size()*2);for(size_t i=0;i<s.size();i++){unsigned char b=s[i];r[2*i]=h[b>>4];r[2*i+1]=h[b&15];}return r;}
 // Switches for measuring on the target machine; all default to the fast setting.
-static bool optHuge=true,optPrefault=true,optAsyncFree=true;
+// Measured on the scoring machine: huge pages help, bulk pre-faulting and the side-thread unmap do not.
+static bool optHuge=true,optPrefault=false,optAsyncFree=false;
 // A fresh anonymous mapping of at least `bytes`: zero-filled, touched lazily, 2 MB aligned and (unless
 // SS_NOHUGE) advised for huge pages, so first touches cost one fault per 2 MB. The whole mapping
 // (for munmap) is reported through rawBase/rawLen when asked for.
@@ -1137,7 +1138,7 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;};
- optHuge=!getenv("SS_NOHUGE");optPrefault=!getenv("SS_NOPREFAULT");optAsyncFree=!getenv("SS_NOASYNCFREE");
+ optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
