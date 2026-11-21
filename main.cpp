@@ -4594,7 +4594,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __fine("map-clicks");
  // Lines per byte, measured on the start of the largest event file, sizes the bucket buffers tightly.
  uint64_t estEvents=eventBytes/70;
- if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
+ // (The count is a plain sum over the bytes, so it is taken in pieces by all threads: the same number as one
+ // pass, which costs this thread the first touch and a scan of 4 MB. SS_SAMPLE=serial: one pass, as before.)
+ if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);uint64_t nl=0;
+  static constexpr size_t SAMPLE_PIECE=size_t(256)<<10;
+  if(T==1||n<=SAMPLE_PIECE||(getenv("SS_SAMPLE")&&string_view(getenv("SS_SAMPLE"))=="serial"))nl=(uint64_t)count_newlines(sampleBase,n);
+  else{
+   #pragma omp parallel for num_threads(T) schedule(static,1) reduction(+:nl)
+   for(size_t at=0;at<n;at+=SAMPLE_PIECE)nl+=(uint64_t)count_newlines(sampleBase+at,min(SAMPLE_PIECE,n-at));
+  }
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
  // SS_POPULATE=all|bg: the input's pages are entered into the page tables by madvise calls, a chunk at a time.
