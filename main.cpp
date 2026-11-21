@@ -1986,8 +1986,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(w=="sse2")isaUse=ISA_SSE2;
   else if(w=="avx512z"&&hasV5)isaUse=ISA_AVX512Z;
   else if(w=="avx512y"&&hasV5)isaUse=ISA_AVX512Y;}
- // SS_LINES=index: the vector loops locate line starts ahead of cutting the lines (see SS_EVENT_LOOP_IX).
- const bool lineIndex=isaUse!=ISA_SSE2&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="index";
+ // The vector loops locate line starts ahead of cutting the lines (see SS_EVENT_LOOP_IX): measured 5% faster
+ // in the parse stage on the scoring machine. SS_LINES=plain switches back to the loop without the index.
+ const bool lineIndex=isaUse!=ISA_SSE2&&!(getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="plain");
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
 #ifdef SS_TS_SELECT
   <<"+tsselect"
