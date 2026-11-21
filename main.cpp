@@ -12,6 +12,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <cstddef>
 #include <climits>
 #include <cerrno>
 #include <cstdio>
@@ -1680,7 +1681,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
  for(size_t p=0;p<PC;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].cb.size())n+=tls[t].cb[p].size();parsedClicks+=n;maxClBucket=max(maxClBucket,n);}
  unsigned pshift=0;
- {const uint64_t want=max<uint64_t>(1,parsedEvents/16384);while(pshift<16&&(npersons>>pshift)>want)++pshift;}
+ // SS_PERSONBUCKET: events per person bucket to aim for (measuring switch; the last stage sorts one
+ // bucket at a time in two buffers of 16 bytes per event, so this sets its working set).
+ static const uint64_t perBucket=[]{const char* v=getenv("SS_PERSONBUCKET");const long long x=v?atoll(v):16384;return (uint64_t)(x<256?256:x>(1<<24)?(1<<24):x);}();
+ {const uint64_t want=max<uint64_t>(1,parsedEvents/perBucket);while(pshift<16&&(npersons>>pshift)>want)++pshift;}
  if(const char* v=getenv("SS_TEST_PSHIFT")){int s=atoi(v);if(s>=0&&s<=16)pshift=(unsigned)s;} // tests force odd bucket widths
  const uint32_t W=1u<<pshift;
  const size_t UPn=(size_t)((npersons?npersons-1:0)>>pshift)+1;
@@ -1869,7 +1873,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  for(unsigned done=0;done<ccellBits||cpass.empty();){const unsigned b=min(digitBits,ccellBits-done);cpass.push_back({CCSH+done,(uint32_t)((1u<<b)-1)});done+=b;if(!b)break;}
  for(const Pass& q:cpass)maxDigit=max(maxDigit,q.mask);
  const size_t ncells=ncamp*(size_t)ndays;
- {const size_t need=ncells*(sizeof(Totals)+sizeof(uint64_t))+2*maxEvPerson*sizeof(Ev)+2*maxClPerson*sizeof(Click)+(size_t(50000)+(size_t)ndays)*48+(size_t(4)<<20);
+ {const size_t need=ncells*(sizeof(Totals)+sizeof(uint64_t))+2*maxEvPerson*sizeof(Ev)+2*maxClPerson*sizeof(Click)+(maxEvPerson+1)*24+(size_t(50000)+(size_t)ndays)*48+(size_t(4)<<20);
   for(int t=0;t<T;++t)surv[t].pool.next=max<size_t>(size_t(8)<<20,need);} // one more region per thread at most, unless names are very long
  vector<Totals*> threadTotals(T,nullptr);vector<uint64_t*> threadAssists(T,nullptr);vector<string> dbg(debugCsv?T:0);
  // sessions and events of one row can never exceed the number of parsed event lines, so they are written
@@ -1879,6 +1883,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const vector<PqCol> userCols={{"user_id",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},{"sessions",countType,false,CONV_NONE},
   {"events",countType,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"top_category",PQ_BYTES,true,CONV_UTF8}};
  static const size_t pfa=[]{const char* v=getenv("SS_PFA");const long x=v?atol(v):0;return (size_t)(x<0?0:x>4096?4096:x);}(); // measuring switch: write prefetch this many bytes ahead in the two event counting passes (0 = off)
+ // Measuring switch, off by default: cut a person's events into cells in a separate pass without data-dependent
+ // branches. On dev it trades about 29 more instructions per event for 0.35 fewer mispredicted branches.
+ static const bool cellPass=getenv("SS_CELLPASS")!=nullptr;
  uint64_t num_sessions=0;
  // Input files nobody reads any more are unmapped by the worker threads, a few large pieces each,
  // instead of leaving every page of them to process exit, which tears mappings down on one thread.
@@ -1932,6 +1939,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   Scratch<Ev> bufA,bufB;Scratch<Click> bufC,bufD;
   bufA.pool=bufB.pool=&pool;bufC.pool=bufD.pool=&pool;
   bufA.reserve(maxEvPerson);bufB.reserve(maxEvPerson);bufC.reserve(maxClPerson);bufD.reserve(maxClPerson);
+  // One person's cells: earliest and latest key, the OR of the keys' low halves (purchase flag), and where the cell ends.
+  struct Cell{uint64_t mn,mx;uint32_t anyLo,end;};
+  static_assert(sizeof(Cell)==24&&offsetof(Cell,end)==offsetof(Cell,anyLo)+4);
+  Scratch<Cell> cellBuf;cellBuf.pool=&pool;if(cellPass)cellBuf.reserve(maxEvPerson+2);
+  Cell* const cells=cellBuf.p;
   vector<uint32_t> thist((size_t)maxDigit+2),phist((size_t)W+3),chist((size_t)W+2);
   uint32_t* const th=thist.data();uint32_t* const pp=phist.data();uint32_t* const cp=chist.data();
   #pragma omp for schedule(dynamic,1)
@@ -2027,13 +2039,29 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const Click *add=cb,*expire=cb;
     int currentday=-1;uint64_t dsess=0,devs=0,drev=0;
     Totals* cur=nullptr;bool purchasing=false;uint64_t prevmax=0;
+    // Cells: events are ordered by cell, so a cell ends at the first key at or past its upper bound.
+    // With the cell pass the person's cells are first written out by a loop without data-dependent
+    // branches (every event updates the current cell's entry; a new cell just moves to the next entry).
+    const Cell* nextCell=cells+1; // entry 0 is a dummy the first event steps over
+    if(cellPass){
+     Cell* c=cells;uint64_t cellEnd=0,mn=0,mx=0,any=0;
+     for(size_t i=es;i<ee;++i){
+      const uint64_t x=E[i].k;const uint64_t nw=0-(uint64_t)(x>=cellEnd); // all ones if x starts a new cell
+      c=(Cell*)((char*)c+(nw&sizeof(Cell)));
+      cellEnd^=(cellEnd^(((x>>CSH)+1)<<CSH))&nw;
+      mn=min(mn|nw,x);mx=max(mx&~nw,x);any=(any&~nw)|x; // written with masks: a new cell must not be a branch
+      c->mn=mn;c->mx=mx;const uint64_t tail=(uint64_t)(uint32_t)any|((uint64_t)(i+1)<<32);memcpy((void*)&c->anyLo,&tail,8); // anyLo and end in one store
+     }
+    }
     for(size_t a=es;;){
-     // One cell: earliest and latest time, and whether it holds a purchase. Events are ordered by cell,
-     // so the cell ends at the first key at or past its upper bound.
+     // One cell: earliest and latest time, and whether it holds a purchase.
      uint64_t mn=0,mx=0,any=0;size_t b=a;bool fresh=false;int d=currentday;
      if(a<ee){
-      mn=E[a].k;mx=mn;any=mn;const uint64_t cellEnd=((mn>>CSH)+1)<<CSH;
-      for(b=a+1;b<ee;++b){const uint64_t x=E[b].k;if(x>=cellEnd)break;mn=min(mn,x);mx=max(mx,x);any|=x;}
+      if(cellPass){mn=nextCell->mn;mx=nextCell->mx;any=nextCell->anyLo;b=nextCell->end;++nextCell;}
+      else{
+       mn=E[a].k;mx=mn;any=mn;const uint64_t cellEnd=((mn>>CSH)+1)<<CSH;
+       for(b=a+1;b<ee;++b){const uint64_t x=E[b].k;if(x>=cellEnd)break;mn=min(mn,x);mx=max(mx,x);any|=x;}
+      }
       // A session starts with this cell if it is the person's first or the gap to the previous cell is too long.
       // Its day is the UTC date of its first event.
       if(!cur||(mn>>EV_TS)-prevmax>(uint64_t)GAP){fresh=true;d=(int)(((mn>>EV_TS)+dayOff)/(uint64_t)DAY);}
