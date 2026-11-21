@@ -85,7 +85,7 @@ static thread_local DateMemo dateMemo[64];
 static inline bool f1_date(const char* p,int64_t& dayms){
  uint64_t k8;uint16_t k2;memcpy(&k8,p,8);memcpy(&k2,p+8,2);
  DateMemo& e=dateMemo[(((uint32_t)k2*2654435761u)^((uint32_t)(k8>>32)*40503u))>>26];
- if(e.k8==k8&&e.k2==k2){dayms=e.ms;return true;} // k8 is never 0 for a real date, so an empty entry cannot match
+ if(e.k8==k8&&e.k2==k2&&k8){dayms=e.ms;return true;} // k8 is never 0 for a real date; the k8 test keeps an empty entry from matching NUL bytes
  if(p[4]!='-'||p[7]!='-')return false;
  static constexpr unsigned char pos[8]={0,1,2,3,5,6,8,9};
  unsigned d[8];for(int i=0;i<8;++i){d[i]=(unsigned)(unsigned char)p[pos[i]]-'0';if(d[i]>9)return false;}
@@ -265,76 +265,7 @@ template<int N,class PRE,class FN> static void for_records(const char* base,size
   for(int i=0;i<nb;++i)fn(f[i]);
  }
 }
-// AVX2 version of the splitter for CPUs that have it (checked once at start-up).
-// The whole line (up to 128 bytes) is turned into newline/comma/quote bit masks with no data-dependent
-// branches, and the fields are cut from the masks. Longer lines and the last bytes of a file use the
-// SSE2/scalar path, which gives the same answer.
 #define SS_V3 __attribute__((target("avx2,bmi,bmi2,popcnt,lzcnt")))
-template<int N> SS_V3 static inline bool split_line_v3(const char* p,const char* end,string_view* out,const char*& next){
- if(end-p>=128){
-  const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
-  const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
-  uint64_t nl0=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0,vnl))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1,vnl))<<32);
-  uint64_t c0=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0,vc))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1,vc))<<32);
-  uint64_t q0=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0,vq))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1,vq))<<32);
-  uint64_t nl1=0,c1=0,q1=0;unsigned L;
-  if(nl0){L=(unsigned)_tzcnt_u64(nl0);const uint64_t keep=_blsmsk_u64(nl0)>>1;c0&=keep;q0&=keep;}
-  else{
-   const __m256i x2=_mm256_loadu_si256((const __m256i*)(p+64)),x3=_mm256_loadu_si256((const __m256i*)(p+96));
-   nl1=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2,vnl))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3,vnl))<<32);
-   if(nl1){
-    c1=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2,vc))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3,vc))<<32);
-    q1=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2,vq))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3,vq))<<32);
-    L=64+(unsigned)_tzcnt_u64(nl1);const uint64_t keep=_blsmsk_u64(nl1)>>1;c1&=keep;q1&=keep;
-   }
-  }
-  if(nl0|nl1){
-   next=p+L+1;
-   const int ncomma=(int)(_mm_popcnt_u64(c0)+_mm_popcnt_u64(c1)),nquote=(int)(_mm_popcnt_u64(q0)+_mm_popcnt_u64(q1));
-   if(ncomma!=N-1||L==0)return false;
-   // p[s] and p[e-1] decide whether a field is wrapped in quotes. For an empty field both are a
-   // comma or a newline (p[-1] is the previous line's newline), so it is never taken as quoted.
-   unsigned s=0,quoted=0,ok=1;
-   for(int j=0;j<N;++j){
-    unsigned e;
-    if(j==N-1)e=L;
-    else{
-     const bool lowHalf=c0!=0;
-     e=lowHalf?(unsigned)_tzcnt_u64(c0):64+(unsigned)_tzcnt_u64(c1);
-     const uint64_t rest1=_blsr_u64(c1);
-     c1=lowHalf?c1:rest1;c0=_blsr_u64(c0);
-    }
-    const unsigned qd=p[s]=='"',endq=p[(ptrdiff_t)e-1]=='"';
-    ok&=qd==endq;
-    out[j]=string_view(p+s+qd,(size_t)(e-s-2*qd)); // only used when the line is well-formed
-    quoted+=qd;s=e+1;
-   }
-   return ok&&nquote==(int)(2*quoted);
-  }
- }
- const char* comma[N];int ncomma,nquote;const char* lineEnd;
- next=scan_line(p,end,comma,N,ncomma,nquote,lineEnd);
- return take_fields(p,lineEnd,comma,ncomma,nquote,N,out);
-}
-template<int N,class PRE,class FN> SS_V3 static void for_records_v3(const char* base,size_t len,size_t from,size_t to,PRE&& pre,FN&& fn){
- if(from>=len)return;
- const char* end=base+len;
- const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
- if(!nl)return;
- const char* p=nl+1;
- const char* lim=base+min(to,len);
- static constexpr int BATCH=12;
- string_view f[BATCH][N];
- while(p<lim){
-  int nb=0;
-  while(nb<BATCH&&p<lim){
-   const char* next;
-   if(split_line_v3<N>(p,end,f[nb],next)){pre(f[nb]);++nb;}
-   p=next;
-  }
-  for(int i=0;i<nb;++i)fn(f[i]);
- }
-}
 template<class FN> static void read_lines(const fs::path& path,FN&& fn){
  Mapped m=map_file(path);if(!m.len)return;
  for_lines(m.base,m.len,0,m.len,fn);
@@ -464,10 +395,14 @@ struct KeyTable{
  void prefetch(string_view s)const{uint64_t k0;uint32_t k1;if(pack(s,k0,k1))__builtin_prefetch(&slots[hash_packed(k0,k1)&mask],0,1);}
  // The key's value; a key nobody has seen gets the next ID. NONE if the key is new and the table is full.
  uint32_t find_or_add(string_view s){
-  const auto R=memory_order_relaxed;
   uint64_t k0;uint32_t k1;
   if(!pack(s,k0,k1))return find_or_add_long(s);
-  for(size_t j=hash_packed(k0,k1)&mask;;){
+  return find_or_add_packed(k0,k1,hash_packed(k0,k1)&mask,s);
+ }
+ // Same, for a key that is already packed (k0,k1 from pack(s)) with j = hash_packed(k0,k1)&mask.
+ uint32_t find_or_add_packed(uint64_t k0,uint32_t k1,size_t j,string_view s){
+  const auto R=memory_order_relaxed;
+  for(;;){
    Slot& e=slots[j];uint32_t c=e.k1.load(memory_order_acquire);
    if(c==k1){if(e.k0.load(R)==k0)return e.v.load(R);}
    else if(c==0){
@@ -648,6 +583,289 @@ struct PqFile{
 };
 static void put_bytes(string& o,string_view s){put_le32(o,(uint32_t)s.size());o.append(s);}
 template<class V> static string_view raw(const V& v){return string_view((const char*)v.data(),v.size()*sizeof(v[0]));}
+// ---- AVX2 parse path (CPUs with AVX2+BMI, checked once at start-up) ----
+// A line is cut straight from comma/quote/newline bit masks and parsed with its fields held in
+// registers; nothing is stored per field. Any line the short path is not sure about (too long for
+// its windows, malformed, an unusual ingest_ts, a user ID too long for an in-slot key, the last
+// line of a file without '\n') is handed to the portable splitter and the general handler, which decide.
+// Valid lines are finished in two steps: the record is pushed with user 0 and the table slot of its
+// user is prefetched; once a small batch has collected, the users are looked up in line order.
+#define SS_V3I SS_V3 static inline __attribute__((always_inline))
+SS_V3I uint64_t mask64_v3(__m256i a,__m256i b,__m256i v){
+ return (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,v))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,v))<<32);
+}
+// Quote rules for one window of a line, as bit masks: q = quotes, starts = first byte of each field,
+// ends = the comma or newline that ends each field (q has no bit 63). `opened` gets the end bit of every
+// field that starts with a quote: adding the opening quotes to ~ends carries from each one up to its
+// field's end bit. A quote that does not open a field must close one, i.e. sit right before an end bit,
+// so shifting those up by one must give exactly `opened`. The result is zero iff every quote wraps a
+// whole field ("" included; a lone " or a quote inside a field is not zero).
+SS_V3I uint64_t quote_errors_v3(uint64_t q,uint64_t starts,uint64_t ends,uint64_t& sq,uint64_t& opened){
+ sq=q&starts;
+ opened=(sq+~ends)&ends;
+ return opened^((q&~starts)<<1);
+}
+// Time of day of "....-..-..THH:MM:SS": milliseconds since midnight, or -1 unless the 'T', both colons
+// and the six digits are in place and in range. The date and what follows the seconds are not looked at.
+SS_V3I int64_t tod_v3(const char* p){
+ const __m128i x=_mm_loadu_si128((const __m128i*)(p+3)); // bytes 3..18: 7 date bytes, then THH:MM:SS
+ const __m128i tmpl=_mm_setr_epi8(0,0,0,0,0,0,0,'T','0','0',':','0','0',':','0','0');
+ const __m128i lim=_mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,0,2,9,0,5,9,0,5,9);
+ const __m128i v=_mm_sub_epi8(x,tmpl);
+ if(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(v,lim),lim))!=0xFFFF)return -1;
+ const __m128i w8=_mm_setr_epi8(0,0,0,0,0,0,0,0,10,1,0,10,1,0,10,1);
+ const __m128i w16=_mm_setr_epi16(0,0,0,0,3600,60,60,1);
+ const __m128i s=_mm_madd_epi16(_mm_maddubs_epi16(v,w8),w16); // dword 2 = H*3600+tens of minutes*600, dword 3 = minute units*60+S
+ const uint64_t r=(uint64_t)_mm_extract_epi64(s,1);
+ const uint64_t ms=(r*((1000ULL<<32)|1000ULL))>>32;   // (dword2+dword3)*1000; both products stay below 2^32
+ return ms<86400000ULL?(int64_t)ms:-1;                 // hours 24..29 pass the per-digit limits
+}
+// Thirteen ASCII digits (epoch milliseconds) to a number; false if any of them is not 0-9.
+SS_V3I bool epoch13_v3(const char* p,int64_t& out){
+ const __m128i v=_mm_sub_epi8(_mm_loadu_si128((const __m128i*)p),_mm_set1_epi8('0'));
+ const __m128i lim=_mm_setr_epi8(9,9,9,9,9,9,9,9,9,9,9,9,9,-1,-1,-1);
+ if(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(v,lim),lim))!=0xFFFF)return false;
+ const __m128i a=_mm_maddubs_epi16(v,_mm_setr_epi8(10,1,10,1,10,1,10,1,10,1,10,1,1,0,0,0)); // six 2-digit numbers, then digit 12
+ const __m128i b=_mm_madd_epi16(a,_mm_setr_epi16(100,1,100,1,100,1,1,0));                    // three 4-digit numbers, then digit 12
+ const __m128i c=_mm_packus_epi32(b,b);
+ const __m128i e=_mm_madd_epi16(c,_mm_setr_epi16(10000,1,10,1,0,0,0,0));                     // digits 0-7 and digits 8-12
+ const uint64_t r=(uint64_t)_mm_cvtsi128_si64(e);
+ out=(int64_t)((r&0xFFFFFFFFULL)*100000ULL+(r>>32));
+ return true;
+}
+// "YYYY-MM-DD" -> milliseconds at 00:00 UTC, remembered per thread. The slot comes straight from the
+// month and day digits, so the dates of one year never push each other out. Only valid dates are stored.
+struct DateMemo3{uint64_t k;uint32_t cc;uint32_t pad;int64_t ms;}; // k = bytes 2..9, cc = bytes 0..1; cc of an unused entry is all ones and never matches
+static thread_local DateMemo3 dateMemo3[4096];
+static thread_local bool dateMemo3Ready=false;
+static DateMemo3* date_memo3(){
+ if(!dateMemo3Ready){for(auto& e:dateMemo3){e.k=0;e.cc=0xFFFFFFFFu;e.pad=0;e.ms=0;}dateMemo3Ready=true;}
+ return dateMemo3;
+}
+[[gnu::noinline]] static bool date3_miss(const char* p,DateMemo3& e,int64_t& dayms){
+ if(p[4]!='-'||p[7]!='-')return false;
+ static constexpr unsigned char pos[8]={0,1,2,3,5,6,8,9};
+ unsigned d[8];for(int i=0;i<8;++i){d[i]=(unsigned)(unsigned char)p[pos[i]]-'0';if(d[i]>9)return false;}
+ const int y=(int)(d[0]*1000+d[1]*100+d[2]*10+d[3]),m=(int)(d[4]*10+d[5]),dd=(int)(d[6]*10+d[7]);
+ static constexpr int mlen[13]={0,31,28,31,30,31,30,31,31,30,31,30,31};
+ if(m<1||m>12||dd<1||dd>mlen[m]+((m==2&&leap(y))?1:0))return false;
+ dayms=days_from_civil(y,(unsigned)m,(unsigned)dd)*DAY;
+ uint16_t cc;memcpy(&e.k,p+2,8);memcpy(&cc,p,2);e.cc=cc;e.ms=dayms;return true;
+}
+static inline __attribute__((always_inline)) bool date3(const char* p,DateMemo3* memo,int64_t& dayms){
+ uint64_t k;uint16_t cc;memcpy(&k,p+2,8);memcpy(&cc,p,2);
+ // gathers the low bits of the month and day digits into a 12-bit slot number
+ DateMemo3& e=memo[((k&0x0F03000F01000000ULL)*((1ULL<<4)|(1ULL<<22)|(1ULL<<34)))>>52];
+ if(__builtin_expect(e.k==k&&e.cc==cc,1)){dayms=e.ms;return true;}
+ return date3_miss(p,e,dayms);
+}
+// Same result as parse_ts for the n bytes at p (which may be read a little past their end).
+SS_V3I bool ts_v3(const char* p,unsigned n,DateMemo3* memo,int64_t& out){
+ if(n==20){
+  int64_t tod,dayms;
+  if(p[19]=='Z'&&(tod=tod_v3(p))>=0&&date3(p,memo,dayms)){out=dayms+tod;return true;}
+ }else if(n==13){
+  if(epoch13_v3(p,out))return true;
+ }else if(n==25){
+  int64_t tod,dayms;
+  const unsigned o1=(unsigned)(unsigned char)p[20]-'0',o2=(unsigned)(unsigned char)p[21]-'0',o3=(unsigned)(unsigned char)p[23]-'0',o4=(unsigned)(unsigned char)p[24]-'0';
+  if((p[19]=='+'||p[19]=='-')&&p[22]==':'&&o1<=9&&o2<=9&&o3<=9&&o4<=9&&(tod=tod_v3(p))>=0&&date3(p,memo,dayms)){
+   const int oh=(int)(o1*10+o2),om=(int)(o3*10+o4);
+   if(oh>23||om>59)return false;
+   const int64_t off=(oh*60+om)*60000LL;
+   out=dayms+tod-(p[19]=='-'?-off:off);
+   return true;
+  }
+ }
+ return parse_ts(string_view(p,n),out);
+}
+// hkey() of the n bytes at p, without the loop for the usual short IDs.
+SS_V3I uint64_t hkey_v3(const char* p,size_t n){
+ if(__builtin_expect(n>=16,0))return hkey(string_view(p,n));
+ uint64_t h=0x9e3779b97f4a7c15ULL^(n*0xbf58476d1ce4e5b9ULL),w0,w1,tail;
+ memcpy(&w0,p,8);memcpy(&w1,p+8,8);
+ if(n>=8){h=(h^w0)*0xa0761d6478bd642fULL;tail=_bzhi_u64(w1,(unsigned)(8*(n-8)));}
+ else tail=_bzhi_u64(w0,(unsigned)(8*n));
+ return mix64(h^tail);
+}
+// A pushed record that still needs its user: the packed user key, its table slot, and the record.
+// A bucket is only ever grown right after the waiting records have been finished (see the capacity
+// checks), so `rec` cannot be left pointing into storage that has moved.
+template<class R> struct PendUser{uint64_t k0;const char* u;R* rec;uint32_t j;uint32_t k1;}; // j fits: the table has at most 2^32 slots
+static constexpr int V3_BATCH=16;
+template<class R> static void resolve_users(const PendUser<R>* pend,const PendUser<R>* pendEnd,KeyTable& tab,ThreadState& tl){
+ const auto R_=memory_order_relaxed;
+ KeyTable::Slot* const slots=tab.slots;
+ for(;pend!=pendEnd;++pend){
+  const PendUser<R>& q=*pend;KeyTable::Slot& e=slots[q.j];uint32_t g;
+  if(__builtin_expect(e.k1.load(memory_order_acquire)==q.k1&&e.k0.load(R_)==q.k0,1))g=e.v.load(R_);
+  else{
+   const string_view u(q.u,(size_t)(q.k1>>24)-1);
+   g=tab.find_or_add_packed(q.k0,q.k1,q.j,u);
+   if(g==KeyTable::NONE)g=LOCAL_USER|tl.users.intern(u);
+  }
+  q.rec->user=g;
+ }
+}
+// Does for every data line that begins in [from,to) exactly what for_records<7> + the general event
+// handler would do; `general` is that handler and gets the lines the short path passes on.
+template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){
+ if(from>=len)return;
+ const char* end=base+len;
+ const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
+ if(!nl)return;
+ const char* p=nl+1;
+ const char* lim=base+min(to,len);
+ DateMemo3* const memo=date_memo3();
+ const int64_t wstart=window_start;const uint64_t wlen=(uint64_t)(window_end-window_start);
+ const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
+ PendUser<PRec> pend[V3_BATCH];PendUser<PRec>* pp=pend;
+ while(p<lim){
+  const char* next=nullptr;bool done=false;
+  do{
+   // Window 1: 64 bytes from the line start; must hold the first three commas (fields 0-2).
+   const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
+   const uint64_t c=mask64_v3(x0,x1,vc),qa=mask64_v3(x0,x1,vq),na=mask64_v3(x0,x1,vnl);
+   const uint64_t cA=_blsr_u64(c),cB=_blsr_u64(cA),cR=_blsr_u64(cB);
+   const uint64_t m1=_blsmsk_u64(cB); // bytes up to and including the third comma
+   const uint64_t q1=qa&m1,st1=((c^cB)<<1)|1,en1=c^cR;
+   uint64_t sq1,op1;const uint64_t err1=quote_errors_v3(q1,st1,en1,sq1,op1);
+   // Window 2: 64 bytes from the start of field 3; must hold the last three commas and the newline.
+   const char* const b=p+_tzcnt_u64(cB)+1;
+   const __m256i y0=_mm256_loadu_si256((const __m256i*)b),y1=_mm256_loadu_si256((const __m256i*)(b+32));
+   const uint64_t nb=mask64_v3(y0,y1,vnl);
+   const uint64_t keep=_blsmsk_u64(nb)>>1; // bytes before the newline
+   const uint64_t d=mask64_v3(y0,y1,vc)&keep,qb=mask64_v3(y0,y1,vq)&keep;
+   const uint64_t st2=(d<<1)|1,en2=d|_blsi_u64(nb);
+   uint64_t sq2,op2;const uint64_t err2=quote_errors_v3(qb,st2,en2,sq2,op2);
+   if(__builtin_expect(cB==0||nb==0||_mm_popcnt_u64(d)!=3||(err1|err2|(na&m1))!=0,0))break;
+   next=b+_tzcnt_u64(nb)+1;done=true; // from here on the line is well-formed, 7 fields
+   // Content of each field: starts move one up past an opening quote, ends one down onto a closing quote.
+   uint64_t B1=st1+sq1,E1=en1-(op1>>1),B2=st2+sq2,E2=en2-(op2>>1);
+   const unsigned z0=(unsigned)(q1&1);
+   const char* const s0=p+z0;const unsigned l0=(unsigned)_tzcnt_u64(E1)-z0;
+   if(l0==0)break; // no event_id: dropped
+   const unsigned z3=(unsigned)(qb&1);
+   const char* const s3=b+z3;const unsigned l3=(unsigned)_tzcnt_u64(E2)-z3;
+   // ingest_ts is F1 in generated data; anything else is left to the general handler.
+   int64_t tod3,ingestDay;
+   if(__builtin_expect(l3!=20||s3[19]!='Z'||(tod3=tod_v3(s3))<0||!date3(s3,memo,ingestDay),0)){done=false;break;}
+   const int64_t ingest=ingestDay+tod3;
+   B1=_blsr_u64(B1);E1=_blsr_u64(E1);
+   const unsigned b1=(unsigned)_tzcnt_u64(B1),l1=(unsigned)_tzcnt_u64(E1)-b1;
+   B1=_blsr_u64(B1);E1=_blsr_u64(E1);
+   const unsigned b2=(unsigned)_tzcnt_u64(B1),l2=(unsigned)_tzcnt_u64(E1)-b2;
+   B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+   const unsigned b4=(unsigned)_tzcnt_u64(B2),l4=(unsigned)_tzcnt_u64(E2)-b4;
+   B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+   const unsigned b5=(unsigned)_tzcnt_u64(B2),l5=(unsigned)_tzcnt_u64(E2)-b5;
+   const char* const s1=p+b1;const char* const s2=p+b2;
+   PRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
+   const unsigned kind=event_kind(string_view(b+b4,l4));
+   bool valid=false;
+   if(kind&&l1!=0&&l5!=0){
+    int64_t ts;bool tsOk;
+    uint64_t a8,b8;uint16_t a2,b2_;
+    // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
+    if(l2==20&&s2[19]=='Z'&&(memcpy(&a8,s2,8),memcpy(&b8,s3,8),memcpy(&a2,s2+8,2),memcpy(&b2_,s3+8,2),((a8^b8)|(uint64_t)(a2^b2_))==0)){
+     const int64_t tod2=tod_v3(s2);
+     if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
+    }else tsOk=ts_v3(s2,l2,memo,ts);
+    // window_start <= ts < window_end as one unsigned compare (the window is far shorter than 2^63 ms)
+    if(tsOk&&(uint64_t)ts-(uint64_t)wstart<wlen&&ingest-ts<=DAY){
+     int32_t price=0;const bool purchase=kind==3;
+     if(purchase){
+      B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+      const unsigned b6=(unsigned)_tzcnt_u64(B2),l6=(unsigned)_tzcnt_u64(E2)-b6;
+      if(price_value(string_view(b+b6,l6),price)){
+       const uint32_t ci=products.find(string_view(b+b5,l5));
+       r.cat=ci==KeyTable::NONE?0:(uint16_t)ci;r.flags=F_VALID|F_PURCHASE;r.ts=ts;r.price=price;valid=true;
+      }
+     }else{r.flags=F_VALID;r.ts=ts;valid=true;}
+    }
+   }
+   AVec<PRec>& vec=tl.eb[(size_t)(((r.h>>40)*PE)>>24)];
+   if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
+   if(valid){
+    uint64_t k0;uint32_t k1;
+    if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID: nothing has been stored yet
+    const size_t j=KeyTable::hash_packed(k0,k1)&tab.mask;
+    __builtin_prefetch(&tab.slots[j],0,1);
+    PendUser<PRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.data()+vec.size();pu.k1=k1;
+   }
+   vec.push_back(r);
+   if(pp==pend+V3_BATCH){resolve_users(pend,pp,tab,tl);pp=pend;}
+  }while(0);
+  if(!done){
+   // Keep the order of lines: finish the waiting ones before the general handler stores anything.
+   resolve_users(pend,pp,tab,tl);pp=pend;
+   const char* comma[7];int ncomma,nquote;const char* lineEnd;string_view f[7];
+   next=scan_line(p,end,comma,7,ncomma,nquote,lineEnd);
+   if(take_fields(p,lineEnd,comma,ncomma,nquote,7,f))general(f);
+  }
+  p=next;
+ }
+ resolve_users(pend,pp,tab,tl);
+}
+// The same for click lines (4 fields, one 64-byte window).
+template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){
+ if(from>=len)return;
+ const char* end=base+len;
+ const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
+ if(!nl)return;
+ const char* p=nl+1;
+ const char* lim=base+min(to,len);
+ DateMemo3* const memo=date_memo3();
+ const uint64_t wlen=(uint64_t)(window_end-clickStart);
+ const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
+ PendUser<CRec> pend[V3_BATCH];PendUser<CRec>* pp=pend;
+ while(p<lim){
+  const char* next=nullptr;bool done=false;
+  do{
+   const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
+   const uint64_t nb=mask64_v3(x0,x1,vnl);
+   const uint64_t keep=_blsmsk_u64(nb)>>1;
+   const uint64_t c=mask64_v3(x0,x1,vc)&keep,q=mask64_v3(x0,x1,vq)&keep;
+   const uint64_t st=(c<<1)|1,en=c|_blsi_u64(nb);
+   uint64_t sq,op;const uint64_t err=quote_errors_v3(q,st,en,sq,op);
+   if(__builtin_expect(nb==0||_mm_popcnt_u64(c)!=3||err!=0,0))break;
+   next=p+_tzcnt_u64(nb)+1;done=true; // well-formed, 4 fields
+   uint64_t B=st+sq,E=en-(op>>1);
+   const unsigned z0=(unsigned)(q&1);
+   const char* const s0=p+z0;const unsigned l0=(unsigned)_tzcnt_u64(E)-z0;
+   B=_blsr_u64(B);E=_blsr_u64(E);
+   const unsigned b1=(unsigned)_tzcnt_u64(B),l1=(unsigned)_tzcnt_u64(E)-b1;
+   if(l0==0||l1==0)break;
+   B=_blsr_u64(B);E=_blsr_u64(E);
+   const unsigned b2=(unsigned)_tzcnt_u64(B),l2=(unsigned)_tzcnt_u64(E)-b2;
+   B=_blsr_u64(B);E=_blsr_u64(E);
+   const unsigned b3=(unsigned)_tzcnt_u64(B),l3=(unsigned)_tzcnt_u64(E)-b3;
+   // Copies of a click are identical, so validating before the dedup keeps the same clicks.
+   int64_t ts=0;
+   if(!ts_v3(p+b3,l3,memo,ts)||(uint64_t)ts-(uint64_t)clickStart>=wlen)break; // clickStart <= ts < window_end
+   const uint32_t ci=camps.find(string_view(p+b2,l2));if(ci==KeyTable::NONE)break;
+   const char* const s1=p+b1;
+   uint64_t k0;uint32_t k1;
+   if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID
+   const size_t j=KeyTable::hash_packed(k0,k1)&tab.mask;
+   __builtin_prefetch(&tab.slots[j],0,1);
+   CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.ts=ts;r.user=0;r.campaign=(uint16_t)ci;r.flags=0;
+   AVec<CRec>& vec=tl.cb[(size_t)(((r.h>>40)*PC)>>24)];
+   if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
+   PendUser<CRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.data()+vec.size();pu.k1=k1;
+   vec.push_back(r);
+   if(pp==pend+V3_BATCH){resolve_users(pend,pp,tab,tl);pp=pend;}
+  }while(0);
+  if(!done){
+   resolve_users(pend,pp,tab,tl);pp=pend;
+   const char* comma[4];int ncomma,nquote;const char* lineEnd;string_view f[4];
+   next=scan_line(p,end,comma,4,ncomma,nquote,lineEnd);
+   if(take_fields(p,lineEnd,comma,ncomma,nquote,4,f))general(f);
+  }
+  p=next;
+ }
+ resolve_users(pend,pp,tab,tl);
+}
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;};
@@ -711,6 +929,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
  }
  const uint32_t nlinked=tab.nextId.load();
+ if(getenv("SS_TEST_MAXNEW"))tab.idLimit=min<uint64_t>(tab.idLimit,(uint64_t)nlinked+maxNew64); // test hook: really force the full-table fallback
  __mark("LINKREAD");
  // Flatten, then name each person by the byte-wise smallest of their IDs.
  vector<uint32_t> root(nlinked);
@@ -808,8 +1027,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
    if(useV3){
-    if(ck.click)for_records_v3<4>(ck.base,ck.len,ck.from,ck.to,warm_user,on_click);
-    else for_records_v3<7>(ck.base,ck.len,ck.from,ck.to,warm_user,on_event);
+    if(ck.click)clicks_v3(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
+    else events_v3(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
    }else{
     if(ck.click)for_records<4>(ck.base,ck.len,ck.from,ck.to,warm_user,on_click);
     else for_records<7>(ck.base,ck.len,ck.from,ck.to,warm_user,on_event);
