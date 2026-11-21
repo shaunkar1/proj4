@@ -1962,7 +1962,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const int countType=narrow?PQ_INT32:PQ_INT64;
  const vector<PqCol> userCols={{"user_id",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},{"sessions",countType,false,CONV_NONE},
   {"events",countType,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"top_category",PQ_BYTES,true,CONV_UTF8}};
- static const size_t pfa=[]{const char* v=getenv("SS_PFA");const long x=v?atol(v):0;return (size_t)(x<0?0:x>4096?4096:x);}(); // measuring switch: write prefetch this many bytes ahead in the two event counting passes (0 = off)
+ static const size_t pfa=[]{const char* v=getenv("SS_PFA");const long x=v?atol(v):128;return (size_t)(x<0?0:x>4096?4096:x);}(); // write prefetch this many bytes ahead in the two event counting passes (0 = off; 128 measured ~1% faster overall on the scoring machine)
  // Measuring switch, off by default: cut a person's events into cells in a separate pass without data-dependent
  // branches. On dev it trades about 29 more instructions per event for 0.35 fewer mispredicted branches.
  static const bool cellPass=getenv("SS_CELLPASS")!=nullptr;
