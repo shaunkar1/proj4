@@ -6,7 +6,7 @@ usage: dense_check.py CORE DATA_DIR WORK_DIR [K=V ...]      (K=V: extra environm
 Runs CORE on DATA_DIR
   A  with SS_NODENSE=1, SS_ISA=sse2, one thread: the reference. Its rows-*.txt hold every event / click line
      that produces a record, with the raw ID texts, as the general handlers saw it.
-  R  with SS_DENSE_RECORDS=1 on every ISA with 1, 3 and 8 threads and several SS_DENSE_AHEAD values.
+  R  with SS_DENSE_RECORDS=1 on every ISA with 1, 2, 3 and 8 threads (DC_PLAN=isa:threads,... picks other runs).
 From A and an independent decoder of the ID texts (below) the script works out what the parse stage must
 leave behind, and compares every run R with it:
   1. event slots: exactly the dense event IDs of A are in use; each slot holds the copy with the smallest
@@ -59,7 +59,7 @@ def counter(text, letter, key):
 def run(name, env, threads, sub="dump"):
     out = os.path.join(work, sub)
     e = dict(os.environ); e.update(env)
-    for k in ("SS_NODENSE", "SS_DENSE_USERS", "SS_DENSE_RECORDS", "SS_ISA", "SS_DENSE_AHEAD"):
+    for k in ("SS_NODENSE", "SS_DENSE_USERS", "SS_DENSE_RECORDS", "SS_ISA"):
         if k not in env: e.pop(k, None)
     o = os.path.join(work, "out"); os.makedirs(o, exist_ok=True)
     e.update(DATA_DIR=data, OUTPUT_DIR=o, SCRATCH_DIR=o, NCPU=str(threads), SS_DENSE_DUMP=out, SS_STATS="1")
@@ -98,15 +98,13 @@ def diff(what, a, b):
 
 dense_env = dict(extra); dense_env.update(SS_DENSE_RECORDS="1")
 A, _ = run("A-nodense-sse2", {"SS_NODENSE": "1", "SS_ISA": "sse2"}, 1, "dumpA")
-plan = [("sse2", 1, None), ("sse2", 3, None), ("avx2", 1, None), ("avx2", 3, None), ("avx2", 8, None), ("avx2", 3, "0"), ("avx2", 2, "16"),
-        ("avx512z", 1, None), ("avx512z", 3, "1"), ("avx512y", 1, None), ("avx512y", 3, None), ("sse2", 8, None)]
-if os.environ.get("DC_PLAN"):   # e.g. DC_PLAN=avx2:8:2,avx2:8:0
-    plan = [(a.split(":")[0], int(a.split(":")[1]), a.split(":")[2] if a.count(":") > 1 else None) for a in os.environ["DC_PLAN"].split(",")]
+plan = [("sse2", 1), ("sse2", 3), ("avx2", 1), ("avx2", 2), ("avx2", 3), ("avx2", 8), ("avx512z", 1), ("avx512z", 3), ("avx512y", 1), ("avx512y", 3), ("sse2", 8)]
+if os.environ.get("DC_PLAN"):   # e.g. DC_PLAN=avx2:8,avx2:8,sse2:2
+    plan = [(a.split(":")[0], int(a.split(":")[1])) for a in os.environ["DC_PLAN"].split(",")]
 keys = None; done = []
-for isa, threads, ahead in plan:
+for isa, threads in plan:
     env = dict(dense_env, SS_ISA=isa)
-    if ahead is not None: env["SS_DENSE_AHEAD"] = ahead
-    name = "%s/%d%s" % (isa, threads, "" if ahead is None else "/ahead" + ahead)
+    name = "%s/%d" % (isa, threads)
     R, k = run(name, env, threads)
     if not k: sys.exit("no 'STATS dense keys' line")
     if keys is None:

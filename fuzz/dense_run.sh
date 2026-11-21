@@ -10,7 +10,7 @@ set -- $K; LE=$4; LC=$5; LI=$6
 DM_BIN=1 python3 -I $H/dense_mut.py $B $W/data $S $K || exit 1
 n=0
 for e in "SS_TEST_LIME=$LE SS_TEST_LIMC=$LC SS_TEST_LIMI=$LI" \
-         "SS_TEST_LIME=$((LE+1)) SS_TEST_LIMC=$((LC+1)) SS_TEST_LIMI=$((LI+1)) SS_TEST_COMPLEX=3 SS_DENSE_AHEAD=3" \
+         "SS_TEST_LIME=$((LE+1)) SS_TEST_LIMC=$((LC+1)) SS_TEST_LIMI=$((LI+1)) SS_TEST_COMPLEX=3" \
          "SS_TEST_LIME=$((LE-1)) SS_TEST_LIMC=$((LC-1)) SS_TEST_LIMI=$((LI-1)) SS_TEST_COMPLEX=2 SS_TEST_SIDE=1" \
          "SS_TEST_MAXNEW=50 SS_TEST_COMPLEX=5" "SS_LINES=plain"; do
   n=$((n+1)); r=$(python3 $H/dense_check.py $C $W/data $W/chk $e 2>&1 | tail -6)
