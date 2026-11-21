@@ -384,24 +384,14 @@ int main(){
  auto add=[&](const char* group,int reps,vector<pair<string,string>> env,const char* bin="",bool hs=false){for(int i=0;i<reps;++i)vars.push_back({string(group)+"#"+to_string(i),env,bin,hs});};
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
- auto ring=[&](const char* name,const char* ahead,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","slot"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD",ahead}},"",hs);};
- auto bkt=[&](const char* name,const char* sh,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","bucket"},{"SS_DENSE_DUMP","-"},{"SS_DSHIFT",sh},{"SS_CSHIFT",sh}},"",hs);};
- auto full=[&](const char* name,vector<pair<string,string>> env,bool hs){env.insert(env.begin(),N8);add(name,1,env,"",hs);};
- for(int r=0;r<2;++r){
-  add("B",1,{N8});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("nod",1,{N8,{"SS_NODENSE","1"}});
-  full("bk14",{{"SS_DENSE_RECORDS","bucket"}},false);full("bk12",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","12"},{"SS_CSHIFT","12"}},false);
-  full("bk13",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","13"},{"SS_CSHIFT","13"}},false);full("bk16",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","16"},{"SS_CSHIFT","16"}},false);
-  full("sl2",{{"SS_DENSE_AHEAD","2"}},false);full("sl4",{{"SS_DENSE_AHEAD","4"}},false);full("sl8",{{"SS_DENSE_AHEAD","8"}},false);full("sl16",{{"SS_DENSE_AHEAD","16"}},false);
+ for(int r=0;r<3;++r){
+  add("B",1,{N8});add("pf",1,{N8,{"SS_PREFAULT","1"}});add("af",1,{N8,{"SS_ASYNCFREE","1"}});
+  add("n6",1,{{"NCPU","6"}});add("n7",1,{{"NCPU","7"}});add("n12",1,{{"NCPU","12"}});add("n16",1,{{"NCPU","16"}});
+  add("a16",1,{N8,{"SS_DENSE_AHEAD","16"}});add("nh",1,{N8,{"SS_NOHUGE","1"}});
  }
- full("bk14",{{"SS_DENSE_RECORDS","bucket"}},false);add("nod",1,{N8,{"SS_NODENSE","1"}});
- full("bk14z",{{"SS_DENSE_RECORDS","bucket"},{"SS_ISA","avx512z"}},false);
- add("bk14n4",1,{{"NCPU","4"},{"SS_DENSE_RECORDS","bucket"}});add("bk14n1",1,{{"NCPU","1"},{"SS_DENSE_RECORDS","bucket"}});
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);
-  full("Hbk14",{{"SS_DENSE_RECORDS","bucket"}},true);full("Hbk16",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","16"},{"SS_CSHIFT","16"}},true);
-  full("Hbk15",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","15"},{"SS_CSHIFT","15"}},true);
-  full("Hsl8",{{"SS_DENSE_AHEAD","8"}},true);add("HB",1,{N8},"",true);}
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hpf",1,{N8,{"SS_PREFAULT","1"}},"",true);add("Hn12",1,{{"NCPU","12"}},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -413,7 +403,8 @@ int main(){
   auto get=[&](const string& label)->const RunResult*{const RunResult* b=nullptr;for(auto& r:results)if(r.label==label&&r.rc==0&&(!b||r.wall<b->wall))b=&r;return b;};
   auto bestd=[&]()->const RunResult*{const RunResult* b=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='d'&&r.rc==0&&(!b||r.wall<b->wall))b=&r;return b;};
   auto stages=[&](const RunResult& r)->string{char t[256];auto g=[&](const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};
-   string s2;for(auto& kv:r.t){char one[48];snprintf(one,sizeof one,"%s%.0f ",(kv.first.rfind("LINK",0)==0&&kv.first.size()>4?("L"+kv.first.substr(4,3)):kv.first.substr(0,4)).c_str(),kv.second*1e3);s2+=one;}
+   string s2;for(auto& kv:r.t){char one[48];static const map<string,string> ab={{"AGGREGATE","AGG"},{"DEDUP","DED"},{"DENSE","DNS"},{"DENSE1","DN1"},{"PARSE","PAR"},{"WRITE","WR"},{"FLATTEN","FL"},{"LINKMAP","LM"},{"LINKREAD","LR"},{"LINKSETUP","LS"},{"LINKS","LK"},{"KEYS","KEY"},{"MAP","MAP"}};
+    auto it=ab.find(kv.first);snprintf(one,sizeof one,"%s%.1f ",(it==ab.end()?kv.first:it->second).c_str(),kv.second*1e3);s2+=one;}
    snprintf(t,sizeof t,"w%.0f u%.0f s%.0f flt%ld rss%ld cs%ld/%ld | ",r.wall*1e3,r.user*1e3,r.sys*1e3,r.minflt,r.maxrssMB,r.nvcsw,r.nivcsw);(void)g;return string(t)+s2;};
   string cid,chan;vector<int32_t> days;vector<int64_t> c1,c2,c3,c4;int idx=0;
   auto row=[&](const string& label,const string& text,int64_t a,int64_t b,int64_t c,int64_t d){
@@ -429,13 +420,12 @@ int main(){
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=fmt("nodense w/PARSE/DEDUP/AGG/links/user/sys","nod","wPDALus")+fmt("| slot AHEAD0 w/P/D/DENSE1/DENSE/A/L/u/s","B","wPDYXALus")+fmt("| users+general wPDAL","rec0","wPDAL");
-  a+="| bucket wPDYXALus by shift: ";for(const char* g:{"bk12","bk13","bk14","bk16"})a+=fmt(g+2,g,"wPDYXALus");
-  a+="| slot wPYX by AHEAD: ";for(const char* g:{"sl2","sl4","sl8","sl16"})a+=fmt(g+2,g,"wPYX");
-  a+=fmt("| bucket14 avx512z wPYX","bk14z","wPYX")+fmt("n4 wPYXA","bk14n4","wPYXA")+fmt("n1 wPYXAus","bk14n1","wPYXAus");
-  c+="60x: "+fmt("nodense wPDALus","Hnod","wPDALus")+fmt("| slot0 wPDYXALus","HB","wPDYXALus")+fmt("slot8 wPYX","Hsl8","wPYX");
-  c+="| bucket wPDYXALusfr by shift: ";for(const char* g:{"Hbk14","Hbk15","Hbk16"})c+=fmt(g+3,g,"wPDYXALusfr");
-  {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,5,"bk14#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
+  {const RunResult* r=get("B#0");a+="B: "+(r?stages(*r):string("none"));}
+  a+=" || "+fmt("pf wPXus","pf","wPXus")+fmt("af wPXus","af","wPXus")+fmt("n6 wPX","n6","wPX")+fmt("n7 wPX","n7","wPX")+fmt("n12 wPXus","n12","wPXus")+fmt("n16 wPX","n16","wPX")+fmt("a16 wP","a16","wP")+fmt("nohuge wPus","nh","wPus");
+  {const RunResult* r=get("HB#0");c+="60x B: "+(r?stages(*r):string("none"));}
+  c+=" || "+fmt("pf wPXus","Hpf","wPXus")+fmt("n12 wPXus","Hn12","wPXus");
+  {struct utsname u;uname(&u);c+=string("| ")+u.release+" thp ";for(const char* f:{"/sys/kernel/mm/transparent_hugepage/enabled","/sys/kernel/mm/transparent_hugepage/defrag"}){ifstream in(f);string l;getline(in,l);size_t x=l.find('['),y=l.find(']');c+=(x!=string::npos&&y!=string::npos?l.substr(x+1,y-x-1):string("?"))+"/";}}
+  {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
   {string all;for(auto& r:results){auto g=[&](const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};char one[96];
