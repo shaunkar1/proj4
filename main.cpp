@@ -178,7 +178,12 @@ static vector<fs::path> csv_files(const fs::path& dir){
  vector<fs::path> out;
  if(!fs::is_directory(dir))throw runtime_error("Missing input folder: "+dir.string());
  for(auto& f:fs::directory_iterator(dir))if(f.is_regular_file()&&f.path().extension()==".csv")out.push_back(f.path());
- sort(out.begin(),out.end());return out;
+ // All entries are dir/name with the same dir, so comparing the whole strings orders them exactly as comparing the
+ // paths does (which walks both paths element by element on every comparison). SS_PATHSORT=path: the path comparison.
+ static const bool pathSort=getenv("SS_PATHSORT")&&string_view(getenv("SS_PATHSORT"))=="path";
+ if(pathSort)sort(out.begin(),out.end());
+ else sort(out.begin(),out.end(),[](const fs::path& a,const fs::path& b){return a.native()<b.native();});
+ return out;
 }
 // Every input file stays mapped until exit: IDs are kept as views into the maps.
 struct Mapped{const char* base=nullptr;size_t len=0;};
@@ -250,20 +255,40 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
  // them, file by file, as before. SS_NOWILLNEED=1: no such calls at all.
  static const int willNeed=getenv("SS_NOWILLNEED")?0:(getenv("SS_WILLNEED")&&string_view(getenv("SS_WILLNEED"))=="inline")?1:2;
  vector<pair<void*,size_t>> later;
- for(size_t i=0;i<paths.size();++i){
-  if(!lens[i])continue;
-  int fd=open(paths[i].c_str(),O_RDONLY);
-  if(fd<0)throw runtime_error("Cannot open "+paths[i].string());
-  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
-  close(fd);
-  if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
-  if(willNeed==1)madvise(got,lens[i],MADV_WILLNEED);
-  else if(willNeed==2)later.push_back({got,lens[i]});
-  if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
-  if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
-  out[i]={g.base+off,lens[i]};
-  off+=slot_of(lens[i]);g.ends.push_back(off);
+ // Where each file goes is fixed first, so the files can be opened and mapped by several threads at once (the calls
+ // of one file take ~8 us and a run has a few hundred files): SS_MAPTHREADS=n, n = 2..16 threads for folders of 16
+ // files or more. Default 1 (this thread alone, as before): not measurable on the loaded two-core dev box.
+ static const int mapThreads=[]{const char* v=getenv("SS_MAPTHREADS");const int x=v?atoi(v):1;return x<1?1:x>16?16:x;}();
+ vector<size_t> offs(paths.size(),0);
+ for(size_t i=0;i<paths.size();++i){if(!lens[i])continue;offs[i]=off;off+=slot_of(lens[i]);g.ends.push_back(off);}
+ atomic<size_t> nextFile{0},badOpen{SIZE_MAX},badMap{SIZE_MAX};
+ const auto note_min=[](atomic<size_t>& a,size_t i){size_t c=a.load();while(i<c&&!a.compare_exchange_weak(c,i)){}};
+ const auto map_some=[&]{
+  for(;;){
+   const size_t i=nextFile.fetch_add(1,memory_order_relaxed);if(i>=paths.size())break;
+   if(!lens[i])continue;
+   int fd=open(paths[i].c_str(),O_RDONLY);
+   if(fd<0){note_min(badOpen,i);continue;}
+   void* got=mmap(g.base+offs[i],lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
+   close(fd);
+   if(got==MAP_FAILED){note_min(badMap,i);continue;}
+   if(willNeed==1)madvise(got,lens[i],MADV_WILLNEED);
+   if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
+   if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
+   out[i]={g.base+offs[i],lens[i]};
+  }
+ };
+ {
+  vector<thread> helpers;
+  if(paths.size()>=16)for(int t=1;t<mapThreads;++t)helpers.emplace_back(map_some);
+  map_some();
+  for(thread& h:helpers)h.join();
  }
+ // The first file that failed, in the order of the list, is the one reported (open before map, as one thread would).
+ {const size_t bo=badOpen.load(),bm=badMap.load();
+  if(bo!=SIZE_MAX&&bo<bm)throw runtime_error("Cannot open "+paths[bo].string());
+  if(bm!=SIZE_MAX)throw runtime_error("Cannot map "+paths[bm].string());}
+ if(willNeed==2)for(size_t i=0;i<paths.size();++i)if(lens[i])later.push_back({(void*)out[i].base,lens[i]});
  // Advice only: it cannot change what is read. (A call that came after its file was unmapped would fail or hint
  // at whatever is mapped there by then; the calls are done long before anything is unmapped.)
  if(!later.empty())thread([list=move(later)]{for(const auto& [p,n]:list)madvise(p,n,MADV_WILLNEED);}).detach();
@@ -5728,11 +5753,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // region on one thread: the WRITE stage). SS_CAMPWRITE=end: after the region, as before. Same bytes either way.
  static const bool campEarly=!(getenv("SS_CAMPWRITE")&&string_view(getenv("SS_CAMPWRITE"))=="end");
  string campCsv; // SS_DEBUG_CSV rows
+ vector<Totals> campTotals(ncamp*(size_t)ndays);
+ const auto merge_totals=[&](size_t lo,size_t hi){ // cells [lo,hi) of every thread's totals added into campTotals
+  for(const Totals* tt:threadTotals)if(tt)for(size_t i=lo;i<hi;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
+  for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=lo;i<hi;++i)campTotals[i].assists+=ta[i];
+ };
+ static constexpr size_t MERGE_BLOCK=4096;
  const auto write_campaigns=[&]{
-  vector<Totals> campTotals(ncamp*(size_t)ndays);
-  for(const Totals* tt:threadTotals)if(tt)for(size_t i=0;i<ncells;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
-  for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=0;i<ncells;++i)campTotals[i].assists+=ta[i];
+  if(!campEarly)merge_totals(0,ncells); // otherwise all threads have added the totals up, a block of cells each
   string cid,chan;string& csv=campCsv;vector<int32_t> days;vector<int64_t> s,p,r,a;
+  if(campEarly){ // room for a row of every cell, so nothing grows while the rows are appended (SS_CAMPWRITE=end: as before)
+   size_t idBytes=0,chBytes=0;for(size_t ci=0;ci<ncamp;++ci){idBytes+=4+campaigns[ci].id.size();chBytes+=4+campaigns[ci].channel.size();}
+   cid.reserve(idBytes*(size_t)ndays);chan.reserve(chBytes*(size_t)ndays);days.reserve(ncells);s.reserve(ncells);p.reserve(ncells);r.reserve(ncells);a.reserve(ncells);
+  }
   for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
    put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
    s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
@@ -6430,6 +6463,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
   // The loop above ended with a barrier: every thread's totals are final. (A failed write ends the run from
   // inside the region, as a failed write of a user_daily file does.)
+  // The totals are added up by all threads (each cell by one thread), then one of them builds and writes the file.
+  #pragma omp for schedule(static)
+  for(size_t b=0;b<(campEarly?(ncells+MERGE_BLOCK-1)/MERGE_BLOCK:0);++b)merge_totals(b*MERGE_BLOCK,min(ncells,(b+1)*MERGE_BLOCK));
   #pragma omp single nowait
   {if(campEarly){__fine("campaign-begin");write_campaigns();__fine("campaign-end");}}
   // Every row is in the output buffers now (names are copied there): nothing points into an input file.
