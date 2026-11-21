@@ -856,6 +856,8 @@ static inline uint64_t order36(uint64_t y){
  const unsigned n=1+(y>=36u)+(y>=1296u)+(y>=46656u)+(y>=1679616u)+(y>=60466176u)+(y>=2176782336ull)+(y>=78364164096ull);
  return y*POW36[8-n]*16+n;
 }
+// SPREAD3[m]: bit 3j is set where bit j of m is set (an alias mask laid over the 3-bit group fields of a denseComp word).
+static constexpr array<uint32_t,256> SPREAD3=[]{array<uint32_t,256> a{};for(unsigned m=0;m<256;++m){uint32_t v=0;for(unsigned j=0;j<8;++j)if((m>>j)&1)v|=1u<<(3*j);a[m]=v;}return a;}();
 // SPREAD8[m]: byte j is 1 where bit j of m is set (eight one-byte counters bumped by one add).
 static constexpr array<uint64_t,256> SPREAD8=[]{array<uint64_t,256> a{};for(unsigned m=0;m<256;++m){uint64_t v=0;for(unsigned j=0;j<8;++j)if((m>>j)&1)v|=1ull<<(8*j);a[m]=v;}return a;}();
 static inline size_t text36_fast(char letter,uint64_t y,char* out){
@@ -2766,11 +2768,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   const uint32_t d=person-denseBase,root=d&7;const uint64_t idx=d>>3;
   const uint32_t stored=denseComp[idx].load(memory_order_relaxed);
   if(__builtin_expect(stored==0,1))return text36_fast('u',dn::value_of((idx<<dn::GEN_ALIAS_BITS)|root,dense.ku),buf); // nothing grouped under this index
-  const uint32_t w=stored^COMP_IDENT;uint64_t best=~0ull,bestV=0;
-  for(uint32_t a=root;a<8;++a)if(comp_root(w,a)==root){ // the root is its group's smallest alias
+  // The members of the root's group: the fields of the word that hold the root (bit 3a for alias a).
+  const uint32_t x=(stored^COMP_IDENT)^(root*0x249249u);uint32_t members=~(x|(x>>1)|(x>>2))&0x249249u;
+  uint64_t best=~0ull,bestV=0;
+  do{
+   const uint32_t a=(uint32_t)__builtin_ctz(members)/3u;members&=members-1;
    const uint64_t v=dn::value_of((idx<<dn::GEN_ALIAS_BITS)|a,dense.ku),key=order36(v);
-   if(key<best){best=key;bestV=v;}
-  }
+   const uint64_t lt=0-(uint64_t)(key<best);bestV^=(bestV^v)&lt;best^=(best^key)&lt; // (masks: the compiler makes a branch of a ?: here)
+  }while(members);
   return text36_fast('u',bestV,buf);
  };
  auto name_of=[&](uint32_t person)->string_view{
@@ -3252,7 +3257,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   HugePool& pool=surv[tid].pool;
   Totals* const tot=(Totals*)pool.take(ncells*sizeof(Totals));threadTotals[tid]=tot;
   uint64_t* const assists=(uint64_t*)pool.take(ncells*sizeof(uint64_t));threadAssists[tid]=assists;
-  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp);size_t nact=0;
+  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp+1);size_t nact=0; // active: one free place after a full list (see the fast lane's large click sets)
   vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
   PqFile file;
   auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
@@ -3476,7 +3481,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(__builtin_expect(n!=ec||m!=cc,0)){fprintf(stderr,"ERROR dense slots changed under the reader\n");_exit(1);}
       // One person: every alias in use has the same smallest alias of its group.
       const uint32_t a0=(uint32_t)__builtin_ctz(mask|0x100u);root=a0^((stored>>(3*a0))&7);
-      if(mask&(mask-1))for(uint32_t a=a0+1;a<8;++a)if(((mask>>a)&1)&&(a^((stored>>(3*a))&7))!=root){fast=false;why=6;}
+      // (The group fields of all eight aliases against the root at once; SPREAD3 puts the aliases in use on the fields.)
+      {const uint32_t x=(stored^COMP_IDENT)^(root*0x249249u),differs=(x|(x>>1)|(x>>2))&0x249249u;
+       if(differs&SPREAD3[mask&255u]){fast=false;why=6;}}
      }
      if(fast){
       const uint32_t person=dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|root);
@@ -3603,8 +3610,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        else if(mode==LARGE){
         const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
-        while(add<ce&&add->key<addLim){const uint16_t c=(uint16_t)add->key;if(fr[c]++==0){pos[c]=(uint32_t)na;act[na++]=c;}++add;}
-        while(expire<add&&expire->key<expLim){const uint16_t c=(uint16_t)expire->key;if(--fr[c]==0){const uint32_t at=pos[c];const uint16_t back=act[--na];act[at]=back;pos[back]=at;}++expire;}
+        // Whether a click is the first (last) of its campaign in the window is as good as random, so the
+        // list of active campaigns is kept without a branch on it: a write that must not happen goes to the
+        // free place after the list (act has one place more than there are campaigns) or rewrites what is there.
+        while(add<ce&&add->key<addLim){
+         const uint16_t c=(uint16_t)add->key;const uint32_t f=fr[c],isNew=f==0,p=pos[c];
+         fr[c]=f+1;act[na]=c;pos[c]=p^((p^(uint32_t)na)&(0u-isNew));na+=isNew;++add;} // (masks, not ?: - the compiler makes branches of those)
+        while(expire<add&&expire->key<expLim){
+         const uint16_t c=(uint16_t)expire->key;const uint32_t f=fr[c]-1,gone=f==0;
+         fr[c]=f;na-=gone;
+         const uint16_t back=act[na];const uint32_t at=(uint32_t)na^(((uint32_t)na^pos[c])&(0u-gone)),pb=pos[back];
+         act[at]=back;pos[back]=pb^((pb^at)&(0u-gone));++expire;}
         if(add>expire)credited=(uint16_t)add[-1].key;
         uint64_t* const arow=assists+(size_t)d*ncamp;
         #pragma GCC unroll 4
