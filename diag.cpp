@@ -20,6 +20,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
 #include <cerrno>
 #include <map>
 #include <string_view>
@@ -137,53 +140,68 @@ struct PqFile{
 static void put_bytes(string& o,string_view s){put_le32(o,(uint32_t)s.size());o.append(s);}
 template<class V> static string_view raw(const V& v){return string_view((const char*)v.data(),v.size()*sizeof(v[0]));}
 
-struct RunResult{string label;double wall=0;int rc=0;map<string,double> t;};
+struct RunResult{string label;double wall=0,user=0,sys=0;long minflt=0,majflt=0,maxrssMB=0,nvcsw=0,nivcsw=0;int rc=0;map<string,double> t;uint64_t pc[4]={0,0,0,0};int perfErr=0;};
 static vector<RunResult> results;
-// Runs the pipeline as a child, forwards its stderr to ours and keeps its "TIME <stage> <seconds>" lines.
-static int run_child(const string& bin,vector<pair<string,string>> env,double& wall,map<string,double>& marks){
- int pfd[2];if(pipe(pfd)!=0)return -2;
+static int perf_open(pid_t pid,uint32_t type,uint64_t config){
+ perf_event_attr a;memset(&a,0,sizeof a);a.size=sizeof a;a.type=type;a.config=config;a.inherit=1;a.exclude_kernel=0;a.exclude_hv=1;a.disabled=0;
+ return (int)syscall(SYS_perf_event_open,&a,pid,-1,-1,0);
+}
+// Runs the pipeline as a child, forwards its stderr to ours, keeps its "TIME <stage> <seconds>" lines,
+// its resource usage and (if the kernel allows) hardware counters: instructions, cycles, cache misses, branch misses.
+static void run_child(const string& bin,vector<pair<string,string>> env,RunResult& r){
+ int pfd[2],go[2];if(pipe(pfd)!=0||pipe(go)!=0){r.rc=-2;return;}
  double t=now();pid_t pid=fork();
- if(pid==0){dup2(pfd[1],2);close(pfd[0]);close(pfd[1]);for(auto& kv:env)setenv(kv.first.c_str(),kv.second.c_str(),1);execl(bin.c_str(),bin.c_str(),(char*)nullptr);_exit(127);}
- close(pfd[1]);string out;char buf[4096];ssize_t n;
+ if(pid==0){dup2(pfd[1],2);close(pfd[0]);close(pfd[1]);close(go[1]);char c;(void)!read(go[0],&c,1);close(go[0]);
+  for(auto& kv:env)setenv(kv.first.c_str(),kv.second.c_str(),1);execl(bin.c_str(),bin.c_str(),(char*)nullptr);_exit(127);}
+ close(pfd[1]);close(go[0]);
+ int fds[4];const uint64_t cfg[4]={PERF_COUNT_HW_INSTRUCTIONS,PERF_COUNT_HW_CPU_CYCLES,PERF_COUNT_HW_CACHE_MISSES,PERF_COUNT_HW_BRANCH_MISSES};
+ for(int i=0;i<4;++i){fds[i]=perf_open(pid,PERF_TYPE_HARDWARE,cfg[i]);if(fds[i]<0&&!r.perfErr)r.perfErr=errno;}
+ t=now();(void)!write(go[1],"g",1);close(go[1]);
+ string out;char buf[4096];ssize_t n;
  while((n=read(pfd[0],buf,sizeof buf))>0)out.append(buf,n);
  close(pfd[0]);
- int st=0;waitpid(pid,&st,0);wall=now()-t;
+ int st=0;rusage ru{};wait4(pid,&st,0,&ru);r.wall=now()-t;
+ for(int i=0;i<4;++i)if(fds[i]>=0){uint64_t v=0;if(read(fds[i],&v,8)==8)r.pc[i]=v;close(fds[i]);}
+ r.user=ru.ru_utime.tv_sec+ru.ru_utime.tv_usec*1e-6;r.sys=ru.ru_stime.tv_sec+ru.ru_stime.tv_usec*1e-6;
+ r.minflt=ru.ru_minflt;r.majflt=ru.ru_majflt;r.maxrssMB=ru.ru_maxrss/1024;r.nvcsw=ru.ru_nvcsw;r.nivcsw=ru.ru_nivcsw;
  fwrite(out.data(),1,out.size(),stderr);
  size_t p=0;while(p<out.size()){size_t e=out.find('\n',p);if(e==string::npos)e=out.size();string line=out.substr(p,e-p);p=e+1;
-  if(line.rfind("TIME ",0)==0){size_t sp=line.find(' ',5);if(sp!=string::npos)marks[line.substr(5,sp-5)]+=atof(line.c_str()+sp+1);}}
- return WIFEXITED(st)?WEXITSTATUS(st):-1;
+  if(line.rfind("TIME ",0)==0){size_t sp=line.find(' ',5);if(sp!=string::npos)r.t[line.substr(5,sp-5)]+=atof(line.c_str()+sp+1);}}
+ r.rc=WIFEXITED(st)?WEXITSTATUS(st):-1;
 }
-// Writes `reps` copies of a CSV directory with a replica letter put in front of the given ID fields,
-// so every copy has its own events and people. Returns bytes written.
+// Writes each CSV of `src` into `dst` `reps` times over (one output file per source file, header once),
+// with a replica letter put in front of the given ID fields so every copy has its own events and people.
 static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int idFields){
- fs::create_directories(dst);uint64_t total=0;int part=0;
+ fs::create_directories(dst);
  vector<fs::path> files;for(auto& f:fs::directory_iterator(src))if(f.path().extension()==".csv")files.push_back(f.path());
  sort(files.begin(),files.end());
  atomic<size_t> next{0};atomic<uint64_t> bytes{0};
- struct Job{fs::path in;int rep;int part;};vector<Job> jobs;
- for(int r=0;r<reps;++r)for(auto& f:files)jobs.push_back({f,r,part++});
- par(8,[&](int){for(;;){size_t j=next.fetch_add(1);if(j>=jobs.size())break;const Job& jb=jobs[j];
-   string in;{ifstream f(jb.in,ios::binary);in.assign(istreambuf_iterator<char>(f),{});}
+ par(8,[&](int){for(;;){size_t j=next.fetch_add(1);if(j>=files.size())break;
+   string in;{ifstream f(files[j],ios::binary);in.assign(istreambuf_iterator<char>(f),{});}
+   size_t hdr=in.find('\n');if(hdr==string::npos)hdr=in.size();else ++hdr;
+   char name[64];snprintf(name,sizeof name,"part-%05zu.csv",j);
+   FILE* f=fopen((dst/name).c_str(),"wb");if(!f)continue;
+   fwrite(in.data(),1,hdr,f);uint64_t wrote=hdr;
    string out;out.reserve(in.size()+in.size()/8);
-   size_t p=in.find('\n');if(p==string::npos){p=in.size();}else ++p;
-   out.append(in,0,p); // header
-   const char tag=(char)('A'+jb.rep);
-   while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
-    size_t q=p;
-    for(int k=0;k<idFields&&q<=e;++k){ // tag the start of field k unless it is empty
-     size_t c=in.find(',',q);if(c==string::npos||c>e)c=e;
-     if(c>q){if(in[q]=='"'){out.push_back('"');if(c-q>2)out.push_back(tag);out.append(in,q+1,c-q-1);}else{out.push_back(tag);out.append(in,q,c-q);}}
-     if(c<e)out.push_back(',');
-     q=c+1;
+   for(int rep=0;rep<reps;++rep){
+    out.clear();const char tag=(char)('A'+rep%26),tag2=(char)('a'+rep/26);
+    size_t p=hdr;
+    while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
+     size_t q=p;
+     for(int k=0;k<idFields&&q<=e;++k){ // tag the start of field k unless it is empty
+      size_t c=in.find(',',q);if(c==string::npos||c>e)c=e;
+      if(c>q){if(in[q]=='"'){out.push_back('"');if(c-q>2){out.push_back(tag);if(reps>26)out.push_back(tag2);}out.append(in,q+1,c-q-1);}else{out.push_back(tag);if(reps>26)out.push_back(tag2);out.append(in,q,c-q);}}
+      if(c<e)out.push_back(',');
+      q=c+1;
+     }
+     if(q<=e)out.append(in,q,e-q);
+     out.push_back('\n');p=e+1;
     }
-    if(q<=e)out.append(in,q,e-q);
-    out.push_back('\n');p=e+1;
+    fwrite(out.data(),1,out.size(),f);wrote+=out.size();
    }
-   char name[64];snprintf(name,sizeof name,"part-%05d.csv",jb.part);
-   FILE* f=fopen((dst/name).c_str(),"wb");if(f){fwrite(out.data(),1,out.size(),f);fclose(f);}
-   bytes+=out.size();
+   fclose(f);bytes+=wrote;
  }});
- total=bytes.load();return total;
+ return bytes.load();
 }
 static double gMemsetGBs=0,gTouchUsPage=0,gPopulateRc=-9,gTouch8[4]={0,0,0,0},gSpin[3]={0,0,0},gReadGBs[2]={0,0},gReplicaSec=0,gMunmap[4]={0,0,0,0};
 static string gCpu,gKernel,gThp,gDefrag,gFs;static int gAff=0,gFlags=0;
@@ -243,93 +261,87 @@ int main(){
    gReadGBs[pass]=bytes/1e9/t;
    fprintf(stderr,"DIAG read /data events pass %d: %.3fs %.1f MB (%.2f GB/s)\n",pass,t,bytes/1e6,bytes/1e9/t);}}
  // ---- pipeline on the dev data, several settings ----
- auto pipeline=[&](const string& label,const string& d,const string& o,vector<pair<string,string>> env){
+ auto pipeline=[&](const string& label,const string& d,const string& o,vector<pair<string,string>> env,string bin=""){
+  if(bin.empty())bin=core;else{bin=fs::path(core).parent_path().string()+"/"+bin;if(!fs::exists(bin)){fprintf(stderr,"DIAG RUN %s skipped: no %s\n",label.c_str(),bin.c_str());return;}}
   env.push_back({"DATA_DIR",d});env.push_back({"OUTPUT_DIR",o});env.push_back({"SCRATCH_DIR",scratch});
-  fprintf(stderr,"DIAG RUN %s begin\n",label.c_str());RunResult r;r.label=label;r.rc=run_child(core,env,r.wall,r.t);
-  fprintf(stderr,"DIAG RUN %s end: wall %.3fs rc=%d (total elapsed %.1fs)\n",label.c_str(),r.wall,r.rc,now()-T0);results.push_back(r);};
+  fprintf(stderr,"DIAG RUN %s begin\n",label.c_str());RunResult r;r.label=label;run_child(bin,env,r);
+  fprintf(stderr,"DIAG RUN %s end: wall %.3fs user %.3f sys %.3f minflt %ld rc=%d (total elapsed %.1fs)\n",label.c_str(),r.wall,r.user,r.sys,r.minflt,r.rc,now()-T0);results.push_back(r);};
  int runid=0;auto od=[&]{return scratch+"/dout"+to_string(runid++);};
- pipeline("dev n8 a",data,od(),{{"NCPU","8"}});
- pipeline("dev n8 b",data,od(),{{"NCPU","8"}});
- // ---- replicas of the dev data: every copy gets its own events and people ----
- // "huge" has HUGE copies (about the size of the final data); "big" is the first BIG of them (practice size).
- const int HUGE=getenv("SS_DIAG_HUGE")?atoi(getenv("SS_DIAG_HUGE")):60,BIG=getenv("SS_DIAG_BIG")?atoi(getenv("SS_DIAG_BIG")):20;
- const fs::path huge=fs::path(scratch)/"huge",big=fs::path(scratch)/"big";
+ // ---- a practice-sized replica of the dev data: BIG copies, same number of files as the dev set ----
+ const int BIG=getenv("SS_DIAG_BIG")?atoi(getenv("SS_DIAG_BIG")):20;
+ const fs::path big=fs::path(scratch)/"big";
  {double t=now();uint64_t b=0;
-  for(const char* sub:{"events","clicks","links"}){
-   b+=replicate(fs::path(data)/sub,huge/sub,HUGE,2);
-   size_t nfiles=0;for(auto& f:fs::directory_iterator(fs::path(data)/sub))if(f.path().extension()==".csv")++nfiles;
-   fs::create_directories(big/sub);
-   for(size_t k=0;k<nfiles*(size_t)BIG;++k){char name[64];snprintf(name,sizeof name,"part-%05zu.csv",k);error_code ec;fs::create_symlink(huge/sub/name,big/sub/name,ec);}
-  }
-  for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
+  for(const char* sub:{"events","clicks","links"})b+=replicate(fs::path(data)/sub,big/sub,BIG,2);
+  for(const char* f:{"products.csv","campaigns.csv","manifest.json"})fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);
   gReplicaSec=now()-t;
-  fprintf(stderr,"DIAG replica: %d copies, %.1f MB written in %.2fs (elapsed %.1fs); big = first %d copies\n",HUGE,b/1e6,now()-t,now()-T0,BIG);}
- const string B=big.string(),H=huge.string();
- auto timeleft=[&](double need){if(now()-T0+need>150){fprintf(stderr,"DIAG skipping the rest of this group: out of time (%.1fs elapsed)\n",now()-T0);return false;}return true;};
- pipeline("big n8 default #1",B,od(),{{"NCPU","8"}});
- pipeline("big n8 default #2",B,od(),{{"NCPU","8"}});
- pipeline("big n8 default #3",B,od(),{{"NCPU","8"}});
- if(timeleft(25)){pipeline("huge n8 default #1",H,od(),{{"NCPU","8"}});pipeline("huge n8 default #2",H,od(),{{"NCPU","8"}});}
- struct Var{const char* label;vector<pair<string,string>> env;};
+  fprintf(stderr,"DIAG replica: %d copies, %.1f MB written in %.2fs (elapsed %.1fs)\n",BIG,b/1e6,now()-t,now()-T0);}
+ const string B=big.string();
+ auto timeleft=[&](double need){if(now()-T0+need>150){fprintf(stderr,"DIAG skipping the rest: out of time (%.1fs elapsed)\n",now()-T0);return false;}return true;};
+ struct Var{const char* label;vector<pair<string,string>> env;const char* bin="";};
  const vector<Var> vars={
-  {"big n8 sse2",{{"NCPU","8"},{"SS_ISA","sse2"}}},
-  {"big n8 noprefault",{{"NCPU","8"},{"SS_NOPREFAULT","1"}}},
-  {"big n8 nohuge",{{"NCPU","8"},{"SS_NOHUGE","1"}}},
-  {"big n8 nohuge noprefault",{{"NCPU","8"},{"SS_NOHUGE","1"},{"SS_NOPREFAULT","1"}}},
-  {"big n8 noasyncfree",{{"NCPU","8"},{"SS_NOASYNCFREE","1"}}},
-  {"big n4",{{"NCPU","4"}}},{"big n2",{{"NCPU","2"}}},{"big n1",{{"NCPU","1"}}},{"big n16",{{"NCPU","16"}}},
-  {"big n8 procbind",{{"NCPU","8"},{"OMP_PROC_BIND","true"}}},
-  {"big n8 activewait",{{"NCPU","8"},{"OMP_WAIT_POLICY","active"}}},
-  {"big n8 procbind activewait",{{"NCPU","8"},{"OMP_PROC_BIND","true"},{"OMP_WAIT_POLICY","active"}}},
-  {"big n8 default #4",{{"NCPU","8"}}}};
- for(const Var& v:vars){if(!timeleft(12))break;pipeline(v.label,B,od(),v.env);}
+  {"d1",{{"NCPU","8"}}},{"p1",{{"NCPU","8"}},"core-v31"},{"d2",{{"NCPU","8"}}},{"p2",{{"NCPU","8"}},"core-v31"},{"d3",{{"NCPU","8"}}},{"p3",{{"NCPU","8"}},"core-v31"},
+  {"abl1",{{"NCPU","8"},{"SS_ABL","1"}},"core-abl"},{"abl2",{{"NCPU","8"},{"SS_ABL","2"}},"core-abl"},{"abl6",{{"NCPU","8"},{"SS_ABL","6"}},"core-abl"},{"abl3",{{"NCPU","8"},{"SS_ABL","3"}},"core-abl"},
+  {"abl4",{{"NCPU","8"},{"SS_ABL","4"}},"core-abl"},{"abl5",{{"NCPU","8"},{"SS_ABL","5"}},"core-abl"},
+  {"abl1b",{{"NCPU","8"},{"SS_ABL","1"}},"core-abl"},{"abl2b",{{"NCPU","8"},{"SS_ABL","2"}},"core-abl"},{"abl6b",{{"NCPU","8"},{"SS_ABL","6"}},"core-abl"},{"abl3b",{{"NCPU","8"},{"SS_ABL","3"}},"core-abl"},
+  {"abl4b",{{"NCPU","8"},{"SS_ABL","4"}},"core-abl"},{"abl5b",{{"NCPU","8"},{"SS_ABL","5"}},"core-abl"},
+  {"avx512z",{{"NCPU","8"},{"SS_ISA","avx512z"}}},{"avx512y",{{"NCPU","8"},{"SS_ISA","avx512y"}}},
+  {"noearly",{{"NCPU","8"},{"SS_NOEARLYUNMAP","1"}}},{"nowill",{{"NCPU","8"},{"SS_NOWILLNEED","1"}}},
+  {"nohuge",{{"NCPU","8"},{"SS_NOHUGE","1"}}},{"prefault",{{"NCPU","8"},{"SS_PREFAULT","1"}}},
+  {"n4",{{"NCPU","4"}}},{"n1",{{"NCPU","1"}}},{"n2",{{"NCPU","2"}}},{"n6",{{"NCPU","6"}}},{"n12",{{"NCPU","12"}}},{"n16",{{"NCPU","16"}}},
+  {"4abl1",{{"NCPU","4"},{"SS_ABL","1"}},"core-abl"},{"4abl2",{{"NCPU","4"},{"SS_ABL","2"}},"core-abl"},{"4abl3",{{"NCPU","4"},{"SS_ABL","3"}},"core-abl"},{"4abl4",{{"NCPU","4"},{"SS_ABL","4"}},"core-abl"},
+  {"1abl1",{{"NCPU","1"},{"SS_ABL","1"}},"core-abl"},{"1abl2",{{"NCPU","1"},{"SS_ABL","2"}},"core-abl"},{"1abl3",{{"NCPU","1"},{"SS_ABL","3"}},"core-abl"},{"1abl4",{{"NCPU","1"},{"SS_ABL","4"}},"core-abl"},
+  {"avx512z2",{{"NCPU","8"},{"SS_ISA","avx512z"}}},{"avx512y2",{{"NCPU","8"},{"SS_ISA","avx512y"}}},{"noearly2",{{"NCPU","8"},{"SS_NOEARLYUNMAP","1"}}},
+  {"n4cores",{{"NCPU","4"},{"OMP_PLACES","cores"},{"OMP_PROC_BIND","spread"}}},
+  {"n8bind",{{"NCPU","8"},{"OMP_PLACES","threads"},{"OMP_PROC_BIND","close"}}},
+  {"n8active",{{"NCPU","8"},{"OMP_WAIT_POLICY","active"}}},
+  {"sse2",{{"NCPU","8"},{"SS_ISA","sse2"}}},
+  {"mallocthp",{{"NCPU","8"},{"GLIBC_TUNABLES","glibc.malloc.hugetlb=1"}}},
+  {"d4",{{"NCPU","8"}}},{"p4",{{"NCPU","8"}},"core-v31"},{"d5",{{"NCPU","8"}}},{"p5",{{"NCPU","8"}},"core-v31"}};
+ pipeline("dev",data,od(),{{"NCPU","8"}});
+ for(const Var& v:vars){if(!timeleft(8))break;pipeline(v.label,B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
  pipeline("final /data -> /output",data,outdir,{{"NCPU","8"}});
- // Put the findings into extra campaign_daily rows: the dev check reports the rows that differ.
- // Row order (by campaign_id) is importance order. Integers: sessions = wall time in microseconds,
- // purchasing_sessions = PARSE us, revenue_cents = DEDUP us * 10^8 + AGGREGATE us, assisted_sessions = links us.
+ // Put the findings into extra campaign_daily rows: the dev check reports a few rows that differ, as JSON.
+ // Row order (by campaign_id) is importance order; the text columns carry the measurements.
  {
   auto us=[](double sec){return (int64_t)(sec*1e6+0.5);};
-  auto best=[&](const string& prefix)->RunResult{RunResult b;b.wall=1e9;for(auto& r:results)if(r.label.rfind(prefix,0)==0&&r.rc==0&&r.wall<b.wall)b=r;return b;};
-  auto code=[](const string& sset)->int{size_t l=sset.find('[');if(l==string::npos)return 9;string v=sset.substr(l+1,sset.find(']')-l-1);return v=="never"?0:v=="madvise"?1:v=="always"?2:v=="defer"?3:v=="defer+madvise"?4:8;};
+  auto get=[&](const string& label)->const RunResult*{const RunResult* b=nullptr;for(auto& r:results)if(r.label==label&&r.rc==0&&(!b||r.wall<b->wall))b=&r;return b;};
+  auto bestd=[&]()->const RunResult*{const RunResult* b=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='d'&&r.rc==0&&(!b||r.wall<b->wall))b=&r;return b;};
+  auto stages=[&](const RunResult& r)->string{char t[256];auto g=[&](const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};
+   string s2;for(auto& kv:r.t){char one[48];snprintf(one,sizeof one,"%s%.0f ",kv.first.substr(0,4).c_str(),kv.second*1e3);s2+=one;}
+   snprintf(t,sizeof t,"w%.0f u%.0f s%.0f flt%ld rss%ld cs%ld/%ld | ",r.wall*1e3,r.user*1e3,r.sys*1e3,r.minflt,r.maxrssMB,r.nvcsw,r.nivcsw);(void)g;return string(t)+s2;};
   string cid,chan;vector<int32_t> days;vector<int64_t> c1,c2,c3,c4;int idx=0;
   auto row=[&](const string& label,const string& text,int64_t a,int64_t b,int64_t c,int64_t d){
-   char id[64];snprintf(id,sizeof id,"!%02d %s",idx++,label.c_str());put_bytes(cid,id);put_bytes(chan,text);days.push_back(20000+idx);
+   char id[16];snprintf(id,sizeof id,"!%02d ",idx++);put_bytes(cid,string(id)+label);put_bytes(chan,text);days.push_back(20000+idx);
    c1.push_back(a);c2.push_back(b);c3.push_back(c);c4.push_back(d);};
-  auto run_row=[&](const string& label,const RunResult& r){
-   auto g=[&](const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second;};
-   char text[96];snprintf(text,sizeof text,"L%.0f P%.0f D%.0f A%.0f ms rc%d",(g("MAP")+g("LINKREAD")+g("FLATTEN")+g("LINKS"))*1e3,g("PARSE")*1e3,g("DEDUP")*1e3,g("AGGREGATE")*1e3,r.rc);
-   row(label,text,us(r.wall),us(g("PARSE")),us(g("DEDUP"))*100000000LL+us(g("AGGREGATE")),us(g("MAP")+g("LINKREAD")+g("FLATTEN")+g("LINKS")));};
-  run_row("big n8 best",best("big n8 default"));
-  run_row("huge n8 best",best("huge n8 default"));
-  {string cpu=gCpu;for(const char* cut:{"Intel(R) ","Xeon(R) ","CPU ","Processor "}){size_t q=cpu.find(cut);if(q!=string::npos)cpu.erase(q,strlen(cut));}
-   // sessions: allowed CPUs*1000 + thp enabled*100 + defrag*10 + (populate ok); purchasing: cpu flag bits
-   // (avx2,bmi2,avx512f,bw,vl,vbmi,vbmi2,erms,fsrm,hypervisor); revenue: 8-thread memset MB/s * 10^6 + 1-thread first-touch ns/page;
-   // assisted: kernel major*1000+minor
-   int kmaj=0,kmin=0;sscanf(gKernel.c_str(),"%d.%d",&kmaj,&kmin);
-   row("machine",cpu,gAff*1000LL+code(gThp)*100+code(gDefrag)*10+(gPopulateRc==0?1:0),gFlags,(int64_t)(gMemsetGBs*1000)*1000000LL+(int64_t)(gTouchUsPage*1000),kmaj*1000LL+kmin);}
-  {RunResult n1=best("big n1");auto g=[&](const char* k){auto it=n1.t.find(k);return it==n1.t.end()?0.0:it->second;};
-   char text[96];snprintf(text,sizeof text,"n1 L%.0f P%.0f D%.0f A%.0f ms",(g("MAP")+g("LINKREAD")+g("FLATTEN")+g("LINKS"))*1e3,g("PARSE")*1e3,g("DEDUP")*1e3,g("AGGREGATE")*1e3);
-   row("wall us n1 n4 n2 n16",text,us(n1.wall),us(best("big n4").wall),us(best("big n2").wall),us(best("big n16").wall));}
-  {char text[96];snprintf(text,sizeof text,"tch8 %.0f/%.0f/%.0f/%.0f ms",gTouch8[0]*1e3,gTouch8[1]*1e3,gTouch8[2]*1e3,gTouch8[3]*1e3);
-   // first touch of 1.5GB with 8 threads: plain / huge pages / populate / huge+populate
-   row("wall us nohuge nopref sse2 nofree",text,us(best("big n8 nohuge").wall),us(best("big n8 noprefault").wall),us(best("big n8 sse2").wall),us(best("big n8 noasyncfree").wall));}
-  {char text[96];snprintf(text,sizeof text,"spin %.0f/%.0f/%.0f ms",gSpin[0]*1e3,gSpin[1]*1e3,gSpin[2]*1e3);
-   row("wall us bind active both dev",text,us(best("big n8 procbind").wall),us(best("big n8 activewait").wall),us(best("big n8 procbind activewait").wall),us(best("dev n8").wall));}
-  run_row("big n1",best("big n1"));
-  run_row("big n4",best("big n4"));
-  run_row("big n8 nohuge",best("big n8 nohuge"));
-  run_row("big n8 noprefault",best("big n8 noprefault"));
-  run_row("big n8 sse2",best("big n8 sse2"));
-  run_row("big n2",best("big n2"));
-  run_row("big n16",best("big n16"));
-  run_row("big n8 noasyncfree",best("big n8 noasyncfree"));
-  run_row("dev n8 best",best("dev n8"));
-  row("replica us, read MB/s p0 p1",gFs,us(gReplicaSec),(int64_t)(gReadGBs[0]*1000),(int64_t)(gReadGBs[1]*1000),0);
-  row("munmap 1.5GB us plain huge",gThp.substr(0,30),us(gMunmap[0]),us(gMunmap[1]),us(gMunmap[2]),us(gMunmap[3]));
-  row("kernel",gKernel.substr(0,30),0,0,0,0);
-  row("thp defrag",gDefrag.substr(0,30),0,0,0,0);
-  for(auto& r:results)run_row("run "+r.label.substr(0,24),r);
+  // row 0: best default run in full, with hardware counters (instructions, cycles, cache misses, branch misses)
+  {const RunResult* d=bestd();RunResult z;if(!d)d=&z;char pc[160];snprintf(pc,sizeof pc," | perf err%d ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",d->perfErr,d->pc[0]/1e9,d->pc[1]/1e9,d->pc[2]/1e6,d->pc[3]/1e6);
+   string all;for(auto& r:results)if(r.label[0]=='d'||(r.label.size()==2&&r.label[0]=='p')){char one[32];snprintf(one,sizeof one,"%s=%.0f ",r.label.c_str(),r.wall*1e3);all+=one;}
+   {const RunResult* pb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='p'&&r.rc==0&&(!pb||r.wall<pb->wall))pb=&r;if(pb)all+="| best v31: "+stages(*pb);}
+   row("v32 d*, v31 p*: "+all,stages(*d)+pc,us(d->wall),us(d->user),us(d->sys),d->minflt);}
+  // row 1: thread counts
+  {string walls,detail;for(const char* l:{"n1","n2","n4","n6","n12","n16","n4cores","n8bind","n8active"}){const RunResult* r=get(l);char one[48];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);walls+=one;}
+   const RunResult* n1=get("n1");const RunResult* n4=get("n4");
+   detail="n1: "+(n1?stages(*n1):string("-"))+" || n4: "+(n4?stages(*n4):string("-"));
+   if(n1){char pc[120];snprintf(pc,sizeof pc," || n1 perf ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",n1->pc[0]/1e9,n1->pc[1]/1e9,n1->pc[2]/1e6,n1->pc[3]/1e6);detail+=pc;}
+   row("threads ms: "+walls,detail,n1?us(n1->wall):0,n4?us(n4->wall):0,n1?us(n1->user):0,n1?us(n1->sys):0);}
+  // row 2: variants
+  {string walls,detail;for(const char* l:{"avx512z","avx512z2","avx512y","avx512y2","noearly","noearly2","nowill","nohuge","prefault","mallocthp","sse2"}){const RunResult* r=get(l);char one[48];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);walls+=one;
+    if(r){auto g=[&](const char* k){auto it=r->t.find(k);return it==r->t.end()?0.0:it->second*1e3;};char d2[96];snprintf(d2,sizeof d2,"%s:P%.0f,D%.0f,A%.0f,s%.0f,f%ld ",l,g("PARSE"),g("DEDUP"),g("AGGREGATE"),r->sys*1e3,r->minflt);detail+=d2;}}
+   row("variants ms: "+walls,detail,0,0,0,0);}
+  // row 3: parser ablation (PARSE stage ms; the run stops after that stage)
+  {string a,detail;for(auto& r:results)if(r.label.find("abl")!=string::npos){auto it=r.t.find("PARSE");char one[64];snprintf(one,sizeof one,"%s=%.0f ",r.label.c_str(),it==r.t.end()?-1.0:it->second*1e3);a+=one;
+    char d2[96];snprintf(d2,sizeof d2,"%s:u%.0f,s%.0f,f%ld,w%.0f ",r.label.c_str(),r.user*1e3,r.sys*1e3,r.minflt,r.wall*1e3);detail+=d2;}
+   row("ablation PARSE ms (1 scan,2 +fields,3 +push,4 +users,5 clicks only,6 +record into a small ring instead of buckets): "+a,detail,0,0,0,0);}
+  // row 4: every run, compact
+  {string all;for(auto& r:results){auto g=[&](const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};char one[96];
+    snprintf(one,sizeof one,"%s:%.0f/%.0f/%.0f/%.0f/%.0f/u%.0f/s%.0f ",r.label.c_str(),r.wall*1e3,g("PARSE"),g("DEDUP"),g("AGGREGATE"),r.wall*1e3-g("PARSE")-g("DEDUP")-g("AGGREGATE"),r.user*1e3,r.sys*1e3);all+=one;}
+   row("all runs: label:wall/parse/dedup/agg/rest/user/sys ms",all,0,0,0,0);}
+  // row 5: machine
+  {char t[400];snprintf(t,sizeof t,"%s | kernel %s | thp %s | defrag %s | aff %d | fs %s | memset8 %.1fGB/s touch1 %.2fus/page touch8(1.5GB) %.0f/%.0f/%.0f/%.0f ms munmap %.0f/%.0f ms | spin1/4/8 %.0f/%.0f/%.0f ms | read %.1f/%.1f GB/s | replica %.1fs",
+    gCpu.c_str(),gKernel.c_str(),gThp.c_str(),gDefrag.c_str(),gAff,gFs.c_str(),gMemsetGBs,gTouchUsPage,gTouch8[0]*1e3,gTouch8[1]*1e3,gTouch8[2]*1e3,gTouch8[3]*1e3,gMunmap[0]*1e3,gMunmap[1]*1e3,gSpin[0]*1e3,gSpin[1]*1e3,gSpin[2]*1e3,gReadGBs[0],gReadGBs[1],gReplicaSec);
+   string extra=string("cpu.max ")+slurp("/sys/fs/cgroup/cpu.max",40)+" | cpuset "+slurp("/sys/fs/cgroup/cpuset.cpus.effective",40)+" | mem.max "+slurp("/sys/fs/cgroup/memory.max",30)+" | L2 "+slurp("/sys/devices/system/cpu/cpu0/cache/index2/size",12)+" L3 "+slurp("/sys/devices/system/cpu/cpu0/cache/index3/size",12)+" | sib0 "+slurp("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",16)+" | flags "+to_string(gFlags);
+   row("machine: "+extra,t,gAff,gFlags,0,0);}
   PqFile f;
   f.open(fs::path(outdir)/"campaign_daily"/"part-00099.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
    {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});
