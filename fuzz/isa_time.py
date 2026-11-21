@@ -11,7 +11,7 @@ for r in range(runs):
         r0=resource.getrusage(resource.RUSAGE_CHILDREN); t0=time.time()
         p=subprocess.run([b],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE); wall=time.time()-t0
         r1=resource.getrusage(resource.RUSAGE_CHILDREN); e=p.stderr.decode('latin1')
-        used=re.search(r'splitter: (\w+)',e).group(1); pw=float(re.search(r'TIME PARSE ([0-9.e+-]+)',e).group(1)); pc=float(re.search(r'CPU PARSE ([0-9.e+-]+)',e).group(1))
+        used=re.search(r'splitter: (\S+)',e).group(1); pw=float(re.search(r'TIME PARSE ([0-9.e+-]+)',e).group(1)); pc=float(re.search(r'CPU PARSE ([0-9.e+-]+)',e).group(1))
         print('run%d SS_ISA=%s used=%s rc=%d PARSE wall=%.3f cpu=%.3f | process wall=%.2f user=%.2f sys=%.2f'%(r+1,i,used,p.returncode,pw,pc,wall,r1.ru_utime-r0.ru_utime,r1.ru_stime-r0.ru_stime),flush=True)
         if p.returncode==0:
             res[i]['pw'].append(pw);res[i]['pc'].append(pc);res[i]['user'].append(r1.ru_utime-r0.ru_utime);res[i]['wall'].append(wall)
