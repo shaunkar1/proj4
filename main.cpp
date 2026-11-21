@@ -629,21 +629,17 @@ template<class T> struct Scratch{
  ~Scratch(){free(p);}
  T* get(size_t n){if(n>cap){free(p);cap=n+n/4+64;p=(T*)malloc(cap*sizeof(T));if(!p)throw bad_alloc();}return p;}
 };
-// Memory for the block lists below: handed out from 4 MB slabs owned by one thread, given back all at once.
-// The slabs come straight from mmap (2 MB aligned, huge pages where allowed) like the bucket arenas.
+// Memory for the block lists below: handed out from 1 MB slabs owned by one thread, freed all at once.
+// (Plain malloc: slabs mapped one by one, with or without huge pages, measured slower in the dedup stage.)
 struct SlabPool{
- char* cur=nullptr;char* end=nullptr;vector<Region> slabs;
+ char* cur=nullptr;char* end=nullptr;vector<void*> slabs;
  SlabPool()=default;SlabPool(const SlabPool&)=delete;SlabPool& operator=(const SlabPool&)=delete;
- ~SlabPool(){release();}
- void release(){for(const Region& r:slabs)munmap(r.base,r.len);slabs.clear();cur=end=nullptr;}
+ ~SlabPool(){for(void* p:slabs)free(p);}
  __attribute__((noinline,cold)) void* take(size_t bytes){
   if((size_t)(end-cur)<bytes){
-   static constexpr size_t SLAB=size_t(4)<<20,HUGE=size_t(2)<<20;
-   void* mem=mmap(nullptr,SLAB+HUGE,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
-   if(mem==MAP_FAILED){fprintf(stderr,"ERROR out of memory\n");_exit(1);}
-   char* a=(char*)(((uintptr_t)mem+HUGE-1)&~(uintptr_t)(HUGE-1));
-   if(optHuge)madvise(a,SLAB,MADV_HUGEPAGE);
-   slabs.push_back({mem,SLAB+HUGE});cur=a;end=a+SLAB;
+   static constexpr size_t SLAB=size_t(1)<<20;
+   void* p=malloc(SLAB);if(!p){fprintf(stderr,"ERROR out of memory\n");_exit(1);}
+   slabs.push_back(p);cur=(char*)p;end=cur+SLAB;
   }
   void* r=cur;cur+=bytes;return r;
  }
@@ -1122,33 +1118,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const uint32_t maxIds=(uint32_t)(maxLinked+maxNew64);
  KeyTable tab((size_t)maxIds*8/5); // at most 62% full even if every allowed ID shows up
  tab.begin_parallel(0,maxIds);
- // Union-find over linked IDs. Both arrays hold "value XOR index", so an untouched (all-zero) entry
- // means "itself": they come from mmap as zero pages, need no initialising pass, and the part beyond
- // the IDs actually seen is never touched. parent(x) <= x always (a root links to a smaller root), so
- // the forest can never form a cycle. best(r): the ID with the byte-wise smallest name seen so far in root r's group.
- struct ZeroPages{
-  void* p;size_t n;
-  explicit ZeroPages(size_t bytes):n(bytes){p=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);if(p==MAP_FAILED)throw bad_alloc();}
-  void release(){if(p){munmap(p,n);p=nullptr;}}
-  ~ZeroPages(){release();}
-  ZeroPages(const ZeroPages&)=delete;ZeroPages& operator=(const ZeroPages&)=delete;
- };
- static_assert(sizeof(atomic<uint32_t>)==4);
- ZeroPages parentMem((maxLinked+1)*sizeof(uint32_t)),bestMem((maxLinked+1)*sizeof(uint32_t));
- atomic<uint32_t>* const parentX=(atomic<uint32_t>*)parentMem.p;atomic<uint32_t>* const bestX=(atomic<uint32_t>*)bestMem.p;
+ // parent[x] <= x always (a root links to a smaller root), so the forest can never form a cycle.
+ // (Initialised by a pass below. Mapping the two arrays as zero pages with "value XOR index" entries,
+ // to skip that pass, measured slower: every page then takes its faults in the middle of the hot loops.)
+ unique_ptr<atomic<uint32_t>[]> parent(new atomic<uint32_t>[maxLinked+1]);
  auto find_root=[&](uint32_t u)->uint32_t{
   for(;;){
-   uint32_t su=parentX[u].load(memory_order_relaxed);if(!su)return u;
-   const uint32_t p=su^u;
-   const uint32_t sp=parentX[p].load(memory_order_relaxed);if(!sp)return p;
-   const uint32_t gp=sp^p;
-   parentX[u].compare_exchange_weak(su,gp^u); // path halving; losing the race is harmless
+   uint32_t p=parent[u].load(memory_order_relaxed);if(p==u)return u;
+   uint32_t gp=parent[p].load(memory_order_relaxed);if(gp==p)return p;
+   parent[u].compare_exchange_weak(p,gp); // path halving; losing the race is harmless
    u=gp;
   }
  };
+ // best[r]: the ID with the byte-wise smallest name seen so far in root r's group.
+ unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[maxLinked+1]);
  atomic<size_t> nextLink{0};
  #pragma omp parallel num_threads(T)
  {
+  #pragma omp for schedule(static)
+  for(uint64_t i=0;i<maxLinked;++i){parent[i].store((uint32_t)i,memory_order_relaxed);best[i].store((uint32_t)i,memory_order_relaxed);}
   // Lines are handled in small batches so the table slots of a batch, and then the parent entries of
   // its IDs, are on their way into the cache before they are needed.
   static constexpr int LB=16;
@@ -1160,14 +1148,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     // cannot be full: the table holds 2 IDs per link line
     const uint32_t a=q.k1[0]?tab.find_or_add_packed(q.k0[0],q.k1[0],q.j[0],q.f[0]):tab.find_or_add_long(q.f[0]);
     const uint32_t b=q.k1[1]?tab.find_or_add_packed(q.k0[1],q.k1[1],q.j[1],q.f[1]):tab.find_or_add_long(q.f[1]);
-    ida[i]=a;idb[i]=b;__builtin_prefetch(&parentX[a],1,1);__builtin_prefetch(&parentX[b],1,1);
+    ida[i]=a;idb[i]=b;__builtin_prefetch(&parent[a],1,1);__builtin_prefetch(&parent[b],1,1);
    }
    for(int i=0;i<nb;++i){
     uint32_t a=ida[i],b=idb[i];
     for(;;){
      a=find_root(a);b=find_root(b);if(a==b)break;
      if(a<b)swap(a,b);
-     uint32_t expect=0;if(parentX[a].compare_exchange_strong(expect,b^a))break; // a is still a root: link it under b
+     uint32_t expect=a;if(parent[a].compare_exchange_strong(expect,b))break;
     }
    }
   };
@@ -1228,18 +1216,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    #pragma omp for schedule(static)
    for(uint32_t i=0;i<nlinked;++i){
     const uint32_t r=find_root(i);if(r==i)continue;
-    uint32_t sc=bestX[r].load(memory_order_relaxed);
-    while(name_less(names[i],names[sc^r])&&!bestX[r].compare_exchange_weak(sc,i^r)){}
+    uint32_t cur=best[r].load(memory_order_relaxed);
+    while(name_less(names[i],names[cur])&&!best[r].compare_exchange_weak(cur,i)){}
     uint64_t k0;uint32_t k1;
     if(KeyTable::pack(names[i].view(),k0,k1))tab.set_packed(k0,k1,r); // longer keys are in tab.longs, below
    }
    // A root's own name is no longer needed once every member has been compared, and no other person reads it.
    #pragma omp for schedule(static)
-   for(uint32_t i=0;i<nlinked;++i)if(!parentX[i].load(memory_order_relaxed)){const uint32_t sb=bestX[i].load(memory_order_relaxed);if(sb)names[i]=names[sb^i];}
+   for(uint32_t i=0;i<nlinked;++i)if(parent[i].load(memory_order_relaxed)==i){const uint32_t bi=best[i].load(memory_order_relaxed);if(bi!=i)names[i]=names[bi];}
   }
   for(auto& l:tab.longs)if(l.v<nlinked)l.v=find_root(l.v);
  }
- parentMem.release();bestMem.release();
+ parent.reset();best.reset();
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
@@ -1730,9 +1718,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
-  // Every bucket is done (the loop above ends with a barrier): each thread hands back its own survivor
-  // lists here, in parallel, instead of leaving all of it to process exit.
-  if((size_t)tid<surv.size())surv[(size_t)tid].pool.release();
   if(file.is_open())file.close();
  }
  vector<Totals> campTotals(ncamp*(size_t)ndays);
