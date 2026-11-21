@@ -1712,6 +1712,132 @@ TARGET static void NAME(ESlot* const ev,const size_t from,const size_t to,KeyTab
 }
 SS_RESOLVE_RAW(resolve_raw_v3,SS_V3,parse36_v3)
 SS_RESOLVE_RAW(resolve_raw_plain,,dn::parse36)
+// ---- Raw users read where they lie (the folded form: no pass that rewrites the slots). ----
+// What a raw text stands for without asking the ID table: its DENSE_USER code, or the raw word itself
+// (DENSE_USER_RAW | length) if the text is not a dense user's. Exactly the test of SS_RESOLVE_RAW.
+SS_V3 [[gnu::noinline]] static uint32_t raw_dense_code_v3(uint64_t raw,uint32_t len){
+ uint64_t y;uint32_t code=0;
+ return parse36_v3((const char*)&raw,len,y)&&dense_user_code(dn::index_of(y,dense.ku),code)?code:(DENSE_USER_RAW|len);
+}
+[[gnu::noinline]] static uint32_t raw_dense_code_plain(uint64_t raw,uint32_t len){
+ uint64_t y;uint32_t code=0;
+ return dn::parse36((const char*)&raw,len,y)&&dense_user_code(dn::index_of(y,dense.ku),code)?code:(DENSE_USER_RAW|len);
+}
+// A user word that is a DENSE_USER code (top bits 01; a raw word has 11, a LOCAL number 10, a table number 00).
+static inline __attribute__((always_inline)) bool is_dense_code(uint32_t u){return (u>>30)==1u;}
+// The first 16 bytes of an event slot: all a reader of resolved slots needs (see ev_at in run()).
+struct ESmall{uint64_t k;uint32_t user;uint16_t cat;uint16_t thread;};
+static_assert(sizeof(ESmall)==16&&offsetof(ESmall,user)==offsetof(ESlot,user)&&offsetof(ESmall,cat)==offsetof(ESlot,cat)&&offsetof(ESmall,thread)==offsetof(ESlot,thread)&&offsetof(ESlot,k)==0);
+// One thread's reader of slot users when the slots are left as the parser wrote them. code() gives the
+// user word of a slot holding a valid event: unchanged if the line resolved it (DENSE_USER code, table
+// number, LOCAL number of the slot's thread); for a raw text its DENSE_USER code, or the raw word if the
+// text is not a dense user's - unless this thread has already asked the ID table for it (set_table),
+// then that answer (a table number, or a LOCAL number of THIS thread). A user's rows are neighbours but
+// change between the user's aliases (texts) from row to row, so the answers are kept in a small table
+// indexed by a hash of the text; a row costs one probe of it. (Slots resolved on their line have no
+// text and share entry 0; they are rare where it matters.)
+struct RawCtx{
+ static constexpr unsigned BITS=8;
+ struct Entry{uint64_t raw;uint32_t user,code;};
+ uint32_t dmax=0; // largest DENSE_USER code decoded here
+ bool v3=false;
+ Entry memo[1u<<BITS];
+ RawCtx(){for(Entry& m:memo){m.raw=0;m.user=0xFFFFFFFFu;m.code=0;}} // no slot has that user word
+ static inline __attribute__((always_inline)) size_t at(uint64_t raw){return (size_t)((raw*0x9E3779B97F4A7C15ULL)>>(64-BITS));}
+ [[gnu::noinline]] uint32_t slow(Entry& m,uint32_t u,uint64_t sp){
+  uint32_t code=u;
+  if((u&DENSE_USER_RAW)==DENSE_USER_RAW){
+   const uint32_t len=u&15u;
+   code=v3?raw_dense_code_v3(sp,len):raw_dense_code_plain(sp,len);
+   if(is_dense_code(code))dmax=max(dmax,code);
+  }
+  m.raw=sp;m.user=u;m.code=code;return code;
+ }
+ // sl must be the head of a 32-byte ESlot (the text is in its spare word).
+ inline __attribute__((always_inline)) uint32_t code(const ESmall& sl){
+  const uint32_t u=sl.user;const uint64_t sp=((const ESlot*)(const void*)&sl)->spare;
+  Entry& m=memo[at(sp)];
+  if(__builtin_expect((m.raw!=sp)|(m.user!=u),0))return slow(m,u,sp);
+  return m.code;
+ }
+ void set_table(uint64_t sp,uint32_t len,uint32_t code){Entry& m=memo[at(sp)];m.raw=sp;m.user=DENSE_USER_RAW|len;m.code=code;}
+};
+// Where one thread puts the session lists of the runs it reads (blocks of its pool) and a run's purchases.
+struct SessArena{uint64_t* cur=nullptr;uint64_t* end=nullptr;vector<uint64_t> pur;};
+// The event sweep of the counters [lo,hi) of an event slot array (stride 1 << evShift bytes, layout ESmall
+// at the head of each slot). A run is a stretch of valid slots of one user index, not broken by a valid
+// slot of anybody else; it belongs to the piece it starts in and may run past `hi` (cross), up to evEnd,
+// so a piece first steps over the run that reaches into it. While a run is read its sessions are made as
+// well: every row either continues the current session or starts one (more than GAP after the row
+// before), written without a branch on that - each row writes "a session starts here" into the next free
+// entry, and the entry only stays if the row really starts one. The run's counts, alias mask and session
+// list go to the index's DInfo.
+//   code_of(slot)     the user word of a valid slot (see RawCtx::code; plain `user` when slots are resolved)
+//   run_start(code)   called with the first row's DENSE_USER code of every run
+//   other(slot,code)  a valid slot of this piece whose user is not a dense user
+// Returns the number of rows in the runs of this piece.
+template<class CODE,class START,class OTHER>
+static inline __attribute__((always_inline)) uint64_t sweep_event_runs(const char* const evBase,const unsigned evShift,const size_t lo,const size_t hi,const size_t evEnd,const bool cross,
+  DInfo* const info,HugePool& pool,SessArena& ar,CODE&& code_of,START&& run_start,OTHER&& other){
+ const auto ev_at=[evBase,evShift](size_t c)->const ESmall&{return *(const ESmall*)(const void*)(evBase+(c<<evShift));};
+ uint64_t rows=0;
+ size_t c=lo;
+ if(cross&&lo>0){
+  size_t p=lo;uint32_t code0=0;bool reaches=false;
+  while(p>0){--p;const ESmall& sl=ev_at(p);if(sl.k>=PR_KBIAS){const uint32_t u=code_of(sl);if(is_dense_code(u)){code0=u&~7u;reaches=true;}break;}}
+  if(reaches)for(;c<hi;++c){const ESmall& sl=ev_at(c);if(sl.k>=PR_KBIAS&&(code_of(sl)&~7u)!=code0)break;}
+ }
+ const size_t stop=cross?evEnd:hi; // how far a run may go
+ while(c<hi){
+  const ESmall& sl=ev_at(c);const uint64_t k0=sl.k;
+  if(k0<PR_KBIAS){++c;continue;} // empty, or present but not valid
+  const uint32_t u=code_of(sl);
+  if(!is_dense_code(u)){other(sl,u);++c;continue;}
+  run_start(u);
+  const uint32_t code=u&~7u;const size_t first=c;size_t lastSlot=c;
+  // Room: one entry per slot looked at, at most, plus the end entry.
+  if((size_t)(ar.end-ar.cur)<hi-c+2){const size_t want=max<size_t>(hi-c+2,size_t(1)<<19);ar.cur=(uint64_t*)pool.take(want*8);ar.end=ar.cur+want;}
+  uint64_t* blk=ar.cur;size_t cap=(size_t)(ar.end-blk);
+  size_t n=0,ns=0;uint64_t last=0-(uint64_t)(GAP+1),disorder=0;uint32_t mask=0;ar.pur.clear();
+  size_t j=c;
+  const size_t stride=size_t(1)<<evShift;
+  for(;;){
+   const size_t lim=min(stop,c+cap-2);
+   const char* p=(const char*)&ev_at(j);const char* const pe=(const char*)&ev_at(lim);const char* lastp=p;
+   for(;p<pe;p+=stride){
+    const ESmall& r=*(const ESmall*)(const void*)p;const uint64_t k=r.k;
+    if(k<PR_KBIAS)continue;
+    const uint32_t al=code_of(r)^code; // the alias if the row is this index's
+    if(al>7)break;
+    mask|=1u<<al;
+    const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
+    disorder|=step; // its top bit: a row before its predecessor
+    blk[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
+    if(__builtin_expect((k&EV_PURCHASE)!=0,0))ar.pur.push_back(((uint64_t)(ns-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
+    ++n;lastp=p;
+   }
+   j=(size_t)(p-(const char*)&ev_at(0))>>evShift;
+   if(n)lastSlot=(size_t)(lastp-(const char*)&ev_at(0))>>evShift;
+   if(p<pe)goto run_done; // a valid slot of somebody else
+   if(j>=stop)break;
+   {const size_t cap2=cap*2;uint64_t* const nb=(uint64_t*)pool.take(cap2*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=cap2;ar.end=nb+cap2;} // a long run past the piece: a bigger block
+  }
+  run_done:;
+  {const size_t np=ar.pur.size(),need=ns+1+np+1;
+   if(cap<need){uint64_t* const nb=(uint64_t*)pool.take(need*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=need;ar.end=nb+need;}
+   blk[ns]=n;if(np)memcpy(blk+ns+1,ar.pur.data(),np*8);blk[ns+1+np]=~0ull;
+   ar.cur=blk+need;}
+  DInfo& f=info[(code&~DENSE_USER)>>dn::ALIAS_BITS];
+  dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)lastSlot+1);f.ec.fetch_add((uint32_t)n,memory_order_relaxed);
+  uint64_t* none=nullptr;
+  if(f.sess.compare_exchange_strong(none,blk,memory_order_relaxed)){
+   f.ns.store((uint32_t)ns|(((disorder>>63)||n>=(size_t(1)<<24))?0x80000000u:0u),memory_order_relaxed);f.amask.store((uint8_t)mask,memory_order_relaxed);}
+  else f.multi.store(1,memory_order_relaxed); // the index has another run
+  rows+=n;
+  c=j;
+ }
+ return rows;
+}
 // The event loop of one chunk for one mask builder.
 #define SS_EVENT_LOOP(NAME,TARGET,MASKS) \
 template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
@@ -2456,20 +2582,67 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   dense_note_end(denseEvEnd,tl.evEnd);dense_note_end(denseClEnd,tl.clEnd);
   tl.slotWaits=eslotWaits;
  }
- // ---- Raw users in the event slots become what the line loop would have written (see DENSE_USER_RAW). ----
- // The ID table still takes new IDs here; a thread's part of the slots is one contiguous range.
+ __mark("PARSE");
+ // ---- Raw users in the event slots (see DENSE_USER_RAW). The ID table still takes new IDs here. ----
+ // Folded form (default): the event sweep of the DENSE stage runs here and reads the raw texts as it
+ // goes; no slot is rewritten, so the slot array is read-only from here on and every later reader of
+ // event slot users goes through RawCtx::code (rawSlots). Rows that are not a dense user's get their
+ // table or LOCAL number here and wait in a per-thread list (k, user, cat, thread - the slot is not
+ // needed again) until the person buckets exist. Only the piece that owns such a row asks the table.
+ // SS_RESOLVE_RAW=pass: the separate pass that rewrites every raw slot, and the sweep after DEDUP, as
+ // before (also when the slots are dumped for the parse checks, which expect resolved slots, and when
+ // the index table cannot be mapped at its full size).
+ // Event slots per piece of the sweep. SS_TEST_ECH: tests make the pieces tiny, so that runs cross piece ends all the time.
+ static const size_t ECH=[]{const char* v=getenv("SS_TEST_ECH");const long long x=v?atoll(v):0;return x>0?(size_t)x:size_t(1)<<15;}();
+ uint64_t rdSlotEv=0; // SS_STATS: valid event slots seen by the sweep
+ vector<vector<ESmall>> sideRows(T); // folded form: the rows of table and LOCAL users, by sweeping thread
+ vector<HugePool> sessPools(T);     // folded form: the session lists of each thread's runs
+ bool rawSlots=false;
  if(dparse.raw&&denseEv){
   const size_t evEnd=denseEvEnd.load();
-  #pragma omp parallel num_threads(T)
-  {
-   const size_t t=(size_t)omp_get_thread_num();ThreadState& tl=tls[t];uint32_t dmax=0;
-   const size_t from=evEnd*t/(size_t)T,to=evEnd*(t+1)/(size_t)T;
-   if(hasV3)resolve_raw_v3(denseEv,from,to,tab,tl,dmax);else resolve_raw_plain(denseEv,from,to,tab,tl,dmax);
-   if(dmax)dense_note_index((dmax&~DENSE_USER)>>dn::ALIAS_BITS);
+  {const char* v=getenv("SS_RESOLVE_RAW");rawSlots=!dumpDir&&!(v&&string_view(v)=="pass");}
+  if(rawSlots){ // the index table by the index limit: the highest index is only known after this pass
+   try{denseInfo=(DInfo*)map_huge(((size_t)dense.limI+2)*sizeof(DInfo));}catch(const bad_alloc&){rawSlots=false;}
+  }
+  if(rawSlots){
+   for(int t=0;t<T;++t){sessPools[t].first=(((evEnd/4+4096)*8/(size_t)T)+(size_t(8)<<20));sessPools[t].next=max<size_t>(size_t(8)<<20,sessPools[t].first/4);}
+   #pragma omp parallel num_threads(T) reduction(+:rdSlotEv)
+   {
+    const size_t t=(size_t)omp_get_thread_num();ThreadState& tl=tls[t];
+    RawCtx rc;rc.v3=hasV3;SessArena arena;vector<ESmall>& side=sideRows[t];HugePool& pool=sessPools[t];
+    const uint16_t tid=(uint16_t)tl.tid;
+    uint64_t inRuns=0;
+    #pragma omp for schedule(dynamic,1) nowait
+    for(size_t lo=0;lo<evEnd;lo+=ECH)
+     inRuns+=sweep_event_runs((const char*)denseEv,5,lo,min(evEnd,lo+ECH),evEnd,true,denseInfo,pool,arena,
+      [&rc](const ESmall& sl){return rc.code(sl);},
+      [](uint32_t){},
+      [&](const ESmall& sl,uint32_t u){
+       uint16_t th=sl.thread;
+       if((sl.user&DENSE_USER_RAW)==DENSE_USER_RAW){ // a raw text that is not a dense user's: a number of this thread's making
+        th=tid;
+        if((u&DENSE_USER_RAW)==DENSE_USER_RAW){const uint32_t len=u&15u;const uint64_t raw=((const ESlot*)(const void*)&sl)->spare;
+         u=raw_user_table(raw,len,tab,tl);rc.set_table(raw,len,u);}
+       }
+       side.push_back(ESmall{sl.k,u,sl.cat,th});
+      });
+    rdSlotEv+=inRuns;
+    if(rc.dmax)dense_note_index((rc.dmax&~DENSE_USER)>>dn::ALIAS_BITS);
+   }
+  }
+  else{
+   // A thread's part of the slots is one contiguous range.
+   #pragma omp parallel num_threads(T)
+   {
+    const size_t t=(size_t)omp_get_thread_num();ThreadState& tl=tls[t];uint32_t dmax=0;
+    const size_t from=evEnd*t/(size_t)T,to=evEnd*(t+1)/(size_t)T;
+    if(hasV3)resolve_raw_v3(denseEv,from,to,tab,tl,dmax);else resolve_raw_plain(denseEv,from,to,tab,tl,dmax);
+    if(dmax)dense_note_index((dmax&~DENSE_USER)>>dn::ALIAS_BITS);
+   }
   }
  }
  const uint32_t totalIds=tab.end_parallel();
- __mark("PARSE");
+ __mark("RESOLVE");
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
   cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
@@ -2618,8 +2791,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // The reader only needs the first 16 bytes of an event slot (k, user, cat, thread). When the slots are
  // filled here from buckets, the array holds just those (ESmall) and the winners' ingest times live in a
  // scratch array while a bucket is filled; ev_at() reads either layout.
- struct ESmall{uint64_t k;uint32_t user;uint16_t cat;uint16_t thread;};
- static_assert(sizeof(ESmall)==16&&offsetof(ESmall,user)==offsetof(ESlot,user)&&offsetof(ESmall,cat)==offsetof(ESlot,cat)&&offsetof(ESmall,thread)==offsetof(ESlot,thread)&&offsetof(ESlot,k)==0);
  const char* const evBase=nEvBuckets?(const char*)map_huge((size_t)(dense.limE+1)*sizeof(ESmall)):(const char*)denseEv;
  const unsigned evShift=nEvBuckets?4:5;
  const auto ev_at=[evBase,evShift](size_t c)->const ESmall&{return *(const ESmall*)(const void*)(evBase+(c<<evShift));};
@@ -2628,7 +2799,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const auto db_size=[&](int t,size_t b)->size_t{return b<tls[t].db.size()?tls[t].db[b].size():0;};
  const auto dcb_size=[&](int t,size_t b)->size_t{return b<tls[t].dcb.size()?tls[t].dcb[b].size():0;};
  const bool slotMode=evBase||denseCl;
- if(slotMode)denseInfo=(DInfo*)map_huge(((size_t)denseMaxIdx.load()+2)*sizeof(DInfo));
+ if(slotMode&&!denseInfo)denseInfo=(DInfo*)map_huge(((size_t)denseMaxIdx.load()+2)*sizeof(DInfo));
  uint64_t parsedEvents=0,parsedClicks=0;
  size_t maxEvBucket=0,maxClBucket=0; // most parsed lines in one ID bucket (all threads together)
  for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
@@ -2645,7 +2816,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // of the event slots estimates it (a wrong guess costs time, nothing else).
  unsigned shA=0,shB=0;
  {uint64_t estA=parsedEvents;
-  if(denseEv){const size_t end=denseEvEnd.load(),step=max<size_t>(1,end/1024);size_t taken=0,tableRows=0;
+  if(rawSlots)for(int t=0;t<T;++t)estA+=sideRows[t].size(); // the rows the event slots add to the first stretch: known exactly
+  else if(denseEv){const size_t end=denseEvEnd.load(),step=max<size_t>(1,end/1024);size_t taken=0,tableRows=0;
    for(size_t c=step/2;c<end;c+=step){++taken;const ESlot& sl=denseEv[c];if(sl.k.load(memory_order_relaxed)>=PR_KBIAS&&!(sl.user&DENSE_USER))++tableRows;}
    if(taken)estA+=(uint64_t)end*tableRows/taken;}
   if(nEvBuckets){ // rows still in buckets: the first record of every few buckets stands for its bucket
@@ -2845,12 +3017,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Rows of all other users go to the general person lists right here.
  const size_t evEnd=nEvBuckets?(size_t)dense.limE:evBase?denseEvEnd.load():0,clEnd=nClBuckets?(size_t)dense.limC:denseCl?denseClEnd.load():0;
  const bool slots=evEnd||clEnd;
- static constexpr size_t ECH=size_t(1)<<15,CCH=size_t(1)<<16,ICH=512; // slots / user indexes per piece of work
+ static constexpr size_t CCH=size_t(1)<<16,ICH=512; // slots / user indexes per piece of work (ECH: above)
  // Test switches: every n-th user index is treated as if its rows were spread out (it takes the
  // sweep of part 3) / as if it could not take the fast lane (its rows are handed over in part 2).
  static const uint32_t noTightN=[]{const char* v=getenv("SS_TEST_NOTIGHT");return v?(uint32_t)max(1,atoi(v)):0u;}();
  static const uint32_t noFastN=[]{const char* v=getenv("SS_TEST_NOFAST");return v?(uint32_t)max(1,atoi(v)):0u;}();
- uint64_t rdSlotEv=0,rdSlotCl=0,rdHandEv=0,rdHandCl=0,rdFastIdx=0,rdFastEv=0,rdFastCl=0,rdDeferIdx=0; // SS_STATS
+ uint64_t rdSlotCl=0,rdHandEv=0,rdHandCl=0,rdFastIdx=0,rdFastEv=0,rdFastCl=0,rdDeferIdx=0; // SS_STATS
  // Who is handed over, in events (SS_STATS): rows of users that came through the ID table - of a linked
  // person, of an unlinked dense-looking ID with alias 8 or more, of an unlinked ID of a complex index, of
  // any other text - or through the fallback; then dense users whose index has rows in the general lane,
@@ -2879,71 +3051,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();HugePool& pool=surv[tid].pool;
    DInfo* const info=denseInfo;IdText txt;
    const auto bad_user=[]{fprintf(stderr,"ERROR dense user index above the reported maximum\n");_exit(1);};
-   // The sweep of one stretch of counters (events, then clicks).
-   // Session lists go to pieces of this thread's pool, one block per run.
-   uint64_t* acur=nullptr;uint64_t* aend=nullptr;vector<uint64_t> purTmp;
-   // The event sweep of [lo,hi). A run is a stretch of valid slots of one user index, not broken by a
-   // valid slot of anybody else; it belongs to the piece it starts in and may run past `hi` (cross),
-   // so a piece first steps over the run that reaches into it. While a run is read its sessions are
-   // made as well: every row either continues the current session or starts one (more than GAP after
-   // the row before), written without a branch on that - each row writes "a session starts here" into
-   // the next free entry, and the entry only stays if the row really starts one.
+   // The sweep of one stretch of counters (events, then clicks). Session lists go to pieces of this
+   // thread's pool, one block per run (sweep_event_runs). With rawSlots the event sweep has run already
+   // (see RESOLVE) and only the rows it set aside are handed over here.
+   SessArena arena;
    const auto sweep_events=[&](size_t lo,size_t hi,bool cross){
-    size_t c=lo;
-    if(cross&&lo>0){
-     size_t p=lo;uint32_t code0=0;bool reaches=false;
-     while(p>0){--p;const ESmall& sl=ev_at(p);if(sl.k>=PR_KBIAS){if(sl.user&DENSE_USER){code0=sl.user&~7u;reaches=true;}break;}}
-     if(reaches)for(;c<hi;++c){const ESmall& sl=ev_at(c);if(sl.k>=PR_KBIAS&&(sl.user&~7u)!=code0)break;}
-    }
-    const size_t stop=cross?evEnd:hi; // how far a run may go
-    while(c<hi){
-     const ESmall& sl=ev_at(c);const uint64_t k0=sl.k;
-     if(k0<PR_KBIAS){++c;continue;} // empty, or present but not valid
-     const uint32_t u=sl.user;
-     if(!(u&DENSE_USER)){hand_event(myEv,pool,k0,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++rdHandEv;++rdSlotEv;++c;if(stats)++rdWhy[why_table(u)];continue;}
-     if(__builtin_expect(u>denseTop,0))bad_user();
-     const uint32_t code=u&~7u;const size_t first=c;size_t lastSlot=c;
-     // Room: one entry per slot looked at, at most, plus the end entry.
-     if((size_t)(aend-acur)<hi-c+2){const size_t want=max<size_t>(hi-c+2,size_t(1)<<19);acur=(uint64_t*)pool.take(want*8);aend=acur+want;}
-     uint64_t* blk=acur;size_t cap=(size_t)(aend-blk);
-     size_t n=0,ns=0;uint64_t last=0-(uint64_t)(GAP+1),disorder=0;uint32_t mask=0;purTmp.clear();
-     size_t j=c;
-     const size_t stride=size_t(1)<<evShift;
-     for(;;){
-      const size_t lim=min(stop,c+cap-2);
-      const char* p=(const char*)&ev_at(j);const char* const pe=(const char*)&ev_at(lim);const char* lastp=p;
-      for(;p<pe;p+=stride){
-       const ESmall& r=*(const ESmall*)(const void*)p;const uint64_t k=r.k;
-       if(k<PR_KBIAS)continue;
-       const uint32_t al=r.user^code; // the alias if the row is this index's
-       if(al>7)break;
-       mask|=1u<<al;
-       const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
-       disorder|=step; // its top bit: a row before its predecessor
-       blk[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
-       if(__builtin_expect((k&EV_PURCHASE)!=0,0))purTmp.push_back(((uint64_t)(ns-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
-       ++n;lastp=p;
-      }
-      j=(size_t)(p-(const char*)&ev_at(0))>>evShift;
-      if(n)lastSlot=(size_t)(lastp-(const char*)&ev_at(0))>>evShift;
-      if(p<pe)goto run_done; // a valid slot of somebody else
-      if(j>=stop)break;
-      {const size_t cap2=cap*2;uint64_t* const nb=(uint64_t*)pool.take(cap2*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=cap2;aend=nb+cap2;} // a long run past the piece: a bigger block
-     }
-     run_done:;
-     {const size_t np=purTmp.size(),need=ns+1+np+1;
-      if(cap<need){uint64_t* const nb=(uint64_t*)pool.take(need*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=need;aend=nb+need;}
-      blk[ns]=n;if(np)memcpy(blk+ns+1,purTmp.data(),np*8);blk[ns+1+np]=~0ull;
-      acur=blk+need;}
-     DInfo& f=info[(code&~DENSE_USER)>>dn::ALIAS_BITS];
-     dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)lastSlot+1);f.ec.fetch_add((uint32_t)n,memory_order_relaxed);
-     uint64_t* none=nullptr;
-     if(f.sess.compare_exchange_strong(none,blk,memory_order_relaxed)){
-      f.ns.store((uint32_t)ns|(((disorder>>63)||n>=(size_t(1)<<24))?0x80000000u:0u),memory_order_relaxed);f.amask.store((uint8_t)mask,memory_order_relaxed);}
-     else f.multi.store(1,memory_order_relaxed); // the index has another run
-     rdSlotEv+=n;
-     c=j;
-    }
+    uint64_t others=0;
+    const uint64_t inRuns=sweep_event_runs(evBase,evShift,lo,hi,evEnd,cross,info,pool,arena,
+     [](const ESmall& sl){return sl.user;},
+     [&](uint32_t u){if(__builtin_expect(u>denseTop,0))bad_user();},
+     [&](const ESmall& sl,uint32_t u){
+      if(__builtin_expect((u&DENSE_USER_RAW)==DENSE_USER_RAW,0))bad_user(); // a raw user here: the slots were not resolved
+      hand_event(myEv,pool,sl.k,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++others;if(stats)++rdWhy[why_table(u)];});
+    rdHandEv+=others;rdSlotEv+=inRuns+others;
    };
    const auto sweep_clicks=[&](size_t lo,size_t hi){
     for(size_t c=lo;c<hi;){
@@ -3008,8 +3128,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     }
    }
    else{
-    #pragma omp for schedule(dynamic,1) nowait
-    for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH),true);
+    if(rawSlots){
+     #pragma omp for schedule(dynamic,1) nowait
+     for(int t=0;t<T;++t){
+      for(const ESmall& r:sideRows[t]){const uint32_t u=r.user;
+       hand_event(myEv,pool,r.k,(u&LOCAL_USER)?trans[r.thread][u&~LOCAL_USER]:u,r.cat);if(stats)++rdWhy[why_table(u)];}
+      rdHandEv+=sideRows[t].size();rdSlotEv+=sideRows[t].size();
+     }
+    }
+    else{
+     #pragma omp for schedule(dynamic,1) nowait
+     for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH),true);
+    }
     #pragma omp for schedule(dynamic,1)
     for(size_t lo=0;lo<clEnd;lo+=CCH)sweep_clicks(lo,min(clEnd,lo+CCH));
    }
@@ -3241,6 +3371,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   {
    EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();
    DInfo* const info=denseInfo;IdText txt;
+   // The user word of an event slot holding a valid event (with rawSlots the slots are as the parser left them).
+   RawCtx rawCtx;rawCtx.v3=hasV3;
+   const auto ucode=[&rawCtx,rawSlots](const ESmall& sl)->uint32_t{return rawSlots?rawCtx.code(sl):sl.user;};
    // A click of the fast lane: time and campaign as in Click, and its counter, which stands for its ID.
    struct FClick{uint64_t key;uint32_t user;uint32_t ctr;};
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
@@ -3294,8 +3427,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       uint64_t* const myPur=listed?nullptr:purBuf.get((size_t)ec+2);size_t np=0;
       uint64_t last=0-(uint64_t)(GAP+1); // the first row starts a session
       if(!listed)for(size_t c=ef;c<el;++c){
-       const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t u=sl.user;
-       if(!((uint32_t)(k>=PR_KBIAS)&(uint32_t)((u^code)<8)))continue;
+       const ESmall& sl=ev_at(c);const uint64_t k=sl.k;
+       if(k<PR_KBIAS)continue;
+       const uint32_t u=ucode(sl);
+       if((u^code)>=8)continue;
        mask|=1u<<(u&7);
        const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
        disorder|=step>>63;
@@ -3322,7 +3457,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        // Not in time order: copy the rows out, sort them, and make the session list from the copy.
        E=fastE.get((size_t)ec+1);size_t q=0;
        for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);
-        if(sl.k>=PR_KBIAS&&(sl.user^code)<8){E[q].k=sl.k-PR_KBIAS;E[q].person=person;E[q].cat=sl.cat;E[q].pad=0;++q;}}
+        if(sl.k>=PR_KBIAS&&(ucode(sl)^code)<8){E[q].k=sl.k-PR_KBIAS;E[q].person=person;E[q].cat=sl.cat;E[q].pad=0;++q;}}
        ev_time_sort(E,E+n);
        uint64_t* const sortedPur=purBuf.get((size_t)ec+2);size_t np=0;
        if(!mySL){mySL=sessTs.get((size_t)ec+2);}
@@ -3456,8 +3591,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       ++rdFastIdx;rdFastEv+=n;rdFastCl+=m;
      }
      else{
-      for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t d=sl.user^code;
-       if(k>=PR_KBIAS&&d<8){hand_event(myEv,pool,k,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),sl.cat);++rdHandEv;++rdWhy[why];}}
+      for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;if(k<PR_KBIAS)continue;const uint32_t d=ucode(sl)^code;
+       if(d<8){hand_event(myEv,pool,k,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),sl.cat);++rdHandEv;++rdWhy[why];}}
       for(size_t c=cf;c<cl;++c){const CSlot& sl=denseCl[c];const uint32_t d=sl.user^code;
        if(sl.present&&d<8){hand_click(myCl,pool,txt,sl.key,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),(uint32_t)c);++rdHandCl;}}
      }
@@ -3467,8 +3602,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    #pragma omp for schedule(dynamic,1) nowait
    for(size_t lo=min<uint64_t>(deferLoE,deferHiE);lo<deferHiE;lo+=ECH){
     const size_t hi=min<size_t>(deferHiE,lo+ECH);
-    for(size_t c=lo;c<hi;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t u=sl.user;
-     if(k>=PR_KBIAS&&(u&DENSE_USER)){const uint32_t d=u&~DENSE_USER;
+    for(size_t c=lo;c<hi;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;if(k<PR_KBIAS)continue;const uint32_t u=ucode(sl);
+     if(is_dense_code(u)){const uint32_t d=u&~DENSE_USER;
       if(info[d>>dn::ALIAS_BITS].state.load(memory_order_relaxed)==DSTATE_DEFER){hand_event(myEv,pool,k,dBase+(d^((comp[d>>3].load(memory_order_relaxed)>>(3*(d&7)))&7)),sl.cat);++rdHandEv;++rdWhy[8];}}}
    }
    #pragma omp for schedule(dynamic,1)
