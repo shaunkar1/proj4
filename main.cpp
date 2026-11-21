@@ -2613,7 +2613,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  dparse.twoPhase=dparse.raw&&!getenv("SS_DENSE_AHEAD");
  // SS_LINES=batch: the batch event loop (SS_EVENT_LOOP_BATCH), for comparison while it is being built.
  dparse.batch=dparse.twoPhase&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="batch";
- // SS_LINES=ev8: the event loop that hands eight lines at a time to a kernel (SS_EVENT_LOOP_EV8).
+ // SS_LINES=ev8: the event loop that hands eight lines at a time to a kernel (SS_EVENT_LOOP_EV8). Where the CPU
+ // has the AVX-512 kernel it is also the default (decided at the parse stage, see ev8Auto); SS_LINES=2p keeps the
+ // two-phase loop there.
  dparse.ev8=dparse.twoPhase&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="ev8";
  cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<" batch "<<dparse.batch<<" ev8 "<<dparse.ev8<<"\n";
  // First pass over the link files.
@@ -2870,8 +2872,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // The vector loops locate line starts ahead of cutting the lines (see SS_EVENT_LOOP_IX): measured 5% faster
  // in the parse stage on the scoring machine. SS_LINES=plain switches back to the loop without the index.
  const bool lineIndex=isaUse!=ISA_SSE2&&!(getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="plain");
+ // The event loop with the AVX-512 kernel (vert::ev8_v5) is the default for dense-record event files on a CPU that
+ // has it: measured on the scoring machine at less than half the time per row of the two-phase loop. With no
+ // SS_ISA the event files then use the avx512z masks (the kernel uses 512-bit registers anyway) while the click
+ // files stay on the avx2 loop; with SS_ISA=avx512z|avx512y everything follows that choice. Any SS_LINES value
+ // switches the default off (SS_LINES=ev8 asks for the loop explicitly, also on avx2 with the scalar kernel).
+ const bool ev8Auto=hasE8&&dparse.twoPhase&&!getenv("SS_LINES")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
-  <<"\n";
+  <<(ev8Auto?" events: ev8 kernel":"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -2998,7 +3006,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const Chunk& ck=chunks[c];
    // Dense records (DREC loops) exist with the line index only; SS_LINES=plain then applies to the other kind of file.
    const bool drec=ck.click?dparse.clicks:dparse.events;
-   const bool ev8Use=dparse.ev8&&(isaUse==ISA_AVX2||hasE8); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
+   const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
+   if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){events_avx512z_e8(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);continue;} // the default on an AVX-512 CPU
    #define SS_RUN_LOOPS(ISA) \
     if(ck.click){if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
