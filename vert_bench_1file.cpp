@@ -310,9 +310,7 @@ VERT_T3 static inline unsigned id8_v3(const uint64_t* w,const uint64_t* n,uint64
  const uint64_t lim40=limit<MASK40+1?limit:MASK40+1; // an index is always < 2^40
  return id4_v3(w,n,key,lim40,ctr)|(id4_v3(w+4,n+4,key,lim40,ctr+4)<<4);
 }
-VERT_T5 static inline unsigned id8_v5(const uint64_t* w,const uint64_t* n,uint64_t key,uint64_t limit,uint64_t* ctr){
- const __m512i W=_mm512_loadu_si512((const void*)w);
- const __m512i N=_mm512_loadu_si512((const void*)n);
+VERT_T5 static inline __m512i id8k_v5(__m512i W,__m512i N,uint64_t key,uint64_t limit,__mmask8& okOut){
  const __m512i n8=_mm512_slli_epi64(N,3);
  const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(W,_mm512_sub_epi64(_mm512_set1_epi64(64),n8)),_mm512_srlv_epi64(_mm512_set1_epi8(0x30),n8));
  const __m512i t=_mm512_sub_epi8(x,_mm512_set1_epi8('0')),u=_mm512_sub_epi8(x,_mm512_set1_epi8('a'));
@@ -321,7 +319,7 @@ VERT_T5 static inline unsigned id8_v5(const uint64_t* w,const uint64_t* n,uint64
  const __m512i p2=_mm512_maddubs_epi16(d,_mm512_set1_epi16(0x0124));
  const __m512i p4=_mm512_madd_epi16(p2,_mm512_set1_epi32(0x00010510));
  const __m512i val=_mm512_add_epi64(_mm512_mul_epu32(p4,_mm512_set1_epi64(1679616)),_mm512_srli_epi64(p4,32));
- // MIN36[n] picked by the low three bits of n (n == 8 -> entry 0); n == 0 and n > 8 are refused by `nok`
+ // MIN36[n] picked by the low three bits of n (n == 8 -> entry 0); n == 0 and n > 8 are refused by the length test
  const __m512i min36=_mm512_permutexvar_epi64(N,_mm512_setr_epi64(78364164096LL,0,36,1296,46656,1679616,60466176,2176782336LL));
  __mmask8 ok=_mm512_testn_epi64_mask(bad,bad);
  ok&=_mm512_cmple_epu64_mask(_mm512_sub_epi64(N,_mm512_set1_epi64(1)),_mm512_set1_epi64(7));
@@ -333,8 +331,11 @@ VERT_T5 static inline unsigned id8_v5(const uint64_t* w,const uint64_t* n,uint64
  m=_mm512_xor_si512(m,_mm512_set1_epi64((long long)key));
  const __m512i c=_mm512_and_si512(_mm512_mullo_epi64(m,_mm512_set1_epi64((long long)I1)),mask);
  ok&=_mm512_cmplt_epu64_mask(c,_mm512_set1_epi64((long long)limit));
- _mm512_storeu_si512((void*)ctr,c);
- return (unsigned)ok;
+ okOut=ok;return c;
+}
+VERT_T5 static inline unsigned id8_v5(const uint64_t* w,const uint64_t* n,uint64_t key,uint64_t limit,uint64_t* ctr){
+ __mmask8 ok;const __m512i c=id8k_v5(_mm512_loadu_si512((const void*)w),_mm512_loadu_si512((const void*)n),key,limit,ok);
+ _mm512_storeu_si512((void*)ctr,c);return (unsigned)ok;
 }
 // =====================================================================================================
 // Shared layouts (BATCH.md). DateEnt is layout-identical to main.cpp's DateMemo3: k = date bytes 2..9,
@@ -468,7 +469,8 @@ static inline unsigned kind8_ref(const uint64_t* w,const uint64_t* n,uint64_t* k
  unsigned acc=0;for(int i=0;i<8;++i){kind[i]=kind_ref(w[i],n[i]);if(kind[i])acc|=1u<<i;}return acc;
 }
 // =====================================================================================================
-// K5 ev8: the whole content part of an event row (BATCH.md). Row accepted (ok bit) iff
+// K5 evop8 (operand form; the line form ev8 is further down): the whole content part of an event row from
+// operands that are already cut out of the line. Row accepted (ok bit) iff
 //   - the event ID is dense (K1),
 //   - ingest_ts is "YYYY-MM-DDTHH:MM:SSZ" with a valid time of day and its date is in the table,
 //   - ts is one of: tsn 20, Z form, valid time of day, date in the table (same day as ingest or not);
@@ -481,7 +483,7 @@ static inline unsigned kind8_ref(const uint64_t* w,const uint64_t* n,uint64_t* k
 // clears k if the price is bad). Stage 1 must guarantee what the kernel cannot see: the field lengths
 // (ingest 20, ts = tsn) and the ID's letter.
 // =====================================================================================================
-static inline void ev8_ref(const EvBatch& b,const EvConst& c,EvBatchOut& o){
+static inline void evop8_ref(const EvBatch& b,const EvConst& c,EvBatchOut& o){
  o.idok=(uint8_t)id8_ref(b.idw,b.idn,c.ke,c.limE,o.ve);
  unsigned ok=0;
  for(int i=0;i<8;++i){
@@ -589,7 +591,7 @@ VERT_T3 static inline unsigned kind8_v3(const uint64_t* w,const uint64_t* n,uint
  for(int h=0;h<8;h+=4){__m256i nz;const __m256i v=kind4_v3(VERT_LD3(w+h),VERT_LD3(n+h),nz);_mm256_storeu_si256((__m256i*)(kind+h),v);acc|=VERT_MM3(nz)<<h;}
  return acc;
 }
-VERT_T3 static inline void ev8_v3(const EvBatch& b,const EvConst& c,EvBatchOut& o){
+VERT_T3 static inline void evop8_v3(const EvBatch& b,const EvConst& c,EvBatchOut& o){
  const uint64_t lim40=c.limE<MASK40+1?c.limE:MASK40+1;
  unsigned idok=0,ok=0;
  const __m256i sign=VERT_C3(0x8000000000000000ULL),ones=VERT_C3(-1);
@@ -701,7 +703,7 @@ VERT_T5 static inline unsigned sameday8_v5(const uint64_t* a0,const uint64_t* a1
 VERT_T5 static inline unsigned kind8_v5(const uint64_t* w,const uint64_t* n,uint64_t* kind){
  __mmask8 nz;const __m512i v=kind8k_v5(VERT_LD5(w),VERT_LD5(n),nz);_mm512_storeu_si512((void*)kind,v);return (unsigned)nz;
 }
-VERT_T5 static inline void ev8_v5(const EvBatch& b,const EvConst& c,EvBatchOut& o){
+VERT_T5 static inline void evop8_v5(const EvBatch& b,const EvConst& c,EvBatchOut& o){
  const unsigned idok=id8_v5(b.idw,b.idn,c.ke,c.limE,o.ve);
  const __m512i ig2=VERT_LD5(b.ig2),ig1=VERT_LD5(b.ig1);
  __mmask8 oki,hiti,oks,hits,okoff,okep,knz;
@@ -733,6 +735,192 @@ VERT_T5 static inline void ev8_v5(const EvBatch& b,const EvConst& c,EvBatchOut& 
  _mm512_storeu_si512((void*)o.kind,kind);
  o.idok=(uint8_t)idok;o.ok=(uint8_t)(idok&iok&tok);
 }
+
+// =====================================================================================================
+// ev8 (line form): eight event lines straight from the line index. See the caller contract at the top of
+// this file and BATCH.md. ls[0..8]: line i starts at ls[i] and its newline is the byte ls[i+1]-1.
+// =====================================================================================================
+struct alignas(64) EvOut{
+ uint64_t ve[8];      // event counter; exact wherever idok is set (== event_pre_v3 of the line)
+ uint64_t k[8];       // 0 = not a valid event, else (ts - window_start + 1) << 25 (provisional for kind 3)
+ uint64_t ingest[8];  // ingest_ts, ms
+ uint64_t kind[8];    // 0 none, 1 view, 2 cart, 3 purchase
+ uint64_t uw[8],un[8];// raw user: the un (0..8) bytes after the 'u', zero-padded; both 0 if the user field is empty
+ const char* s5[8];uint64_t l5[8]; // product_id field (content without quotes)
+ const char* s6[8];uint64_t l6[8]; // price_cents field
+ uint8_t ok;          // bit i: every output of row i is exact and the row is on event_line_v3's fast path
+ uint8_t idok;        // bit i: ve[i] is exactly event_pre_v3's counter of the line (ok implies idok)
+};
+static inline uint64_t ld8_ref(const char* p){uint64_t w;memcpy(&w,p,8);return w;}
+static inline void masks_ref(const char* p,uint64_t& c,uint64_t& q){c=0;q=0;for(int i=0;i<64;++i){c|=(uint64_t)(p[i]==',')<<i;q|=(uint64_t)(p[i]=='"')<<i;}}
+static inline unsigned tz_ref(uint64_t x){return x?(unsigned)__builtin_ctzll(x):64u;}
+static inline uint64_t blsr_ref(uint64_t x){return x&(x-1);}
+static inline void ev8_ref(const char* const* ls,const EvConst& c,EvOut& o){
+ unsigned okm=0,idm=0;
+ for(int i=0;i<8;++i){
+  o.ve[i]=o.k[i]=o.ingest[i]=o.kind[i]=o.uw[i]=o.un[i]=o.l5[i]=o.l6[i]=0;o.s5[i]=o.s6[i]=ls[i];
+  const char* const p=ls[i];const char* const nl=ls[i+1]-1;
+  uint64_t cm,qa;masks_ref(p,cm,qa);
+  // the counter as event_pre_v3 sees it: text before the first comma of the first 16 bytes, one quote pair stripped
+  {const unsigned cp=tz_ref(cm)<16?tz_ref(cm):16;const unsigned z=(unsigned)(qa&1);
+   const uint64_t n=(uint64_t)cp-2*z-1,w=ld8_ref(p+z+1);uint64_t ctr[8];const uint64_t ws[8]={w,w,w,w,w,w,w,w},ns[8]={n,n,n,n,n,n,n,n};
+   if(p[z]=='e'&&(id8_ref(ws,ns,c.ke,c.limE,ctr)&1)){o.ve[i]=ctr[0];idm|=1u<<i;}}
+  // structure, as event_line_v3 (DREC form: the newline is known)
+  const uint64_t cA=blsr_ref(cm),cB=blsr_ref(cA),cR=blsr_ref(cB);
+  const uint64_t m1=cB^(cB-1);
+  const uint64_t q1=qa&m1,st1=((cm^cB)<<1)|1,en1=cm^cR;
+  const uint64_t sq1=q1&st1,op1=(sq1+~en1)&en1,err1=op1^((q1&~st1)<<1);
+  const uint64_t e2=tz_ref(cB);
+  const char* const b=p+e2+1;
+  uint64_t c2,q2;masks_ref(b,c2,q2);
+  const uint64_t L=(uint64_t)(nl-b),nbit=1ull<<(L&63),keep=nbit-1;
+  const uint64_t d=c2&keep,qb=q2&keep;
+  const uint64_t st2=(d<<1)|1,en2=d|nbit;
+  const uint64_t sq2=qb&st2,op2=(sq2+~en2)&en2,err2=op2^((qb&~st2)<<1);
+  if((err1|err2|(uint64_t)(__builtin_popcountll(d)^3)|((e2|L)>>6))!=0)continue;
+  uint64_t B1=st1+sq1,E1=en1-(op1>>1),B2=st2+sq2,E2=en2-(op2>>1);
+  const unsigned z0=(unsigned)(q1&1);
+  const unsigned l0=tz_ref(E1)-z0;
+  if(l0==0)continue;
+  const unsigned z3=(unsigned)(qb&1);
+  const char* const s3=b+z3;const unsigned l3=tz_ref(E2)-z3;
+  B1=blsr_ref(B1);E1=blsr_ref(E1);
+  const unsigned b1=tz_ref(B1),l1=tz_ref(E1)-b1;
+  B1=blsr_ref(B1);E1=blsr_ref(E1);
+  const unsigned b2=tz_ref(B1),l2=tz_ref(E1)-b2;
+  B2=blsr_ref(B2);E2=blsr_ref(E2);
+  const unsigned b4=tz_ref(B2),l4=tz_ref(E2)-b4;
+  B2=blsr_ref(B2);E2=blsr_ref(E2);
+  const unsigned b5=tz_ref(B2),l5=tz_ref(E2)-b5;
+  B2=blsr_ref(B2);E2=blsr_ref(E2);
+  const unsigned b6=tz_ref(B2),l6=tz_ref(E2)-b6;
+  const char* const s1=p+b1;const char* const s2=p+b2;
+  o.s5[i]=b+b5;o.l5[i]=l5;o.s6[i]=b+b6;o.l6[i]=l6;
+  o.kind[i]=kind_ref(ld8_ref(b+b4),l4);
+  if(!(idm>>i&1))continue;                                   // (then l0 is 2..9 and the ID is the line's first field)
+  if(!(l1==0||(s1[0]=='u'&&l1<=9)))continue;                 // user: empty, or 'u' + 0..8 bytes
+  if(l1){o.un[i]=l1-1;o.uw[i]=l1-1==8?ld8_ref(s1+1):(ld8_ref(s1+1)&((1ull<<(8*(l1-1)))-1));}
+  if(l3!=20)continue;
+  const uint64_t ig0=ld8_ref(s3),ig1=ld8_ref(s3+8),ig2=ld8_ref(s3+12);
+  uint64_t todi,dayi;
+  if(!tod_ref(ig1,ig2,todi)||byte_of(ig2,7)!='Z'||!day_ref(ig0,ig1,c.memo,dayi))continue;
+  const int64_t ingest=(int64_t)(dayi+todi);
+  o.ingest[i]=(uint64_t)ingest;
+  int64_t ts;
+  if(l2==13){uint64_t v;if(!epoch_ref(ld8_ref(s2),ld8_ref(s2+5),v))continue;ts=(int64_t)v;}
+  else if(l2==20||l2==25){
+   const uint64_t t0=ld8_ref(s2),t1=ld8_ref(s2+8),t2=ld8_ref(s2+12);
+   uint64_t tods,days;
+   if(!tod_ref(t1,t2,tods)||!day_ref(t0,t1,c.memo,days))continue;
+   ts=(int64_t)(days+tods);
+   if(l2==20){if(byte_of(t2,7)!='Z')continue;}
+   else{int64_t delta;if(!off_ref(t2,ld8_ref(s2+17),delta))continue;ts+=delta;}
+  }else continue;
+  okm|=1u<<i;
+  const uint64_t tsrel=(uint64_t)ts-(uint64_t)c.wstart;
+  if(o.kind[i]!=0&&l1!=0&&l5!=0&&tsrel<c.wlen&&ingest-ts<=DAYMS)o.k[i]=(tsrel+1)<<EV_TS_SHIFT;
+ }
+ o.ok=(uint8_t)okm;o.idok=(uint8_t)idm;
+}
+VERT_T5 static inline void ev8_v5(const char* const* ls,const EvConst& c,EvOut& o){
+ // ---- horizontal: the two 64-byte windows of every line -> comma and quote masks ----
+ alignas(64) uint64_t aC1[8],aQ1[8],aC2[8],aQ2[8],aB[8];
+ {const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"');
+  for(int i=0;i<8;++i){
+   const char* const p=ls[i];
+   const __m512i x=_mm512_loadu_si512((const void*)p);
+   const uint64_t cm=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));
+   aC1[i]=cm;aQ1[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq));
+   const char* const b=p+_tzcnt_u64(_blsr_u64(_blsr_u64(cm)))+1; // one past the third comma (p+65 if there is none)
+   const __m512i y=_mm512_loadu_si512((const void*)b);
+   aC2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc));aQ2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));aB[i]=(uint64_t)b;
+  }}
+ // ---- vertical ----
+ const __m512i one=VERT_C5(1),ones=VERT_C5(-1),c63=VERT_C5(63),c64=VERT_C5(64);
+ #define VERT_TZ5(x,xm) _mm512_sub_epi64(c63,_mm512_lzcnt_epi64(_mm512_xor_si512(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
+ const __m512i P=VERT_LD5(ls),NL=_mm512_add_epi64(VERT_LD5(ls+1),ones),Bv=_mm512_load_si512((const void*)aB);
+ const __m512i C1=_mm512_load_si512((const void*)aC1),Q1=_mm512_load_si512((const void*)aQ1),C2=_mm512_load_si512((const void*)aC2),Q2=_mm512_load_si512((const void*)aQ2);
+ // window 1: the first three commas, quote rules up to the third
+ const __m512i t0=_mm512_add_epi64(C1,ones),c0=VERT_TZ5(C1,t0),cA=_mm512_and_si512(C1,t0);
+ const __m512i t1=_mm512_add_epi64(cA,ones),c1=VERT_TZ5(cA,t1),cB=_mm512_and_si512(cA,t1);
+ const __m512i t2=_mm512_add_epi64(cB,ones),m1=_mm512_xor_si512(cB,t2),cR=_mm512_and_si512(cB,t2);
+ const __m512i c2=_mm512_add_epi64(_mm512_sub_epi64(Bv,P),ones); // tzcnt(cB), 64 if there is no third comma
+ const __m512i q1=_mm512_and_si512(Q1,m1),st1=_mm512_or_si512(_mm512_slli_epi64(_mm512_xor_si512(C1,cB),1),one),en1=_mm512_xor_si512(C1,cR);
+ const __m512i sq1=_mm512_and_si512(q1,st1),op1=_mm512_and_si512(_mm512_add_epi64(_mm512_sub_epi64(sq1,en1),ones),en1);
+ const __m512i err1=_mm512_xor_si512(op1,_mm512_slli_epi64(_mm512_andnot_si512(st1,q1),1));
+ // window 2: the bytes before the newline, three commas, quote rules
+ const __m512i L=_mm512_sub_epi64(NL,Bv),nbit=_mm512_sllv_epi64(one,_mm512_and_si512(L,c63)),keep=_mm512_add_epi64(nbit,ones);
+ const __m512i d=_mm512_and_si512(C2,keep),qb=_mm512_and_si512(Q2,keep);
+ const __m512i st2=_mm512_or_si512(_mm512_slli_epi64(d,1),one),en2=_mm512_or_si512(d,nbit);
+ const __m512i sq2=_mm512_and_si512(qb,st2),op2=_mm512_and_si512(_mm512_add_epi64(_mm512_sub_epi64(sq2,en2),ones),en2);
+ const __m512i err2=_mm512_xor_si512(op2,_mm512_slli_epi64(_mm512_andnot_si512(st2,qb),1));
+ const __m512i u0=_mm512_add_epi64(d,ones),d0=VERT_TZ5(d,u0),dA=_mm512_and_si512(d,u0);
+ const __m512i u1=_mm512_add_epi64(dA,ones),d1=VERT_TZ5(dA,u1),dB=_mm512_and_si512(dA,u1);
+ const __m512i u2=_mm512_add_epi64(dB,ones),d2=VERT_TZ5(dB,u2),dR=_mm512_and_si512(dB,u2);
+ const __m512i err=_mm512_or_si512(err1,err2);
+ __mmask8 ok=_mm512_testn_epi64_mask(err,err)&_mm512_testn_epi64_mask(dR,dR)&_mm512_test_epi64_mask(dB,dB); // no quote error, exactly three commas
+ ok&=_mm512_cmplt_epu64_mask(c2,c64)&_mm512_cmplt_epu64_mask(L,c64);                                           // third comma and newline inside their windows
+ // fields: a quoted field starts one later and is two shorter
+ const __m512i z0=_mm512_and_si512(Q1,one);
+ const __m512i a1=_mm512_add_epi64(c0,one),z1=_mm512_and_si512(_mm512_srlv_epi64(q1,a1),one),o1=_mm512_add_epi64(a1,z1),l1=_mm512_sub_epi64(_mm512_sub_epi64(c1,o1),z1);
+ const __m512i a2=_mm512_add_epi64(c1,one),z2=_mm512_and_si512(_mm512_srlv_epi64(q1,a2),one),o2=_mm512_add_epi64(a2,z2),l2=_mm512_sub_epi64(_mm512_sub_epi64(c2,o2),z2);
+ const __m512i z3=_mm512_and_si512(qb,one),l3=_mm512_sub_epi64(d0,_mm512_add_epi64(z3,z3));
+ const __m512i a4=_mm512_add_epi64(d0,one),z4=_mm512_and_si512(_mm512_srlv_epi64(qb,a4),one),o4=_mm512_add_epi64(a4,z4),l4=_mm512_sub_epi64(_mm512_sub_epi64(d1,o4),z4);
+ const __m512i a5=_mm512_add_epi64(d1,one),z5=_mm512_and_si512(_mm512_srlv_epi64(qb,a5),one),o5=_mm512_add_epi64(a5,z5),l5=_mm512_sub_epi64(_mm512_sub_epi64(d2,o5),z5);
+ const __m512i a6=_mm512_add_epi64(d2,one),z6=_mm512_and_si512(_mm512_srlv_epi64(qb,a6),one),o6=_mm512_add_epi64(a6,z6),l6=_mm512_sub_epi64(_mm512_sub_epi64(L,o6),z6);
+ #define VERT_G5(a) _mm512_i64gather_epi64(a,(const void*)0,1)
+ // event_id exactly as event_pre_v3: first comma of the first 16 bytes, one quote pair stripped
+ const __m512i idn=_mm512_sub_epi64(_mm512_sub_epi64(_mm512_min_epu64(c0,VERT_C5(16)),_mm512_add_epi64(z0,z0)),one);
+ const __m512i S0=_mm512_add_epi64(P,z0);
+ const __m512i W0=VERT_G5(S0),IDW=VERT_G5(_mm512_add_epi64(S0,one));
+ __mmask8 idok;const __m512i ve=id8k_v5(IDW,idn,c.ke,c.limE,idok);
+ const __m512i lowbyte=VERT_C5(0xFF);
+ idok&=_mm512_cmpeq_epi64_mask(_mm512_and_si512(W0,lowbyte),VERT_C5('e'));
+ // user: empty, or 'u' + 0..8 bytes kept as text
+ const __m512i S1=_mm512_add_epi64(P,o1);
+ const __m512i U0=VERT_G5(S1),UW=VERT_G5(_mm512_add_epi64(S1,one));
+ const __mmask8 hasu=_mm512_test_epi64_mask(l1,l1);
+ ok&=(__mmask8)(~hasu|(_mm512_cmpeq_epi64_mask(_mm512_and_si512(U0,lowbyte),VERT_C5('u'))&_mm512_cmple_epu64_mask(l1,VERT_C5(9))));
+ const __m512i un=_mm512_maskz_sub_epi64(hasu,l1,one);
+ const __m512i uw=_mm512_and_si512(UW,_mm512_srlv_epi64(ones,_mm512_sub_epi64(c64,_mm512_slli_epi64(un,3)))); // un == 0: shift by 64 gives 0
+ // ingest_ts: 20 bytes, Z form
+ const __m512i S3=_mm512_add_epi64(Bv,z3);
+ const __m512i ig0=VERT_G5(S3),ig1=VERT_G5(_mm512_add_epi64(S3,VERT_C5(8))),ig2=VERT_G5(_mm512_add_epi64(S3,VERT_C5(12)));
+ __mmask8 oki,hiti,oks,hits,okoff,okep,knz;
+ const __m512i todi=tod8k_v5(ig1,ig2,oki);
+ const __m512i dayi=day8k_v5(ig0,ig1,c.memo,hiti);
+ const __m512i ingest=_mm512_add_epi64(dayi,todi);
+ ok&=oki&hiti&_mm512_cmpeq_epi64_mask(_mm512_srli_epi64(ig2,56),VERT_C5('Z'))&_mm512_cmpeq_epi64_mask(l3,VERT_C5(20));
+ // ts: 20 (Z), 13 (digits), 25 (offset)
+ const __mmask8 is20=_mm512_cmpeq_epi64_mask(l2,VERT_C5(20)),is25=_mm512_cmpeq_epi64_mask(l2,VERT_C5(25)),is13=_mm512_cmpeq_epi64_mask(l2,VERT_C5(13));
+ const __m512i S2=_mm512_add_epi64(P,o2);
+ const __m512i ts0=VERT_G5(S2),ts1=VERT_G5(_mm512_add_epi64(S2,_mm512_mask_mov_epi64(VERT_C5(8),is13,VERT_C5(5))));
+ const __m512i ts2=VERT_G5(_mm512_add_epi64(S2,VERT_C5(12))),ts3=VERT_G5(_mm512_add_epi64(S2,VERT_C5(17)));
+ const __m512i tods=tod8k_v5(ts1,ts2,oks);
+ const __m512i days=day8k_v5(ts0,ts1,c.memo,hits);
+ const __m512i off=off8k_v5(ts3,okoff);
+ const __m512i ep=epoch8k_v5(ts0,ts1,okep);
+ const __m512i b19=_mm512_srli_epi64(ts2,56);
+ const __mmask8 isZ=_mm512_cmpeq_epi64_mask(b19,VERT_C5('Z')),isP=_mm512_cmpeq_epi64_mask(b19,VERT_C5('+')),isM=_mm512_cmpeq_epi64_mask(b19,VERT_C5('-'));
+ __m512i ts=_mm512_add_epi64(days,tods);
+ ts=_mm512_mask_sub_epi64(ts,(__mmask8)(is25&isP),ts,off);
+ ts=_mm512_mask_add_epi64(ts,(__mmask8)(is25&isM),ts,off);
+ ts=_mm512_mask_mov_epi64(ts,is13,ep);
+ ok&=(__mmask8)((is13&okep)|(oks&hits&((is20&isZ)|(is25&okoff&(isP|isM)))));
+ // kind, validity, k
+ const __m512i kind=kind8k_v5(VERT_G5(_mm512_add_epi64(Bv,o4)),l4,knz);
+ const __m512i tsrel=_mm512_sub_epi64(ts,VERT_C5(c.wstart));
+ __mmask8 valid=knz&hasu&_mm512_test_epi64_mask(l5,l5)&_mm512_cmplt_epu64_mask(tsrel,VERT_C5(c.wlen));
+ valid&=_mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest,ts),VERT_C5(DAYMS));
+ const __m512i k=_mm512_maskz_slli_epi64(valid,_mm512_add_epi64(tsrel,one),EV_TS_SHIFT);
+ _mm512_store_si512((void*)o.ve,ve);_mm512_store_si512((void*)o.k,k);_mm512_store_si512((void*)o.ingest,ingest);_mm512_store_si512((void*)o.kind,kind);
+ _mm512_store_si512((void*)o.uw,uw);_mm512_store_si512((void*)o.un,un);
+ _mm512_store_si512((void*)o.s5,_mm512_add_epi64(Bv,o5));_mm512_store_si512((void*)o.l5,l5);
+ _mm512_store_si512((void*)o.s6,_mm512_add_epi64(Bv,o6));_mm512_store_si512((void*)o.l6,l6);
+ o.idok=(uint8_t)idok;o.ok=(uint8_t)(ok&idok);
+ #undef VERT_G5
+ #undef VERT_TZ5
+}
 } // namespace vert
 #endif
 #include <cstdio>
@@ -752,6 +940,7 @@ struct alignas(64) Data{
  uint8_t o0[R],l0[R],o2[R],l2[R],o3[R],o4[R],l4[R]; // field offsets / lengths: event_id, ts, ingest_ts, event_type
  // operands (BATCH.md layout)
  vert::EvBatch bt[R/8];
+ char lines[R*112+4096];const char* ls[R+8]; // the same rows as one piece of CSV text (79% of them with quoted fields) and its line index
  alignas(64) uint8_t buf[1024]; // scalar chunk's work buffer
  prod::DateMemo3 memo[4096];
  uint64_t key,limit;int64_t wstart;uint64_t wlen;
@@ -787,6 +976,11 @@ static void fill(Data& d,unsigned seed){
   const unsigned kr=(unsigned)(rnd()%10);const char* kind=kr<7?"view":kr<9?"cart":"purchase";const size_t lk=strlen(kind);
   d.o4[r]=(uint8_t)p;d.l4[r]=(uint8_t)lk;memcpy(t+p,kind,lk);p+=lk;t[p++]=',';
   p+=(size_t)snprintf(t+p,16,"p%u,%u\n",(unsigned)(rnd()%20000),(unsigned)(rnd()%10000));
+  {static thread_local size_t at;if(r==0)at=0; // the line again, contiguous, some fields quoted
+   const unsigned qm=(rnd()%100<79)?(unsigned)(rnd()&127)|(1u<<(rnd()%7)):0;
+   d.ls[r]=d.lines+at;unsigned fi=0;const char* f0=t;
+   for(const char* q=t;;++q)if(*q==','||*q=='\n'){const bool qq=qm>>fi&1;if(qq)d.lines[at++]='"';memcpy(d.lines+at,f0,(size_t)(q-f0));at+=(size_t)(q-f0);if(qq)d.lines[at++]='"';d.lines[at++]=*q;f0=q+1;++fi;if(*q=='\n')break;}
+   d.ls[r+1]=d.lines+at;if(r==R-1){memset(d.lines+at,0,4096);for(int x=R+1;x<R+8;++x)d.ls[x]=d.lines+at;}}
   const char* q2=t+d.o2[r];const char* q3=t+d.o3[r];
   memcpy(&B.idw[j],t+1,8);B.idn[j]=l0-1;
   memcpy(&B.ts0[j],q2,8);memcpy(&B.ts1[j],q2+(l2==13?5:8),8);memcpy(&B.ts2[j],q2+12,8);memcpy(&B.ts3[j],q2+17,8);B.tsn[j]=l2;
@@ -844,11 +1038,11 @@ SS_V3 __attribute__((noinline)) static uint64_t ev_scalar(Data& d,int r){
  return s;
 }
 static inline uint64_t sum_ev(const vert::EvBatchOut& o){uint64_t s=0;for(int i=0;i<8;++i)if(o.ok>>i&1)s+=o.ve[i]+o.ingest[i]+o.k[i]+o.kind[i];return s;}
-VERT_T3 __attribute__((noinline)) static uint64_t ev_v3(Data& d,int r){vert::EvBatchOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::ev8_v3(d.bt[r/8],c,o);return sum_ev(o);}
-VERT_T5 __attribute__((noinline)) static uint64_t ev_v5(Data& d,int r){vert::EvBatchOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::ev8_v5(d.bt[r/8],c,o);return sum_ev(o);}
+VERT_T3 __attribute__((noinline)) static uint64_t ev_v3(Data& d,int r){vert::EvBatchOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::evop8_v3(d.bt[r/8],c,o);return sum_ev(o);}
+VERT_T5 __attribute__((noinline)) static uint64_t ev_v5(Data& d,int r){vert::EvBatchOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::evop8_v5(d.bt[r/8],c,o);return sum_ev(o);}
 // ev_v5 plus what a line-level kernel adds: vplzcntq (vector tzcnt) and one more 512-bit gather through computed offsets
 VERT_T5 __attribute__((noinline)) static uint64_t evz_v5(Data& d,int r){vert::EvBatchOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};
- const vert::EvBatch& B=d.bt[r/8];vert::ev8_v5(B,c,o);
+ const vert::EvBatch& B=d.bt[r/8];vert::evop8_v5(B,c,o);
  const __m512i x=_mm512_loadu_si512((const void*)B.kw);
  const __m512i tz=_mm512_sub_epi64(_mm512_set1_epi64(63),_mm512_lzcnt_epi64(_mm512_and_si512(x,_mm512_sub_epi64(_mm512_setzero_si512(),x)))); // tzcnt
  const __m512i tz2=_mm512_lzcnt_epi64(_mm512_and_si512(_mm512_loadu_si512((const void*)B.ig2),_mm512_sub_epi64(x,_mm512_set1_epi64(1))));
@@ -856,6 +1050,10 @@ VERT_T5 __attribute__((noinline)) static uint64_t evz_v5(Data& d,int r){vert::Ev
  const __m512i m=_mm512_mullo_epi64(g,_mm512_set1_epi64(0x9E3779B97F4A7C15LL));
  return sum_ev(o)+(uint64_t)_mm512_reduce_add_epi64(_mm512_srli_epi64(m,60));
 }
+// line form: the kernel starts from the line index (structure, field cutting, gathers and the content part)
+static inline uint64_t sum_evl(const vert::EvOut& o){uint64_t s=0;for(int i=0;i<8;++i)if(o.ok>>i&1)s+=o.ve[i]+o.ingest[i]+o.k[i]+o.kind[i];return s;}
+VERT_T5 __attribute__((noinline)) static uint64_t evl_v5(Data& d,int r){vert::EvOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::ev8_v5(d.ls+r,c,o);return sum_evl(o);}
+__attribute__((noinline)) static uint64_t evl_ref(Data& d,int r){vert::EvOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::ev8_ref(d.ls+r,c,o);return sum_evl(o);}
 //@@KERNELS
 typedef uint64_t (*Kern)(Data&,int);
 struct Case{const char* name;Kern k;int need;bool mixed;}; // need: 0 none, 3 avx2, 5 avx512
@@ -894,7 +1092,7 @@ static const Case cases[]={
   {"ev_scalar+chunk",ev_scalar,3,true},{"ev_v3+chunk",ev_v3,3,true},
   //@@CASES_B
   {"id_v5",id_v5,5,false},{"id_v5+chunk",id_v5,5,true},
-  {"ev_v5",ev_v5,5,false},{"evz_v5",evz_v5,5,false},{"ev_v5+chunk",ev_v5,5,true},{"evz_v5+chunk",evz_v5,5,true},
+  {"ev_v5",ev_v5,5,false},{"evz_v5",evz_v5,5,false},{"evl_v5",evl_v5,5,false},{"ev_v5+chunk",ev_v5,5,true},{"evz_v5+chunk",evz_v5,5,true},{"evl_v5+chunk",evl_v5,5,true},
   //@@CASES_C
   {"chunk_again",nullptr,0,false},
  };
@@ -916,7 +1114,8 @@ int main(int argc,char** argv){
   for(Data* d:ds)cg_run(*d,ev_scalar,1);
   const uint64_t a=cg_run(*ds[0],ev_scalar,1),b=cg_run(*ds[0],ev_v3,1),c=h5?cg_run(*ds[0],ev_v5,1):a;
   const uint64_t a1=cg_run(*ds[0],id_scalar,1),b1=cg_run(*ds[0],id_v3,1),c1=h5?cg_run(*ds[0],id_v5,1):a1;
-  printf("check %s\n",(a==b&&a==c&&a1==b1&&a1==c1&&a!=0)?"ok":"MISMATCH");
+  const uint64_t l0=cg_run(*ds[0],evl_ref,1),l1=h5?cg_run(*ds[0],evl_v5,1):l0;
+  printf("check %s\n",(a==b&&a==c&&a1==b1&&a1==c1&&a!=0&&l0==a&&l1==a)?"ok":"MISMATCH");
  }
  uint64_t ref=0;const char* refname="";
  for(const Case& c:cases){
