@@ -334,33 +334,19 @@ int main(){
  auto add=[&](const char* group,int reps,vector<pair<string,string>> env,const char* bin="",bool hs=false){for(int i=0;i<reps;++i)vars.push_back({string(group)+"#"+to_string(i),env,bin,hs});};
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
- add("B",2,{N8});
- add("z",2,{N8,{"SS_ISA","avx512z"}});add("y",2,{N8,{"SS_ISA","avx512y"}});
- add("idx",1,{N8,{"SS_LINES","index"}});add("idxz",1,{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}});
- add("pop",1,{N8,{"SS_INPUT","populate"}});add("seq",1,{N8,{"SS_INPUT","seq"}});add("chk",1,{N8,{"SS_INPUT","chunk"}});
- add("tsk",2,{N8},"core-tsk");
- for(int r=0;r<2;++r)for(const char* a:{"1","2","6","3","4","5"})vars.push_back({string("a")+a+"#"+to_string(r),{N8,{"SS_ABL",a}},"core-abl",false});
- add("B",1,{N8});
- add("pb4k",1,{N8,{"SS_PERSONBUCKET","4096"}});add("pb8k",2,{N8,{"SS_PERSONBUCKET","8192"}});add("pb32k",1,{N8,{"SS_PERSONBUCKET","32768"}});
- add("cell",2,{N8,{"SS_CELLPASS","1"}});add("tabfull",2,{N8,{"SS_TABLE_FULL","1"}});add("noidblk",1,{N8,{"SS_NOIDBLOCKS","1"}});
- add("nowill",1,{N8,{"SS_NOWILLNEED","1"}});add("noearly",2,{N8,{"SS_NOEARLYUNMAP","1"}});
- add("ev2k",1,{N8,{"SS_PER","16384"}},"core-x");add("ev512",1,{N8,{"SS_PER","65536"}},"core-x");
- add("z",1,{N8,{"SS_ISA","avx512z"}});add("y",1,{N8,{"SS_ISA","avx512y"}});add("idx",1,{N8,{"SS_LINES","index"}});add("idxz",1,{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}});
- add("pop",1,{N8,{"SS_INPUT","populate"}});add("seq",1,{N8,{"SS_INPUT","seq"}});add("chk",1,{N8,{"SS_INPUT","chunk"}});
- add("B",1,{N8});
+ auto slots=[&](const char* name,const char* ahead,bool hs,int reps,const char* ncpu="8"){add(name,reps,{{"NCPU",ncpu},{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD",ahead}},"",hs);};
+ for(int r=0;r<2;++r){
+  add("B",1,{N8});add("nod",1,{N8,{"SS_NODENSE","1"}});add("u0",1,{N8,{"SS_DENSE_USERS","0"}});
+  slots("s0","0",false,1);slots("s1","1",false,1);slots("s2","2",false,1);slots("s3","3",false,1);slots("s4","4",false,1);
+  slots("s6","6",false,1);slots("s8","8",false,1);slots("s12","12",false,1);slots("s16","16",false,1);
+ }
+ add("B",1,{N8});add("nod",1,{N8,{"SS_NODENSE","1"}});
+ add("sz4",2,{N8,{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD","4"},{"SS_ISA","avx512z"}});
+ add("sp4",1,{N8,{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD","4"},{"SS_LINES","plain"}});
+ add("4B",1,{{"NCPU","4"}});slots("4s4","4",false,1,"4");slots("1s4","4",false,1,"1");
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- add("HB",2,{N8},"",true);
- add("Hz",1,{N8,{"SS_ISA","avx512z"}},"",true);
- add("Hpb8k",1,{N8,{"SS_PERSONBUCKET","8192"}},"",true);add("Hpb32k",1,{N8,{"SS_PERSONBUCKET","32768"}},"",true);add("Hpb49k",1,{N8,{"SS_PERSONBUCKET","49152"}},"",true);
- add("Hev4k",1,{N8,{"SS_PER","16384"},{"SS_CAP","8192"}},"core-x",true);add("Hev8k",1,{N8,{"SS_PER","8192"},{"SS_CAP","16384"}},"core-x",true);add("Hev1k",1,{N8,{"SS_CAP","1024"}},"core-x",true);
- add("Hcell",1,{N8,{"SS_CELLPASS","1"}},"",true);add("Hchk",1,{N8,{"SS_INPUT","chunk"}},"",true);add("Htabfull",1,{N8,{"SS_TABLE_FULL","1"}},"",true);
- add("Hslot150",1,{N8,{"SS_SLOTPCT","150"}},"",true);add("Hnoprobe",1,{N8,{"SS_NOSIMDPROBE","1"}},"",true);
- add("HB",1,{N8},"",true);add("Hz",1,{N8,{"SS_ISA","avx512z"}},"",true);
- // thread counts, practice-sized
- add("n4",1,{{"NCPU","4"}});add("n1",1,{{"NCPU","1"}});add("n6",1,{{"NCPU","6"}});add("B",1,{N8});
- const uint64_t benchN=getenv("SS_DIAG_BENCHN")?strtoull(getenv("SS_DIAG_BENCHN"),nullptr,10):20000000ull;
- const vector<double> bench8=bench_dense(benchN,8),bench8b=bench_dense(benchN,8),bench4=bench_dense(benchN,4),bench8x=bench_dense(benchN*3,8);
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);slots("Hs2","2",true,1);slots("Hs4","4",true,1);slots("Hs8","8",true,1);slots("Hs16","16",true,1);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -388,18 +374,12 @@ int main(){
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=fmt("B wPDALus","B","wPDALus");
-  a+="| P: ";for(const char* g:{"z","y","idx","idxz","pop","seq","chk","tsk","nowill","tabfull"})a+=fmt(g,g,"P");
-  a+="| abl P: ";for(const char* g:{"a1","a2","a6","a3","a4","a5"})a+=fmt(g+1,g,"P");
-  a+="| w: ";for(const char* g:{"z","y","idxz","chk","tsk","noearly","tabfull","noidblk","n4","n6","n1"})a+=fmt(g,g,"w");
-  a+="| n1 u/s: "+to_string(mn("n1","u"))+"/"+to_string(mn("n1","s"));
-  c+="DA: ";for(const char* g:{"pb4k","pb8k","pb32k","cell"})c+=fmt(g,g,"wDA");
-  c+=fmt("ev2k wPD","ev2k","wPD")+fmt("ev512","ev512","wPD")+fmt("noidblk L","noidblk","L")+fmt("tabfull L","tabfull","L");
-  c+="| 60x: "+fmt("B wPDALus","HB","wPDALus")+fmt("z wP","Hz","wP")+fmt("chk wP","Hchk","wP")+fmt("tabfull wP","Htabfull","wP");
-  for(const char* g:{"Hpb8k","Hpb32k","Hpb49k","Hcell","Hslot150","Hnoprobe"})c+=fmt(string(g+1)+" wDA",g,"wDA");
-  for(const char* g:{"Hev1k","Hev4k","Hev8k"})c+=fmt(string(g+1)+" wPDA",g,"wPDA");
-  {auto bs=[&](const char* name,const vector<double>& v){string o=string(name)+"=";for(size_t i=0;i<v.size();++i){if(i)o+="/";o+=to_string((long)(v[i]+0.5));}return o+" ";};
-   c+="| bench work/scatter/pass/direct1/2/4/8: "+bs("t8",bench8)+bs("t8b",bench8b)+bs("t4",bench4)+bs("t8x3",bench8x);}
+  a+=fmt("dense-users B wPDALus","B","wPDALus")+fmt("| nodense wPDALus","nod","wPDALus")+fmt("| users0 wPDAL","u0","wPDAL");
+  a+="| slots PARSE by AHEAD: ";for(const char* g:{"s0","s1","s2","s3","s4","s6","s8","s12","s16"})a+=fmt(g+1,g,"P");
+  a+=fmt("| s4 us","s4","us")+fmt("s4 avx512z P","sz4","P")+fmt("s4 plain P","sp4","P")+fmt("n4: B P","4B","P")+fmt("s4 P","4s4","P")+fmt("n1 s4 P","1s4","P");
+  c+="60x: "+fmt("B wPDALus","HB","wPDALus")+fmt("| nodense wPDALus","Hnod","wPDALus")+"| slots PARSE: ";
+  for(const char* g:{"Hs2","Hs4","Hs8","Hs16"})c+=fmt(g+2,g,"P");
+  c+=fmt("| Hs4 us","Hs4","us");
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
