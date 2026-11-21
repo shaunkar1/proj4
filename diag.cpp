@@ -398,12 +398,13 @@ int main(){
  for(int r=0;r<3;++r){
   add("B",1,{N8});add("v3",1,{N8,V3});add("O",1,{N8});add("Os",1,{N8,ST});add("Oe",1,{N8,{"SS_OUTOPEN","early"}});add("Ow",1,{N8,{"SS_OUTWRITE","end"}});
   add("pB",1,{N8,PO});add("pN",1,{N8,PO},"core-n");add("pK",1,{N8,PO},"core-k");
+  add("h",1,{N8},"core-h");
   add("pb",1,{N8,{"OMP_PROC_BIND","true"}});add("wa",1,{N8,{"OMP_WAIT_POLICY","active"}});add("pbwa",1,{N8,{"OMP_PROC_BIND","true"},{"OMP_WAIT_POLICY","active"}});
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
  for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hv3",1,{N8,V3},"",true);add("HO",1,{N8},"",true);add("HOs",1,{N8,ST},"",true);add("HOe",1,{N8,{"SS_OUTOPEN","early"}},"",true);
-  add("HpB",1,{N8,PO},"",true);add("HpN",1,{N8,PO},"core-n",true);add("HpK",1,{N8,PO},"core-k",true);add("Hpbwa",1,{N8,{"OMP_PROC_BIND","true"},{"OMP_WAIT_POLICY","active"}},"",true);}
+  add("HpB",1,{N8,PO},"",true);add("HpN",1,{N8,PO},"core-n",true);add("HpK",1,{N8,PO},"core-k",true);add("Hpbwa",1,{N8,{"OMP_PROC_BIND","true"},{"OMP_WAIT_POLICY","active"}},"",true);add("Hh",1,{N8},"core-h",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
@@ -458,9 +459,9 @@ int main(){
    string y;bool skip=false;size_t i=0;while(i<x.size()){size_t e=x.find(' ',i);if(e==string::npos)e=x.size();const string tok=x.substr(i,e-i);i=e+1;if(tok.empty())continue;
     const bool name=isalpha((unsigned char)tok[0]);if(name)skip=(tok=="n"||tok=="nl"||tok=="se"||tok=="ew"||tok=="wc"||tok=="gn"||tok=="tc"||tok=="le");if(!skip){if(!y.empty())y+=' ';y+=tok;}}
    return y;};
-  a+=eqText+" | wPRYXAW/us/exit: "+fmt("v4","B","wPRYXAWusE")+fmt("v3","v3","wPRXus")+fmt("v4->/output","O","wPRYXAWusE")+fmt("outopen-early","Oe","wXAW")+fmt("outwrite-end","Ow","wXAW")+fmt("bind","pb","wPX")+fmt("spin","wa","wPX")+fmt("bind+spin","pbwa","wPXus");
+  a+=eqText+" | wPRYXAW/us/exit: "+fmt("v4","B","wPRYXAWusE")+fmt("v3","v3","wPRXus")+fmt("v4->/output","O","wPRYXAWusE")+fmt("outopen-early","Oe","wXAW")+fmt("outwrite-end","Ow","wXAW")+fmt("bind","pb","wPX")+fmt("spin","wa","wPX")+fmt("bind+spin","pbwa","wPXus")+fmt("march=cascadelake","h","wPRXAus");
   a+="| parse-only P/us: "+fmt("base","pB","Pus")+fmt("nolock","pN","Pus")+fmt("nocommit","pK","Pus")+fmt("60x base","HpB","Pus")+fmt("60x nolock","HpN","Pus")+fmt("60x nocommit","HpK","Pus");
-  c+="60x wPRYXAW/us/exit: "+fmt("v4","HB","wPRYXAWusE")+fmt("v3","Hv3","wPRX")+fmt("v4->/output","HO","wPRYXAWusE")+fmt("outopen-early","HOe","wXAW")+fmt("bind+spin","Hpbwa","wPX");
+  c+="60x wPRYXAW/us/exit: "+fmt("v4","HB","wPRYXAWusE")+fmt("v3","Hv3","wPRX")+fmt("v4->/output","HO","wPRYXAWusE")+fmt("outopen-early","HOe","wXAW")+fmt("bind+spin","Hpbwa","wPX")+fmt("march=cascadelake","Hh","wPRXA");
   {const RunResult* r=get("Os#0");if(r)c+="| DENSE threads 20M->/output:"+squeeze(r->dth)+" csw "+r->csw+" "+fmt("w/sysX/cpuX","Os","wzx");}
   {const RunResult* r=get("HOs#0");if(r)c+="| 60x:"+squeeze(r->dth)+" csw "+r->csw+" "+fmt("w/sysX/cpuX","HOs","wzx");}
   c+="|| "+benchText;
