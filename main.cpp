@@ -178,7 +178,12 @@ static vector<fs::path> csv_files(const fs::path& dir){
  vector<fs::path> out;
  if(!fs::is_directory(dir))throw runtime_error("Missing input folder: "+dir.string());
  for(auto& f:fs::directory_iterator(dir))if(f.is_regular_file()&&f.path().extension()==".csv")out.push_back(f.path());
- sort(out.begin(),out.end());return out;
+ // All entries are dir/name with the same dir, so comparing the whole strings orders them exactly as comparing the
+ // paths does (which walks both paths element by element on every comparison). SS_PATHSORT=path: the path comparison.
+ static const bool pathSort=getenv("SS_PATHSORT")&&string_view(getenv("SS_PATHSORT"))=="path";
+ if(pathSort)sort(out.begin(),out.end());
+ else sort(out.begin(),out.end(),[](const fs::path& a,const fs::path& b){return a.native()<b.native();});
+ return out;
 }
 // Every input file stays mapped until exit: IDs are kept as views into the maps.
 struct Mapped{const char* base=nullptr;size_t len=0;};
@@ -244,20 +249,49 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
  if(base==MAP_FAILED)throw runtime_error("Cannot reserve address space for the input files");
  if(optFileAlign)base=(void*)(((uintptr_t)base+HUGE2M-1)&~(uintptr_t)(HUGE2M-1)); // the unused edges stay reserved, without pages
  g.base=(char*)base;g.len=total;size_t off=0;
- static const bool willNeed=!getenv("SS_NOWILLNEED"); // measuring switch
- for(size_t i=0;i<paths.size();++i){
-  if(!lens[i])continue;
-  int fd=open(paths[i].c_str(),O_RDONLY);
-  if(fd<0)throw runtime_error("Cannot open "+paths[i].string());
-  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
-  close(fd);
-  if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
-  if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
-  if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
-  if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
-  out[i]={g.base+off,lens[i]};
-  off+=slot_of(lens[i]);g.ends.push_back(off);
+ // MADV_WILLNEED walks the page cache of the whole file (measured: ~15 us per 11 MB file with everything cached,
+ // more than half of the MAP stage). By default a background thread per folder makes those calls, so read-ahead of
+ // files that are not cached still starts at once while this thread goes on. SS_WILLNEED=inline: this thread makes
+ // them, file by file, as before. SS_NOWILLNEED=1: no such calls at all.
+ static const int willNeed=getenv("SS_NOWILLNEED")?0:(getenv("SS_WILLNEED")&&string_view(getenv("SS_WILLNEED"))=="inline")?1:2;
+ vector<pair<void*,size_t>> later;
+ // Where each file goes is fixed first, so the files can be opened and mapped by several threads at once (the calls
+ // of one file take ~8 us and a run has a few hundred files): SS_MAPTHREADS=n, n = 2..16 threads for folders of 16
+ // files or more. Default 1 (this thread alone, as before): not measurable on the loaded two-core dev box.
+ static const int mapThreads=[]{const char* v=getenv("SS_MAPTHREADS");const int x=v?atoi(v):1;return x<1?1:x>16?16:x;}();
+ vector<size_t> offs(paths.size(),0);
+ for(size_t i=0;i<paths.size();++i){if(!lens[i])continue;offs[i]=off;off+=slot_of(lens[i]);g.ends.push_back(off);}
+ atomic<size_t> nextFile{0},badOpen{SIZE_MAX},badMap{SIZE_MAX};
+ const auto note_min=[](atomic<size_t>& a,size_t i){size_t c=a.load();while(i<c&&!a.compare_exchange_weak(c,i)){}};
+ const auto map_some=[&]{
+  for(;;){
+   const size_t i=nextFile.fetch_add(1,memory_order_relaxed);if(i>=paths.size())break;
+   if(!lens[i])continue;
+   int fd=open(paths[i].c_str(),O_RDONLY);
+   if(fd<0){note_min(badOpen,i);continue;}
+   void* got=mmap(g.base+offs[i],lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
+   close(fd);
+   if(got==MAP_FAILED){note_min(badMap,i);continue;}
+   if(willNeed==1)madvise(got,lens[i],MADV_WILLNEED);
+   if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
+   if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
+   out[i]={g.base+offs[i],lens[i]};
+  }
+ };
+ {
+  vector<thread> helpers;
+  if(paths.size()>=16)for(int t=1;t<mapThreads;++t)helpers.emplace_back(map_some);
+  map_some();
+  for(thread& h:helpers)h.join();
  }
+ // The first file that failed, in the order of the list, is the one reported (open before map, as one thread would).
+ {const size_t bo=badOpen.load(),bm=badMap.load();
+  if(bo!=SIZE_MAX&&bo<bm)throw runtime_error("Cannot open "+paths[bo].string());
+  if(bm!=SIZE_MAX)throw runtime_error("Cannot map "+paths[bm].string());}
+ if(willNeed==2)for(size_t i=0;i<paths.size();++i)if(lens[i])later.push_back({(void*)out[i].base,lens[i]});
+ // Advice only: it cannot change what is read. (A call that came after its file was unmapped would fail or hint
+ // at whatever is mapped there by then; the calls are done long before anything is unmapped.)
+ if(!later.empty())thread([list=move(later)]{for(const auto& [p,n]:list)madvise(p,n,MADV_WILLNEED);}).detach();
  return out;
 }
 // Cuts a group into about `parts` pieces of similar size at file boundaries (for unmapping in parallel).
@@ -4530,6 +4564,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  auto __sysflt=[&](const char* label){double s;long f,v,iv;__ru_now(s,f,v,iv);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\nCSW "<<label<<" "<<v-__vol0<<" "<<iv-__inv0<<"\n";__sys0=s;__flt0=f;__vol0=v;__inv0=iv;};
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
+ // SS_FINE=1: FINE lines, the time since the start of run() at points inside the stages (the split of the serial
+ // work before the parse stage, the side thread, the campaign file). Measuring only.
+ static const bool fineLines=getenv("SS_FINE")!=nullptr;
+ static const auto fineT0=chrono::steady_clock::now();
+ const auto __fine=[](const char* label){if(fineLines)fprintf(stderr,"FINE %s %.6f\n",label,chrono::duration<double>(chrono::steady_clock::now()-fineT0).count());};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
  if(const char* v=getenv("SS_FILEALIGN")){const string_view w(v);optFileAlign=w=="2m"?1:w=="2m+huge"?2:0;}
  if(const char* v=getenv("SS_OUTOPEN"))optOutEarly=string_view(v)=="early";
@@ -4538,12 +4577,46 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(const char* v=getenv("SS_POPULATE")){const string_view w(v);optPopulate=w=="ahead"?1:w=="all"?2:w.substr(0,2)=="bg"?3:0;
   if(optPopulate==3&&w.size()>2){const int n=atoi(v+2);if(n>=1&&n<=64)optPopulateBg=n;}}
  if(__cpuLines)cerr<<"STATS kernel switches: SS_FILEALIGN="<<(optFileAlign==2?"2m+huge":optFileAlign?"2m":"off")<<" SS_POPULATE="<<(optPopulate==1?"ahead":optPopulate==2?"all":optPopulate==3?"bg"+to_string(optPopulateBg):string("off"))
-  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" SS_OUTOPEN="<<(optOutEarly?"early":"off")<<" SS_OUTWRITE="<<(optOutEnd?"end":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
+  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" SS_OUTOPEN="<<(optOutEarly?"early":"off")<<" SS_OUTWRITE="<<(optOutEnd?"end":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<(getenv("SS_NOWILLNEED")?"off":(getenv("SS_WILLNEED")&&string_view(getenv("SS_WILLNEED"))=="inline")?"inline":"bg")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
  int nday=(int)((window_end-window_start+DAY-1)/DAY);
  if(nday<=0||nday>1000)throw runtime_error("Unreasonable window length");
+ // ---- Products and campaigns: two small files that depend on nothing else. They are read by a side thread
+ // while this one maps the inputs and the link stages run (about 9 million instructions that used to sit, on one
+ // thread, in front of the parse stage). The tables are only used after the join below, where a failure of the
+ // side thread is thrown again. SS_CATALOG=inline: read them on this thread at that place, as before.
+ FastMap<uint16_t> categories;vector<string> catnames;
+ KeyTable products(1<<17); // product_id -> category number
+ vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
+ uint16_t organic=0;
+ const auto load_catalog=[&]{
+ cat_id("unknown",categories,catnames);
+ // Categories repeat: a small memo of the last category texts seen saves most of the string-map lookups.
+ struct CatMemo{const char* p;uint32_t n;uint16_t id;};
+ CatMemo catMemo[64]={};
+ read_pairs(data/"products.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean products.csv");
+  const string_view c=f[1];
+  uint64_t w;memcpy(&w,c.data(),8);w&=LOW_BYTES[min<size_t>(c.size(),8)]; // mapped input: reading past the end is safe
+  CatMemo& e=catMemo[((w^c.size())*0x9e3779b97f4a7c15ULL)>>58];
+  uint16_t id;
+  if(e.p&&e.n==c.size()&&memcmp(e.p,c.data(),c.size())==0)id=e.id;
+  else{id=cat_id(c,categories,catnames);e.p=c.data();e.n=(uint32_t)c.size();e.id=id;}
+  products.intern(f[0],id);
+ });
+ read_pairs(data/"campaigns.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean campaigns.csv");
+  if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
+  const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
+ organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
+ };
+ const bool catalogBg=!(getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="inline");
+ exception_ptr catalogErr;thread catalogThread;
+ struct Joiner{thread& t;~Joiner(){if(t.joinable())t.join();}} catalogJoiner{catalogThread}; // an exception on the way must not meet a running thread
+ if(catalogBg)catalogThread=thread([&]{try{load_catalog();}catch(...){catalogErr=current_exception();}__fine("catalog-read-end");});
+ __fine("start");
  // The scorer may limit CPU by quota rather than by affinity, so trust NCPU when it is set.
  int T=max(1,omp_get_max_threads());
  if(const char* n=getenv("NCPU")){int v=atoi(n);if(v>=1&&v<=1024)T=v;}
@@ -4559,10 +4632,20 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(size_t from=0;from<m.len;from+=CH)chunks.push_back({m.base,m.len,from,from+CH,click});}
  };
  add_files(data/"events",false,eventBytes,eventFiles);
+ __fine("map-events");
  add_files(data/"clicks",true,clickBytes,clickFiles);
+ __fine("map-clicks");
  // Lines per byte, measured on the start of the largest event file, sizes the bucket buffers tightly.
  uint64_t estEvents=eventBytes/70;
- if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
+ // (The count is a plain sum over the bytes, so it is taken in pieces by all threads: the same number as one
+ // pass, which costs this thread the first touch and a scan of 4 MB. SS_SAMPLE=serial: one pass, as before.)
+ if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);uint64_t nl=0;
+  static constexpr size_t SAMPLE_PIECE=size_t(256)<<10;
+  if(T==1||n<=SAMPLE_PIECE||(getenv("SS_SAMPLE")&&string_view(getenv("SS_SAMPLE"))=="serial"))nl=(uint64_t)count_newlines(sampleBase,n);
+  else{
+   #pragma omp parallel for num_threads(T) schedule(static,1) reduction(+:nl)
+   for(size_t at=0;at<n;at+=SAMPLE_PIECE)nl+=(uint64_t)count_newlines(sampleBase+at,min(SAMPLE_PIECE,n-at));
+  }
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
  // SS_POPULATE=all|bg: the input's pages are entered into the page tables by madvise calls, a chunk at a time.
@@ -4599,6 +4682,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   };
   const vector<uint64_t> es=sample(sampleBase,sampleLen,0,'e'),us=sample(sampleBase,sampleLen,1,'u');
   vector<uint64_t> cs;for(const Chunk& c:chunks)if(c.click&&c.from==0){cs=sample(c.base,c.len,0,'k');if(cs.size()>=12)break;}
+  __fine("key-samples");
   dn::Info d;
   d.limE=min<uint64_t>(estEvents+estEvents/8+4096,uint64_t(1)<<31);
   d.limC=min<uint64_t>(estClicks+estClicks/8+4096,uint64_t(1)<<31);
@@ -4643,6 +4727,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   ++linkLines; // a last line without '\n'
   linkBytes+=m.len;++linkFileCount;
   for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+ __fine("map-links");
  static const bool idBlocks=!getenv("SS_NOIDBLOCKS"); // measuring switch: per-thread ID blocks in the links stage
  // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
  // If a dataset has more, the extra ones take the thread-private fallback path (slower, still exact).
@@ -4728,6 +4813,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    apply();out.maxIdx=maxIdx;
   }
  }
+ __fine("link-pass");
  // The pairs to replay: for every complex index, each alias that the simple lines put into a group
  // with a smaller one. (Indexes the test switch marked complex were never noted; they are looked up here.)
  struct Replay{uint32_t idx;uint8_t a,b;};
@@ -4895,28 +4981,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked-idHoles<<"\n";
- FastMap<uint16_t> categories;vector<string> catnames;
- cat_id("unknown",categories,catnames);
- KeyTable products(1<<17); // product_id -> category number
- // Categories repeat: a small memo of the last category texts seen saves most of the string-map lookups.
- struct CatMemo{const char* p;uint32_t n;uint16_t id;};
- CatMemo catMemo[64]={};
- read_pairs(data/"products.csv",[&](const string_view* f,bool ok){
-  if(!ok)throw runtime_error("Malformed clean products.csv");
-  const string_view c=f[1];
-  uint64_t w;memcpy(&w,c.data(),8);w&=LOW_BYTES[min<size_t>(c.size(),8)]; // mapped input: reading past the end is safe
-  CatMemo& e=catMemo[((w^c.size())*0x9e3779b97f4a7c15ULL)>>58];
-  uint16_t id;
-  if(e.p&&e.n==c.size()&&memcmp(e.p,c.data(),c.size())==0)id=e.id;
-  else{id=cat_id(c,categories,catnames);e.p=c.data();e.n=(uint32_t)c.size();e.id=id;}
-  products.intern(f[0],id);
- });
- vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
- read_pairs(data/"campaigns.csv",[&](const string_view* f,bool ok){
-  if(!ok)throw runtime_error("Malformed clean campaigns.csv");
-  if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
-  const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
- uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
+ __fine("catalog-join");
+ if(catalogBg){catalogThread.join();if(catalogErr)rethrow_exception(catalogErr);}else load_catalog();
+ __fine("catalog-ready");
 
  // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
  const size_t PE=pow2_parts(eventBytes/70),PC=pow2_parts(clickBytes/40);
@@ -4994,6 +5061,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const size_t usedE=DE?min<size_t>(DE,(size_t)((spanE-1)>>dparse.shE)+1):0,usedC=DC?min<size_t>(DC,(size_t)((spanC-1)>>dparse.shC)+1):0;
  if(getenv("SS_STATS")&&(DE||DC))cerr<<"STATS dense buckets events "<<DE<<" (span "<<spanE<<", "<<usedE<<" x "<<rdFull<<" records) clicks "<<DC<<" (span "<<spanC<<", "<<usedC<<" x "<<rdcFull<<" records)\n";
  if(T>65535)throw runtime_error("Too many threads"); // ESlot::thread
+ __fine("parse-region");
  #pragma omp parallel num_threads(T)
  {
   ThreadState& tl=tls[omp_get_thread_num()];
@@ -5765,6 +5833,55 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  static const size_t SMALL_BUCKET=[]{const char* v=getenv("SS_SMALLBUCKET");const long x=v?atol(v):4096;return (size_t)(x<0?0:x);}();
  if(personSess)cerr<<"test: every person through sessionize_person\n";
  uint64_t num_sessions=0;
+ // campaign_daily: the totals of all threads added up, one row per campaign and day with a session or an assist,
+ // one file. By default one worker does this as soon as every thread has left the last sessionizing loop, while
+ // the others flush and close their user_daily files and hand memory back (it used to follow the parallel
+ // region on one thread: the WRITE stage). SS_CAMPWRITE=end: after the region, as before. Same bytes either way.
+ static const bool campEarly=!(getenv("SS_CAMPWRITE")&&string_view(getenv("SS_CAMPWRITE"))=="end");
+ string campCsv; // SS_DEBUG_CSV rows
+ vector<Totals> campTotals(ncamp*(size_t)ndays);
+ const auto merge_totals=[&](size_t lo,size_t hi){ // cells [lo,hi) of every thread's totals added into campTotals
+  for(const Totals* tt:threadTotals)if(tt)for(size_t i=lo;i<hi;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
+  for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=lo;i<hi;++i)campTotals[i].assists+=ta[i];
+ };
+ static constexpr size_t MERGE_BLOCK=4096;
+ const auto write_campaigns=[&]{
+  if(!campEarly)merge_totals(0,ncells); // otherwise all threads have added the totals up, a block of cells each
+  string& csv=campCsv;
+  const auto open_camp=[&](PqFile& f){f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
+   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});};
+  if(campEarly){
+   // The same column bodies as below, written through pointers into buffers with room for a row of every cell
+   // (a length-prefixed text is its 32-bit little-endian length and its bytes; the numbers are little-endian as stored).
+   size_t idBytes=0,chBytes=0;for(size_t ci=0;ci<ncamp;++ci){idBytes+=4+campaigns[ci].id.size();chBytes+=4+campaigns[ci].channel.size();}
+   const auto cidBuf=make_unique_for_overwrite<char[]>(idBytes*(size_t)ndays+1),chanBuf=make_unique_for_overwrite<char[]>(chBytes*(size_t)ndays+1);
+   const auto dayBuf=make_unique_for_overwrite<int32_t[]>(ncells+1);
+   const auto sBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),pBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),rBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),aBuf=make_unique_for_overwrite<int64_t[]>(ncells+1);
+   char* pc=cidBuf.get();char* ph=chanBuf.get();size_t n=0;
+   for(size_t ci=0;ci<ncamp;++ci){
+    const string& id=campaigns[ci].id;const string& ch=campaigns[ci].channel;const uint32_t il=(uint32_t)id.size(),cl=(uint32_t)ch.size();
+    for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
+     memcpy(pc,&il,4);memcpy(pc+4,id.data(),il);pc+=4+il;memcpy(ph,&cl,4);memcpy(ph+4,ch.data(),cl);ph+=4+cl;
+     dayBuf[n]=(int32_t)(firstday+d);sBuf[n]=(int64_t)t.sessions;pBuf[n]=(int64_t)t.purchasing_sessions;rBuf[n]=(int64_t)t.revenue;aBuf[n]=(int64_t)t.assists;++n;
+     if(debugCsv){csv+=hexstr(id);csv+=',';csv+=hexstr(ch);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
+    }
+   }
+   PqFile f;open_camp(f);
+   if(n)f.row_group((int64_t)n,{string_view(cidBuf.get(),(size_t)(pc-cidBuf.get())),string_view(chanBuf.get(),(size_t)(ph-chanBuf.get())),string_view((const char*)dayBuf.get(),n*sizeof(int32_t)),
+    string_view((const char*)sBuf.get(),n*sizeof(int64_t)),string_view((const char*)pBuf.get(),n*sizeof(int64_t)),string_view((const char*)rBuf.get(),n*sizeof(int64_t)),string_view((const char*)aBuf.get(),n*sizeof(int64_t))});
+   f.close();
+   return;
+  }
+  string cid,chan;vector<int32_t> days;vector<int64_t> s,p,r,a;
+  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
+   put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
+   s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
+   if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
+  }
+  PqFile f;open_camp(f);
+  if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
+  f.close();
+ };
  // Input files nobody reads any more are unmapped by the worker threads, a few large pieces each,
  // instead of leaving every page of them to process exit, which tears mappings down on one thread.
  vector<pair<char*,size_t>> unmapFirst,unmapLast;
@@ -6495,9 +6612,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    }
    thr_chunk_out();
   }
+  // The loop above ended with a barrier: every thread's totals are final. (A failed write ends the run from
+  // inside the region, as a failed write of a user_daily file does.)
+  // The totals are added up by all threads (each cell by one thread), then one of them builds and writes the file.
+  #pragma omp for schedule(static)
+  for(size_t b=0;b<(campEarly?(ncells+MERGE_BLOCK-1)/MERGE_BLOCK:0);++b)merge_totals(b*MERGE_BLOCK,min(ncells,(b+1)*MERGE_BLOCK));
+  #pragma omp single nowait
+  {if(campEarly){__fine("campaign-begin");write_campaigns();__fine("campaign-end");}}
   const double thrE0=stats?now_s():0;
   // Every row is in the output buffers now (names are copied there): nothing points into an input file.
-  #pragma omp for schedule(static,1) nowait
+  #pragma omp for schedule(dynamic,1) nowait // whoever is free takes a piece: the thread with the campaign file comes late
   for(size_t i=0;i<unmapLast.size();++i)munmap(unmapLast[i].first,unmapLast[i].second);
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
@@ -6508,9 +6632,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(stats)thr_line("aggregate",astat,thrA0?thrA0:thrR0,0,0);
  if(earlyOut)for(size_t t=0;t<earlyOut->fd.size();++t)if(earlyOut->fd[t]>=0){ // a file no worker wrote to: it must not stay behind empty
   ::close(earlyOut->fd[t]);earlyOut->fd[t]=-1;char name[32];snprintf(name,sizeof name,"part-%05d.parquet",(int)t);::unlink((output/"user_daily"/name).c_str());}
- vector<Totals> campTotals(ncamp*(size_t)ndays);
- for(const Totals* tt:threadTotals)if(tt)for(size_t i=0;i<ncells;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
- for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=0;i<ncells;++i)campTotals[i].assists+=ta[i];
+ __fine("region-end");
+ if(!campEarly)write_campaigns();
+ if(earlyOut&&earlyOut->campFd>=0){::close(earlyOut->campFd);earlyOut->campFd=-1;} // SS_OUTOPEN=early: the campaign file is written by write_campaigns() through its own descriptor
 __mark("AGGREGATE");
  if(slots&&stats){
   fprintf(stderr,"STATS dense reader: slots %llu events %llu clicks, fast lane %llu indexes %llu events %llu clicks, handed over %llu events %llu clicks, deferred indexes %llu\n",
@@ -6520,19 +6644,7 @@ __mark("AGGREGATE");
   fprintf(stderr,"STATS person buckets: %zu of 2^%u table persons, %zu of 2^%u dense persons\n",nA,shA,UPn-nA,shB);
  }
  {
-  string cid,chan,csv;vector<int32_t> days;vector<int64_t> s,p,r,a;
-  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
-   put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
-   s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
-   if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
-  }
-  PqFile f;
-  const vector<PqCol> campCols={{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
-   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}};
-  if(earlyOut&&earlyOut->campFd>=0){f.adopt(earlyOut->campFd,campCols);earlyOut->campFd=-1;}
-  else f.open(output/"campaign_daily"/"part-00000.parquet",campCols);
-  if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
-  f.close();
+  const string& csv=campCsv;
   if(debugCsv){
    fs::create_directories(scratch);
    ofstream uout(scratch/"user_rows.csv",ios::binary|ios::trunc),cout(scratch/"campaign_rows.csv",ios::binary|ios::trunc);
