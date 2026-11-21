@@ -554,28 +554,26 @@ static constexpr uint32_t LOCAL_USER=0x80000000u;
 // One parsed event line, 32 bytes (two per cache line), bucketed by event_id hash so duplicates meet in one bucket.
 //  id    start of the event_id text in the mapped input. Its length is not kept: the text ends at the
 //        first ',' or '"' (an ID holds neither, and field 0 is always followed by one of them).
-//  k     for a valid line Ev::k (see below) with PR_VALID set on top, else 0.
+//  k     0 for a line that is not a valid event, else Ev::k (see below) + PR_KBIAS: the relative time is
+//        kept one higher, so a valid k is never 0.
 //  user  the user/person number (filled in by resolve_users on the AVX2 path); may carry LOCAL_USER.
 //  cat   category number of a purchase, else 0.
 //  hx    hash bits 25-40 of the event_id.
-//  ih    ingest code << 25 | hash bits 0-24. The ingest code is ingest_ts in whole seconds counted from
-//        INGEST_BASE_S; INGEST_SIDE means "not representable": the true milliseconds are then in the
-//        thread's ingestSide list under this id pointer (only the general parser path can produce that).
+//  ih    ingest code << 25 | hash bits 0-24. The ingest code is ingest_ts in milliseconds counted from
+//        ingestBase (about 8.7 years before the window; 39 bits reach about 8.7 years past it).
+//        INGEST_SIDE means "out of that range": the true value is then in the thread's ingestSide list
+//        under this id pointer. Only the general parser path stores such records.
 struct PRec{const char* id;uint64_t k;uint32_t user;uint16_t cat;uint16_t hx;uint64_t ih;};
 static_assert(sizeof(PRec)==32);
-static constexpr uint64_t PR_VALID=1ull<<63; // Ev::k never reaches bit 62
+static constexpr uint64_t PR_KBIAS=1ull<<25; // = 1 << EV_TS; relative time + 1 still fits (window < 2^37 ms)
 static constexpr unsigned PR_HBITS=25;
 static constexpr uint64_t PR_HMASK=(1ull<<PR_HBITS)-1;
-// One day before 0000-01-01T00:00:00Z: every F1/F2 timestamp (years 0000-9999, offsets up to 23:59)
-// lies above it and less than 2^39-1 seconds past it.
-static constexpr int64_t INGEST_BASE_S=-62167219200LL-86400;
 static constexpr uint64_t INGEST_SIDE=(1ull<<39)-1;
-// Ingest code of a timestamp in milliseconds, INGEST_SIDE if it is not whole seconds or out of range.
+static int64_t ingestBase; // set with the window: window_start - 2^38 ms
+// Ingest code of a timestamp in milliseconds, INGEST_SIDE if it is out of range. Codes order like the times.
 static inline uint64_t ingest_code(int64_t ms){
- if(ms%1000!=0)return INGEST_SIDE;
- const int64_t sec=ms/1000;
- if(sec<INGEST_BASE_S)return INGEST_SIDE;
- const uint64_t c=(uint64_t)(sec-INGEST_BASE_S);
+ if(ms<ingestBase)return INGEST_SIDE;
+ const uint64_t c=(uint64_t)ms-(uint64_t)ingestBase; // exact: the true distance is below 2^64
  return c<INGEST_SIDE?c:INGEST_SIDE;
 }
 // h = hkey(event_id); code = ingest code; k and cat as described above.
@@ -608,6 +606,7 @@ struct Chunk{const char* base;size_t len,from,to;bool click;};
 struct Ev{uint64_t k;uint32_t person;uint16_t cat;uint16_t pad;};
 static constexpr uint64_t EV_PURCHASE=1ull<<24,EV_PRICE=EV_PURCHASE-1;
 static constexpr unsigned EV_TS=25;
+static_assert(PR_KBIAS==1ull<<EV_TS);
 // One surviving click, 24 bytes. key = (ts - (window_start - 7 days))<<16 | campaign.
 struct Click{uint64_t key;const char* id;uint32_t person;uint32_t idlen;};
 // Order of a person's clicks: by ts, and at equal ts the byte-wise larger ID first, so the last click
@@ -829,7 +828,8 @@ SS_V3I bool epoch13_v3(const char* p,int64_t& out){
  return true;
 }
 // "YYYY-MM-DD" -> milliseconds at 00:00 UTC, remembered per thread. The slot comes straight from the
-// month and day digits, so the dates of one year never push each other out. Only valid dates are stored.
+// month and day digits, so the dates of one year never push each other out. Only valid dates within
+// reach of an ingest code (see PRec) are stored; for any other text the answer is false.
 struct DateMemo3{uint64_t k;uint32_t cc;uint32_t pad;int64_t ms;}; // k = bytes 2..9, cc = bytes 0..1; cc of an unused entry is all ones and never matches
 static thread_local DateMemo3 dateMemo3[4096];
 static thread_local bool dateMemo3Ready=false;
@@ -844,7 +844,11 @@ static DateMemo3* date_memo3(){
  const int y=(int)(d[0]*1000+d[1]*100+d[2]*10+d[3]),m=(int)(d[4]*10+d[5]),dd=(int)(d[6]*10+d[7]);
  static constexpr int mlen[13]={0,31,28,31,30,31,30,31,31,30,31,30,31};
  if(m<1||m>12||dd<1||dd>mlen[m]+((m==2&&leap(y))?1:0))return false;
- dayms=days_from_civil(y,(unsigned)m,(unsigned)dd)*DAY;
+ const int64_t ms=days_from_civil(y,(unsigned)m,(unsigned)dd)*DAY;
+ // Days that an ingest code cannot express (years away from the window) are not remembered and not
+ // answered here: the callers then take their general route, which is exact for any date.
+ if(ms<ingestBase||(uint64_t)ms-(uint64_t)ingestBase>=INGEST_SIDE-(uint64_t)DAY)return false;
+ dayms=ms;
  uint16_t cc;memcpy(&e.k,p+2,8);memcpy(&cc,p,2);e.cc=cc;e.ms=dayms;return true;
 }
 static inline __attribute__((always_inline)) bool date3(const char* p,DateMemo3* memo,int64_t& dayms){
@@ -914,7 +918,7 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
  const char* p=nl+1;
  const char* lim=base+min(to,len);
  DateMemo3* const memo=date_memo3();
- const int64_t wstart=window_start;const uint64_t wlen=(uint64_t)(window_end-window_start);
+ const int64_t wstart=window_start;const uint64_t wlen=(uint64_t)(window_end-window_start),ibase=(uint64_t)ingestBase;
  const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
  PendUser<PRec> pend[V3_BATCH];PendUser<PRec>* pp=pend;
  AVec<PRec>* const buckets=tl.eb.data();KeyTable::Slot* const slots=tab.slots;const size_t tmask=tab.mask;
@@ -949,6 +953,7 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
    int64_t tod3,ingestDay;
    if(__builtin_expect(l3!=20||s3[19]!='Z'||(tod3=tod_v3(s3))<0||!date3(s3,memo,ingestDay),0)){done=false;break;}
    const int64_t ingest=ingestDay+tod3;
+   const uint64_t icode=(uint64_t)ingest-ibase; // in range: date3 only knows days whose codes fit
    B1=_blsr_u64(B1);E1=_blsr_u64(E1);
    const unsigned b1=(unsigned)_tzcnt_u64(B1),l1=(unsigned)_tzcnt_u64(E1)-b1;
    B1=_blsr_u64(B1);E1=_blsr_u64(E1);
@@ -981,13 +986,12 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
       const unsigned b6=(unsigned)_tzcnt_u64(B2),l6=(unsigned)_tzcnt_u64(E2)-b6;
       if(price_value(string_view(b+b6,l6),price)){
        const uint32_t ci=products.find(string_view(b+b5,l5));
-       cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;k=PR_VALID|(tsrel<<EV_TS)|EV_PURCHASE|(uint64_t)(uint32_t)price;valid=true;
+       cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;k=((tsrel+1)<<EV_TS)|EV_PURCHASE|(uint64_t)(uint32_t)price;valid=true;
       }
-     }else{k=PR_VALID|(tsrel<<EV_TS);valid=true;}
+     }else{k=(tsrel+1)<<EV_TS;valid=true;}
     }
    }
-   // an F1 ingest_ts is whole seconds within years 0000-9999, so its code always fits
-   const PRec r=make_prec(s0,h,(uint64_t)(ingest-INGEST_BASE_S*1000)/1000u,k,cat);
+   const PRec r=make_prec(s0,h,icode,k,cat);
    AVec<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
    if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
    if(valid){
@@ -1078,6 +1082,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  optHuge=!getenv("SS_NOHUGE");optPrefault=!getenv("SS_NOPREFAULT");optAsyncFree=!getenv("SS_NOASYNCFREE");
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
+ ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
  int nday=(int)((window_end-window_start+DAY-1)/DAY);
  if(nday<=0||nday>1000)throw runtime_error("Unreasonable window length");
  // The scorer may limit CPU by quota rather than by affinity, so trust NCPU when it is set.
@@ -1300,7 +1305,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(tsOk&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY){
      int32_t price=0;const bool purchase=kind==3;
      if(!purchase||price_value(f[6],price)){
-      k=PR_VALID|((uint64_t)(ts-window_start)<<EV_TS)|(purchase?EV_PURCHASE:0)|(uint64_t)(uint32_t)price;user=user_of(f[1]);
+      k=((uint64_t)(ts-window_start+1)<<EV_TS)|(purchase?EV_PURCHASE:0)|(uint64_t)(uint32_t)price;user=user_of(f[1]);
       if(purchase){const uint32_t c=products.find(f[5]);cat=c==KeyTable::NONE?0:(unsigned)(uint16_t)c;}
      }
     }
@@ -1357,7 +1362,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(!sideIngest.empty())cerr<<"ingest values kept on the side: "<<sideIngest.size()<<"\n";
  auto ingest_ms=[&](const PRec& r)->int64_t{
   const uint64_t c=r.ih>>PR_HBITS;
-  return c==INGEST_SIDE?sideIngest.find(r.id)->second:((int64_t)c+INGEST_BASE_S)*1000;
+  return c==INGEST_SIDE?sideIngest.find(r.id)->second:(int64_t)(c+(uint64_t)ingestBase);
  };
  const uint32_t newCount=totalIds-nlinked;
  cerr<<"unlinked IDs: "<<newCount<<" (+"<<extraNames.size()<<" via fallback)\n";
@@ -1414,9 +1419,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         // Keep the earliest ingested copy; copies with equal ingest_ts are identical.
         ++dups;
         const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
-        const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi; // codes order like the times
+        const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi;
         if(notEarlier)goto next_event;
-        if(o.k&PR_VALID){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
+        if(o.k){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
       }
@@ -1425,11 +1430,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      S[j]=tg|g1;
      {
       const uint64_t rk=r->k;
-      if(rk&PR_VALID){
+      if(rk){
        uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
        Ev* const out=myEv[u>>pshift].slot(pool);
        emitted[g1-1]=out;
-       out->k=rk&~PR_VALID; // otherwise already in its final form
+       out->k=rk-PR_KBIAS; // otherwise already in its final form
        const uint64_t w=(uint64_t)u|((uint64_t)r->cat<<32);memcpy((void*)&out->person,&w,8);
       }
      }
