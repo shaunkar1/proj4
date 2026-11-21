@@ -159,9 +159,11 @@ static void run_child(const string& bin,vector<pair<string,string>> env,RunResul
  for(int i=0;i<4;++i){fds[i]=perf_open(pid,PERF_TYPE_HARDWARE,cfg[i]);if(fds[i]<0&&!r.perfErr)r.perfErr=errno;}
  t=now();(void)!write(go[1],"g",1);close(go[1]);
  string out;char buf[4096];ssize_t n;
- while((n=read(pfd[0],buf,sizeof buf))>0)out.append(buf,n);
+ double tFirst=0,tLast=0;
+ while((n=read(pfd[0],buf,sizeof buf))>0){tLast=now();if(tFirst==0)tFirst=tLast;out.append(buf,n);}
  close(pfd[0]);
  int st=0;rusage ru{};wait4(pid,&st,0,&ru);r.wall=now()-t;
+ if(tFirst>0){r.t["zEXIT"]=t+r.wall-tLast;r.t["zFIRST"]=tFirst-t;} // last output -> reaped; start -> first output (the MAP mark)
  for(int i=0;i<4;++i)if(fds[i]>=0){uint64_t v=0;if(read(fds[i],&v,8)==8)r.pc[i]=v;close(fds[i]);}
  r.user=ru.ru_utime.tv_sec+ru.ru_utime.tv_usec*1e-6;r.sys=ru.ru_stime.tv_sec+ru.ru_stime.tv_usec*1e-6;
  r.minflt=ru.ru_minflt;r.majflt=ru.ru_majflt;r.maxrssMB=ru.ru_maxrss/1024;r.nvcsw=ru.ru_nvcsw;r.nivcsw=ru.ru_nivcsw;
@@ -388,10 +390,11 @@ int main(){
   add("B",1,{N8});add("pf",1,{N8,{"SS_PREFAULT","1"}});add("af",1,{N8,{"SS_ASYNCFREE","1"}});
   add("n6",1,{{"NCPU","6"}});add("n7",1,{{"NCPU","7"}});add("n12",1,{{"NCPU","12"}});add("n16",1,{{"NCPU","16"}});
   add("a16",1,{N8,{"SS_DENSE_AHEAD","16"}});add("nh",1,{N8,{"SS_NOHUGE","1"}});
+  add("ra",1,{N8},"core-a");add("rc",1,{N8,{"SS_DENSE_USERS","code"}},"core-a");
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hpf",1,{N8,{"SS_PREFAULT","1"}},"",true);add("Hn12",1,{{"NCPU","12"}},"",true);}
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hpf",1,{N8,{"SS_PREFAULT","1"}},"",true);add("Hn12",1,{{"NCPU","12"}},"",true);add("Hra",1,{N8},"core-a",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -421,9 +424,9 @@ int main(){
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
   {const RunResult* r=get("B#0");a+="B: "+(r?stages(*r):string("none"));}
-  a+=" || "+fmt("pf wPXus","pf","wPXus")+fmt("af wPXus","af","wPXus")+fmt("n6 wPX","n6","wPX")+fmt("n7 wPX","n7","wPX")+fmt("n12 wPXus","n12","wPXus")+fmt("n16 wPX","n16","wPX")+fmt("a16 wP","a16","wP")+fmt("nohuge wPus","nh","wPus");
+  a+=" || "+fmt("pf wPXus","pf","wPXus")+fmt("af wPXus","af","wPXus")+fmt("n6 wPX","n6","wPX")+fmt("n7 wPX","n7","wPX")+fmt("n12 wPXus","n12","wPXus")+fmt("n16 wPX","n16","wPX")+fmt("a16 wP","a16","wP")+fmt("nohuge wPus","nh","wPus")+fmt("| A raw wPYXus","ra","wPYXus")+fmt("A code wPYXus","rc","wPYXus");
   {const RunResult* r=get("HB#0");c+="60x B: "+(r?stages(*r):string("none"));}
-  c+=" || "+fmt("pf wPXus","Hpf","wPXus")+fmt("n12 wPXus","Hn12","wPXus");
+  c+=" || "+fmt("pf wPXus","Hpf","wPXus")+fmt("n12 wPXus","Hn12","wPXus")+fmt("A raw wPYXus","Hra","wPYXus");
   {struct utsname u;uname(&u);c+=string("| ")+u.release+" thp ";for(const char* f:{"/sys/kernel/mm/transparent_hugepage/enabled","/sys/kernel/mm/transparent_hugepage/defrag"}){ifstream in(f);string l;getline(in,l);size_t x=l.find('['),y=l.find(']');c+=(x!=string::npos&&y!=string::npos?l.substr(x+1,y-x-1):string("?"))+"/";}}
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
