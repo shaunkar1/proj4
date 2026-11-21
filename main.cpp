@@ -837,6 +837,7 @@ struct alignas(64) ThreadState{
  uint64_t slotWaits=0; // eslotWaits of this thread
  uint64_t cl8Rows=0,cl8Slow=0; // cl8 click loop: lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
+ uint64_t laneFixE=0,laneFixC=0; // lane loops: line ends of event / click rows looked up with memchr (SS_STATS)
  uint64_t laneShort=0; // lane loops: groups with fewer than eight lanes at work (SS_STATS)
  uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
@@ -3407,6 +3408,15 @@ SS_EVENT_LOOP_EV8(events_avx512y_e8v3,SS_V5,win_masks_avx512y,nl_mask_avx512y,ve
 // such a row is used. The last line of a file without a newline goes to line_general after the loop, as above.
 // Rows are finished in lane order, not file order: nothing in the dense-record loops depends on the order (slots keep
 // the smallest ingest_ts, send / dmax are maxima, the line code has no state across lines but the date memo).
+// Every full group asks for the cache lines lanePf and lanePf2 bytes ahead of each lane's next line (SS_LANES_PF=n,
+// SS_LANES_PF2=n; 0 = that one off). Without them the lanes lose to the index loops: eight streams per thread are not
+// covered by the hardware prefetchers, and a miss in a lane's scan load holds up the whole group, where the index
+// pass ran through 4 KB at a time with many loads under way (parse-only CPU time of one thread on 3.2M events + 0.8M
+// clicks, this box: index loops 178 ms, lanes without prefetch 233, one prefetch 512 or 1024 ahead 151, two 138).
+// Two per lane because an event line (77 bytes) is more than one cache line per group.
+static unsigned lanePf=1024,lanePf2=1088;
+#define SS_LANE_PF(X_) if(__builtin_expect(lanePf!=0,1)){const unsigned d_=lanePf;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+d_,0,3); \
+  if(lanePf2){const unsigned e_=lanePf2;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+e_,0,3);}}
 static inline void lane_cut(const char* p,const char* lim,const char* end,const char** c){
  const size_t step=(size_t)(lim-p)/8;c[0]=p;c[8]=lim;
  for(unsigned i=1;i<8;++i){
@@ -3416,8 +3426,8 @@ static inline void lane_cut(const char* p,const char* lim,const char* end,const 
 }
 // Rows whose line end the scan did not give (bits of unc): x[i] = one past the first newline from l[i]. A line
 // without one (the last line of the file): returned as a bit, `tail` = the line, the lane goes to the end.
-[[gnu::noinline]] static unsigned lane_fix(const char* const* l,const char** x,unsigned unc,const char* end,const char*& tail){
- unsigned gone=0;
+[[gnu::noinline]] static unsigned lane_fix(const char* const* l,const char** x,unsigned unc,const char* end,const char*& tail,uint64_t& looked){
+ unsigned gone=0;looked+=(unsigned)__builtin_popcount(unc);
  for(;unc;unc&=unc-1){const unsigned i=(unsigned)__builtin_ctz(unc);
   const char* const nl=(const char*)memchr(l[i],'\n',(size_t)(end-l[i]));
   if(nl)x[i]=nl+1;else{tail=l[i];x[i]=end;gone|=1u<<i;}}
@@ -3462,13 +3472,13 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  {const char* cut_[9];lane_cut(p,lim,end,cut_);for(unsigned i_=0;i_<8;++i_){A[0][i_]=cut_[i_];le[i_]=cut_[i_+1];}} \
  const char* const* lD=A[0];const char* const* xD=A[0];const char* const* lF=A[0];const char* const* xF=A[0]; /* lines and next lines of D, F */ \
  unsigned g=0,nD=0,nF=0;VNS::Ev8Scan* sN=&sc[0];VNS::Ev8Scan* sD=&sc[1];VNS::Ev8Out* oD=&out[0];VNS::Ev8Out* oF=&out[1];bool more=true; /* row masks of D and F; N's and D's scan; D's and F's results */ \
- __m256i vmx=_mm256_setzero_si256();bool fastAny=false;uint64_t rows=0,shortG=0; \
+ __m256i vmx=_mm256_setzero_si256();bool fastAny=false;uint64_t rows=0,shortG=0,fixed=0; \
  do{ \
   unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
   if(more){ \
    const unsigned live_=LIVE(lN,le); \
-   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail);} \
-   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail); \
+   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF(xN)} \
+   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail,fixed); \
     for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
    else more=false; \
   } \
@@ -3484,7 +3494,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  }while(more||nD||nF); \
  if(tail)line_general<7>(tail,end,general); /* the last line has no newline */ \
  if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
- tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send);tl.ev8Rows+=rows;tl.laneShort+=shortG; \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send);tl.ev8Rows+=rows;tl.laneShort+=shortG;tl.laneFixE+=fixed; \
 }
 // _e8l = the lane form of _e8 (kernel version 4 only). The avx2 instance is the test stand-in (scalar kernel).
 SS_EVENT_LOOP_EV8L(events_avx2_e8l,SS_V3,lane_scan_ev_avx2,lane_live_scalar,ev8_dec_ref4,vert4,SS_EV8_CONST4,events_avx2_e8_slow)
@@ -4651,7 +4661,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  if(p>=lim)return; \
  const char* const end=base+len; \
  ClLoop lp_(tl,tab,camps,PC,end,clickStart);lp_.ahead=0;const ClLoop& lp=lp_; /* no ring: a slow row writes its slot at the end of its line, a group after the kernel asked for it */ \
- PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CRing* const ring=nullptr;unsigned rpos=0;uint64_t rows=0,slow=0,shortG=0; \
+ PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CRing* const ring=nullptr;unsigned rpos=0;uint64_t rows=0,slow=0,shortG=0,fixed=0; \
  const VNS::ClConst cc=CCONST(lp); \
  VNS::Cl8Out out[2];VNS::Cl8Scan sc[2]; \
  alignas(64) const char* A[4][8];alignas(64) const char* le[8];const char* tail=nullptr; \
@@ -4662,8 +4672,8 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
   unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
   if(more){ \
    const unsigned live_=LIVE(lN,le); \
-   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail);} \
-   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail); \
+   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF(xN)} \
+   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail,fixed); \
     for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
    else more=false; \
   } \
@@ -4678,7 +4688,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
   {VNS::Cl8Scan* const t_=sN;sN=sD;sD=t_;VNS::Cl8Out* const u_=oD;oD=oF;oF=u_;} \
  }while(more||nD||nF); \
  if(tail)line_general<4>(tail,end,general); /* the last line has no newline */ \
- tl.denseMax=max(tl.denseMax,dmax);tl.clEnd=max(tl.clEnd,send);tl.cl8Rows+=rows;tl.cl8Slow+=slow;tl.laneShort+=shortG; \
+ tl.denseMax=max(tl.denseMax,dmax);tl.clEnd=max(tl.clEnd,send);tl.cl8Rows+=rows;tl.cl8Slow+=slow;tl.laneShort+=shortG;tl.laneFixC+=fixed; \
 }
 // _c8l = the lane form of _c8 (kernel version 2 only). The avx2 instance is the test stand-in (scalar kernel).
 SS_CLICK_LOOP_CL8L(clicks_avx2_c8l,SS_V3,win_masks_avx2,lane_scan_cl_avx2,lane_live_scalar,cl8_dec_ref2,vcl2,SS_CL8_CONST2)
@@ -5106,8 +5116,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool cl8V1=getenv("SS_CL8")&&string_view(getenv("SS_CL8"))=="1";
  // Lanes (SS_EVENT_LOOP_EV8L): wherever the ev8 loop runs kernel version 4, eight lanes walk eight pieces of a chunk and
  // there is no line index; the same for the cl8 loop with kernel version 2 (SS_CLICK_LOOP_CL8L). SS_LANES=0: the loops
- // with the index; SS_LANES=e / c: lanes for event / click files only. Same output.
+ // with the index; SS_LANES=e / c: lanes for event / click files only. Same output. SS_LANES_PF=n / SS_LANES_PF2=n: see lanePf.
  const char* const lanesEnv=getenv("SS_LANES"); // 0 = neither, e = events only, c = clicks only
+ if(const char* v=getenv("SS_LANES_PF")){const long long x=atoll(v);lanePf=x>0&&x<=(1<<20)?(unsigned)x:0;}
+ if(const char* v=getenv("SS_LANES_PF2")){const long long x=atoll(v);lanePf2=x>0&&x<=(1<<20)?(unsigned)x:0;}
  const bool lanes=!(lanesEnv&&(string_view(lanesEnv)=="0"||string_view(lanesEnv)=="c")),lanesC=!(lanesEnv&&(string_view(lanesEnv)=="0"||string_view(lanesEnv)=="e"));
  const bool cl8Auto=hasE8&&dparse.clicks&&!dparse.bucket&&!getenv("SS_CLICKS")&&!getenv("SS_DENSE_AHEAD")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
@@ -5344,8 +5356,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";
   uint64_t er=0,es=0;for(int t=0;t<T;++t){er+=tls[t].ev8Rows;es+=tls[t].ev8Slow;}
   if(er)cerr<<"STATS ev8 loop: rows "<<er<<" left to the line code "<<es<<"\n";
-  uint64_t lsg=0;for(int t=0;t<T;++t)lsg+=tls[t].laneShort;
-  if(lsg)cerr<<"STATS lanes: groups with fewer than eight lanes at work "<<lsg<<"\n";}
+  uint64_t lsg=0,lfe=0,lfc=0;for(int t=0;t<T;++t){lsg+=tls[t].laneShort;lfe+=tls[t].laneFixE;lfc+=tls[t].laneFixC;}
+  if(lsg|lfe|lfc)cerr<<"STATS lanes: groups with fewer than eight lanes at work "<<lsg<<", line ends looked up with memchr: event rows "<<lfe<<" click rows "<<lfc<<"\n";}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
  if(dumpDir){
   // Test only (fuzz/dense_check.py): rows-T.txt = what the general handlers saw (raw texts, written above),
