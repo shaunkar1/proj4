@@ -552,6 +552,26 @@ template<class T> struct ArenaAlloc{
  template<class U> bool operator!=(const ArenaAlloc<U>&)const{return false;}
 };
 template<class T> using AVec=vector<T,ArenaAlloc<T>>;
+// Append-only array of parsed records in the calling thread's arena. Like a vector, but appending is
+// always inlined (it sits in the hottest loops) and nothing is ever value-initialised or freed singly.
+template<class T> struct Bucket{
+ T* b=nullptr;T* e=nullptr;T* c=nullptr;
+ size_t size()const{return (size_t)(e-b);}
+ size_t capacity()const{return (size_t)(c-b);}
+ bool full()const{return e==c;}
+ T* data(){return b;}
+ const T* data()const{return b;}
+ T& operator[](size_t i){return b[i];}
+ const T& operator[](size_t i)const{return b[i];}
+ [[gnu::noinline]] void reserve(size_t n){ // only the thread that owns the bucket may call this
+  if(n<=capacity())return;
+  T* const nb=(T*)tlArena.get(n*sizeof(T));const size_t have=size();
+  if(have)memcpy((void*)nb,(const void*)b,have*sizeof(T));
+  b=nb;e=nb+have;c=nb+n;
+ }
+ __attribute__((always_inline)) void append(const T& r){*e++=r;} // there must be room
+ __attribute__((always_inline)) void push_back(const T& r){if(__builtin_expect(e==c,0))reserve(max<size_t>(16,2*capacity()));*e++=r;}
+};
 static void unmap_regions(vector<Region> regions){for(const Region& r:regions)munmap(r.base,r.len);}
 static constexpr uint32_t LOCAL_USER=0x80000000u;
 // One parsed event line, 32 bytes (two per cache line), bucketed by event_id hash so duplicates meet in one bucket.
@@ -667,7 +687,7 @@ using EvList=Blocks<Ev,4096>;using ClickList=Blocks<Click,4096>;
 struct alignas(64) ThreadState{
  SmallTable users; // IDs that did not fit in the shared table
  vector<pair<const char*,int64_t>> ingestSide; // (event id pointer, ingest ms) of records whose ingest code is INGEST_SIDE
- vector<AVec<PRec>> eb;vector<AVec<CRec>> cb; // parsed lines by event/click ID hash
+ vector<Bucket<PRec>> eb;vector<Bucket<CRec>> cb; // parsed lines by event/click ID hash
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
 };
 static size_t pow2_parts(uint64_t est){size_t p=1;while(p<2048&&p*32768<est)p<<=1;return p;}
@@ -914,37 +934,78 @@ template<class R> static void resolve_users(const PendUser<R>* pend,const PendUs
   q.rec->user=g;
  }
 }
-// Does for every data line that begins in [from,to) exactly what for_records<7> + the general event
-// handler would do; `general` is that handler and gets the lines the short path passes on.
-template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){
- if(from>=len)return;
- const char* end=base+len;
- const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
- if(!nl)return;
- const char* p=nl+1;
- const char* lim=base+min(to,len);
- DateMemo3* const memo=date_memo3();
- const int64_t wstart=window_start;const uint64_t wlen=(uint64_t)(window_end-window_start),ibase=(uint64_t)ingestBase;
+// ---- The line loops, once per way of building the window masks ----
+// The masks of a 64-byte window (bit i = byte i is a comma / a quote / a newline) are the only thing
+// that differs between the vector paths:
+//   avx2     two 32-byte compares per character and movemask (the default)
+//   avx512z  one 64-byte compare per character straight into a mask register (AVX-512BW)
+//   avx512y  two 32-byte compares per character into mask registers, joined with kunpckdq
+//            (AVX-512BW+VL; no 512-bit register is touched, so no 512-bit frequency licence)
+// Everything after the masks is the same code (event_line_v3 / click_line_v3), inlined into each loop.
+// The AVX-512 loops are only compiled with 256-bit vectors as the compiler's own choice, so the one
+// 512-bit use is the explicit window load and compare of avx512z.
+struct WinMasks{uint64_t c,q,n;};
+SS_V3I WinMasks win_masks_avx2(const char* p){
  const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
- PendUser<PRec> pend[V3_BATCH];PendUser<PRec>* pp=pend;
- AVec<PRec>* const buckets=tl.eb.data();KeyTable::Slot* const slots=tab.slots;const size_t tmask=tab.mask;
- while(p<lim){
+ const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
+ return {mask64_v3(x0,x1,vc),mask64_v3(x0,x1,vq),mask64_v3(x0,x1,vnl)};
+}
+#define SS_V5 __attribute__((target("avx2,bmi,bmi2,popcnt,lzcnt,avx512f,avx512bw,avx512vl,prefer-vector-width=256")))
+#define SS_V5I SS_V5 static inline __attribute__((always_inline))
+SS_V5I WinMasks win_masks_avx512z(const char* p){
+ const __m512i x=_mm512_loadu_si512((const void*)p);
+ return {_mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8(',')),_mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8('"')),_mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8('\n'))};
+}
+SS_V5I WinMasks win_masks_avx512y(const char* p){
+ const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
+ const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
+ return {_cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(x1,vc),_mm256_cmpeq_epi8_mask(x0,vc))),
+         _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(x1,vq),_mm256_cmpeq_epi8_mask(x0,vq))),
+         _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(x1,vnl),_mm256_cmpeq_epi8_mask(x0,vnl)))};
+}
+// A line the short path passed on: the portable splitter and the general handler decide. Kept out of
+// line and compiled without any vector extension, so the loops stay small and no wide register is used here.
+template<int N,class GEN> [[gnu::noinline]] static const char* line_general(const char* p,const char* end,GEN&& general){
+ const char* comma[N];int ncomma,nquote;const char* lineEnd;string_view f[N];
+ const char* const next=scan_line(p,end,comma,N,ncomma,nquote,lineEnd);
+ if(take_fields(p,lineEnd,comma,ncomma,nquote,N,f))general(f);
+ return next;
+}
+// Where the first data line of a chunk starts and where the chunk's lines stop; false if there is none.
+static inline bool chunk_lines(const char* base,size_t len,size_t from,size_t to,const char*& p,const char*& lim){
+ if(from>=len)return false;
+ const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
+ if(!nl)return false;
+ p=nl+1;lim=base+min(to,len);return true;
+}
+// What an event loop keeps across lines (never changes during a chunk).
+struct EvLoop{ThreadState& tl;KeyTable& tab;const KeyTable& products;size_t PE;const char* end;DateMemo3* memo;int64_t wstart;uint64_t wlen,ibase;Bucket<PRec>* buckets;KeyTable::Slot* slots;size_t tmask;
+ EvLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& products_,size_t PE_,const char* end_):tl(tl_),tab(tab_),products(products_),PE(PE_),end(end_),memo(date_memo3()),
+  wstart(window_start),wlen((uint64_t)(window_end-window_start)),ibase((uint64_t)ingestBase),buckets(tl_.eb.data()),slots(tab_.slots),tmask(tab_.mask){}
+};
+// Start of window 2 of an event line: one past the third comma of window 1 (p+65 if there is none).
+SS_V3I const char* event_window2(const char* p,uint64_t c){return p+_tzcnt_u64(_blsr_u64(_blsr_u64(c)))+1;}
+// One event line at p, given the masks of its two windows (w1 at p, w2 at b=event_window2(p,w1.c)).
+// Does exactly what for_records<7> + the general event handler would do with the line; `general` is
+// that handler and gets the line if the short path passes it on. Returns the start of the next line.
+template<class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const EvLoop& lp,PendUser<PRec>* const pend,PendUser<PRec>*& pp,GEN&& general){
+ ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& products=lp.products;const size_t PE=lp.PE;
+ DateMemo3* const memo=lp.memo;const int64_t wstart=lp.wstart;const uint64_t wlen=lp.wlen,ibase=lp.ibase;
+ Bucket<PRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
+ {
   const char* next=nullptr;bool done=false;
   do{
    // Window 1: 64 bytes from the line start; must hold the first three commas (fields 0-2).
-   const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
-   const uint64_t c=mask64_v3(x0,x1,vc),qa=mask64_v3(x0,x1,vq),na=mask64_v3(x0,x1,vnl);
+   const uint64_t c=w1.c,qa=w1.q,na=w1.n;
    const uint64_t cA=_blsr_u64(c),cB=_blsr_u64(cA),cR=_blsr_u64(cB);
    const uint64_t m1=_blsmsk_u64(cB); // bytes up to and including the third comma
    const uint64_t q1=qa&m1,st1=((c^cB)<<1)|1,en1=c^cR;
    uint64_t sq1,op1;const uint64_t err1=quote_errors_v3(q1,st1,en1,sq1,op1);
    // Window 2: 64 bytes from the start of field 3; must hold the last three commas and the newline.
    const uint64_t e2=_tzcnt_u64(cB); // 64 if there is no third comma
-   const char* const b=p+e2+1;
-   const __m256i y0=_mm256_loadu_si256((const __m256i*)b),y1=_mm256_loadu_si256((const __m256i*)(b+32));
-   const uint64_t nb=mask64_v3(y0,y1,vnl);
+   const uint64_t nb=w2.n;
    const uint64_t keep=_blsmsk_u64(nb)>>1; // bytes before the newline
-   const uint64_t d=mask64_v3(y0,y1,vc)&keep,qb=mask64_v3(y0,y1,vq)&keep;
+   const uint64_t d=w2.c&keep,qb=w2.q&keep;
    const uint64_t st2=(d<<1)|1,en2=d|_blsi_u64(nb);
    uint64_t sq2,op2;const uint64_t err2=quote_errors_v3(qb,st2,en2,sq2,op2);
    const uint64_t L=_tzcnt_u64(nb); // 64 if there is no newline in the window
@@ -1001,49 +1062,52 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
     }
    }
    const PRec r=make_prec(s0,h,icode,k,cat);
-   AVec<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
-   if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
+   Bucket<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
+   if(__builtin_expect(vec.full(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record appended below stays put
    if(k){
     uint64_t k0;uint32_t k1;
     if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID: nothing has been stored yet
     const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
     __builtin_prefetch(&slots[j],0,1);
-    PendUser<PRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.data()+vec.size();pu.k1=k1;
+    PendUser<PRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.e;pu.k1=k1;
    }
-   vec.push_back(r);
+   vec.append(r);
    if(pp==pend+V3_BATCH){resolve_users(pend,pp,tab,tl);pp=pend;}
   }while(0);
   if(!done){
    // Keep the order of lines: finish the waiting ones before the general handler stores anything.
    resolve_users(pend,pp,tab,tl);pp=pend;
-   const char* comma[7];int ncomma,nquote;const char* lineEnd;string_view f[7];
-   next=scan_line(p,end,comma,7,ncomma,nquote,lineEnd);
-   if(take_fields(p,lineEnd,comma,ncomma,nquote,7,f))general(f);
+   next=line_general<7>(p,lp.end,general);
   }
-  p=next;
+  return next;
  }
- resolve_users(pend,pp,tab,tl);
 }
+// The event loop of one chunk for one mask builder.
+#define SS_EVENT_LOOP(NAME,TARGET,MASKS) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const EvLoop lp(tl,tab,products,PE,base+len);PendUser<PRec> pend[V3_BATCH];PendUser<PRec>* pp=pend; \
+ while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,general);} \
+ resolve_users(pend,pp,tab,tl); \
+}
+SS_EVENT_LOOP(events_avx2,SS_V3,win_masks_avx2)
+SS_EVENT_LOOP(events_avx512z,SS_V5,win_masks_avx512z)
+SS_EVENT_LOOP(events_avx512y,SS_V5,win_masks_avx512y)
 // The same for click lines (4 fields, one 64-byte window).
-template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){
- if(from>=len)return;
- const char* end=base+len;
- const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
- if(!nl)return;
- const char* p=nl+1;
- const char* lim=base+min(to,len);
- DateMemo3* const memo=date_memo3();
- const uint64_t wlen=(uint64_t)(window_end-clickStart);
- const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
- PendUser<CRec> pend[V3_BATCH];PendUser<CRec>* pp=pend;
- AVec<CRec>* const buckets=tl.cb.data();KeyTable::Slot* const slots=tab.slots;const size_t tmask=tab.mask;
- while(p<lim){
+struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
+ ClLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& camps_,size_t PC_,const char* end_,int64_t clickStart_):tl(tl_),tab(tab_),camps(camps_),PC(PC_),end(end_),memo(date_memo3()),
+  clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask){}
+};
+template<class GEN> SS_V3I const char* click_line_v3(const char* const p,const WinMasks w,const ClLoop& lp,PendUser<CRec>* const pend,PendUser<CRec>*& pp,GEN&& general){
+ ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& camps=lp.camps;const size_t PC=lp.PC;
+ DateMemo3* const memo=lp.memo;const int64_t clickStart=lp.clickStart;const uint64_t wlen=lp.wlen;
+ Bucket<CRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
+ {
   const char* next=nullptr;bool done=false;
   do{
-   const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
-   const uint64_t nb=mask64_v3(x0,x1,vnl);
+   const uint64_t nb=w.n;
    const uint64_t keep=_blsmsk_u64(nb)>>1;
-   const uint64_t c=mask64_v3(x0,x1,vc)&keep,q=mask64_v3(x0,x1,vq)&keep;
+   const uint64_t c=w.c&keep,q=w.q&keep;
    const uint64_t st=(c<<1)|1,en=c|_blsi_u64(nb);
    uint64_t sq,op;const uint64_t err=quote_errors_v3(q,st,en,sq,op);
    const uint64_t L=_tzcnt_u64(nb); // 64 if there is no newline in the window
@@ -1071,25 +1135,37 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
    const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
    __builtin_prefetch(&slots[j],0,1);
    CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=(trel<<16)|(uint16_t)ci;r.user=0;
-   AVec<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
-   if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
-   PendUser<CRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.data()+vec.size();pu.k1=k1;
-   vec.push_back(r);
+   Bucket<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
+   if(__builtin_expect(vec.full(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record appended below stays put
+   PendUser<CRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.e;pu.k1=k1;
+   vec.append(r);
    if(pp==pend+V3_BATCH){resolve_users(pend,pp,tab,tl);pp=pend;}
   }while(0);
   if(!done){
    resolve_users(pend,pp,tab,tl);pp=pend;
-   const char* comma[4];int ncomma,nquote;const char* lineEnd;string_view f[4];
-   next=scan_line(p,end,comma,4,ncomma,nquote,lineEnd);
-   if(take_fields(p,lineEnd,comma,ncomma,nquote,4,f))general(f);
+   next=line_general<4>(p,lp.end,general);
   }
-  p=next;
+  return next;
  }
- resolve_users(pend,pp,tab,tl);
 }
+#define SS_CLICK_LOOP(NAME,TARGET,MASKS) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const ClLoop lp(tl,tab,camps,PC,base+len,clickStart);PendUser<CRec> pend[V3_BATCH];PendUser<CRec>* pp=pend; \
+ while(p<lim)p=click_line_v3(p,MASKS(p),lp,pend,pp,general); \
+ resolve_users(pend,pp,tab,tl); \
+}
+SS_CLICK_LOOP(clicks_avx2,SS_V3,win_masks_avx2)
+SS_CLICK_LOOP(clicks_avx512z,SS_V5,win_masks_avx512z)
+SS_CLICK_LOOP(clicks_avx512y,SS_V5,win_masks_avx512y)
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
- auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;};
+ // With SS_STATS=1 every TIME line is followed by a CPU line: processor time (all threads, user+system) of that stage.
+ const bool __cpuLines=getenv("SS_STATS")!=nullptr;
+ auto __cpu_now=[]{timespec t;clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;};
+ double __cpu0=__cpu_now();
+ auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
+  if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;}};
  optHuge=!getenv("SS_NOHUGE");optPrefault=!getenv("SS_NOPREFAULT");optAsyncFree=!getenv("SS_NOASYNCFREE");
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
@@ -1273,9 +1349,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const size_t PE=pow2_parts(eventBytes/70),PC=pow2_parts(clickBytes/40);
  const size_t UP=pow2_parts(eventBytes/70); // person buckets for the last stage
  // SS_ISA=sse2 forces the portable splitter (used by tests to check both paths give the same tables).
- bool useV3=__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("popcnt")&&__builtin_cpu_supports("lzcnt");
- if(const char* isa=getenv("SS_ISA"))if(string_view(isa)=="sse2")useV3=false;
- cerr<<"splitter: "<<(useV3?"avx2":"sse2")<<"\n";
+ // SS_ISA=avx512z / avx512y pick an AVX-512 mask builder (see the line loops) when the CPU has AVX-512BW+VL;
+ // without it they fall back to avx2. The default is avx2.
+ const bool hasV3=__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("popcnt")&&__builtin_cpu_supports("lzcnt");
+ const bool hasV5=hasV3&&__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512vl");
+ enum{ISA_SSE2,ISA_AVX2,ISA_AVX512Z,ISA_AVX512Y};
+ int isaUse=hasV3?ISA_AVX2:ISA_SSE2;
+ if(const char* isa=getenv("SS_ISA")){const string_view w(isa);
+  if(w=="sse2")isaUse=ISA_SSE2;
+  else if(w=="avx512z"&&hasV5)isaUse=ISA_AVX512Z;
+  else if(w=="avx512y"&&hasV5)isaUse=ISA_AVX512Y;}
+ cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -1338,9 +1422,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
-   if(useV3){
-    if(ck.click)clicks_v3(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
-    else events_v3(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
+   if(isaUse==ISA_AVX2){
+    if(ck.click)clicks_avx2(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
+    else events_avx2(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
+   }else if(isaUse==ISA_AVX512Z){
+    if(ck.click)clicks_avx512z(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
+    else events_avx512z(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
+   }else if(isaUse==ISA_AVX512Y){
+    if(ck.click)clicks_avx512y(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
+    else events_avx512y(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
    }else{
     if(ck.click)for_records<4>(ck.base,ck.len,ck.from,ck.to,warm_user,on_click);
     else for_records<7>(ck.base,ck.len,ck.from,ck.to,warm_user,on_event);
@@ -1474,7 +1564,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
     const size_t home=(size_t)(((uint64_t)(uint32_t)(tls[ot].eb[p][og-off[ot]].ih&PR_HMASK)*cap)>>PR_HBITS),d=j>=home?j-home:j+cap-home;
     ++stEvN;stEvDisp+=d;stEvMax=max<uint64_t>(stEvMax,d);}
-   for(int t=0;t<T;++t)if(p<tls[t].eb.size())tls[t].eb[p]=AVec<PRec>();
+   for(int t=0;t<T;++t)if(p<tls[t].eb.size())tls[t].eb[p]=Bucket<PRec>();
    surviving-=dead;dedupCount+=n-dups;
   }
   // Copies of a click are identical, so the first one seen is kept.
@@ -1514,7 +1604,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
     const size_t home=(size_t)(((tls[ot].cb[p][og-off[ot]].h&0xffffffffu)*cap)>>32),d=j>=home?j-home:j+cap-home;
     ++stClN;stClDisp+=d;stClMax=max<uint64_t>(stClMax,d);}
-   for(int t=0;t<T;++t)if(p<tls[t].cb.size())tls[t].cb[p]=AVec<CRec>();
+   for(int t=0;t<T;++t)if(p<tls[t].cb.size())tls[t].cb[p]=Bucket<CRec>();
   }
  }
  if(stats)fprintf(stderr,"STATS event dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\nSTATS click dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\n",
