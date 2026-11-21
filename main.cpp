@@ -2193,6 +2193,15 @@ SS_EVENT_LOOP_BATCH(events_avx512y_bt,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 // kernel's answers for an ok row are exactly what event_line_v3<true,true> would hand to eslot_commit for
 // that line, a purchase's category excepted (see pur); the contract is the comment of Ev8Out below and the
 // head of /home/claude/vert/vert.h.
+// Option set of the pasted kernel. Bit 0: the event_id and the user's letter come from the first 16 bytes of
+// each line, which the scan keeps, instead of three gathers (a user letter beyond them leaves the row to the
+// line code). Bit 1: when every Z/offset-form ts of a group has its ingest_ts date text, the date lookup of
+// ingest_ts is reused instead of three more gathers. Same results for every set (the kernel's own tests ran
+// all four). Set 3 measured fastest on the scoring machine, where gathers are slow: 37.9 ns per row against
+// 43.8 for set 0. -DVERT_EV8_OPT=n overrides.
+#ifndef VERT_EV8_OPT
+#define VERT_EV8_OPT 3
+#endif
 // ---- ev8: eight event lines per call (vertical AVX-512). Generated from /home/claude/vert/vert.h by mkpaste.py; contract in
 // ---- vert.h / BATCH.md. Tested as this exact text by vert_line_test -DVERT_PASTE. Do not edit here: change vert.h and regenerate.
 namespace vert{
