@@ -350,6 +350,8 @@ static string json_string(const string& s,const string& key){
  auto e=s.find('"',p+1);if(e==string::npos)throw runtime_error("manifest error");return s.substr(p+1,e-p-1);
 }
 static string hexstr(string_view s){static constexpr char h[]="0123456789ABCDEF";string r; r.resize(s.size()*2);for(size_t i=0;i<s.size();i++){unsigned char b=s[i];r[2*i]=h[b>>4];r[2*i+1]=h[b&15];}return r;}
+// Switches for measuring on the target machine; all default to the fast setting.
+static bool optHuge=true,optPrefault=true,optAsyncFree=true;
 struct TransparentHash {
  using is_transparent=void;
  size_t operator()(string_view x)const noexcept {return hash<string_view>{}(x);}
@@ -399,7 +401,7 @@ struct KeyTable{
   size_t c=1024;while(c<want)c<<=1;
   void* mem=mmap(nullptr,c*sizeof(Slot),PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); // zero pages, touched lazily
   if(mem==MAP_FAILED)throw bad_alloc();
-  madvise(mem,c*sizeof(Slot),MADV_HUGEPAGE); // fewer page faults and TLB misses where the kernel allows it
+  if(optHuge)madvise(mem,c*sizeof(Slot),MADV_HUGEPAGE); // fewer page faults and TLB misses where the kernel allows it
   slots=(Slot*)mem;cap=c;mask=c-1;
  }
  static bool pack(string_view s,uint64_t& k0,uint32_t& k1){ // s must be a view into a mapped input
@@ -529,8 +531,8 @@ struct Arena{
   void* mem=mmap(nullptr,want+huge,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
   if(mem==MAP_FAILED)throw bad_alloc();
   char* a=(char*)(((uintptr_t)mem+huge-1)&~(uintptr_t)(huge-1)); // 2 MB aligned so huge pages can be used
-  madvise(a,want,MADV_HUGEPAGE);
-  if(warm)madvise(a,min(warm,want),MADV_POPULATE_WRITE); // ignored by old kernels: pages then fault in one by one
+  if(optHuge)madvise(a,want,MADV_HUGEPAGE);
+  if(warm&&optPrefault)madvise(a,min(warm,want),MADV_POPULATE_WRITE); // ignored by old kernels: pages then fault in one by one
   cur=a;lim=a+want;
   lock_guard<mutex> g(regionMu);stageRegions[stage].push_back({mem,want+huge});
  }
@@ -693,6 +695,7 @@ template<class V> static string_view raw(const V& v){return string_view((const c
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;};
+ optHuge=!getenv("SS_NOHUGE");optPrefault=!getenv("SS_NOPREFAULT");optAsyncFree=!getenv("SS_NOASYNCFREE");
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  int nday=(int)((window_end-window_start+DAY-1)/DAY);
@@ -971,7 +974,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // into them any more) back on a side thread so process exit has less to tear down.
  {vector<Region> dead;{lock_guard<mutex> g(regionMu);dead.swap(stageRegions[0]);}
   if(!anyLongName.load()&&extraNames.empty())dead.insert(dead.end(),eventMaps.begin(),eventMaps.end());
-  thread(unmap_regions,std::move(dead)).detach();}
+  if(optAsyncFree)thread(unmap_regions,std::move(dead)).detach();}
  __mark("DEDUP");
  // ---- Per person bucket: sort, sessionize, attribute. Each thread writes its own Parquet file. ----
  fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");
