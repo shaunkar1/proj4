@@ -156,46 +156,88 @@ static uint64_t hkey(string_view s){
  uint64_t tail=0;memcpy(&tail,p,n);
  return mix64(h^tail);
 }
-// Open-addressing string -> dense id table. Keys are views into the mapped inputs.
+// Open-addressing string -> uint32 table built for one cache miss per lookup:
+// keys of up to 11 bytes (every generated user ID) live inside the 16-byte slot,
+// so a probe never follows a pointer. Longer keys fall back to a side list.
 // find() is const and safe to call from many threads while nobody inserts.
-struct StrTable{
- vector<uint64_t> slots; // (hash32<<32)|(id+1), 0 = empty
- vector<string_view> keys;vector<uint32_t> hs;size_t mask=0;
- explicit StrTable(size_t cap=1024){size_t c=1024;while(c<cap)c<<=1;slots.assign(c,0);mask=c-1;}
- size_t size()const{return keys.size();}
- uint32_t find(string_view s,uint32_t h)const{
-  for(size_t j=h&mask;;j=(j+1)&mask){
-   uint64_t e=slots[j];if(!e)return UINT32_MAX;
-   if((uint32_t)(e>>32)==h){const string_view& k=keys[(uint32_t)e-1];if(k.size()==s.size()&&memcmp(k.data(),s.data(),s.size())==0)return (uint32_t)e-1;}
+struct KeyTable{
+ struct Slot{uint64_t k0;uint32_t k1;uint32_t v;}; // k1 top byte: 0 empty, len+1 inline, 0xFF long (k0=hash, v=index into longs)
+ struct Long{string_view key;uint32_t v;};
+ Slot* slots=nullptr;size_t cap=0,mask=0,count=0;vector<Long> longs;
+ static constexpr uint32_t NONE=UINT32_MAX;
+ explicit KeyTable(size_t want=1024){alloc(want);}
+ KeyTable(const KeyTable&)=delete;KeyTable& operator=(const KeyTable&)=delete;
+ ~KeyTable(){free(slots);}
+ void alloc(size_t want){
+  size_t c=1024;while(c<want)c<<=1;
+  size_t bytes=c*sizeof(Slot);void* mem=nullptr;
+  if(posix_memalign(&mem,64,bytes)!=0)throw bad_alloc();
+  memset(mem,0,bytes);slots=(Slot*)mem;cap=c;mask=c-1;
+ }
+ static bool pack(string_view s,uint64_t& k0,uint32_t& k1){
+  size_t n=s.size();if(n>11)return false;
+  k0=0;k1=0;
+  if(n>=8){memcpy(&k0,s.data(),8);memcpy(&k1,s.data()+8,n-8);}else memcpy(&k0,s.data(),n);
+  k1|=(uint32_t)(n+1)<<24;return true;
+ }
+ static uint64_t hash_packed(uint64_t k0,uint32_t k1){return mix64(k0^((uint64_t)k1*0xa0761d6478bd642fULL));}
+ uint32_t find(string_view s)const{
+  uint64_t k0;uint32_t k1;
+  if(pack(s,k0,k1)){
+   for(size_t j=hash_packed(k0,k1)&mask;;j=(j+1)&mask){const Slot& e=slots[j];
+    if(e.k1==k1&&e.k0==k0)return e.v;
+    if(!e.k1)return NONE;
+   }
+  }
+  uint64_t h=hkey(s);
+  for(size_t j=h&mask;;j=(j+1)&mask){const Slot& e=slots[j];
+   if(!e.k1)return NONE;
+   if(e.k1==0xFF000000u&&e.k0==h&&longs[e.v].key==s)return longs[e.v].v;
   }
  }
- uint32_t intern(string_view s,uint32_t h){
-  size_t j=h&mask;
-  for(;;j=(j+1)&mask){
-   uint64_t e=slots[j];if(!e)break;
-   if((uint32_t)(e>>32)==h){const string_view& k=keys[(uint32_t)e-1];if(k.size()==s.size()&&memcmp(k.data(),s.data(),s.size())==0)return (uint32_t)e-1;}
+ // Returns the stored value, or stores v and returns it if the key is new (check count to tell).
+ uint32_t intern(string_view s,uint32_t v){
+  if(count*2>=cap)grow();
+  uint64_t k0;uint32_t k1;
+  if(pack(s,k0,k1)){
+   for(size_t j=hash_packed(k0,k1)&mask;;j=(j+1)&mask){Slot& e=slots[j];
+    if(e.k1==k1&&e.k0==k0)return e.v;
+    if(!e.k1){e.k0=k0;e.k1=k1;e.v=v;++count;return v;}
+   }
   }
-  if(keys.size()>=0x7ffffff0u)throw runtime_error("Too many IDs");
-  uint32_t id=(uint32_t)keys.size();keys.push_back(s);hs.push_back(h);
-  slots[j]=((uint64_t)h<<32)|(id+1);
-  if(keys.size()*2>slots.size())grow();
-  return id;
+  uint64_t h=hkey(s);
+  for(size_t j=h&mask;;j=(j+1)&mask){Slot& e=slots[j];
+   if(!e.k1){e.k0=h;e.k1=0xFF000000u;e.v=(uint32_t)longs.size();longs.push_back({s,v});++count;return v;}
+   if(e.k1==0xFF000000u&&e.k0==h&&longs[e.v].key==s)return longs[e.v].v;
+  }
  }
  void grow(){
-  size_t c=slots.size()*2;slots.assign(c,0);mask=c-1;
-  for(uint32_t id=0;id<keys.size();++id){size_t j=hs[id]&mask;while(slots[j])j=(j+1)&mask;slots[j]=((uint64_t)hs[id]<<32)|(id+1);}
+  Slot* old=slots;size_t oldcap=cap;alloc(cap*2);
+  for(size_t i=0;i<oldcap;++i){const Slot& e=old[i];if(!e.k1)continue;
+   size_t j=(e.k1==0xFF000000u?e.k0:hash_packed(e.k0,e.k1))&mask;
+   while(slots[j].k1)j=(j+1)&mask;
+   slots[j]=e;
+  }
+  free(old);
+ }
+ template<class FN> void remap(FN&& fn){ // rewrite every stored value
+  for(size_t i=0;i<cap;++i){Slot& e=slots[i];if(e.k1&&e.k1!=0xFF000000u)e.v=fn(e.v);}
+  for(auto& l:longs)l.v=fn(l.v);
  }
 };
 struct IdGraph{
- StrTable tab{1<<16};
+ KeyTable tab{1<<16};
  vector<uint32_t> parent,sz;
  vector<string_view> names; // at a root: byte-wise smallest ID of the person
- uint32_t intern(string_view s){uint32_t n=(uint32_t)tab.size();uint32_t id=tab.intern(s,(uint32_t)hkey(s));
+ uint32_t intern(string_view s){uint32_t n=(uint32_t)parent.size();
+  if(n>=0x7ffffff0u)throw runtime_error("Too many IDs");
+  uint32_t id=tab.intern(s,n);
   if(id==n){parent.push_back(n);sz.push_back(1);names.push_back(s);}return id;
  }
  uint32_t find(uint32_t x){uint32_t y=x;while(parent[y]!=y)y=parent[y];while(parent[x]!=x){auto z=parent[x];parent[x]=y;x=z;}return y;}
  void link(string_view a,string_view b){uint32_t x=find(intern(a)),y=find(intern(b));if(x==y)return;
-  if(sz[x]<sz[y])swap(x,y);parent[y]=x;sz[x]+=sz[y];if(names[y]<names[x])names[x]=names[y];
+  if(sz[x]<sz[y])swap(x,y);
+  parent[y]=x;sz[x]+=sz[y];if(names[y]<names[x])names[x]=names[y];
  }
 };
 static constexpr uint8_t F_VALID=1,F_PURCHASE=2,F_DEAD=4;
@@ -206,7 +248,7 @@ struct PRec{const char* id;uint64_t h;int64_t ingest;int64_t ts;uint32_t idlen;u
 struct CRec{const char* id;uint64_t h;int64_t ts;uint32_t idlen;uint32_t user;uint16_t campaign;uint8_t flags;};
 struct Chunk{const char* base;size_t len,from,to;bool click;};
 struct alignas(64) ThreadState{
- StrTable users{1<<12}; // IDs seen in events/clicks that no link mentions
+ KeyTable users{1<<14};vector<string_view> userKeys; // IDs seen in events/clicks that no link mentions
  vector<vector<PRec>> eb;vector<vector<CRec>> cb;
 };
 template<class T> struct Arr{ // uninitialised buffer, so pages are first touched by the threads that fill it
@@ -247,10 +289,10 @@ static void run(const fs::path& data,const fs::path& scratch){
  add_files(data/"clicks",true,clickBytes);
  IdGraph graph;
  for(const auto& p:csv_files(data/"links"))read_lines(p,[&](string_view line){string_view f[2];if(fields(line,2,f)&&!f[0].empty()&&!f[1].empty())graph.link(f[0],f[1]);});
- // Flatten: root[id] is the person of a linked ID. Read-only from here on.
+ // Flatten: after this the table maps a linked ID straight to its person. Read-only during parsing.
  const uint32_t nlinked=(uint32_t)graph.parent.size();
- vector<uint32_t> root(nlinked);
- for(uint32_t i=0;i<nlinked;++i)root[i]=graph.find(i);
+ {vector<uint32_t> root(nlinked);for(uint32_t i=0;i<nlinked;++i)root[i]=graph.find(i);
+  graph.tab.remap([&](uint32_t v){return root[v];});}
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
  cat_id("unknown",categories,catnames);
@@ -272,9 +314,11 @@ static void run(const fs::path& data,const fs::path& scratch){
   {size_t r=(size_t)(eventBytes/70/((uint64_t)T*PE)*5/4)+16;for(auto& v:tl.eb)v.reserve(r);}
   {size_t r=(size_t)(clickBytes/40/((uint64_t)T*PC)*5/4)+16;for(auto& v:tl.cb)v.reserve(r);}
   auto user_of=[&](string_view u)->uint32_t{
-   uint32_t h=(uint32_t)hkey(u);uint32_t g=graph.tab.find(u,h);
-   if(g!=UINT32_MAX)return root[g];
-   return LOCAL_USER|tl.users.intern(u,h);
+   uint32_t g=graph.tab.find(u);
+   if(g!=KeyTable::NONE)return g;
+   uint32_t n=(uint32_t)tl.userKeys.size();uint32_t id=tl.users.intern(u,n);
+   if(id==n)tl.userKeys.push_back(u);
+   return LOCAL_USER|id;
   };
   auto on_event=[&](string_view line){
    string_view f[7];if(!fields(line,7,f)||f[0].empty())return;
@@ -310,9 +354,11 @@ static void run(const fs::path& data,const fs::path& scratch){
  __mark("PARSE");
  // ---- Give IDs that no link mentions a global person number. ----
  vector<vector<uint32_t>> trans(T);
- for(int t=0;t<T;++t){auto& u=tls[t].users;trans[t].resize(u.size());
-  for(uint32_t i=0;i<u.size();++i){uint32_t n=(uint32_t)graph.tab.size();uint32_t id=graph.tab.intern(u.keys[i],u.hs[i]);
-   if(id==n)graph.names.push_back(u.keys[i]);
+ for(int t=0;t<T;++t){auto& keys=tls[t].userKeys;trans[t].resize(keys.size());
+  for(size_t i=0;i<keys.size();++i){uint32_t n=(uint32_t)graph.names.size();
+   if(n>=0x7ffffff0u)throw runtime_error("Too many IDs");
+   uint32_t id=graph.tab.intern(keys[i],n);
+   if(id==n)graph.names.push_back(keys[i]);
    trans[t][i]=id; // not linked, so the ID is its own person
   }
  }
