@@ -121,28 +121,35 @@ int main(){
  int runid=0;auto od=[&]{return scratch+"/dout"+to_string(runid++);};
  pipeline("dev n8 a",data,od(),{{"NCPU","8"}});
  pipeline("dev n8 b",data,od(),{{"NCPU","8"}});
- // ---- 20x replica of the dev data (each copy gets its own events and people) ----
- const fs::path big=fs::path(scratch)/"big";
+ // ---- replicas of the dev data: every copy gets its own events and people ----
+ // "huge" has HUGE copies (about the size of the final data); "big" is the first BIG of them (practice size).
+ const int HUGE=getenv("SS_DIAG_HUGE")?atoi(getenv("SS_DIAG_HUGE")):60,BIG=getenv("SS_DIAG_BIG")?atoi(getenv("SS_DIAG_BIG")):20;
+ const fs::path huge=fs::path(scratch)/"huge",big=fs::path(scratch)/"big";
  {double t=now();uint64_t b=0;
-  b+=replicate(fs::path(data)/"events",big/"events",20,2);
-  b+=replicate(fs::path(data)/"clicks",big/"clicks",20,2);
-  b+=replicate(fs::path(data)/"links",big/"links",20,2);
-  for(const char* f:{"products.csv","campaigns.csv","manifest.json"})fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);
-  fprintf(stderr,"DIAG replica: %.1f MB written in %.2fs (elapsed %.1fs)\n",b/1e6,now()-t,now()-T0);}
- const string B=big.string();
+  for(const char* sub:{"events","clicks","links"}){
+   b+=replicate(fs::path(data)/sub,huge/sub,HUGE,2);
+   size_t nfiles=0;for(auto& f:fs::directory_iterator(fs::path(data)/sub))if(f.path().extension()==".csv")++nfiles;
+   fs::create_directories(big/sub);
+   for(size_t k=0;k<nfiles*(size_t)BIG;++k){char name[64];snprintf(name,sizeof name,"part-%05zu.csv",k);error_code ec;fs::create_symlink(huge/sub/name,big/sub/name,ec);}
+  }
+  for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
+  fprintf(stderr,"DIAG replica: %d copies, %.1f MB written in %.2fs (elapsed %.1fs); big = first %d copies\n",HUGE,b/1e6,now()-t,now()-T0,BIG);}
+ const string B=big.string(),H=huge.string();
+ auto timeleft=[&](double need){if(now()-T0+need>150){fprintf(stderr,"DIAG skipping the rest of this group: out of time (%.1fs elapsed)\n",now()-T0);return false;}return true;};
  pipeline("big n8 default #1",B,od(),{{"NCPU","8"}});
  pipeline("big n8 default #2",B,od(),{{"NCPU","8"}});
  pipeline("big n8 default #3",B,od(),{{"NCPU","8"}});
- pipeline("big n8 sse2",B,od(),{{"NCPU","8"},{"SS_ISA","sse2"}});
- pipeline("big n8 noprefault",B,od(),{{"NCPU","8"},{"SS_NOPREFAULT","1"}});
- pipeline("big n8 nohuge",B,od(),{{"NCPU","8"},{"SS_NOHUGE","1"}});
- pipeline("big n8 nohuge noprefault",B,od(),{{"NCPU","8"},{"SS_NOHUGE","1"},{"SS_NOPREFAULT","1"}});
- pipeline("big n8 noasyncfree",B,od(),{{"NCPU","8"},{"SS_NOASYNCFREE","1"}});
- pipeline("big n4",B,od(),{{"NCPU","4"}});
- pipeline("big n2",B,od(),{{"NCPU","2"}});
- pipeline("big n1",B,od(),{{"NCPU","1"}});
- pipeline("big n16",B,od(),{{"NCPU","16"}});
- pipeline("big n8 default #4",B,od(),{{"NCPU","8"}});
+ if(timeleft(25)){pipeline("huge n8 default #1",H,od(),{{"NCPU","8"}});pipeline("huge n8 default #2",H,od(),{{"NCPU","8"}});}
+ struct Var{const char* label;vector<pair<string,string>> env;};
+ const vector<Var> vars={
+  {"big n8 sse2",{{"NCPU","8"},{"SS_ISA","sse2"}}},
+  {"big n8 noprefault",{{"NCPU","8"},{"SS_NOPREFAULT","1"}}},
+  {"big n8 nohuge",{{"NCPU","8"},{"SS_NOHUGE","1"}}},
+  {"big n8 nohuge noprefault",{{"NCPU","8"},{"SS_NOHUGE","1"},{"SS_NOPREFAULT","1"}}},
+  {"big n8 noasyncfree",{{"NCPU","8"},{"SS_NOASYNCFREE","1"}}},
+  {"big n4",{{"NCPU","4"}}},{"big n2",{{"NCPU","2"}}},{"big n1",{{"NCPU","1"}}},{"big n16",{{"NCPU","16"}}},
+  {"big n8 default #4",{{"NCPU","8"}}}};
+ for(const Var& v:vars){if(!timeleft(12))break;pipeline(v.label,B,od(),v.env);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
  pipeline("final /data -> /output",data,outdir,{{"NCPU","8"}});
  {error_code ec;for(auto& f:fs::directory_iterator(fs::path(outdir)/"campaign_daily",ec))fs::remove(f.path(),ec);}
