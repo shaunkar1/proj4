@@ -196,6 +196,43 @@ static Mapped map_file(const fs::path& path){
  madvise(base,len,MADV_WILLNEED);
  return {(const char*)base,len};
 }
+// All files of one input folder in a single reservation: each file starts at a page boundary and is
+// followed by at least one page of zeros (as in map_file). One mmap per file instead of two, and the
+// whole folder can be unmapped later in a few large pieces.
+struct FileGroup{char* base=nullptr;size_t len=0;vector<size_t> ends;}; // ends: offset just past each mapped file's slot
+static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
+ vector<size_t> lens(paths.size(),0);size_t total=0;
+ for(size_t i=0;i<paths.size();++i){
+  struct stat st{};if(stat(paths[i].c_str(),&st)!=0)throw runtime_error("Cannot stat "+paths[i].string());
+  lens[i]=(size_t)st.st_size;if(lens[i])total+=((lens[i]+4095)&~size_t(4095))+4096;
+ }
+ vector<Mapped> out(paths.size());
+ if(!total)return out;
+ void* base=mmap(nullptr,total,PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+ if(base==MAP_FAILED)throw runtime_error("Cannot reserve address space for the input files");
+ g.base=(char*)base;g.len=total;size_t off=0;
+ static const bool willNeed=!getenv("SS_NOWILLNEED"); // measuring switch
+ for(size_t i=0;i<paths.size();++i){
+  if(!lens[i])continue;
+  int fd=open(paths[i].c_str(),O_RDONLY);
+  if(fd<0)throw runtime_error("Cannot open "+paths[i].string());
+  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
+  close(fd);
+  if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
+  if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
+  out[i]={g.base+off,lens[i]};
+  off+=((lens[i]+4095)&~size_t(4095))+4096;g.ends.push_back(off);
+ }
+ return out;
+}
+// Cuts a group into about `parts` pieces of similar size at file boundaries (for unmapping in parallel).
+static void group_pieces(const FileGroup& g,size_t parts,vector<pair<char*,size_t>>& out){
+ size_t start=0,k=1;
+ for(size_t e:g.ends){
+  if(e>=g.len/parts*k||e==g.len){if(e>start)out.push_back({g.base+start,e-start});start=e;while(k<parts&&g.len/parts*k<=e)++k;}
+ }
+ if(start<g.len)out.push_back({g.base+start,g.len-start});
+}
 // Calls fn for every data line that begins in [from,to). The header line (offset 0) is never passed.
 // Only '\n' ends a line; a final line without '\n' still counts.
 template<class FN> static void for_lines(const char* base,size_t len,size_t from,size_t to,FN&& fn){
@@ -314,6 +351,36 @@ static string hexstr(string_view s){static constexpr char h[]="0123456789ABCDEF"
 // Switches for measuring on the target machine; all default to the fast setting.
 // Measured on the scoring machine: huge pages help, bulk pre-faulting and the side-thread unmap do not.
 static bool optHuge=true,optPrefault=false,optAsyncFree=false;
+// A fresh anonymous mapping of at least `bytes`: zero-filled, touched lazily, 2 MB aligned and (unless
+// SS_NOHUGE) advised for huge pages, so first touches cost one fault per 2 MB. The whole mapping
+// (for munmap) is reported through rawBase/rawLen when asked for.
+static void* map_huge(size_t bytes,void** rawBase=nullptr,size_t* rawLen=nullptr){
+ const size_t huge=size_t(2)<<20;
+ const size_t want=(max<size_t>(bytes,1)+huge-1)&~(huge-1);
+ void* mem=mmap(nullptr,want+huge,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+ if(mem==MAP_FAILED)throw bad_alloc();
+ char* a=(char*)(((uintptr_t)mem+huge-1)&~(uintptr_t)(huge-1));
+ if(optHuge)madvise(a,want,MADV_HUGEPAGE);
+ if(rawBase)*rawBase=mem;
+ if(rawLen)*rawLen=want+huge;
+ return a;
+}
+// Bump memory for one thread on such mappings. It grows by whole regions (first `first` bytes, then
+// `next` bytes at a time), is never handed back piecemeal, and always starts zeroed because nothing is reused.
+struct HugePool{
+ char* cur=nullptr;char* lim=nullptr;size_t first=size_t(8)<<20,next=size_t(8)<<20;
+ HugePool()=default;HugePool(const HugePool&)=delete;HugePool& operator=(const HugePool&)=delete;
+ __attribute__((noinline,cold)) void grow(size_t bytes){
+  const size_t huge=size_t(2)<<20;
+  const size_t want=(max(bytes,cur?next:first)+huge-1)&~(huge-1);
+  cur=(char*)map_huge(want);lim=cur+want;
+ }
+ void* take(size_t bytes){
+  bytes=(bytes+63)&~size_t(63);
+  if((size_t)(lim-cur)<bytes)grow(bytes);
+  void* r=cur;cur+=bytes;return r;
+ }
+};
 struct TransparentHash {
  using is_transparent=void;
  size_t operator()(string_view x)const noexcept {return hash<string_view>{}(x);}
@@ -371,18 +438,16 @@ struct KeyTable{
  struct Slot{atomic<uint64_t> k0;atomic<uint32_t> k1;atomic<uint32_t> v;}; // k1 top byte: 0 empty, len+1 inline, 0xFE being written, 0xFF long (k0=hash, v=index into longs)
  struct Long{string_view key;uint32_t v;};
  static constexpr uint32_t NONE=UINT32_MAX,BUSY=0xFE000000u,LONGK=0xFF000000u;
- Slot* slots=nullptr;size_t cap=0,mask=0,count=0;vector<Long> longs;
+ Slot* slots=nullptr;size_t cap=0,mask=0,count=0;vector<Long> longs;void* slotsMap=nullptr;size_t slotsMapLen=0;
  // lock-free mode: new keys get idBase+0, idBase+1, ... up to idLimit keys; newNames keeps their text
- atomic<uint32_t> nextId{0};uint32_t idBase=0,idLimit=0;PName* newNames=nullptr;size_t namesBytes=0;mutex longMu;
+ atomic<uint32_t> nextId{0};uint32_t idBase=0,idLimit=0;PName* newNames=nullptr;void* namesMap=nullptr;size_t namesMapLen=0;mutex longMu;
  explicit KeyTable(size_t want=1024){alloc(want);}
  KeyTable(const KeyTable&)=delete;KeyTable& operator=(const KeyTable&)=delete;
- ~KeyTable(){if(slots)munmap((void*)slots,cap*sizeof(Slot));if(newNames)munmap((void*)newNames,namesBytes);}
+ ~KeyTable(){if(slotsMap)munmap(slotsMap,slotsMapLen);if(namesMap)munmap(namesMap,namesMapLen);}
  void alloc(size_t want){
   size_t c=1024;while(c<want)c<<=1;
-  void* mem=mmap(nullptr,c*sizeof(Slot),PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); // zero pages, touched lazily
-  if(mem==MAP_FAILED)throw bad_alloc();
-  if(optHuge)madvise(mem,c*sizeof(Slot),MADV_HUGEPAGE); // fewer page faults and TLB misses where the kernel allows it
-  slots=(Slot*)mem;cap=c;mask=c-1;
+  slots=(Slot*)map_huge(c*sizeof(Slot),&slotsMap,&slotsMapLen); // zero pages, touched lazily, huge where the kernel allows it
+  cap=c;mask=c-1;
  }
  __attribute__((always_inline)) static bool pack(string_view s,uint64_t& k0,uint32_t& k1){ // s must be a view into a mapped input
   const size_t n=s.size();if(n>11)return false;
@@ -411,14 +476,14 @@ struct KeyTable{
  }
  void grow(size_t want=0){
   const auto R=memory_order_relaxed;
-  Slot* old=slots;size_t oldcap=cap;alloc(max(cap*2,want));
-  if(!count){munmap((void*)old,oldcap*sizeof(Slot));return;} // nothing to move: do not even touch the old pages
+  Slot* old=slots;size_t oldcap=cap;void* oldMap=slotsMap;size_t oldMapLen=slotsMapLen;alloc(max(cap*2,want));
+  if(!count){munmap(oldMap,oldMapLen);return;} // nothing to move: do not even touch the old pages
   for(size_t i=0;i<oldcap;++i){Slot& e=old[i];uint32_t c=e.k1.load(R);if(!c)continue;
    size_t j=(c==LONGK?e.k0.load(R):hash_packed(e.k0.load(R),c))&mask;
    while(slots[j].k1.load(R))j=(j+1)&mask;
    slots[j].k0.store(e.k0.load(R),R);slots[j].k1.store(c,R);slots[j].v.store(e.v.load(R),R);
   }
-  munmap((void*)old,oldcap*sizeof(Slot));
+  munmap(oldMap,oldMapLen);
  }
  template<class FN> void remap(FN&& fn){ // rewrite every stored value
   const auto R=memory_order_relaxed;
@@ -428,11 +493,8 @@ struct KeyTable{
  // ---- lock-free mode ----
  void begin_parallel(uint32_t base,uint32_t maxNew){
   idBase=base;idLimit=maxNew;nextId.store(0);
-  // Straight from mmap: calloc would hand out heap memory and zero all of it here, on one thread.
-  namesBytes=((size_t)maxNew+1)*sizeof(PName);
-  void* mem=mmap(nullptr,namesBytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-  if(mem==MAP_FAILED)throw bad_alloc();
-  newNames=(PName*)mem;
+  // Straight from a lazily touched mapping: calloc would hand out heap memory and zero all of it here, on one thread.
+  newNames=(PName*)map_huge(((size_t)maxNew+1)*sizeof(PName),&namesMap,&namesMapLen);
   if((count+maxNew)*2>cap)grow((count+maxNew)*2);
  }
  uint32_t end_parallel(){uint32_t n=min(nextId.load(),idLimit);count+=n;return n;}
@@ -573,7 +635,7 @@ template<class T> struct Bucket{
  __attribute__((always_inline)) void append(const T& r){*e++=r;} // there must be room
  __attribute__((always_inline)) void push_back(const T& r){if(__builtin_expect(e==c,0))reserve(max<size_t>(16,2*capacity()));*e++=r;}
 };
-static void unmap_regions(vector<Region> regions){for(const Region& r:regions)munmap(r.base,r.len);}
+[[maybe_unused]] static void unmap_regions(vector<Region> regions){for(const Region& r:regions)munmap(r.base,r.len);}
 static constexpr uint32_t LOCAL_USER=0x80000000u;
 // One parsed event line, 32 bytes (two per cache line), bucketed by event_id hash so duplicates meet in one bucket.
 //  id    start of the event_id text in the mapped input. Its length is not kept: the text ends at the
@@ -648,39 +710,24 @@ static inline void click_insertion_sort(Click* c0,Click* c1){
   if(click_before(*x,x[-1])){const Click v=*x;Click* y=x;do{*y=y[-1];--y;}while(y>c0&&click_before(v,y[-1]));*y=v;}
  }
 }
-// Grow-only scratch array that is never zero-filled.
+// Scratch array living in a thread's HugePool. reserve() the largest size up front where it is known;
+// get() beyond that takes a new, larger piece and abandons the old one.
 template<class T> struct Scratch{
- T* p=nullptr;size_t cap=0;
- Scratch()=default;Scratch(const Scratch&)=delete;Scratch& operator=(const Scratch&)=delete;
- ~Scratch(){free(p);}
- T* get(size_t n){if(n>cap){free(p);cap=n+n/4+64;p=(T*)malloc(cap*sizeof(T));if(!p)throw bad_alloc();}return p;}
-};
-// Memory for the block lists below: handed out from 1 MB slabs owned by one thread, freed all at once.
-// (Plain malloc: slabs mapped one by one, with or without huge pages, measured slower in the dedup stage.)
-struct SlabPool{
- char* cur=nullptr;char* end=nullptr;vector<void*> slabs;
- SlabPool()=default;SlabPool(const SlabPool&)=delete;SlabPool& operator=(const SlabPool&)=delete;
- ~SlabPool(){for(void* p:slabs)free(p);}
- __attribute__((noinline,cold)) void* take(size_t bytes){
-  if((size_t)(end-cur)<bytes){
-   static constexpr size_t SLAB=size_t(1)<<20;
-   void* p=malloc(SLAB);if(!p){fprintf(stderr,"ERROR out of memory\n");_exit(1);}
-   slabs.push_back(p);cur=(char*)p;end=cur+SLAB;
-  }
-  void* r=cur;cur+=bytes;return r;
- }
+ T* p=nullptr;size_t cap=0;HugePool* pool=nullptr;
+ void reserve(size_t n){if(n>cap){cap=n;p=(T*)pool->take(cap*sizeof(T));}}
+ T* get(size_t n){if(n>cap)reserve(n+n/4+64);return p;}
 };
 // Append-only list of fixed-size blocks: nothing is ever copied when it grows, and an element's address stays valid.
 template<class T,size_t BYTES> struct Blocks{
  static constexpr size_t PER=(BYTES-16)/sizeof(T);
  struct Block{Block* next;size_t pad;T items[PER];};
  T* cur=nullptr;T* end=nullptr;Block* head=nullptr;Block* tail=nullptr;size_t nblocks=0;
- void grow(SlabPool& pool){
+ __attribute__((noinline,cold)) void grow(HugePool& pool){
   Block* b=(Block*)pool.take(sizeof(Block));
   b->next=nullptr;if(tail)tail->next=b;else head=b;
   tail=b;++nblocks;cur=b->items;end=b->items+PER;
  }
- T* slot(SlabPool& pool){if(cur==end)grow(pool);return cur++;} // the place for the next element
+ T* slot(HugePool& pool){if(cur==end)grow(pool);return cur++;} // the place for the next element
  size_t size()const{return nblocks?(nblocks-1)*PER+(size_t)(cur-tail->items):0;}
  size_t count(const Block* b)const{return b==tail?(size_t)(cur-b->items):PER;}
 };
@@ -1180,15 +1227,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Map the big inputs up front so the kernel starts reading them while links are processed.
  vector<Chunk> chunks;uint64_t eventBytes=0,clickBytes=0;
  static constexpr size_t CH=size_t(2)<<20;
- vector<Region> eventMaps;const char* sampleBase=nullptr;size_t sampleLen=0;
- auto add_files=[&](const fs::path& dir,bool click,uint64_t& bytes){
-  for(const auto& p:csv_files(dir)){Mapped m=map_file(p);if(!m.len)continue;bytes+=m.len;
-   if(!click){eventMaps.push_back({(void*)m.base,((m.len+4095)&~size_t(4095))+4096});
-    if(m.len>sampleLen){sampleLen=m.len;sampleBase=m.base;}}
+ const char* sampleBase=nullptr;size_t sampleLen=0;
+ FileGroup eventFiles,clickFiles,linkFiles;
+ auto add_files=[&](const fs::path& dir,bool click,uint64_t& bytes,FileGroup& group){
+  for(const Mapped& m:map_files(csv_files(dir),group)){if(!m.len)continue;bytes+=m.len;
+   if(!click&&m.len>sampleLen){sampleLen=m.len;sampleBase=m.base;}
    for(size_t from=0;from<m.len;from+=CH)chunks.push_back({m.base,m.len,from,from+CH,click});}
  };
- add_files(data/"events",false,eventBytes);
- add_files(data/"clicks",true,clickBytes);
+ add_files(data/"events",false,eventBytes,eventFiles);
+ add_files(data/"clicks",true,clickBytes,clickFiles);
  // Lines per byte, measured on the start of the largest event file, sizes the bucket buffers tightly.
  uint64_t estEvents=eventBytes/70;
  if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
@@ -1197,7 +1244,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __mark("MAP");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0;
- for(const auto& p:csv_files(data/"links")){Mapped m=map_file(p);if(!m.len)continue;
+ for(const Mapped& m:map_files(csv_files(data/"links"),linkFiles)){if(!m.len)continue;
   ++linkLines; // a last line without '\n'
   for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
  #pragma omp parallel for num_threads(T) schedule(dynamic,1) reduction(+:linkLines)
@@ -1214,7 +1261,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // parent[x] <= x always (a root links to a smaller root), so the forest can never form a cycle.
  // (Initialised by a pass below. Mapping the two arrays as zero pages with "value XOR index" entries,
  // to skip that pass, measured slower: every page then takes its faults in the middle of the hot loops.)
- unique_ptr<atomic<uint32_t>[]> parent(new atomic<uint32_t>[maxLinked+1]);
+ static_assert(sizeof(atomic<uint32_t>)==sizeof(uint32_t));
+ atomic<uint32_t>* const parent=(atomic<uint32_t>*)map_huge((maxLinked+1)*sizeof(uint32_t)); // stays mapped: the process ends with _exit
  auto find_root=[&](uint32_t u)->uint32_t{
   for(;;){
    uint32_t p=parent[u].load(memory_order_relaxed);if(p==u)return u;
@@ -1224,7 +1272,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
  };
  // best[r]: the ID with the byte-wise smallest name seen so far in root r's group.
- unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[maxLinked+1]);
+ atomic<uint32_t>* const best=(atomic<uint32_t>*)map_huge((maxLinked+1)*sizeof(uint32_t));
  atomic<size_t> nextLink{0};
  #pragma omp parallel num_threads(T)
  {
@@ -1320,7 +1368,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
   for(auto& l:tab.longs)if(l.v<nlinked)l.v=find_root(l.v);
  }
- parent.reset();best.reset();
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
@@ -1487,27 +1534,35 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // ---- Person buckets: bucket = person >> pshift, so a bucket is a dense range of W person numbers
  // and the last stage can group by person with one counting pass. Aim for about 16k events per bucket.
  const uint64_t npersons=(uint64_t)totalIds+extraNames.size();
- uint64_t parsedEvents=0;
- for(int t=0;t<T;++t)for(const auto& v:tls[t].eb)parsedEvents+=v.size();
+ uint64_t parsedEvents=0,parsedClicks=0;
+ size_t maxEvBucket=0,maxClBucket=0; // most parsed lines in one ID bucket (all threads together)
+ for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
+ for(size_t p=0;p<PC;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].cb.size())n+=tls[t].cb[p].size();parsedClicks+=n;maxClBucket=max(maxClBucket,n);}
  unsigned pshift=0;
  {const uint64_t want=max<uint64_t>(1,parsedEvents/16384);while(pshift<16&&(npersons>>pshift)>want)++pshift;}
  if(const char* v=getenv("SS_TEST_PSHIFT")){int s=atoi(v);if(s>=0&&s<=16)pshift=(unsigned)s;} // tests force odd bucket widths
  const uint32_t W=1u<<pshift;
  const size_t UPn=(size_t)((npersons?npersons-1:0)>>pshift)+1;
  // Survivors by person bucket, one list per thread and bucket (tls[t].uev/ucl are not used any more).
- struct Survivors{vector<EvList> ev;vector<ClickList> cl;SlabPool pool;};
+ struct Survivors{vector<EvList> ev;vector<ClickList> cl;HugePool pool;}; // pool: all of one thread's post-parse memory
  vector<Survivors> surv(T);
- for(int t=0;t<T;++t){surv[t].ev.resize(UPn);surv[t].cl.resize(UPn);tls[t].uev.clear();tls[t].ucl.clear();}
+ // One region per thread should hold its share of the survivors plus its dedup tables; a thread that
+ // does more than its share continues in smaller regions.
+ const size_t slotCap=2*max(maxEvBucket,maxClBucket)+2;
+ for(int t=0;t<T;++t){surv[t].ev.resize(UPn);surv[t].cl.resize(UPn);tls[t].uev.clear();tls[t].ucl.clear();
+  surv[t].pool.first=(size_t)((parsedEvents*sizeof(Ev)+parsedClicks*sizeof(Click))/(uint64_t)T*9/8)+slotCap*sizeof(uint32_t)+maxEvBucket*sizeof(Ev*)+(size_t(2)<<20);
+  surv[t].pool.next=max<size_t>(size_t(8)<<20,surv[t].pool.first/4);}
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
  uint64_t stEvN=0,stEvDisp=0,stEvMax=0,stEvFalse=0,stClN=0,stClDisp=0,stClMax=0,stClFalse=0; // SS_STATS (the two "False" counts are always kept: they cost nothing)
  #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks,stEvN,stEvDisp,stEvFalse,stClN,stClDisp,stClFalse) reduction(max:stEvMax,stClMax)
  {
   const int tid=omp_get_thread_num();
-  EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();SlabPool& pool=surv[tid].pool;
+  EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();HugePool& pool=surv[tid].pool;
   // Slot = tag<<ib | (record number+1), 0 = empty; ib bits are enough for the bucket's record count.
   // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
   Scratch<uint32_t> slotBuf;Scratch<Ev*> emitBuf;vector<size_t> off(T+1);
+  slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);emitBuf.reserve(maxEvBucket);
   auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
   // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
   // turns out to be the earlier ingested one, the event already passed on is turned into a tombstone:
@@ -1610,14 +1665,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  if(stats)fprintf(stderr,"STATS event dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\nSTATS click dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\n",
   (unsigned long long)stEvN,stEvN?(double)stEvDisp/stEvN:0.0,(unsigned long long)stEvMax,(unsigned long long)stEvFalse,(unsigned long long)stClN,stClN?(double)stClDisp/stClN:0.0,(unsigned long long)stClMax,(unsigned long long)stClFalse);
- for(int t=0;t<T;++t){for(const auto& L:surv[t].ev)surviving+=L.size();for(const auto& L:surv[t].cl)survivingClicks+=L.size();}
+ size_t maxEvPerson=0,maxClPerson=0; // most survivors in one person bucket
+ for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
+  surviving+=ne;survivingClicks+=nc;maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
  cerr<<"deduplicated events: "<<dedupCount<<", surviving: "<<surviving<<"\n";
  cerr<<"surviving clicks: "<<survivingClicks<<"\n";
- // The parsed-line buckets are dead now. Hand their memory (and the event files, when nothing points
- // into them any more) back on a side thread so process exit has less to tear down.
- {vector<Region> dead;{lock_guard<mutex> g(regionMu);dead.swap(stageRegions[0]);}
-  if(!anyLongName.load()&&extraNames.empty())dead.insert(dead.end(),eventMaps.begin(),eventMaps.end());
-  if(optAsyncFree)thread(unmap_regions,std::move(dead)).detach();}
  __mark("DEDUP");
  // ---- Per person bucket: order, sessionize, attribute. Each thread writes its own Parquet file. ----
  fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");
@@ -1647,7 +1699,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  vector<Pass> cpass;
  for(unsigned done=0;done<ccellBits||cpass.empty();){const unsigned b=min(digitBits,ccellBits-done);cpass.push_back({CCSH+done,(uint32_t)((1u<<b)-1)});done+=b;if(!b)break;}
  for(const Pass& q:cpass)maxDigit=max(maxDigit,q.mask);
- vector<vector<Totals>> threadTotals(T);vector<vector<uint64_t>> threadAssists(T);vector<string> dbg(debugCsv?T:0);
+ const size_t ncells=ncamp*(size_t)ndays;
+ {const size_t need=ncells*(sizeof(Totals)+sizeof(uint64_t))+2*maxEvPerson*sizeof(Ev)+2*maxClPerson*sizeof(Click)+(size_t(50000)+(size_t)ndays)*48+(size_t(4)<<20);
+  for(int t=0;t<T;++t)surv[t].pool.next=max<size_t>(size_t(8)<<20,need);} // one more region per thread at most, unless names are very long
+ vector<Totals*> threadTotals(T,nullptr);vector<uint64_t*> threadAssists(T,nullptr);vector<string> dbg(debugCsv?T:0);
  // sessions and events of one row can never exceed the number of parsed event lines, so they are written
  // as 32-bit integers whenever that number fits (always, in practice); revenue stays 64-bit.
  const bool narrow=parsedEvents<0x7fffffffu&&!getenv("SS_TEST_WIDECOUNTS"); // tests force the 64-bit columns
@@ -1655,12 +1710,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const vector<PqCol> userCols={{"user_id",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},{"sessions",countType,false,CONV_NONE},
   {"events",countType,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"top_category",PQ_BYTES,true,CONV_UTF8}};
  uint64_t num_sessions=0;
+ // Input files nobody reads any more are unmapped by the worker threads, a few large pieces each,
+ // instead of leaving every page of them to process exit, which tears mappings down on one thread.
+ vector<pair<char*,size_t>> unmapFirst,unmapLast;
+ if(!getenv("SS_NOEARLYUNMAP")){ // measuring switch
+  const bool eventsFree=!anyLongName.load()&&extraNames.empty(); // otherwise a person's name may still point into an event file
+  group_pieces(eventFiles,(size_t)T,eventsFree?unmapFirst:unmapLast);
+  group_pieces(clickFiles,(size_t)T,unmapLast); // click IDs still break ties while sessions are attributed
+  group_pieces(linkFiles,1,unmapLast);
+ }
  #pragma omp parallel num_threads(T) reduction(+:num_sessions)
  {
   const int tid=omp_get_thread_num();
+  #pragma omp for schedule(static,1) nowait
+  for(size_t i=0;i<unmapFirst.size();++i)munmap(unmapFirst[i].first,unmapFirst[i].second);
   // Per-thread campaign totals, laid out [day][campaign].
-  auto& tot=threadTotals[tid];tot.assign(ncamp*(size_t)ndays,Totals{});
-  auto& assists=threadAssists[tid];assists.assign(ncamp*(size_t)ndays,0);
+  // Everything this thread needs comes from its pool (fresh, so zeroed): totals, sort buffers, row buffers.
+  HugePool& pool=surv[tid].pool;
+  Totals* const tot=(Totals*)pool.take(ncells*sizeof(Totals));threadTotals[tid]=tot;
+  uint64_t* const assists=(uint64_t*)pool.take(ncells*sizeof(uint64_t));threadAssists[tid]=assists;
   vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp);size_t nact=0;
   vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
   PqFile file;
@@ -1669,26 +1737,31 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   // so the fixed-width columns never need a capacity check.
   static constexpr size_t FLUSH=50000;
   const size_t rowCap=FLUSH+(size_t)ndays;
-  vector<int32_t> days(rowCap),sess32(narrow?rowCap:0),evs32(narrow?rowCap:0);vector<int64_t> sess(narrow?0:rowCap),evs(narrow?0:rowCap),rev(rowCap);
-  vector<uint8_t> catbits((rowCap+7)/8,0);
-  string uid(1<<16,'\0'),catv,catbody;size_t uidLen=0,nrows=0;
-  char* uidp=uid.data();size_t uidCap=uid.size();
-  int32_t* const dayp=days.data();int32_t* const sess32p=sess32.data();int32_t* const evs32p=evs32.data();int64_t* const sessp=sess.data();int64_t* const evsp=evs.data();int64_t* const revp=rev.data();
+  int32_t* const dayp=(int32_t*)pool.take(rowCap*4);int64_t* const revp=(int64_t*)pool.take(rowCap*8);
+  int32_t* const sess32p=narrow?(int32_t*)pool.take(rowCap*4):nullptr;int32_t* const evs32p=narrow?(int32_t*)pool.take(rowCap*4):nullptr;
+  int64_t* const sessp=narrow?nullptr:(int64_t*)pool.take(rowCap*8);int64_t* const evsp=narrow?nullptr:(int64_t*)pool.take(rowCap*8);
+  uint8_t* const catbits=(uint8_t*)pool.take((rowCap+7)/8);
+  // user_id bytes: room for rowCap short names; a longer run of long names moves to a bigger piece.
+  size_t uidCap=rowCap*20+(size_t(1)<<16),uidLen=0,nrows=0;char* uidp=(char*)pool.take(uidCap);
+  auto grow_uid=[&](size_t need){const size_t cap2=max(uidCap*2,uidLen+need);char* q=(char*)pool.take(cap2);memcpy(q,uidp,uidLen);uidp=q;uidCap=cap2;};
+  string catv,catbody;
   auto flush_rows=[&]{
    if(!nrows)return;
    // top_category page: 1-bit definition levels as one bit-packed run, then the non-null values.
    const size_t n=nrows,groups=(n+7)/8;
    catbody.clear();
    string head;put_varint(head,(groups<<1)|1);
-   put_le32(catbody,(uint32_t)(head.size()+groups));catbody+=head;catbody.append((const char*)catbits.data(),groups);catbody+=catv;
+   put_le32(catbody,(uint32_t)(head.size()+groups));catbody+=head;catbody.append((const char*)catbits,groups);catbody+=catv;
    if(!file.is_open())open_file();
-   file.row_group((int64_t)n,{string_view(uid.data(),uidLen),string_view((const char*)days.data(),n*4),
-    narrow?string_view((const char*)sess32.data(),n*4):string_view((const char*)sess.data(),n*8),
-    narrow?string_view((const char*)evs32.data(),n*4):string_view((const char*)evs.data(),n*8),
-    string_view((const char*)rev.data(),n*8),catbody});
-   memset(catbits.data(),0,groups);catv.clear();uidLen=0;nrows=0;
+   file.row_group((int64_t)n,{string_view(uidp,uidLen),string_view((const char*)dayp,n*4),
+    narrow?string_view((const char*)sess32p,n*4):string_view((const char*)sessp,n*8),
+    narrow?string_view((const char*)evs32p,n*4):string_view((const char*)evsp,n*8),
+    string_view((const char*)revp,n*8),catbody});
+   memset(catbits,0,groups);catv.clear();uidLen=0;nrows=0;
   };
   Scratch<Ev> bufA,bufB;Scratch<Click> bufC,bufD;
+  bufA.pool=bufB.pool=&pool;bufC.pool=bufD.pool=&pool;
+  bufA.reserve(maxEvPerson);bufB.reserve(maxEvPerson);bufC.reserve(maxClPerson);bufD.reserve(maxClPerson);
   vector<uint32_t> thist((size_t)maxDigit+2),phist((size_t)W+3),chist((size_t)W+2);
   uint32_t* const th=thist.data();uint32_t* const pp=phist.data();uint32_t* const cp=chist.data();
   #pragma omp for schedule(dynamic,1)
@@ -1801,11 +1874,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        const size_t r=nrows++;
        // user_id: names of up to 15 bytes sit inside their PName and are copied as one fixed 16-byte block.
-       if(uidCap-uidLen<64){uid.resize(uid.size()*2);uidp=uid.data();uidCap=uid.size();}
+       if(uidCap-uidLen<64)grow_uid(64);
        unsigned char inl=0xFF;if(person<totalIds)inl=(unsigned char)personNames[person].b[15];
        if(inl!=0xFF){char* o=uidp+uidLen;const uint32_t L=inl;memcpy(o,&L,4);memcpy(o+4,personNames[person].b,16);uidLen+=4+L;}
        else{const string_view name=name_of(person);const uint32_t L=(uint32_t)name.size();
-        if(uidCap-uidLen<(size_t)L+64){uid.resize(max(uid.size()*2,uidLen+L+64));uidp=uid.data();uidCap=uid.size();}
+        if(uidCap-uidLen<(size_t)L+64)grow_uid((size_t)L+64);
         char* o=uidp+uidLen;memcpy(o,&L,4);memcpy(o+4,name.data(),L);uidLen+=4+L;}
        dayp[r]=(int32_t)(firstday+currentday);revp[r]=(int64_t)drev;
        if(narrow){sess32p[r]=(int32_t)dsess;evs32p[r]=(int32_t)devs;}else{sessp[r]=(int64_t)dsess;evsp[r]=(int64_t)devs;}
@@ -1829,7 +1902,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       uint16_t credited=organic;
       if(add>expire)credited=(uint16_t)add[-1].key;
       cur=&tot[(size_t)d*ncamp+credited];cur->sessions++;purchasing=false;
-      uint64_t* const arow=assists.data()+(size_t)d*ncamp;
+      uint64_t* const arow=assists+(size_t)d*ncamp;
       #pragma GCC unroll 4
       for(size_t q=0;q<nact;++q)++arow[active[q]];
       ++num_sessions;
@@ -1852,13 +1925,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(nrows>=FLUSH)flush_rows();
    }
   }
+  // Every row is in the output buffers now (names are copied there): nothing points into an input file.
+  #pragma omp for schedule(static,1) nowait
+  for(size_t i=0;i<unmapLast.size();++i)munmap(unmapLast[i].first,unmapLast[i].second);
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
   if(file.is_open())file.close();
  }
  vector<Totals> campTotals(ncamp*(size_t)ndays);
- for(const auto& tt:threadTotals)for(size_t i=0;i<tt.size();++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
- for(const auto& ta:threadAssists)for(size_t i=0;i<ta.size();++i)campTotals[i].assists+=ta[i];
+ for(const Totals* tt:threadTotals)if(tt)for(size_t i=0;i<ncells;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
+ for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=0;i<ncells;++i)campTotals[i].assists+=ta[i];
 __mark("AGGREGATE");
  {
   string cid,chan,csv;vector<int32_t> days;vector<int64_t> s,p,r,a;
@@ -1881,6 +1957,10 @@ __mark("AGGREGATE");
   }
  }
 __mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
+ // Every output file is written and closed. Leave at once: unwinding would only hand gigabytes of
+ // mappings back piece by piece before the kernel drops them anyway.
+ cerr.flush();fflush(nullptr);
+ _exit(0);
 }
 int main(){try{
  // glibc grows each thread's heap with one mprotect per small step, and every mprotect takes the
