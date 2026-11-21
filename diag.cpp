@@ -398,10 +398,12 @@ int main(){
  for(int r=0;r<4;++r){
   add("B",1,{N8});add("c60",1,{N8},"core-b");add("cl1",1,{N8,{"SS_CL8","1"}});add("ix",1,{N8,{"SS_CLICKS","ix"}});
   add("pB",1,{N8,PO});add("p60",1,{N8,PO},"core-b");add("Bs",1,{N8,ST});
+  add("el2",1,{N8,{"SS_EVLEAD","2"}});add("cl2",1,{N8,{"SS_CLLEAD","2"}});add("pt1",1,{N8,{"SS_PF","t1"}});add("pfw",1,{N8,{"SS_PF","w"}});add("pfn",1,{N8,{"SS_PF","none"}});
+  add("S",1,{N8},"core-s");add("Ss",1,{N8,ST},"core-s");
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H60",1,{N8},"core-b",true);add("Hcl1",1,{N8,{"SS_CL8","1"}},"",true);}
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H60",1,{N8},"core-b",true);add("Hcl1",1,{N8,{"SS_CL8","1"}},"",true);add("Hl2",1,{N8,{"SS_EVLEAD","2"},{"SS_CLLEAD","2"}},"",true);add("HS",1,{N8},"core-s",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
@@ -476,8 +478,9 @@ int main(){
   auto allw=[&](const string& name,const string& grp)->string{string o=name+"=";bool first=true;for(auto& r:results){if(r.rc!=0||r.label.compare(0,grp.size()+1,grp+"#")!=0)continue;if(!first)o+=",";first=false;o+=to_string((long)(r.wall*1e3+0.5));}return o+" ";};
   a+=eqText+" | 20M wall of every run: "+allw("c62","B")+allw("c60","c60")+allw("c62-cl8v1","cl1")+allw("c62-oldclicks","ix");
   a+="| min wPRYXAW/us: "+fmt("c62","B","wPRYXAWus")+fmt("c60","c60","wPRYXAWus")+fmt("cl8v1","cl1","wPRXus")+fmt("oldclicks","ix","wPRXus")+"| parse-only P/us: "+fmt("c62","pB","Pus")+fmt("c60","p60","Pus");
+  a+="| slot request variants wPX: "+fmt("evlead2","el2","wPX")+fmt("cllead2","cl2","wPX")+fmt("pf=t1","pt1","wPX")+fmt("pf=w","pfw","wPX")+fmt("pf=none","pfn","wPX")+"| willneed-in-background wP+MAP: "+fmt("","S","wPM")+allw("walls","S")+fmt("small stages MKLDYWE","Ss","MKLDYWE");
   a+="| c62 small stages MAP/KEYS/LINK+FLATTEN/DEDUP/DENSE1/WRITE/exit: "+fmt("","Bs","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","Bs","pqxa")+"| "+floorText;
-  c+="60M wall of every run: "+allw("c62","HB")+allw("c60","H60")+allw("c62-cl8v1","Hcl1")+"| min wPRYXAW/us: "+fmt("c62","HB","wPRYXAWus")+fmt("c60","H60","wPRYXAWus")+fmt("cl8v1","Hcl1","wPRX");
+  c+="60M wall of every run: "+allw("c62","HB")+allw("c60","H60")+allw("c62-cl8v1","Hcl1")+"| min wPRYXAW/us: "+fmt("c62","HB","wPRYXAWus")+fmt("c60","H60","wPRYXAWus")+fmt("cl8v1","Hcl1","wPRX")+fmt("lead2","Hl2","wPRX")+fmt("willneed-bg","HS","wPM")+allw("walls lead2","Hl2")+allw("walls willneed-bg","HS");
   c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
