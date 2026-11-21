@@ -1485,7 +1485,7 @@ SS_V3I const char* event_window2(const char* p,uint64_t c){return p+_tzcnt_u64(_
 // One event line at p, given the masks of its two windows (w1 at p, w2 at b=event_window2(p,w1.c)).
 // Does exactly what for_records<7> + the general event handler would do with the line; `general` is
 // that handler and gets the line if the short path passes it on. Returns the start of the next line.
-template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const EvLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,ERing* const ring,unsigned& rpos,GEN&& general){
+template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const char* const nl,const EvLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,ERing* const ring,unsigned& rpos,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& products=lp.products;const size_t PE=lp.PE;
  DateMemo3* const memo=lp.memo;const int64_t wstart=lp.wstart;const uint64_t wlen=lp.wlen,ibase=lp.ibase;
  Bucket<PRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
@@ -1493,22 +1493,25 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
   const char* next=nullptr;bool done=false;
   do{
    // Window 1: 64 bytes from the line start; must hold the first three commas (fields 0-2).
-   const uint64_t c=w1.c,qa=w1.q,na=w1.n;
+   const uint64_t c=w1.c,qa=w1.q;
    const uint64_t cA=_blsr_u64(c),cB=_blsr_u64(cA),cR=_blsr_u64(cB);
    const uint64_t m1=_blsmsk_u64(cB); // bytes up to and including the third comma
    const uint64_t q1=qa&m1,st1=((c^cB)<<1)|1,en1=c^cR;
    uint64_t sq1,op1;const uint64_t err1=quote_errors_v3(q1,st1,en1,sq1,op1);
    // Window 2: 64 bytes from the start of field 3; must hold the last three commas and the newline.
    const uint64_t e2=_tzcnt_u64(cB); // 64 if there is no third comma
-   const uint64_t nb=w2.n;
-   const uint64_t keep=_blsmsk_u64(nb)>>1; // bytes before the newline
+   // The dense-record loops know where the line ends (nl, from the line index), so the windows need no newline
+   // masks there: L = distance of the newline from the window start. A newline before the third comma makes L
+   // negative, a line too long for the window makes it 64 or more; both fail the test below like a missing comma.
+   uint64_t nbit,keep,L; // nbit: the newline's bit in window 2; keep: the bytes before it
+   if(DREC){L=(uint64_t)(nl-b);nbit=1ull<<(L&63);keep=nbit-1;}
+   else{const uint64_t nb=w2.n;L=_tzcnt_u64(nb);nbit=_blsi_u64(nb);keep=_blsmsk_u64(nb)>>1;} // L: 64 if there is no newline in the window
    const uint64_t d=w2.c&keep,qb=w2.q&keep;
-   const uint64_t st2=(d<<1)|1,en2=d|_blsi_u64(nb);
+   const uint64_t st2=(d<<1)|1,en2=d|nbit;
    uint64_t sq2,op2;const uint64_t err2=quote_errors_v3(qb,st2,en2,sq2,op2);
-   const uint64_t L=_tzcnt_u64(nb); // 64 if there is no newline in the window
    // one test: quote errors, a newline before the third comma, not exactly three more commas, a missing comma or newline
-   if(__builtin_expect((err1|err2|(na&m1)|(uint64_t)(_mm_popcnt_u64(d)^3)|((e2|L)>>6))!=0,0))break;
-   next=b+L+1;done=true; // from here on the line is well-formed, 7 fields
+   if(__builtin_expect((err1|err2|(DREC?0:(w1.n&m1))|(uint64_t)(_mm_popcnt_u64(d)^3)|((e2|L)>>6))!=0,0))break;
+   next=DREC?nl+1:b+L+1;done=true; // from here on the line is well-formed, 7 fields
    // Content of each field: starts move one up past an opening quote, ends one down onto a closing quote.
    uint64_t B1=st1+sq1,E1=en1-(op1>>1),B2=st2+sq2,E2=en2-(op2>>1);
    const unsigned z0=(unsigned)(q1&1);
@@ -1637,7 +1640,8 @@ template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t le
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const EvLoop lp(tl,tab,products,PE,base+len);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* send: one past the highest counter written to a slot */ \
  ESlot scratch;scratch.k.store(0,memory_order_relaxed);ERing ring[RING_MAX];unsigned rpos=0;for(ERing& e:ring){e.k=ESLOT_INVALID;e.ingest=0;e.uct=0;e.slot=&scratch;} /* dmax: largest dense user code seen */ \
- while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,ring,rpos,general);} \
+ static_assert(!DREC,"the dense-record line code needs the line index"); \
+ while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),nullptr,lp,pend,pp,dmax,send,ring,rpos,general);} \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
  for(const ERing& e:ring)eslot_commit(*e.slot,e.k,e.uct,e.ingest); /* the rows still waiting (free places write the scratch slot) */ \
  tl.evEnd=max(tl.evEnd,send); \
@@ -1657,9 +1661,9 @@ template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t le
  while(p<lim){ \
   size_t n=0; \
   for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
-  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,ring,rpos,general);p=starts[i];} \
+  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3<DREC>(p,b,w1,MASKS(b),starts[i]-1,lp,pend,pp,dmax,send,ring,rpos,general);p=starts[i];} \
   if(scan>=end&&p<lim){ /* the last line has no newline */ \
-   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,ring,rpos,general);break;} \
+   if(DREC){p=line_general<7>(p,end,general);break;} const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),nullptr,lp,pend,pp,dmax,send,ring,rpos,general);break;} \
  } \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
  for(const ERing& e:ring)eslot_commit(*e.slot,e.k,e.uct,e.ingest); /* the rows still waiting (free places write the scratch slot) */ \
@@ -1678,21 +1682,21 @@ struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;cons
   clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask),
   dUsers(dparse.users),kc(dense.kc),ku(dense.ku),limC(dense.limC),cl(denseCl),tid(tl_.tid),bucket(dparse.bucket),ahead(dparse.ahead),shC(dparse.shC),dcb(tl_.dcb.data()){}
 };
-template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const p,const WinMasks w,const ClLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,CRing* const ring,unsigned& rpos,GEN&& general){
+template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const p,const WinMasks w,const char* const nl,const ClLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,CRing* const ring,unsigned& rpos,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& camps=lp.camps;const size_t PC=lp.PC;
  DateMemo3* const memo=lp.memo;const int64_t clickStart=lp.clickStart;const uint64_t wlen=lp.wlen;
  Bucket<CRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
  {
   const char* next=nullptr;bool done=false;
   do{
-   const uint64_t nb=w.n;
-   const uint64_t keep=_blsmsk_u64(nb)>>1;
+   uint64_t nbit,keep,L; // as in event_line_v3: the dense-record loops know the line end
+   if(DREC){L=(uint64_t)(nl-p);nbit=1ull<<(L&63);keep=nbit-1;}
+   else{const uint64_t nb=w.n;L=_tzcnt_u64(nb);nbit=_blsi_u64(nb);keep=_blsmsk_u64(nb)>>1;} // L: 64 if there is no newline in the window
    const uint64_t c=w.c&keep,q=w.q&keep;
-   const uint64_t st=(c<<1)|1,en=c|_blsi_u64(nb);
+   const uint64_t st=(c<<1)|1,en=c|nbit;
    uint64_t sq,op;const uint64_t err=quote_errors_v3(q,st,en,sq,op);
-   const uint64_t L=_tzcnt_u64(nb); // 64 if there is no newline in the window
    if(__builtin_expect((err|(uint64_t)(_mm_popcnt_u64(c)^3)|(L>>6))!=0,0))break;
-   next=p+L+1;done=true; // well-formed, 4 fields
+   next=DREC?nl+1:p+L+1;done=true; // well-formed, 4 fields
    uint64_t B=st+sq,E=en-(op>>1);
    const unsigned z0=(unsigned)(q&1);
    const char* const s0=p+z0;const unsigned l0=(unsigned)_tzcnt_u64(E)-z0;
@@ -1784,7 +1788,8 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
 template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const ClLoop lp(tl,tab,camps,PC,base+len,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CSlot scratch;CRing ring[RING_MAX];unsigned rpos=0;for(CRing& e:ring){e.key=0;e.slot=&scratch;e.user=0;} /* dmax: largest dense user code seen */ \
- while(p<lim)p=click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,ring,rpos,general); \
+ static_assert(!DREC,"the dense-record line code needs the line index"); \
+ while(p<lim)p=click_line_v3<DREC>(p,MASKS(p),nullptr,lp,pend,pp,dmax,send,ring,rpos,general); \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
  for(const CRing& e:ring)cslot_commit(*e.slot,e.key,e.user,lp.tid); \
  tl.clEnd=max(tl.clEnd,send); \
@@ -1798,8 +1803,8 @@ template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t le
  while(p<lim){ \
   size_t n=0; \
   for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
-  for(size_t i=0;i<n&&p<lim;++i){click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,ring,rpos,general);p=starts[i];} \
-  if(scan>=end&&p<lim){p=click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,ring,rpos,general);break;} \
+  for(size_t i=0;i<n&&p<lim;++i){click_line_v3<DREC>(p,MASKS(p),starts[i]-1,lp,pend,pp,dmax,send,ring,rpos,general);p=starts[i];} \
+  if(scan>=end&&p<lim){if(DREC)p=line_general<4>(p,end,general);else p=click_line_v3<DREC>(p,MASKS(p),nullptr,lp,pend,pp,dmax,send,ring,rpos,general);break;} \
  } \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
  for(const CRing& e:ring)cslot_commit(*e.slot,e.key,e.user,lp.tid); \
