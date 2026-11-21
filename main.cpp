@@ -744,6 +744,7 @@ struct Chunk{const char* base;size_t len,from,to;bool click;};
 // One surviving event, 16 bytes. k = tsrel<<25 | purchase<<24 | price, with tsrel = ts - window_start
 // (< 2^37 ms: the window is at most 1000 days) and price <= 10,000,000 < 2^24. person is the compact person number.
 struct Ev{uint64_t k;uint32_t person;uint16_t cat;uint16_t pad;};
+static_assert(offsetof(PRec,cat)==offsetof(PRec,user)+4&&offsetof(PRec,hx)==offsetof(PRec,user)+6&&offsetof(Ev,cat)==offsetof(Ev,person)+4&&sizeof(Ev)==16); // dedup copies user+cat(+tag) as one word
 static constexpr uint64_t EV_PURCHASE=1ull<<24,EV_PRICE=EV_PURCHASE-1;
 static constexpr unsigned EV_TS=25;
 static_assert(PR_KBIAS==1ull<<EV_TS);
@@ -1370,6 +1371,116 @@ SS_CLICK_LOOP_IX(clicks_avx512y_ix,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 SS_CLICK_LOOP(clicks_avx2,SS_V3,win_masks_avx2)
 SS_CLICK_LOOP(clicks_avx512z,SS_V5,win_masks_avx512z)
 SS_CLICK_LOOP(clicks_avx512y,SS_V5,win_masks_avx512y)
+// ---- Dense IDs ----------------------------------------------------------------------------------
+// Data made by the track's generator names every event, click and user by a counter pushed through a
+// fixed bijection on 0..2^40 with one secret key per kind and written in base 36 behind a letter:
+//   text = letter + base36( ((index*M1 ^ key) mod 2^40, x ^= x>>17, x*M2 mod 2^40) ).
+// Undoing that turns an ID back into its counter, and counters are dense (0..N-1) and ordered: a user's
+// events are consecutive event counters in time order, a user's clicks consecutive click counters, and
+// a user ID is (user index)*512 + alias. Code that knows the counter can index arrays directly instead
+// of hashing, and finds a person's rows next to each other.
+// Nothing here may be needed for correctness: an ID takes the dense route only if its text is the
+// canonical base-36 form (so text <-> number is one-to-one) and its counter is below a limit; every
+// other ID keeps the general route, and a general ID can never equal a dense one as text. If the keys
+// cannot be found (other data), `dense` stays off and the whole run is the general route.
+namespace dn{
+static constexpr uint64_t MASK=(1ull<<40)-1;
+static constexpr uint64_t M1=0x9E3779B97F4Bull&MASK,M2=0xD6E8FEB86659ull&MASK;
+static constexpr uint64_t inv40(uint64_t a){uint64_t x=a;for(int i=0;i<6;++i)x*=2-a*x;return x&MASK;}
+static constexpr uint64_t I1=inv40(M1),I2=inv40(M2);
+static_assert(((M1*I1)&MASK)==1&&((M2*I2)&MASK)==1);
+static constexpr unsigned GEN_ALIAS_BITS=9; // user number = index<<9 | alias in the generator
+static constexpr unsigned ALIAS_BITS=3;     // aliases 0..7 take the dense route (99% of rows); compact user = index<<3 | alias
+// Undoes the multiplication by M2 and the xor-shift; the key and M1 are still in the result.
+static inline __attribute__((always_inline)) uint64_t unmix(uint64_t y){const uint64_t m=(y*I2)&MASK;return m^(m>>17)^(m>>34);}
+// Counter of the ID whose base-36 value is y (y < 2^40), and back.
+static inline __attribute__((always_inline)) uint64_t index_of(uint64_t y,uint64_t key){return ((unmix(y)^key)*I1)&MASK;}
+static inline uint64_t value_of(uint64_t index,uint64_t key){uint64_t m=((index*M1)^key)&MASK;m^=m>>17;return (m*M2)&MASK;}
+// Canonical base 36: 1-8 characters of [0-9a-z], no leading zero unless it is the only digit, value < 2^40.
+// (s, n) is the text after the ID's letter. Reference version; the parser may use its own vector form.
+static inline bool parse36(const char* s,size_t n,uint64_t& y){
+ if(n-1>7)return false;
+ if(s[0]=='0'&&n>1)return false;
+ uint64_t v=0;
+ for(size_t i=0;i<n;++i){unsigned d=(unsigned char)s[i]-(unsigned)'0';if(d>9){d=(unsigned char)s[i]-(unsigned)'a';if(d>25)return false;d+=10;}v=v*36+d;}
+ if(v>MASK)return false;
+ y=v;return true;
+}
+// Writes letter + canonical base 36 of y into out (room for 9 bytes); returns the length.
+static inline size_t text36(char letter,uint64_t y,char* out){
+ char buf[8];int at=8;do{const unsigned d=(unsigned)(y%36);buf[--at]=(char)(d<10?'0'+d:'a'+(d-10));y/=36;}while(y);
+ out[0]=letter;memcpy(out+1,buf+at,(size_t)(8-at));return (size_t)(9-at);
+}
+// Looks for the key under which sample 0 has a counter that is a multiple of `step` below `limit` and
+// all but at most one of the other samples have counters below `limit`. um[i] = unmix(value of sample i).
+// Candidates are tried in increasing counter order by all threads; the smallest hit wins.
+static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,uint64_t& key,int T){
+ if(n<6||limit<step)return false;
+ const uint64_t cand=limit/step;atomic<uint64_t> best{UINT64_MAX};
+ const uint64_t inc=(M1*step)&MASK;
+ #pragma omp parallel num_threads(T)
+ {
+  const int t=omp_get_thread_num();
+  const uint64_t BL=1u<<16; // blocks are dealt round-robin so every thread stays near the low counters
+  for(uint64_t b=(uint64_t)t*BL;b<cand&&b<best.load(memory_order_relaxed);b+=(uint64_t)T*BL){
+   const uint64_t e=min(cand,b+BL);uint64_t a=(b*inc)&MASK;
+   for(uint64_t c=b;c<e;++c,a=(a+inc)&MASK){
+    const uint64_t k=um[0]^a;
+    if((((um[1]^k)*I1)&MASK)>=limit&&(((um[2]^k)*I1)&MASK)>=limit)continue; // two misses already
+    size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
+    if(miss<2){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}break;}
+   }
+  }
+ }
+ const uint64_t c=best.load();if(c==UINT64_MAX)return false;
+ key=um[0]^((c*inc)&MASK);return true;
+}
+struct Info{
+ bool events=false,clicks=false; // dense route usable for events / for clicks (each also needs the user key)
+ uint64_t ke=0,ku=0,kc=0;        // keys of event, user and click IDs (low 40 bits)
+ uint64_t limE=0,limC=0,limI=0;  // an event / click counter or a user index at or above its limit keeps the general route
+};
+// First `want` canonical IDs with the given letter found in column `col` at the start of a CSV file (header skipped).
+static vector<uint64_t> sample_ids(const char* base,size_t len,int col,char letter,size_t want){
+ vector<uint64_t> out;const char* p=(const char*)memchr(base,'\n',len);if(!p)return out;++p;
+ const char* const end=base+len;
+ while(p<end&&out.size()<want){
+  const char* e=(const char*)memchr(p,'\n',(size_t)(end-p));if(!e)break;
+  const char* f=p;int c=0;
+  while(c<col&&f<e){const char* q=(const char*)memchr(f,',',(size_t)(e-f));if(!q){f=e;break;}f=q+1;++c;}
+  if(c==col&&f<e){const char* q=(const char*)memchr(f,',',(size_t)(e-f));const char* g=q?q:e;
+   if(g-f>=2&&*f=='"'&&g[-1]=='"'){++f;--g;}
+   uint64_t y;if(g-f>=2&&*f==letter&&parse36(f+1,(size_t)(g-f-1),y))out.push_back(y);}
+  p=e+1;
+ }
+ return out;
+}
+// Tries to find one key: any of the first samples may be the anchor (for users it must be an alias-0 ID).
+static bool infer(const vector<uint64_t>& ys,uint64_t limit,uint64_t step,uint64_t& key,int T){
+ if(ys.size()<12)return false;
+ vector<uint64_t> um(ys.size());for(size_t i=0;i<ys.size();++i)um[i]=unmix(ys[i]);
+ for(size_t anchor=0;anchor<6;++anchor){
+  swap(um[0],um[anchor]);const bool ok=find_key(um.data(),um.size(),limit,step,key,T);swap(um[0],um[anchor]);
+  if(!ok)continue;
+  size_t in=0;for(uint64_t y:ys)in+=index_of(y,key)<limit; // most samples must agree, and the mapping must round-trip
+  if(in*4>=ys.size()*3&&value_of(index_of(ys[0],key),key)==ys[0])return true;
+ }
+ return false;
+}
+}
+static dn::Info dense; // set once before the links stage, read-only after that
+// Records and shared state of the dense route (see DENSE.md).
+static constexpr uint32_t DENSE_USER=0x40000000u; // user field: DENSE_USER | (index<<3 | alias) of a user index that is not complex; table IDs stay below this
+// One parsed event line whose event_id is dense, bucketed by counter (ve >> shift): all copies of an event meet in one bucket.
+struct DRec{uint64_t k;int64_t ingest;uint32_t ve;uint32_t user;uint16_t cat;uint16_t pad;uint32_t pad2;}; // k, cat as in PRec; ingest = exact ingest_ts in ms
+static_assert(sizeof(DRec)==32);
+// One valid click line whose click_id is dense, bucketed by counter (kc >> shift). key as in CRec.
+struct DCRec{uint64_t key;uint32_t kc;uint32_t user;};
+static_assert(sizeof(DCRec)==16);
+// Bit per user index: set in the links stage when one of the index's IDs is linked to anything but a
+// dense alias 0-7 of the same index. IDs of a complex index resolve through the ID table like general IDs.
+static uint64_t* denseComplex=nullptr; // limI bits, zero-filled; allocated when dense.events or dense.clicks
+static inline __attribute__((always_inline)) bool dense_complex(uint64_t idx){return (denseComplex[idx>>6]>>(idx&63))&1;}
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  // With SS_STATS=1 every TIME line is followed by a CPU line: processor time (all threads, user+system) of that stage.
@@ -1407,6 +1518,24 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
  __mark("MAP");
+ // ---- Dense IDs: find the generator's keys from the first lines of one event file and one click file. ----
+ // (SS_NODENSE=1 turns the dense route off.)
+ if(!getenv("SS_NODENSE")&&sampleLen){
+  const size_t look=min<size_t>(sampleLen,size_t(1)<<16);
+  const vector<uint64_t> es=dn::sample_ids(sampleBase,look,0,'e',24),us=dn::sample_ids(sampleBase,look,1,'u',24);
+  vector<uint64_t> cs;for(const Chunk& c:chunks)if(c.click&&c.from==0){cs=dn::sample_ids(c.base,min<size_t>(c.len,size_t(1)<<16),0,'k',24);if(cs.size()>=12)break;}
+  dn::Info d;
+  d.limE=min<uint64_t>(estEvents+estEvents/8+4096,uint64_t(1)<<31);
+  d.limC=min<uint64_t>(estClicks+estClicks/8+4096,uint64_t(1)<<31);
+  d.limI=min<uint64_t>(estEvents+estClicks+4096,uint64_t(1)<<27);
+  const bool users=dn::infer(us,d.limI<<dn::GEN_ALIAS_BITS,uint64_t(1)<<dn::GEN_ALIAS_BITS,d.ku,T);
+  d.events=users&&dn::infer(es,d.limE,1,d.ke,T);
+  d.clicks=users&&dn::infer(cs,d.limC,1,d.kc,T);
+  dense=d;
+ }
+ if(dense.events||dense.clicks)denseComplex=(uint64_t*)map_huge(((dense.limI+63)/64+1)*8);
+ cerr<<"dense: events "<<dense.events<<" clicks "<<dense.clicks<<"\n";
+ __mark("KEYS");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0;
  for(const Mapped& m:map_files(csv_files(data/"links"),linkFiles)){if(!m.len)continue;
@@ -1792,6 +1921,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
   Scratch<uint32_t> slotBuf,emitBuf;vector<size_t> off(T+1);
   slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);emitBuf.reserve(maxEvBucket);
+  const bool probe4=simdProbe;const size_t ahead=pfe;const uint32_t tagMask=tagKeep&0xffffu; // plain locals for the hot loops
   auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
   // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
   // turns out to be the earlier ingested one, the event already passed on is turned into a tombstone:
@@ -1811,15 +1941,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
     const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
     for(;r!=rend;++r,++g1){
-     // 41 hash bits per record: the low 25 pick the slot, the tag is the other 16 plus the lowest of the 25.
+     // 41 hash bits per record: the low 25 pick the slot, the other 16 are the tag.
      const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
-     const uint32_t tg=((((uint32_t)r->hx|(hl<<16))&tagKeep)<<ib);
+     const uint32_t tg=((uint32_t)r->hx&tagMask)<<ib;
      size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
      // First look at four slots at once: which are empty, and which carry this record's tag? Almost
      // always the first empty one comes before any such tag, and the record goes there without a
      // data-dependent loop. Everything else (and a run into the never-empty pad) goes slot by slot.
      unsigned mz=0,mt=1;
-     if(simdProbe){
+     if(probe4){
       const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
       mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
       mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
@@ -1848,12 +1978,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       const uint64_t rk=r->k;
       if(rk){
-       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
-       EvList& L=myEv[u>>pshift];Ev* const out=L.slot(pool);
+       // user, cat and the tag bits sit in the record as the event's second word does (person, cat, unused).
+       uint64_t w;memcpy(&w,(const void*)&r->user,8);
+       if(__builtin_expect((w&LOCAL_USER)!=0,0))w=(w&~0xffffffffull)|tr[(uint32_t)w&~LOCAL_USER];
+       EvList& L=myEv[(uint32_t)w>>pshift];Ev* const out=L.slot(pool);
        emitted[g1-1]=L.mark(out);
-       __builtin_prefetch((const char*)out+pfe,1,3); // every time: testing for a new cache line would be an unpredictable branch
+       __builtin_prefetch((const char*)out+ahead,1,3); // every time: testing for a new cache line would be an unpredictable branch
        out->k=rk-PR_KBIAS; // otherwise already in its final form
-       const uint64_t w=(uint64_t)u|((uint64_t)r->cat<<32);memcpy((void*)&out->person,&w,8);
+       memcpy((void*)&out->person,&w,8);
       }
      }
      next_event:;
@@ -1883,7 +2015,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
      size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
      unsigned mz=0,mt=1; // four slots at once, as for events
-     if(simdProbe){
+     if(probe4){
       const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
       mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
       mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
@@ -1903,7 +2035,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
       Click* const out=myCl[u>>pshift].slot(pool);
-      __builtin_prefetch((const char*)out+pfe,1,3);
+      __builtin_prefetch((const char*)out+ahead,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
      }
      next_click:;
@@ -2051,7 +2183,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Ev* A=bufA.get(nE);Ev* B=bufB.get(nE);
    for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
     for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
-     if(pfa)for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));Ev* const d=A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+     if(pfa)
+     #pragma GCC unroll 4
+     for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));Ev* const d=A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
      else
      #pragma GCC unroll 4
      for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));_mm_storeu_si128((__m128i*)(A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++),e);}}}
@@ -2064,7 +2198,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     swap(A,B);
    }
    {uint32_t* const pq=pp+1;
-    if(pfa)for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));Ev* const d=B+pq[A[i].person-base]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+    if(pfa)
+    #pragma GCC unroll 4
+    for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));Ev* const d=B+pq[A[i].person-base]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
     else
     #pragma GCC unroll 4
     for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+pq[A[i].person-base]++),e);}}
