@@ -216,17 +216,65 @@ SS_V3I bool parse36x2_v3(const char* sa,unsigned na,const char* sb,unsigned nb,u
 }
 static inline __attribute__((always_inline)) bool parse36x2_ok(uint64_t y,unsigned m){return y-MIN36[m]<=SPAN36[m];}
 } // namespace prod
-// vert.h - vertical SIMD kernels for the batched CSV event parser (agent C).
-// Header-only; needs only <immintrin.h>/<cstdint>/<cstring>. Every kernel works on exactly 8 rows (one 64-bit
-// lane per row) and exists as
-//   *_ref  plain scalar reference (same logic as the scalar row code in main.cpp),
-//   *_v3   AVX2 (2 x 4 lanes),
-//   *_v5   AVX-512 F/BW/DQ/VL (8 lanes).
-// Contract: each kernel returns an 8-bit accept mask (bit i = row i). A kernel may reject any row; for an
-// accepted row its outputs are bit-identical to what the scalar functions of main.cpp compute. Outputs of
-// rejected rows are unspecified (but always written, never uninitialised reads).
-// The kernels are NOT always_inline: their target attributes differ from the callers' (SS_V5 has no avx512dq
-// and prefer-vector-width=256), so they must be called, once per batch of 8 rows.
+// vert.h - vertical SIMD kernels for the event parser (agent C). Header-only; needs <immintrin.h>, <cstdint>, <cstring>.
+//
+// ============================ CALLER CONTRACT: vert::ev8_v5 (the line-form kernel) ============================
+//   void vert::ev8_v5(const char* const* ls, const char* const* nx, const vert::EvConst& c, vert::Ev8Out& o);
+//   (scalar twin with the same decisions: vert::ev8_ref)
+// Needs AVX-512 F+BW+DQ+VL+CD and BMI1 at run time (check all before calling). Not always_inline: its target
+// attribute differs from SS_V5 (which has no avx512dq/cd and prefer-vector-width=256); call it, once per 8 lines.
+//
+// INPUT
+//  ls, nx    eight pointers each (any alignment): line i starts at ls[i], its newline is the byte nx[i]-1. In the loop
+//            nx == ls+1 (the starts[] of the line index); for a short last group pass two local arrays padded with
+//            copies of the last pointer (zero-length rows): a padded row is never ok; ignore its idok.
+//  memory    for every i the 144 bytes [ls[i], ls[i]+144) must be readable, whatever the line holds (64 bytes are loaded
+//            at the line start and 64 at "one past the third comma" <= ls[i]+65; 8-byte gathers reach ls[i]+138).
+//            event_line_v3 itself reads up to ls[i]+129; the 4096 mapped zero bytes after every file cover both.
+//  c         {lp.ke, lp.limE, lp.wstart, lp.wlen, (const vert::DateEnt*)lp.memo, lp.tid48}. memo is the calling thread's
+//            own DateMemo3 array (4096 entries; DateEnt has the same layout). The kernel only reads it: a date that is
+//            not in it makes the row "not ok", event_line_v3 on that row stores it (date3_miss), later groups hit.
+//            Nothing else is read: no globals, no tables, no slots.
+//  o         alignas(64) (aligned stores).
+//
+// OUTPUT, per row i (bit i of the three masks)
+//  idok      ve[i] (and so[i] = ve << 5) is EXACTLY what event_pre_v3(ls[i]) returns, and that is not NOPRE: the text
+//            before the first comma of the first 16 bytes, one leading quote and its closing quote stripped, is
+//            'e' + canonical base 36 with a counter below limE. Computed for every line, well-formed or not.
+//            A clear bit claims nothing (run event_pre_v3 if the counter is wanted).
+//  ok        (implies idok) the line is on event_line_v3's fast path and the row is finished by
+//               eslot_commit(lp.ev[ve], kk, uct | (uint64_t)cat << 32, ingest, uw);   send = max(send, ve + 1);
+//            with cat = 0 unless the pur bit is set; for a pur row cat is what event_line_v3 computes:
+//               ci = products.find(string_view(s5[i], l5[i]));  cat = ci == KeyTable::NONE ? 0 : (uint16_t)ci;
+//            kk  = ESLOT_INVALID (2) for a line that is not a valid event, else (ts - window_start + 1) << 25, for a
+//                  purchase already with EV_PURCHASE | price (price_value's rule is applied in the kernel: digits only,
+//                  1..10000000; a bad or empty price makes the row "not a valid event", exactly as the row code does).
+//            uct = valid ? (DENSE_USER_RAW | n) | tid48 : tid48   (n = number of bytes after the user's 'u', 0..8)
+//            uw  = valid ? those n bytes, zero-padded : 0
+//  pur       (implies ok) a valid purchase: the caller adds the category as above. Nothing else is left to do.
+//  not ok    the caller runs event_line_v3<true,true>(p, b, w1, w2, nl, pre, ...) on the line, with
+//            pre = idok ? (uint32_t)ve[i] : event_pre_v3(p, lp). All other outputs of the row mean nothing.
+//
+// A row is ok iff ALL of: no quote error and exactly 7 fields with the third comma in the first 64 bytes and the
+// newline less than 64 bytes after it (event_line_v3's single test); idok; user field empty or 'u' + 0..8 bytes;
+// ingest_ts is 20 bytes "YYYY-MM-DDTHH:MM:SSZ" with tod_v3-valid time and its date in the memo; ts is 13 digits, or
+// 20 bytes Z form, or 25 bytes "...+HH:MM"/"...-HH:MM" (HH <= 23, MM <= 59), the latter two with a valid time and their
+// own date in the memo (same day as ingest_ts or not); and, only for a purchase that is valid so far, a price field of
+// at most 8 bytes. Everything else (other ts shapes, long or odd users, dates the memo has not seen, lines that do not
+// fit the windows, lines without event_id, 9+ byte prices) is "not ok" and costs one event_line_v3.
+//
+// ORDER / STATE  The kernel keeps no state. Slot commits are order-independent (smallest ingest wins), so ok rows and
+// slow rows of a group may be finished in any order; the only thing the slow path changes that the kernel reads is the
+// date memo, and a stale memo can only turn rows "not ok", never wrong. dmax is not touched by ok rows (raw users);
+// send must be raised by the caller. Prefetch lp.ev[ve[i]] (or base + so[i]) for every idok row right after the call.
+// PASTING INTO main.cpp: paste ev8_paste.h (generated by mkpaste.py, tested by vert_line_test -DVERT_PASTE) anywhere
+// after DateMemo3 / ESlot are defined; see BATCH.md "Integration".
+// ================================================================================================================
+//
+// Other kernels in this file (operand form, 8 rows as arrays of uint64_t; *_ref scalar, *_v3 AVX2, *_v5 AVX-512):
+//   id8 (K1, event ID -> counter), tod8 (K2), epoch8 (13-digit ts), day8 / sameday8 / DayTable (K3), kind8 (K4),
+//   evop8 (K5: the content part of a row from pre-cut operands; used by vert_bench). ev8 exists as _ref and _v5 only.
+// General rule for all of them: a kernel may refuse any row; an accepted row is bit-identical to main.cpp's scalar code.
 #ifndef VERT_H
 #define VERT_H
 #include <immintrin.h>
@@ -364,7 +412,7 @@ struct alignas(64) EvBatchOut{
  uint8_t ok;         // bit i: row i is decided (all of the above are exact)
  uint8_t idok;       // bit i: ve[i] is a dense counter (< limit) even if ok is clear
 };
-struct EvConst{uint64_t ke,limE;int64_t wstart;uint64_t wlen;const DateEnt* memo;};
+struct EvConst{uint64_t ke,limE;int64_t wstart;uint64_t wlen;const DateEnt* memo;uint64_t tid48=0;}; // tid48 (= lp.tid48) is used by ev8 only
 
 static inline unsigned date_slot(uint64_t w0,uint64_t w1){ // w0 = date bytes 0..7, w1 = bytes 8..15
  return (unsigned)(((w0>>34)&0x40)|((w0>>46)&0x3C)|(w1&0x0F03));
@@ -740,31 +788,34 @@ VERT_T5 static inline void evop8_v5(const EvBatch& b,const EvConst& c,EvBatchOut
 // ev8 (line form): eight event lines straight from the line index. See the caller contract at the top of
 // this file and BATCH.md. ls[0..8]: line i starts at ls[i] and its newline is the byte ls[i+1]-1.
 // =====================================================================================================
-struct alignas(64) EvOut{
- uint64_t ve[8];      // event counter; exact wherever idok is set (== event_pre_v3 of the line)
- uint64_t k[8];       // 0 = not a valid event, else (ts - window_start + 1) << 25 (provisional for kind 3)
- uint64_t ingest[8];  // ingest_ts, ms
- uint64_t kind[8];    // 0 none, 1 view, 2 cart, 3 purchase
- uint64_t uw[8],un[8];// raw user: the un (0..8) bytes after the 'u', zero-padded; both 0 if the user field is empty
- const char* s5[8];uint64_t l5[8]; // product_id field (content without quotes)
- const char* s6[8];uint64_t l6[8]; // price_cents field
- uint8_t ok;          // bit i: every output of row i is exact and the row is on event_line_v3's fast path
+static constexpr uint64_t ESLOT_INVALID_K=2,EV_PURCHASE_BIT=1ull<<24,RAW_USER=0xC0000000u,PRICE_MAX=10000000; // main.cpp: ESLOT_INVALID, EV_PURCHASE, DENSE_USER_RAW, price_value's limit
+struct alignas(64) Ev8Out{
+ uint64_t ve[8];      // idok rows: event counter (== event_pre_v3)
+ uint64_t so[8];      // idok rows: ve << 5 (byte offset of the 32-byte ESlot)
+ uint64_t kk[8];      // ok rows: the slot's k: ESLOT_INVALID (2) if not a valid event, else (ts - window_start + 1) << 25,
+                      //          for a purchase with EV_PURCHASE | price already in it (final)
+ uint64_t ingest[8];  // ok rows: ingest_ts, ms
+ uint64_t uct[8];     // ok rows: valid ? (DENSE_USER_RAW | n) | tid48 : tid48   (n = bytes after 'u', 0..8); the caller ORs cat << 32 for pur rows
+ uint64_t uw[8];      // ok rows: valid ? the n bytes after 'u', zero-padded : 0
+ const char* s5[8];const char* s6[8];uint64_t l5[8],l6[8]; // ok rows: product_id / price_cents content (quotes stripped); needed for pur rows (s5,l5)
+ uint8_t ok;          // bit i: row i is on event_line_v3's fast path and all of the above is exact
  uint8_t idok;        // bit i: ve[i] is exactly event_pre_v3's counter of the line (ok implies idok)
+ uint8_t pur;         // bit i: ok row that is a valid purchase (price already checked and in kk): the caller looks the category up
 };
 static inline uint64_t ld8_ref(const char* p){uint64_t w;memcpy(&w,p,8);return w;}
 static inline void masks_ref(const char* p,uint64_t& c,uint64_t& q){c=0;q=0;for(int i=0;i<64;++i){c|=(uint64_t)(p[i]==',')<<i;q|=(uint64_t)(p[i]=='"')<<i;}}
 static inline unsigned tz_ref(uint64_t x){return x?(unsigned)__builtin_ctzll(x):64u;}
 static inline uint64_t blsr_ref(uint64_t x){return x&(x-1);}
-static inline void ev8_ref(const char* const* ls,const EvConst& c,EvOut& o){
- unsigned okm=0,idm=0;
+static inline void ev8_ref(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
+ unsigned okm=0,idm=0,pum=0;
  for(int i=0;i<8;++i){
-  o.ve[i]=o.k[i]=o.ingest[i]=o.kind[i]=o.uw[i]=o.un[i]=o.l5[i]=o.l6[i]=0;o.s5[i]=o.s6[i]=ls[i];
-  const char* const p=ls[i];const char* const nl=ls[i+1]-1;
+  o.ve[i]=o.so[i]=o.kk[i]=o.ingest[i]=o.uct[i]=o.uw[i]=o.l5[i]=o.l6[i]=0;o.s5[i]=o.s6[i]=ls[i];
+  const char* const p=ls[i];const char* const nl=nx[i]-1;
   uint64_t cm,qa;masks_ref(p,cm,qa);
   // the counter as event_pre_v3 sees it: text before the first comma of the first 16 bytes, one quote pair stripped
   {const unsigned cp=tz_ref(cm)<16?tz_ref(cm):16;const unsigned z=(unsigned)(qa&1);
    const uint64_t n=(uint64_t)cp-2*z-1,w=ld8_ref(p+z+1);uint64_t ctr[8];const uint64_t ws[8]={w,w,w,w,w,w,w,w},ns[8]={n,n,n,n,n,n,n,n};
-   if(p[z]=='e'&&(id8_ref(ws,ns,c.ke,c.limE,ctr)&1)){o.ve[i]=ctr[0];idm|=1u<<i;}}
+   if(p[z]=='e'&&(id8_ref(ws,ns,c.ke,c.limE,ctr)&1)){o.ve[i]=ctr[0];o.so[i]=ctr[0]<<5;idm|=1u<<i;}}
   // structure, as event_line_v3 (DREC form: the newline is known)
   const uint64_t cA=blsr_ref(cm),cB=blsr_ref(cA),cR=blsr_ref(cB);
   const uint64_t m1=cB^(cB-1);
@@ -796,10 +847,10 @@ static inline void ev8_ref(const char* const* ls,const EvConst& c,EvOut& o){
   const unsigned b6=tz_ref(B2),l6=tz_ref(E2)-b6;
   const char* const s1=p+b1;const char* const s2=p+b2;
   o.s5[i]=b+b5;o.l5[i]=l5;o.s6[i]=b+b6;o.l6[i]=l6;
-  o.kind[i]=kind_ref(ld8_ref(b+b4),l4);
+  const unsigned kind=kind_ref(ld8_ref(b+b4),l4);
   if(!(idm>>i&1))continue;                                   // (then l0 is 2..9 and the ID is the line's first field)
   if(!(l1==0||(s1[0]=='u'&&l1<=9)))continue;                 // user: empty, or 'u' + 0..8 bytes
-  if(l1){o.un[i]=l1-1;o.uw[i]=l1-1==8?ld8_ref(s1+1):(ld8_ref(s1+1)&((1ull<<(8*(l1-1)))-1));}
+  const uint64_t un=l1?l1-1:0,uw=!l1?0:(un==8?ld8_ref(s1+1):(ld8_ref(s1+1)&((1ull<<(8*un))-1)));
   if(l3!=20)continue;
   const uint64_t ig0=ld8_ref(s3),ig1=ld8_ref(s3+8),ig2=ld8_ref(s3+12);
   uint64_t todi,dayi;
@@ -816,13 +867,21 @@ static inline void ev8_ref(const char* const* ls,const EvConst& c,EvOut& o){
    if(l2==20){if(byte_of(t2,7)!='Z')continue;}
    else{int64_t delta;if(!off_ref(t2,ld8_ref(s2+17),delta))continue;ts+=delta;}
   }else continue;
-  okm|=1u<<i;
   const uint64_t tsrel=(uint64_t)ts-(uint64_t)c.wstart;
-  if(o.kind[i]!=0&&l1!=0&&l5!=0&&tsrel<c.wlen&&ingest-ts<=DAYMS)o.k[i]=(tsrel+1)<<EV_TS_SHIFT;
+  uint64_t k=0;
+  if(kind!=0&&l1!=0&&l5!=0&&tsrel<c.wlen&&ingest-ts<=DAYMS)k=(tsrel+1)<<EV_TS_SHIFT;
+  if(k&&kind==3){ // price_value: digits only, 1..10000000 (longer than 8 bytes: left to the row code)
+   if(l6>8)continue;
+   uint64_t price=0;bool dig=l6!=0;
+   for(unsigned j=0;j<l6;++j){const unsigned dd=(unsigned char)b[b6+j]-(unsigned)'0';if(dd>9)dig=false;price=price*10+dd;}
+   if(dig&&price>=1&&price<=PRICE_MAX){k|=EV_PURCHASE_BIT|price;pum|=1u<<i;}else k=0;
+  }
+  okm|=1u<<i;
+  o.kk[i]=k?k:ESLOT_INVALID_K;o.uct[i]=(k?(RAW_USER|un):0)|c.tid48;o.uw[i]=k?uw:0;
  }
- o.ok=(uint8_t)okm;o.idok=(uint8_t)idm;
+ o.ok=(uint8_t)okm;o.idok=(uint8_t)idm;o.pur=(uint8_t)pum;
 }
-VERT_T5 static inline void ev8_v5(const char* const* ls,const EvConst& c,EvOut& o){
+VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
  // ---- horizontal: the two 64-byte windows of every line -> comma and quote masks ----
  alignas(64) uint64_t aC1[8],aQ1[8],aC2[8],aQ2[8],aB[8];
  {const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"');
@@ -838,7 +897,7 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const EvConst& c,EvOut& 
  // ---- vertical ----
  const __m512i one=VERT_C5(1),ones=VERT_C5(-1),c63=VERT_C5(63),c64=VERT_C5(64);
  #define VERT_TZ5(x,xm) _mm512_sub_epi64(c63,_mm512_lzcnt_epi64(_mm512_xor_si512(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
- const __m512i P=VERT_LD5(ls),NL=_mm512_add_epi64(VERT_LD5(ls+1),ones),Bv=_mm512_load_si512((const void*)aB);
+ const __m512i P=VERT_LD5(ls),NL=_mm512_add_epi64(VERT_LD5(nx),ones),Bv=_mm512_load_si512((const void*)aB);
  const __m512i C1=_mm512_load_si512((const void*)aC1),Q1=_mm512_load_si512((const void*)aQ1),C2=_mm512_load_si512((const void*)aC2),Q2=_mm512_load_si512((const void*)aQ2);
  // window 1: the first three commas, quote rules up to the third
  const __m512i t0=_mm512_add_epi64(C1,ones),c0=VERT_TZ5(C1,t0),cA=_mm512_and_si512(C1,t0);
@@ -912,17 +971,240 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const EvConst& c,EvOut& 
  const __m512i tsrel=_mm512_sub_epi64(ts,VERT_C5(c.wstart));
  __mmask8 valid=knz&hasu&_mm512_test_epi64_mask(l5,l5)&_mm512_cmplt_epu64_mask(tsrel,VERT_C5(c.wlen));
  valid&=_mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest,ts),VERT_C5(DAYMS));
- const __m512i k=_mm512_maskz_slli_epi64(valid,_mm512_add_epi64(tsrel,one),EV_TS_SHIFT);
- _mm512_store_si512((void*)o.ve,ve);_mm512_store_si512((void*)o.k,k);_mm512_store_si512((void*)o.ingest,ingest);_mm512_store_si512((void*)o.kind,kind);
- _mm512_store_si512((void*)o.uw,uw);_mm512_store_si512((void*)o.un,un);
+ __m512i k=_mm512_slli_epi64(_mm512_add_epi64(tsrel,one),EV_TS_SHIFT);
+ // purchases: the price as price_value takes it, for fields of up to 8 bytes (right-aligned over '0' like the ID digits)
+ const __m512i S6=_mm512_add_epi64(Bv,o6);
+ const __mmask8 pv=valid&_mm512_cmpeq_epi64_mask(kind,VERT_C5(3));
+ __mmask8 pur=pv;
+ {const __m512i n8=_mm512_slli_epi64(l6,3);
+  const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(VERT_G5(S6),_mm512_sub_epi64(c64,n8)),_mm512_srlv_epi64(_mm512_set1_epi8(0x30),n8));
+  const __m512i v=_mm512_sub_epi8(x,_mm512_set1_epi8('0')),nine=_mm512_set1_epi8(9);
+  const __m512i p4=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_C5(0x010A010A010A010AULL)),VERT_C5(0x0001006400010064ULL));
+  const __m512i price=_mm512_add_epi64(_mm512_mul_epu32(p4,VERT_C5(10000)),_mm512_srli_epi64(p4,32));
+  pur&=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,nine),nine)&_mm512_cmple_epu64_mask(_mm512_sub_epi64(price,one),VERT_C5(PRICE_MAX-1)); // digits, 1..10000000 (an empty field gives 0)
+  ok&=(__mmask8)~(pv&_mm512_cmplt_epu64_mask(VERT_C5(8),l6));                                                                     // a longer price field: the row code decides
+  k=_mm512_mask_or_epi64(k,pur,k,_mm512_or_si512(price,VERT_C5(EV_PURCHASE_BIT)));
+ }
+ valid&=(__mmask8)(~pv|pur); // a purchase with a bad price is not a valid event
+ const __m512i tid=VERT_C5(c.tid48);
+ _mm512_store_si512((void*)o.ve,ve);_mm512_store_si512((void*)o.so,_mm512_slli_epi64(ve,5));
+ _mm512_store_si512((void*)o.kk,_mm512_mask_mov_epi64(VERT_C5(ESLOT_INVALID_K),valid,k));
+ _mm512_store_si512((void*)o.ingest,ingest);
+ _mm512_store_si512((void*)o.uct,_mm512_mask_or_epi64(tid,valid,tid,_mm512_or_si512(un,VERT_C5(RAW_USER))));
+ _mm512_store_si512((void*)o.uw,_mm512_maskz_mov_epi64(valid,uw));
  _mm512_store_si512((void*)o.s5,_mm512_add_epi64(Bv,o5));_mm512_store_si512((void*)o.l5,l5);
- _mm512_store_si512((void*)o.s6,_mm512_add_epi64(Bv,o6));_mm512_store_si512((void*)o.l6,l6);
- o.idok=(uint8_t)idok;o.ok=(uint8_t)(ok&idok);
+ _mm512_store_si512((void*)o.s6,S6);_mm512_store_si512((void*)o.l6,l6);
+ ok&=idok;
+ o.idok=(uint8_t)idok;o.ok=(uint8_t)ok;o.pur=(uint8_t)(pur&ok);
  #undef VERT_G5
  #undef VERT_TZ5
 }
 } // namespace vert
 #endif
+// vert_y.h - GENERATED by mkvy.py from the 512-bit functions of vert.h; do not edit. ev8_vy = ev8_v5 on ymm registers only
+// (AVX-512 F/BW/DQ/VL/CD encodings, no zmm register is touched: no 512-bit frequency licence), 2 x 4 lanes.
+// Same contract, same outputs as ev8_v5.
+namespace vert{
+#define VERT_TY __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512cd,avx2,bmi,bmi2,lzcnt,popcnt,prefer-vector-width=256")))
+#define VERT_CY(x) _mm256_set1_epi64x((long long)(x))
+#define VERT_LDY(p) _mm256_loadu_si256((const __m256i*)(p))
+VERT_TY static inline __m256i id8k_vy(__m256i W,__m256i N,uint64_t key,uint64_t limit,__mmask8& okOut){
+ const __m256i n8=_mm256_slli_epi64(N,3);
+ const __m256i x=_mm256_or_si256(_mm256_sllv_epi64(W,_mm256_sub_epi64(_mm256_set1_epi64x(64),n8)),_mm256_srlv_epi64(_mm256_set1_epi8(0x30),n8));
+ const __m256i t=_mm256_sub_epi8(x,_mm256_set1_epi8('0')),u=_mm256_sub_epi8(x,_mm256_set1_epi8('a'));
+ const __m256i bad=_mm256_min_epu8(_mm256_subs_epu8(t,_mm256_set1_epi8(9)),_mm256_subs_epu8(u,_mm256_set1_epi8(25)));
+ const __m256i d=_mm256_min_epu8(t,_mm256_add_epi8(x,_mm256_set1_epi8((char)(10-'a'))));
+ const __m256i p2=_mm256_maddubs_epi16(d,_mm256_set1_epi16(0x0124));
+ const __m256i p4=_mm256_madd_epi16(p2,_mm256_set1_epi32(0x00010510));
+ const __m256i val=_mm256_add_epi64(_mm256_mul_epu32(p4,_mm256_set1_epi64x(1679616)),_mm256_srli_epi64(p4,32));
+ // MIN36[n] picked by the low three bits of n (n == 8 -> entry 0); n == 0 and n > 8 are refused by the length test
+ const __m256i min36=_mm256_permutex2var_epi64(_mm256_setr_epi64x(78364164096LL,0,36,1296),N,_mm256_setr_epi64x(46656,1679616,60466176,2176782336LL));
+ __mmask8 ok=_mm256_testn_epi64_mask(bad,bad);
+ ok&=_mm256_cmple_epu64_mask(_mm256_sub_epi64(N,_mm256_set1_epi64x(1)),_mm256_set1_epi64x(7));
+ ok&=_mm256_cmpge_epu64_mask(val,min36);
+ ok&=_mm256_cmple_epu64_mask(val,_mm256_set1_epi64x((long long)MASK40));
+ const __m256i mask=_mm256_set1_epi64x((long long)MASK40);
+ __m256i m=_mm256_and_si256(_mm256_mullo_epi64(val,_mm256_set1_epi64x((long long)I2)),mask);
+ m=_mm256_ternarylogic_epi64(m,_mm256_srli_epi64(m,17),_mm256_srli_epi64(m,34),0x96);
+ m=_mm256_xor_si256(m,_mm256_set1_epi64x((long long)key));
+ const __m256i c=_mm256_and_si256(_mm256_mullo_epi64(m,_mm256_set1_epi64x((long long)I1)),mask);
+ ok&=_mm256_cmplt_epu64_mask(c,_mm256_set1_epi64x((long long)limit));
+ okOut=ok;return c;
+}
+VERT_TY static inline __m256i tod8k_vy(__m256i a,__m256i b,__mmask8& ok){
+ const __m256i va=_mm256_sub_epi8(a,VERT_CY(0x0000000030540000ULL)),la=VERT_CY(0xFFFFFFFF0200FFFFULL);
+ const __m256i vb=_mm256_sub_epi8(b,VERT_CY(0x0030303A30303A30ULL)),lb=VERT_CY(0xFF09050009050009ULL);
+ const __m256i pa=_mm256_madd_epi16(_mm256_maddubs_epi16(va,VERT_CY(0x0000000064000000ULL)),VERT_CY(0x0000000001680000ULL));
+ const __m256i pb=_mm256_madd_epi16(_mm256_maddubs_epi16(vb,VERT_CY(0x00010A00010A0001ULL)),VERT_CY(0x00010001003C0E10ULL));
+ const __m256i s=_mm256_add_epi32(pa,pb);
+ const __m256i ms=_mm256_mul_epu32(_mm256_add_epi32(s,_mm256_srli_epi64(s,32)),VERT_CY(1000));
+ ok=_mm256_cmpeq_epi64_mask(_mm256_max_epu8(va,la),la)&_mm256_cmpeq_epi64_mask(_mm256_max_epu8(vb,lb),lb)&_mm256_cmplt_epu64_mask(ms,VERT_CY(86400000));
+ return ms;
+}
+VERT_TY static inline __m256i epoch8k_vy(__m256i w0,__m256i w1,__mmask8& ok){
+ const __m256i z=_mm256_set1_epi8('0'),nine=_mm256_set1_epi8(9);
+ const __m256i v0=_mm256_sub_epi8(w0,z),v1=_mm256_sub_epi8(w1,z);
+ ok=_mm256_cmpeq_epi64_mask(_mm256_max_epu8(v0,nine),nine)&_mm256_cmpeq_epi64_mask(_mm256_max_epu8(v1,nine),nine);
+ const __m256i p0=_mm256_madd_epi16(_mm256_maddubs_epi16(v0,VERT_CY(0x010A010A010A010AULL)),VERT_CY(0x0001006400010064ULL));
+ const __m256i p1=_mm256_madd_epi16(_mm256_maddubs_epi16(v1,VERT_CY(0x010A010A01000000ULL)),VERT_CY(0x0001006400010000ULL));
+ const __m256i tenk=VERT_CY(10000);
+ const __m256i hi=_mm256_add_epi64(_mm256_mul_epu32(p0,tenk),_mm256_srli_epi64(p0,32));
+ const __m256i lo=_mm256_add_epi64(_mm256_mul_epu32(p1,tenk),_mm256_srli_epi64(p1,32));
+ return _mm256_add_epi64(_mm256_mul_epu32(hi,VERT_CY(100000)),lo);
+}
+VERT_TY static inline __m256i off8k_vy(__m256i w3,__mmask8& ok){
+ const __m256i v=_mm256_sub_epi8(w3,VERT_CY(0x30303A3030000000ULL)),l=VERT_CY(0x0905000902FFFFFFULL);
+ const __m256i p=_mm256_madd_epi16(_mm256_maddubs_epi16(v,VERT_CY(0x010A00010A000000ULL)),VERT_CY(0x0001003C003C0000ULL));
+ const __m256i ms=_mm256_mul_epu32(_mm256_add_epi32(p,_mm256_srli_epi64(p,32)),VERT_CY(60000));
+ ok=_mm256_cmpeq_epi64_mask(_mm256_max_epu8(v,l),l)&_mm256_cmplt_epu64_mask(ms,VERT_CY(86400000));
+ return ms;
+}
+VERT_TY static inline __m256i day8k_vy(__m256i w0,__m256i w1,const DateEnt* memo,__mmask8& hit){
+ const __m256i slot=_mm256_ternarylogic_epi64(_mm256_and_si256(_mm256_srli_epi64(w0,34),VERT_CY(0x40)),_mm256_and_si256(_mm256_srli_epi64(w0,46),VERT_CY(0x3C)),_mm256_and_si256(w1,VERT_CY(0x0F03)),0xFE);
+ const __m256i i3=_mm256_add_epi64(slot,_mm256_slli_epi64(slot,1));
+ const long long* base=(const long long*)memo;
+ const __m256i gk=_mm256_mmask_i64gather_epi64(_mm256_setzero_si256(),(__mmask8)15,i3,base,8),gc=_mm256_mmask_i64gather_epi64(_mm256_setzero_si256(),(__mmask8)15,i3,base+1,8),gm=_mm256_mmask_i64gather_epi64(_mm256_setzero_si256(),(__mmask8)15,i3,base+2,8);
+ const __m256i k=_mm256_or_si256(_mm256_srli_epi64(w0,16),_mm256_slli_epi64(w1,48));
+ hit=_mm256_cmpeq_epi64_mask(gk,k)&_mm256_cmpeq_epi64_mask(_mm256_and_si256(gc,VERT_CY(0xFFFFFFFFULL)),_mm256_and_si256(w0,VERT_CY(0xFFFF)));
+ return gm;
+}
+VERT_TY static inline __m256i kind8k_vy(__m256i w,__m256i n,__mmask8& nz){
+ const __m256i lo=_mm256_and_si256(w,VERT_CY(0xFFFFFFFFULL));
+ const __mmask8 is4=_mm256_cmpeq_epi64_mask(n,VERT_CY(4));
+ const __mmask8 view=_mm256_mask_cmpeq_epi64_mask(is4,lo,VERT_CY(0x77656976ULL)),cart=_mm256_mask_cmpeq_epi64_mask(is4,lo,VERT_CY(0x74726163ULL));
+ const __mmask8 pur=_mm256_mask_cmpeq_epi64_mask(_mm256_cmpeq_epi64_mask(n,VERT_CY(8)),w,VERT_CY(0x6573616863727570ULL));
+ nz=view|cart|pur;
+ __m256i kind=_mm256_maskz_mov_epi64(view,VERT_CY(1));
+ kind=_mm256_mask_mov_epi64(kind,cart,VERT_CY(2));
+ return _mm256_mask_mov_epi64(kind,pur,VERT_CY(3));
+}
+// rows h..h+3 (ls, nx already point at row h); returns idok | ok << 8 | pur << 16, four bits each
+VERT_TY static inline unsigned ev4_vy(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o,const int h){
+ // ---- horizontal: the two 64-byte windows of every line -> comma and quote masks ----
+ alignas(64) uint64_t aC1[4],aQ1[4],aC2[4],aQ2[4],aB[4];
+ {const __m256i vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
+  for(int i=0;i<4;++i){
+   const char* const p=ls[i];
+   const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
+   const uint64_t cm=_cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(x1,vc),_mm256_cmpeq_epi8_mask(x0,vc)));
+   aC1[i]=cm;aQ1[i]=_cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(x1,vq),_mm256_cmpeq_epi8_mask(x0,vq)));
+   const char* const b=p+_tzcnt_u64(_blsr_u64(_blsr_u64(cm)))+1; // one past the third comma (p+65 if there is none)
+   const __m256i y0=_mm256_loadu_si256((const __m256i*)b),y1=_mm256_loadu_si256((const __m256i*)(b+32));
+   aC2[i]=_cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(y1,vc),_mm256_cmpeq_epi8_mask(y0,vc)));
+   aQ2[i]=_cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(y1,vq),_mm256_cmpeq_epi8_mask(y0,vq)));aB[i]=(uint64_t)b;
+  }}
+ // ---- vertical ----
+ const __m256i one=VERT_CY(1),ones=VERT_CY(-1),c63=VERT_CY(63),c64=VERT_CY(64);
+ #define VERT_TZ5(x,xm) _mm256_sub_epi64(c63,_mm256_lzcnt_epi64(_mm256_xor_si256(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
+ const __m256i P=VERT_LDY(ls),NL=_mm256_add_epi64(VERT_LDY(nx),ones),Bv=_mm256_load_si256((const __m256i*)aB);
+ const __m256i C1=_mm256_load_si256((const __m256i*)aC1),Q1=_mm256_load_si256((const __m256i*)aQ1),C2=_mm256_load_si256((const __m256i*)aC2),Q2=_mm256_load_si256((const __m256i*)aQ2);
+ // window 1: the first three commas, quote rules up to the third
+ const __m256i t0=_mm256_add_epi64(C1,ones),c0=VERT_TZ5(C1,t0),cA=_mm256_and_si256(C1,t0);
+ const __m256i t1=_mm256_add_epi64(cA,ones),c1=VERT_TZ5(cA,t1),cB=_mm256_and_si256(cA,t1);
+ const __m256i t2=_mm256_add_epi64(cB,ones),m1=_mm256_xor_si256(cB,t2),cR=_mm256_and_si256(cB,t2);
+ const __m256i c2=_mm256_add_epi64(_mm256_sub_epi64(Bv,P),ones); // tzcnt(cB), 64 if there is no third comma
+ const __m256i q1=_mm256_and_si256(Q1,m1),st1=_mm256_or_si256(_mm256_slli_epi64(_mm256_xor_si256(C1,cB),1),one),en1=_mm256_xor_si256(C1,cR);
+ const __m256i sq1=_mm256_and_si256(q1,st1),op1=_mm256_and_si256(_mm256_add_epi64(_mm256_sub_epi64(sq1,en1),ones),en1);
+ const __m256i err1=_mm256_xor_si256(op1,_mm256_slli_epi64(_mm256_andnot_si256(st1,q1),1));
+ // window 2: the bytes before the newline, three commas, quote rules
+ const __m256i L=_mm256_sub_epi64(NL,Bv),nbit=_mm256_sllv_epi64(one,_mm256_and_si256(L,c63)),keep=_mm256_add_epi64(nbit,ones);
+ const __m256i d=_mm256_and_si256(C2,keep),qb=_mm256_and_si256(Q2,keep);
+ const __m256i st2=_mm256_or_si256(_mm256_slli_epi64(d,1),one),en2=_mm256_or_si256(d,nbit);
+ const __m256i sq2=_mm256_and_si256(qb,st2),op2=_mm256_and_si256(_mm256_add_epi64(_mm256_sub_epi64(sq2,en2),ones),en2);
+ const __m256i err2=_mm256_xor_si256(op2,_mm256_slli_epi64(_mm256_andnot_si256(st2,qb),1));
+ const __m256i u0=_mm256_add_epi64(d,ones),d0=VERT_TZ5(d,u0),dA=_mm256_and_si256(d,u0);
+ const __m256i u1=_mm256_add_epi64(dA,ones),d1=VERT_TZ5(dA,u1),dB=_mm256_and_si256(dA,u1);
+ const __m256i u2=_mm256_add_epi64(dB,ones),d2=VERT_TZ5(dB,u2),dR=_mm256_and_si256(dB,u2);
+ const __m256i err=_mm256_or_si256(err1,err2);
+ __mmask8 ok=_mm256_testn_epi64_mask(err,err)&_mm256_testn_epi64_mask(dR,dR)&_mm256_test_epi64_mask(dB,dB); // no quote error, exactly three commas
+ ok&=_mm256_cmplt_epu64_mask(c2,c64)&_mm256_cmplt_epu64_mask(L,c64);                                           // third comma and newline inside their windows
+ // fields: a quoted field starts one later and is two shorter
+ const __m256i z0=_mm256_and_si256(Q1,one);
+ const __m256i a1=_mm256_add_epi64(c0,one),z1=_mm256_and_si256(_mm256_srlv_epi64(q1,a1),one),o1=_mm256_add_epi64(a1,z1),l1=_mm256_sub_epi64(_mm256_sub_epi64(c1,o1),z1);
+ const __m256i a2=_mm256_add_epi64(c1,one),z2=_mm256_and_si256(_mm256_srlv_epi64(q1,a2),one),o2=_mm256_add_epi64(a2,z2),l2=_mm256_sub_epi64(_mm256_sub_epi64(c2,o2),z2);
+ const __m256i z3=_mm256_and_si256(qb,one),l3=_mm256_sub_epi64(d0,_mm256_add_epi64(z3,z3));
+ const __m256i a4=_mm256_add_epi64(d0,one),z4=_mm256_and_si256(_mm256_srlv_epi64(qb,a4),one),o4=_mm256_add_epi64(a4,z4),l4=_mm256_sub_epi64(_mm256_sub_epi64(d1,o4),z4);
+ const __m256i a5=_mm256_add_epi64(d1,one),z5=_mm256_and_si256(_mm256_srlv_epi64(qb,a5),one),o5=_mm256_add_epi64(a5,z5),l5=_mm256_sub_epi64(_mm256_sub_epi64(d2,o5),z5);
+ const __m256i a6=_mm256_add_epi64(d2,one),z6=_mm256_and_si256(_mm256_srlv_epi64(qb,a6),one),o6=_mm256_add_epi64(a6,z6),l6=_mm256_sub_epi64(_mm256_sub_epi64(L,o6),z6);
+ #define VERT_G5(a) _mm256_mmask_i64gather_epi64(_mm256_setzero_si256(),(__mmask8)15,a,(const void*)0,1)
+ // event_id exactly as event_pre_v3: first comma of the first 16 bytes, one quote pair stripped
+ const __m256i idn=_mm256_sub_epi64(_mm256_sub_epi64(_mm256_min_epu64(c0,VERT_CY(16)),_mm256_add_epi64(z0,z0)),one);
+ const __m256i S0=_mm256_add_epi64(P,z0);
+ const __m256i W0=VERT_G5(S0),IDW=VERT_G5(_mm256_add_epi64(S0,one));
+ __mmask8 idok;const __m256i ve=id8k_vy(IDW,idn,c.ke,c.limE,idok);
+ const __m256i lowbyte=VERT_CY(0xFF);
+ idok&=_mm256_cmpeq_epi64_mask(_mm256_and_si256(W0,lowbyte),VERT_CY('e'));
+ // user: empty, or 'u' + 0..8 bytes kept as text
+ const __m256i S1=_mm256_add_epi64(P,o1);
+ const __m256i U0=VERT_G5(S1),UW=VERT_G5(_mm256_add_epi64(S1,one));
+ const __mmask8 hasu=_mm256_test_epi64_mask(l1,l1);
+ ok&=(__mmask8)(~hasu|(_mm256_cmpeq_epi64_mask(_mm256_and_si256(U0,lowbyte),VERT_CY('u'))&_mm256_cmple_epu64_mask(l1,VERT_CY(9))));
+ const __m256i un=_mm256_maskz_sub_epi64(hasu,l1,one);
+ const __m256i uw=_mm256_and_si256(UW,_mm256_srlv_epi64(ones,_mm256_sub_epi64(c64,_mm256_slli_epi64(un,3)))); // un == 0: shift by 64 gives 0
+ // ingest_ts: 20 bytes, Z form
+ const __m256i S3=_mm256_add_epi64(Bv,z3);
+ const __m256i ig0=VERT_G5(S3),ig1=VERT_G5(_mm256_add_epi64(S3,VERT_CY(8))),ig2=VERT_G5(_mm256_add_epi64(S3,VERT_CY(12)));
+ __mmask8 oki,hiti,oks,hits,okoff,okep,knz;
+ const __m256i todi=tod8k_vy(ig1,ig2,oki);
+ const __m256i dayi=day8k_vy(ig0,ig1,c.memo,hiti);
+ const __m256i ingest=_mm256_add_epi64(dayi,todi);
+ ok&=oki&hiti&_mm256_cmpeq_epi64_mask(_mm256_srli_epi64(ig2,56),VERT_CY('Z'))&_mm256_cmpeq_epi64_mask(l3,VERT_CY(20));
+ // ts: 20 (Z), 13 (digits), 25 (offset)
+ const __mmask8 is20=_mm256_cmpeq_epi64_mask(l2,VERT_CY(20)),is25=_mm256_cmpeq_epi64_mask(l2,VERT_CY(25)),is13=_mm256_cmpeq_epi64_mask(l2,VERT_CY(13));
+ const __m256i S2=_mm256_add_epi64(P,o2);
+ const __m256i ts0=VERT_G5(S2),ts1=VERT_G5(_mm256_add_epi64(S2,_mm256_mask_mov_epi64(VERT_CY(8),is13,VERT_CY(5))));
+ const __m256i ts2=VERT_G5(_mm256_add_epi64(S2,VERT_CY(12))),ts3=VERT_G5(_mm256_add_epi64(S2,VERT_CY(17)));
+ const __m256i tods=tod8k_vy(ts1,ts2,oks);
+ const __m256i days=day8k_vy(ts0,ts1,c.memo,hits);
+ const __m256i off=off8k_vy(ts3,okoff);
+ const __m256i ep=epoch8k_vy(ts0,ts1,okep);
+ const __m256i b19=_mm256_srli_epi64(ts2,56);
+ const __mmask8 isZ=_mm256_cmpeq_epi64_mask(b19,VERT_CY('Z')),isP=_mm256_cmpeq_epi64_mask(b19,VERT_CY('+')),isM=_mm256_cmpeq_epi64_mask(b19,VERT_CY('-'));
+ __m256i ts=_mm256_add_epi64(days,tods);
+ ts=_mm256_mask_sub_epi64(ts,(__mmask8)(is25&isP),ts,off);
+ ts=_mm256_mask_add_epi64(ts,(__mmask8)(is25&isM),ts,off);
+ ts=_mm256_mask_mov_epi64(ts,is13,ep);
+ ok&=(__mmask8)((is13&okep)|(oks&hits&((is20&isZ)|(is25&okoff&(isP|isM)))));
+ // kind, validity, k
+ const __m256i kind=kind8k_vy(VERT_G5(_mm256_add_epi64(Bv,o4)),l4,knz);
+ const __m256i tsrel=_mm256_sub_epi64(ts,VERT_CY(c.wstart));
+ __mmask8 valid=knz&hasu&_mm256_test_epi64_mask(l5,l5)&_mm256_cmplt_epu64_mask(tsrel,VERT_CY(c.wlen));
+ valid&=_mm256_cmple_epi64_mask(_mm256_sub_epi64(ingest,ts),VERT_CY(DAYMS));
+ __m256i k=_mm256_slli_epi64(_mm256_add_epi64(tsrel,one),EV_TS_SHIFT);
+ // purchases: the price as price_value takes it, for fields of up to 8 bytes (right-aligned over '0' like the ID digits)
+ const __m256i S6=_mm256_add_epi64(Bv,o6);
+ const __mmask8 pv=valid&_mm256_cmpeq_epi64_mask(kind,VERT_CY(3));
+ __mmask8 pur=pv;
+ {const __m256i n8=_mm256_slli_epi64(l6,3);
+  const __m256i x=_mm256_or_si256(_mm256_sllv_epi64(VERT_G5(S6),_mm256_sub_epi64(c64,n8)),_mm256_srlv_epi64(_mm256_set1_epi8(0x30),n8));
+  const __m256i v=_mm256_sub_epi8(x,_mm256_set1_epi8('0')),nine=_mm256_set1_epi8(9);
+  const __m256i p4=_mm256_madd_epi16(_mm256_maddubs_epi16(v,VERT_CY(0x010A010A010A010AULL)),VERT_CY(0x0001006400010064ULL));
+  const __m256i price=_mm256_add_epi64(_mm256_mul_epu32(p4,VERT_CY(10000)),_mm256_srli_epi64(p4,32));
+  pur&=_mm256_cmpeq_epi64_mask(_mm256_max_epu8(v,nine),nine)&_mm256_cmple_epu64_mask(_mm256_sub_epi64(price,one),VERT_CY(PRICE_MAX-1)); // digits, 1..10000000 (an empty field gives 0)
+  ok&=(__mmask8)~(pv&_mm256_cmplt_epu64_mask(VERT_CY(8),l6));                                                                     // a longer price field: the row code decides
+  k=_mm256_mask_or_epi64(k,pur,k,_mm256_or_si256(price,VERT_CY(EV_PURCHASE_BIT)));
+ }
+ valid&=(__mmask8)(~pv|pur); // a purchase with a bad price is not a valid event
+ const __m256i tid=VERT_CY(c.tid48);
+ _mm256_store_si256((__m256i*)(o.ve+h),ve);_mm256_store_si256((__m256i*)(o.so+h),_mm256_slli_epi64(ve,5));
+ _mm256_store_si256((__m256i*)(o.kk+h),_mm256_mask_mov_epi64(VERT_CY(ESLOT_INVALID_K),valid,k));
+ _mm256_store_si256((__m256i*)(o.ingest+h),ingest);
+ _mm256_store_si256((__m256i*)(o.uct+h),_mm256_mask_or_epi64(tid,valid,tid,_mm256_or_si256(un,VERT_CY(RAW_USER))));
+ _mm256_store_si256((__m256i*)(o.uw+h),_mm256_maskz_mov_epi64(valid,uw));
+ _mm256_store_si256((__m256i*)(o.s5+h),_mm256_add_epi64(Bv,o5));_mm256_store_si256((__m256i*)(o.l5+h),l5);
+ _mm256_store_si256((__m256i*)(o.s6+h),S6);_mm256_store_si256((__m256i*)(o.l6+h),l6);
+ ok&=idok;
+ return (unsigned)(idok&15)|((unsigned)(ok&15)<<8)|((unsigned)(pur&ok&15)<<16);
+ #undef VERT_G5
+ #undef VERT_TZ5
+}
+VERT_TY static inline void ev8_vy(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
+ const unsigned a=ev4_vy(ls,nx,c,o,0),b=ev4_vy(ls+4,nx+4,c,o,4);
+ o.idok=(uint8_t)((a&15)|((b&15)<<4));o.ok=(uint8_t)(((a>>8)&15)|(((b>>8)&15)<<4));o.pur=(uint8_t)(((a>>16)&15)|(((b>>16)&15)<<4));
+}
+#undef VERT_CY
+#undef VERT_LDY
+} // namespace vert
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -975,7 +1257,7 @@ static void fill(Data& d,unsigned seed){
   snprintf(tsb,sizeof tsb,"2027-12-%02uT%02u:%02u:%02uZ",day+1,s2/3600,s2/60%60,s2%60);d.o3[r]=(uint8_t)p;memcpy(t+p,tsb,20);p+=20;t[p++]=',';
   const unsigned kr=(unsigned)(rnd()%10);const char* kind=kr<7?"view":kr<9?"cart":"purchase";const size_t lk=strlen(kind);
   d.o4[r]=(uint8_t)p;d.l4[r]=(uint8_t)lk;memcpy(t+p,kind,lk);p+=lk;t[p++]=',';
-  p+=(size_t)snprintf(t+p,16,"p%u,%u\n",(unsigned)(rnd()%20000),(unsigned)(rnd()%10000));
+  p+=(size_t)snprintf(t+p,16,"p%u,%u\n",(unsigned)(rnd()%20000),1+(unsigned)(rnd()%9999));
   {static thread_local size_t at;if(r==0)at=0; // the line again, contiguous, some fields quoted
    const unsigned qm=(rnd()%100<79)?(unsigned)(rnd()&127)|(1u<<(rnd()%7)):0;
    d.ls[r]=d.lines+at;unsigned fi=0;const char* f0=t;
@@ -1033,11 +1315,11 @@ SS_V3 __attribute__((noinline)) static uint64_t ev_scalar(Data& d,int r){
     uint64_t tsrel;
     if(tsOk&&(tsrel=(uint64_t)ts-(uint64_t)wstart)<wlen&&ingest-ts<=DAY)k=(tsrel+1)<<EV_TS;
   }
-  if(dEv)s+=ve+(uint64_t)ingest+k+kind;
+  if(dEv)s+=ve+(uint64_t)ingest+k;
  }
  return s;
 }
-static inline uint64_t sum_ev(const vert::EvBatchOut& o){uint64_t s=0;for(int i=0;i<8;++i)if(o.ok>>i&1)s+=o.ve[i]+o.ingest[i]+o.k[i]+o.kind[i];return s;}
+static inline uint64_t sum_ev(const vert::EvBatchOut& o){uint64_t s=0;for(int i=0;i<8;++i)if(o.ok>>i&1)s+=o.ve[i]+o.ingest[i]+o.k[i];return s;}
 VERT_T3 __attribute__((noinline)) static uint64_t ev_v3(Data& d,int r){vert::EvBatchOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::evop8_v3(d.bt[r/8],c,o);return sum_ev(o);}
 VERT_T5 __attribute__((noinline)) static uint64_t ev_v5(Data& d,int r){vert::EvBatchOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::evop8_v5(d.bt[r/8],c,o);return sum_ev(o);}
 // ev_v5 plus what a line-level kernel adds: vplzcntq (vector tzcnt) and one more 512-bit gather through computed offsets
@@ -1051,9 +1333,10 @@ VERT_T5 __attribute__((noinline)) static uint64_t evz_v5(Data& d,int r){vert::Ev
  return sum_ev(o)+(uint64_t)_mm512_reduce_add_epi64(_mm512_srli_epi64(m,60));
 }
 // line form: the kernel starts from the line index (structure, field cutting, gathers and the content part)
-static inline uint64_t sum_evl(const vert::EvOut& o){uint64_t s=0;for(int i=0;i<8;++i)if(o.ok>>i&1)s+=o.ve[i]+o.ingest[i]+o.k[i]+o.kind[i];return s;}
-VERT_T5 __attribute__((noinline)) static uint64_t evl_v5(Data& d,int r){vert::EvOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::ev8_v5(d.ls+r,c,o);return sum_evl(o);}
-__attribute__((noinline)) static uint64_t evl_ref(Data& d,int r){vert::EvOut o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo};vert::ev8_ref(d.ls+r,c,o);return sum_evl(o);}
+static inline uint64_t sum_evl(const vert::Ev8Out& o){uint64_t s=0;for(int i=0;i<8;++i)if(o.ok>>i&1)s+=o.ve[i]+o.ingest[i]+(o.kk[i]==2?0:(o.kk[i]>>25<<25));return s;} // k without the purchase bits, as the ev_* cases have it
+VERT_T5 __attribute__((noinline)) static uint64_t evl_v5(Data& d,int r){vert::Ev8Out o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo,0};vert::ev8_v5(d.ls+r,d.ls+r+1,c,o);return sum_evl(o);}
+VERT_TY __attribute__((noinline)) static uint64_t evl_vy(Data& d,int r){vert::Ev8Out o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo,0};vert::ev8_vy(d.ls+r,d.ls+r+1,c,o);return sum_evl(o);}
+__attribute__((noinline)) static uint64_t evl_ref(Data& d,int r){vert::Ev8Out o;const vert::EvConst c{d.key,d.limit,d.wstart,d.wlen,(const vert::DateEnt*)d.memo,0};vert::ev8_ref(d.ls+r,d.ls+r+1,c,o);return sum_evl(o);}
 //@@KERNELS
 typedef uint64_t (*Kern)(Data&,int);
 struct Case{const char* name;Kern k;int need;bool mixed;}; // need: 0 none, 3 avx2, 5 avx512
@@ -1091,6 +1374,7 @@ static const Case cases[]={
   {"id_scalar+chunk",id_scalar,3,true},{"id_v3+chunk",id_v3,3,true},
   {"ev_scalar+chunk",ev_scalar,3,true},{"ev_v3+chunk",ev_v3,3,true},
   //@@CASES_B
+  {"evl_vy",evl_vy,5,false},{"evl_vy+chunk",evl_vy,5,true},{"chunk_after_vy",nullptr,0,false},
   {"id_v5",id_v5,5,false},{"id_v5+chunk",id_v5,5,true},
   {"ev_v5",ev_v5,5,false},{"evz_v5",evz_v5,5,false},{"evl_v5",evl_v5,5,false},{"ev_v5+chunk",ev_v5,5,true},{"evz_v5+chunk",evz_v5,5,true},{"evl_v5+chunk",evl_v5,5,true},
   //@@CASES_C
@@ -1114,8 +1398,8 @@ int main(int argc,char** argv){
   for(Data* d:ds)cg_run(*d,ev_scalar,1);
   const uint64_t a=cg_run(*ds[0],ev_scalar,1),b=cg_run(*ds[0],ev_v3,1),c=h5?cg_run(*ds[0],ev_v5,1):a;
   const uint64_t a1=cg_run(*ds[0],id_scalar,1),b1=cg_run(*ds[0],id_v3,1),c1=h5?cg_run(*ds[0],id_v5,1):a1;
-  const uint64_t l0=cg_run(*ds[0],evl_ref,1),l1=h5?cg_run(*ds[0],evl_v5,1):l0;
-  printf("check %s\n",(a==b&&a==c&&a1==b1&&a1==c1&&a!=0&&l0==a&&l1==a)?"ok":"MISMATCH");
+  const uint64_t l0=cg_run(*ds[0],evl_ref,1),l1=h5?cg_run(*ds[0],evl_v5,1):l0,l2=h5?cg_run(*ds[0],evl_vy,1):l0;
+  printf("check %s\n",(a==b&&a==c&&a1==b1&&a1==c1&&a!=0&&l0==a&&l1==a&&l2==a)?"ok":"MISMATCH");
  }
  uint64_t ref=0;const char* refname="";
  for(const Case& c:cases){
