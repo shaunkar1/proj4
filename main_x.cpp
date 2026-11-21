@@ -744,6 +744,7 @@ struct Chunk{const char* base;size_t len,from,to;bool click;};
 // One surviving event, 16 bytes. k = tsrel<<25 | purchase<<24 | price, with tsrel = ts - window_start
 // (< 2^37 ms: the window is at most 1000 days) and price <= 10,000,000 < 2^24. person is the compact person number.
 struct Ev{uint64_t k;uint32_t person;uint16_t cat;uint16_t pad;};
+static_assert(offsetof(PRec,cat)==offsetof(PRec,user)+4&&offsetof(PRec,hx)==offsetof(PRec,user)+6&&offsetof(Ev,cat)==offsetof(Ev,person)+4&&sizeof(Ev)==16); // dedup copies user+cat(+tag) as one word
 static constexpr uint64_t EV_PURCHASE=1ull<<24,EV_PRICE=EV_PURCHASE-1;
 static constexpr unsigned EV_TS=25;
 static_assert(PR_KBIAS==1ull<<EV_TS);
@@ -1794,6 +1795,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
   Scratch<uint32_t> slotBuf,emitBuf;vector<size_t> off(T+1);
   slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);emitBuf.reserve(maxEvBucket);
+  const bool probe4=simdProbe;const size_t ahead=pfe;const uint32_t tagMask=tagKeep&0xffffu; // plain locals for the hot loops
   auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
   // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
   // turns out to be the earlier ingested one, the event already passed on is turned into a tombstone:
@@ -1813,15 +1815,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
     const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
     for(;r!=rend;++r,++g1){
-     // 41 hash bits per record: the low 25 pick the slot, the tag is the other 16 plus the lowest of the 25.
+     // 41 hash bits per record: the low 25 pick the slot, the other 16 are the tag.
      const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
-     const uint32_t tg=((((uint32_t)r->hx|(hl<<16))&tagKeep)<<ib);
+     const uint32_t tg=((uint32_t)r->hx&tagMask)<<ib;
      size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
      // First look at four slots at once: which are empty, and which carry this record's tag? Almost
      // always the first empty one comes before any such tag, and the record goes there without a
      // data-dependent loop. Everything else (and a run into the never-empty pad) goes slot by slot.
      unsigned mz=0,mt=1;
-     if(simdProbe){
+     if(probe4){
       const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
       mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
       mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
@@ -1850,12 +1852,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       const uint64_t rk=r->k;
       if(rk){
-       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
-       EvList& L=myEv[u>>pshift];Ev* const out=L.slot(pool);
+       // user, cat and the tag bits sit in the record as the event's second word does (person, cat, unused).
+       uint64_t w;memcpy(&w,(const void*)&r->user,8);
+       if(__builtin_expect((w&LOCAL_USER)!=0,0))w=(w&~0xffffffffull)|tr[(uint32_t)w&~LOCAL_USER];
+       EvList& L=myEv[(uint32_t)w>>pshift];Ev* const out=L.slot(pool);
        emitted[g1-1]=L.mark(out);
-       __builtin_prefetch((const char*)out+pfe,1,3); // every time: testing for a new cache line would be an unpredictable branch
+       __builtin_prefetch((const char*)out+ahead,1,3); // every time: testing for a new cache line would be an unpredictable branch
        out->k=rk-PR_KBIAS; // otherwise already in its final form
-       const uint64_t w=(uint64_t)u|((uint64_t)r->cat<<32);memcpy((void*)&out->person,&w,8);
+       memcpy((void*)&out->person,&w,8);
       }
      }
      next_event:;
@@ -1885,7 +1889,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
      size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
      unsigned mz=0,mt=1; // four slots at once, as for events
-     if(simdProbe){
+     if(probe4){
       const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
       mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
       mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
@@ -1905,7 +1909,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
       Click* const out=myCl[u>>pshift].slot(pool);
-      __builtin_prefetch((const char*)out+pfe,1,3);
+      __builtin_prefetch((const char*)out+ahead,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
      }
      next_click:;
@@ -2053,7 +2057,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Ev* A=bufA.get(nE);Ev* B=bufB.get(nE);
    for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
     for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
-     if(pfa)for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));Ev* const d=A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+     if(pfa)
+     #pragma GCC unroll 4
+     for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));Ev* const d=A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
      else
      #pragma GCC unroll 4
      for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));_mm_storeu_si128((__m128i*)(A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++),e);}}}
@@ -2066,7 +2072,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     swap(A,B);
    }
    {uint32_t* const pq=pp+1;
-    if(pfa)for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));Ev* const d=B+pq[A[i].person-base]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+    if(pfa)
+    #pragma GCC unroll 4
+    for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));Ev* const d=B+pq[A[i].person-base]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
     else
     #pragma GCC unroll 4
     for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+pq[A[i].person-base]++),e);}}
