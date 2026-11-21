@@ -4,12 +4,14 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <omp.h>
 #include <parallel/algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <climits>
 #include <cerrno>
 #include <cstdio>
 #include <cstdint>
@@ -30,6 +32,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <malloc.h>
 #include <immintrin.h>
 using namespace std;
 namespace fs=std::filesystem;
@@ -363,13 +366,14 @@ static inline uint64_t hkey(string_view s){ // s must be a view into a mapped in
  uint64_t tail;memcpy(&tail,p,8);tail&=LOW_BYTES[n];
  return mix64(h^tail);
 }
+static atomic<bool> anyLongName{false}; // a person name longer than 15 bytes still points into an input file
 // An ID's text in 16 bytes: up to 15 bytes are stored in place (one cache miss to read a name),
 // longer ones keep a pointer into the mapped input.
 struct PName{
  char b[16];
  void set(string_view s){
   if(s.size()<=15){memset(b,0,16);memcpy(b,s.data(),s.size());b[15]=(char)s.size();}
-  else{const char* p=s.data();uint32_t n=(uint32_t)s.size();memcpy(b,&p,8);memcpy(b+8,&n,4);b[15]=(char)0xFF;}
+  else{const char* p=s.data();uint32_t n=(uint32_t)s.size();memcpy(b,&p,8);memcpy(b+8,&n,4);b[15]=(char)0xFF;anyLongName.store(true,memory_order_relaxed);}
  }
  string_view view()const{
   if((unsigned char)b[15]!=0xFF)return string_view(b,(size_t)(unsigned char)b[15]);
@@ -509,7 +513,45 @@ struct SmallTable{
  unordered_map<string_view,uint32_t> m;vector<string_view> keys;
  uint32_t intern(string_view s){auto [it,isnew]=m.try_emplace(s,(uint32_t)keys.size());if(isnew)keys.push_back(s);return it->second;}
 };
-template<class T> using AVec=vector<T>;
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+// Bump allocator for the big per-thread bucket buffers. Regions come straight from mmap, ask for
+// huge pages, and can be pre-faulted in one kernel call, so the hot loops do not take a page fault
+// per 4 KB of output. Nothing is handed back piecemeal: a whole stage's regions are unmapped at once.
+struct Region{void* base;size_t len;};
+static mutex regionMu;static vector<Region> stageRegions[2]; // [0] parsed-line buckets, [1] person buckets
+struct Arena{
+ char* cur=nullptr;char* lim=nullptr;int stage=0;
+ void add_region(size_t bytes,size_t warm){
+  const size_t huge=size_t(2)<<20;
+  const size_t want=(max<size_t>(bytes,size_t(32)<<20)+huge-1)&~(huge-1);
+  void* mem=mmap(nullptr,want+huge,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+  if(mem==MAP_FAILED)throw bad_alloc();
+  char* a=(char*)(((uintptr_t)mem+huge-1)&~(uintptr_t)(huge-1)); // 2 MB aligned so huge pages can be used
+  madvise(a,want,MADV_HUGEPAGE);
+  if(warm)madvise(a,min(warm,want),MADV_POPULATE_WRITE); // ignored by old kernels: pages then fault in one by one
+  cur=a;lim=a+want;
+  lock_guard<mutex> g(regionMu);stageRegions[stage].push_back({mem,want+huge});
+ }
+ void* get(size_t bytes){
+  bytes=(bytes+63)&~size_t(63);
+  if((size_t)(lim-cur)<bytes)add_region(bytes,0);
+  void* r=cur;cur+=bytes;return r;
+ }
+};
+static thread_local Arena tlArena;
+template<class T> struct ArenaAlloc{
+ using value_type=T;
+ ArenaAlloc()=default;
+ template<class U> ArenaAlloc(const ArenaAlloc<U>&){}
+ T* allocate(size_t n){return (T*)tlArena.get(n*sizeof(T));}
+ void deallocate(T*,size_t){}
+ template<class U> bool operator==(const ArenaAlloc<U>&)const{return true;}
+ template<class U> bool operator!=(const ArenaAlloc<U>&)const{return false;}
+};
+template<class T> using AVec=vector<T,ArenaAlloc<T>>;
+static void unmap_regions(vector<Region> regions){for(const Region& r:regions)munmap(r.base,r.len);}
 static constexpr uint8_t F_VALID=1,F_PURCHASE=2,F_DEAD=4;
 static constexpr uint32_t LOCAL_USER=0x80000000u;
 // One parsed event line, bucketed by event_id hash so duplicates meet in one bucket.
@@ -662,12 +704,20 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Map the big inputs up front so the kernel starts reading them while links are processed.
  vector<Chunk> chunks;uint64_t eventBytes=0,clickBytes=0;
  static constexpr size_t CH=size_t(2)<<20;
+ vector<Region> eventMaps;const char* sampleBase=nullptr;size_t sampleLen=0;
  auto add_files=[&](const fs::path& dir,bool click,uint64_t& bytes){
   for(const auto& p:csv_files(dir)){Mapped m=map_file(p);if(!m.len)continue;bytes+=m.len;
+   if(!click){eventMaps.push_back({(void*)m.base,((m.len+4095)&~size_t(4095))+4096});
+    if(m.len>sampleLen){sampleLen=m.len;sampleBase=m.base;}}
    for(size_t from=0;from<m.len;from+=CH)chunks.push_back({m.base,m.len,from,from+CH,click});}
  };
  add_files(data/"events",false,eventBytes);
  add_files(data/"clicks",true,clickBytes);
+ // Lines per byte, measured on the start of the largest event file, sizes the bucket buffers tightly.
+ uint64_t estEvents=eventBytes/70;
+ if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count(sampleBase,sampleBase+n,'\n');
+  if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
+ const uint64_t estClicks=clickBytes/36;
  __mark("MAP");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0;
@@ -711,6 +761,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
  }
  const uint32_t nlinked=tab.nextId.load();
+ if(getenv("SS_TEST_MAXNEW"))tab.idLimit=min<uint64_t>(tab.idLimit,(uint64_t)nlinked+maxNew64); // tests: leave room for only that many unlinked IDs
  __mark("LINKREAD");
  // Flatten, then name each person by the byte-wise smallest of their IDs.
  vector<uint32_t> root(nlinked);
@@ -763,8 +814,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  {
   ThreadState& tl=tls[omp_get_thread_num()];
   tl.eb.resize(PE);tl.cb.resize(PC);tl.uev.resize(UP);tl.ucl.resize(UP);
-  {size_t r=(size_t)(eventBytes/70/((uint64_t)T*PE)*5/4)+16;for(auto& v:tl.eb)v.reserve(r);}
-  {size_t r=(size_t)(clickBytes/40/((uint64_t)T*PC)*5/4)+16;for(auto& v:tl.cb)v.reserve(r);}
+  {const size_t re=(size_t)(estEvents/((uint64_t)T*PE)*9/8)+16,rc=(size_t)(estClicks/((uint64_t)T*PC)*9/8)+16;
+   const size_t need=PE*(re*sizeof(PRec)+64)+PC*(rc*sizeof(CRec)+64);
+   tlArena.stage=0;tlArena.add_region(need+(size_t(4)<<20),need); // one pre-faulted block per thread for its buckets
+   for(auto& v:tl.eb)v.reserve(re);
+   for(auto& v:tl.cb)v.reserve(rc);}
   auto user_of=[&](string_view u)->uint32_t{
    uint32_t g=tab.find_or_add(u);
    if(g!=KeyTable::NONE)return g;
@@ -843,8 +897,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks)
  {
   ThreadState& me=tls[omp_get_thread_num()];
-  {size_t r=(size_t)(eventBytes/70/((uint64_t)T*UP)*5/4)+16;for(auto& v:me.uev)v.reserve(r);}
-  {size_t r=(size_t)(clickBytes/40/((uint64_t)T*UP)*5/4)+16;for(auto& v:me.ucl)v.reserve(r);}
+  {const size_t re=(size_t)(estEvents/((uint64_t)T*UP)*9/8)+16,rc=(size_t)(estClicks/((uint64_t)T*UP)*9/8)+16;
+   const size_t need=UP*(re*sizeof(Ev)+64)+UP*(rc*sizeof(Click)+64);
+   tlArena.stage=1;tlArena.cur=tlArena.lim=nullptr;tlArena.add_region(need+(size_t(4)<<20),need);
+   for(auto& v:me.uev)v.reserve(re);
+   for(auto& v:me.ucl)v.reserve(rc);}
   vector<uint64_t> slots;vector<size_t> off(T+1);
   #pragma omp for schedule(dynamic,1) nowait
   for(size_t p=0;p<PE;++p){
@@ -908,6 +965,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  cerr<<"deduplicated events: "<<dedupCount<<", surviving: "<<surviving<<"\n";
  cerr<<"surviving clicks: "<<survivingClicks<<"\n";
+ // The parsed-line buckets are dead now. Hand their memory (and the event files, when nothing points
+ // into them any more) back on a side thread so process exit has less to tear down.
+ {vector<Region> dead;{lock_guard<mutex> g(regionMu);dead.swap(stageRegions[0]);}
+  if(!anyLongName.load()&&extraNames.empty())dead.insert(dead.end(),eventMaps.begin(),eventMaps.end());
+  thread(unmap_regions,std::move(dead)).detach();}
  __mark("DEDUP");
  // ---- Per person bucket: sort, sessionize, attribute. Each thread writes its own Parquet file. ----
  fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");
@@ -1039,6 +1101,12 @@ __mark("AGGREGATE");
 __mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
 }
 int main(){try{
+ // glibc grows each thread's heap with one mprotect per small step, and every mprotect takes the
+ // process-wide mapping lock that all page faults need. Grow in 64 MB steps and never shrink, so the
+ // parser threads do not queue behind each other in the kernel.
+ mallopt(M_TOP_PAD,64<<20);
+ mallopt(M_TRIM_THRESHOLD,INT_MAX);
+ mallopt(M_MMAP_THRESHOLD,32<<20);
  const char* d=getenv("DATA_DIR");const char* s=getenv("SCRATCH_DIR");const char* o=getenv("OUTPUT_DIR");
  run(d?d:"/data",s?s:"/scratch",o?o:"/output");return 0;
  }catch(const exception& e){cerr<<"ERROR "<<e.what()<<'\n';return 1;}}
