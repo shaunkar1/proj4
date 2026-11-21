@@ -603,7 +603,9 @@ static inline bool same_event_id(const char* a,const char* b){
  }
 }
 // One valid click line, bucketed by click_id hash.
-struct CRec{const char* id;uint64_t h;int64_t ts;uint32_t idlen;uint32_t user;uint16_t campaign;uint8_t flags;};
+// key is already Click::key: (ts - (window_start - 7 days))<<16 | campaign.
+struct CRec{const char* id;uint64_t h;uint64_t key;uint32_t idlen;uint32_t user;};
+static_assert(sizeof(CRec)==32);
 struct Chunk{const char* base;size_t len,from,to;bool click;};
 // One surviving event, 16 bytes. k = tsrel<<25 | purchase<<24 | price, with tsrel = ts - window_start
 // (< 2^37 ms: the window is at most 1000 days) and price <= 10,000,000 < 2^24. person is the compact person number.
@@ -1063,7 +1065,8 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
    const unsigned b3=(unsigned)_tzcnt_u64(B),l3=(unsigned)_tzcnt_u64(E)-b3;
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
-   if(!ts_v3(p+b3,l3,memo,ts)||(uint64_t)ts-(uint64_t)clickStart>=wlen)break; // clickStart <= ts < window_end
+   uint64_t trel;
+   if(!ts_v3(p+b3,l3,memo,ts)||(trel=(uint64_t)ts-(uint64_t)clickStart)>=wlen)break; // clickStart <= ts < window_end
    uint64_t k0;uint32_t k1;
    const string_view camp(p+b2,l2);
    const uint32_t ci=__builtin_expect(KeyTable::pack(camp,k0,k1),1)?camps.find_packed(k0,k1):camps.find(camp);if(ci==KeyTable::NONE)break;
@@ -1071,7 +1074,7 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
    if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID
    const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
    __builtin_prefetch(&slots[j],0,1);
-   CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.ts=ts;r.user=0;r.campaign=(uint16_t)ci;r.flags=0;
+   CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=(trel<<16)|(uint16_t)ci;r.user=0;
    AVec<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
    if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
    PendUser<CRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.data()+vec.size();pu.k1=k1;
@@ -1341,7 +1344,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    int64_t ts=0;
    if(f[1].empty()||!parse_ts_fast(f[3],ts)||ts<clickStart||ts>=window_end)return;
    const uint32_t ci=camps.find(f[2]);if(ci==KeyTable::NONE)return;
-   CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ts=ts;r.user=user_of(f[1]);r.campaign=(uint16_t)ci;r.flags=0;
+   CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.key=((uint64_t)(ts-clickStart)<<16)|(uint16_t)ci;r.user=user_of(f[1]);
    tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
   };
   for(;;){
@@ -1514,7 +1517,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
       Click* const out=myCl[u>>pshift].slot(pool);
-      out->key=((uint64_t)(r->ts-clickStart)<<16)|r->campaign;out->id=r->id;out->person=u;out->idlen=r->idlen;
+      out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
      }
      next_click:;
     }
