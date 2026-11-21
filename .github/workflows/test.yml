@@ -1,0 +1,13 @@
+name: Core correctness and Docker build
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile C++ core and run independent edge-case tests
+        run: make test
+      - name: Build actual competition Docker image
+        run: docker build --platform linux/amd64 -t shopping-sessions .
