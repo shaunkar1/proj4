@@ -1040,6 +1040,73 @@ static inline size_t text36(char letter,uint64_t y,char* out){
 // Looks for the key under which sample 0 has a counter that is a multiple of `step` below `limit` and
 // all but at most one of the other samples have counters below `limit`. um[i] = unmix(value of sample i).
 // Candidates are tried in increasing counter order by all threads; the smallest hit wins.
+// keysearch_paste.h - AVX-512 form of the first round of dn::find_key (agent C2, 2026-11-21). Text to paste into main.cpp.
+//
+// INTEGRATION (for whoever merges it; names are those of /home/claude/wtB/main.cpp at db47b3e, branch agent-post)
+//  1. Paste this file's text inside `namespace dn`, right before `static bool find_key(` (it uses dn::MASK and dn::I1 and
+//     nothing else of the program; it needs <immintrin.h>, <cstdint>, <cstddef>).
+//  2. In find_key, before `#pragma omp parallel`, add:      const bool ks5=ks_has512();
+//  3. In the first-round branch `if(round==0&&limit<=MASK){`, before its line `const uint64_t D1=(u0^u1)<<24,...`, add:
+//         if(ks5){const uint64_t c=ks_block_v5(um,n,limit,inc,b,e);
+//          if(c!=UINT64_MAX){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}}
+//          continue;}
+//     Nothing else changes: the scalar loop below it stays for other CPUs, the second round and the limit > MASK case stay.
+//     (vert/ks_test.cpp builds exactly this patched find_key from the production text and compares it with the original.)
+//  Dispatch: ks_has512() = the CPU has avx512f and avx512dq (vpmullq); the scoring machine has both.
+//
+// CONTRACT  ks_block_v5(um, n, limit, inc, b, e) returns the smallest c in [b, e) that the first round accepts, or
+// UINT64_MAX if there is none - exactly what the scalar loop of the first round does with one block [b, e): c is accepted
+// iff sample 1 has a counter below limit under the key um[0] ^ ((c*inc) & MASK) and at most one of the samples 1..n-1 is
+// at or above limit. Requires limit <= MASK (the branch's own condition) and n >= 2. ks_block_scalar is the scalar loop
+// itself (same text as in find_key), for the test and as the definition.
+// The vector loop tests 32 candidates per turn (four vectors of eight: one xor and one 64-bit multiply each, with the
+// 40-bit numbers in the top 40 bits of the lanes as in the scalar code; then one unsigned compare of the lane-wise minimum
+// of the four products with the limit). When any lane passes, the passing candidates are checked against all samples one
+// by one in increasing c, so the first accepted c of the block is the scalar loop's. The last (e - b) mod 32 candidates
+// run through the scalar loop.
+#define DN_KS5 __attribute__((target("avx512f,avx512dq")))
+static inline bool ks_has512(){static const bool h=__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512dq");return h;}
+// the full rule for one candidate (A = its c*inc in the top 40 bits): at most one of the samples 1..n-1 off
+static inline __attribute__((always_inline)) bool ks_full(const uint64_t* um,size_t n,uint64_t limit,uint64_t A){
+ const uint64_t k=um[0]^(A>>24);
+ size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
+ return miss<2;
+}
+static inline uint64_t ks_block_scalar(const uint64_t* um,size_t n,uint64_t limit,uint64_t inc,uint64_t b,uint64_t e){
+ const uint64_t D1=(um[0]^um[1])<<24,INC=inc<<24,LIM=limit<<24;uint64_t A=((b*inc)&MASK)<<24;
+ for(uint64_t c=b;c<e;++c,A+=INC){
+  if(__builtin_expect(((D1^A)*I1)>=LIM,1))continue; // sample 1 off
+  if(ks_full(um,n,limit,A))return c;
+ }
+ return UINT64_MAX;
+}
+// the candidates of one turn that passed the one-sample test (bit j of m = candidate j, A = c*inc of candidate 0), in
+// increasing c: the first that passes the full rule, as an offset, or UINT64_MAX. Out of line: it keeps the loop small.
+__attribute__((noinline)) static uint64_t ks_hits(const uint64_t* um,size_t n,uint64_t limit,uint64_t A,uint64_t INC,uint32_t m){
+ for(;m;m&=m-1){const unsigned j=(unsigned)__builtin_ctz(m);if(ks_full(um,n,limit,A+(uint64_t)j*INC))return j;}
+ return UINT64_MAX;
+}
+DN_KS5 static uint64_t ks_block_v5(const uint64_t* um,size_t n,uint64_t limit,uint64_t inc,uint64_t b,uint64_t e){
+ const uint64_t D1=(um[0]^um[1])<<24,INC=inc<<24,LIM=limit<<24;uint64_t A=((b*inc)&MASK)<<24,c=b;
+ const __m512i vD=_mm512_set1_epi64((long long)D1),vI=_mm512_set1_epi64((long long)I1),vL=_mm512_set1_epi64((long long)LIM),v8=_mm512_set1_epi64((long long)(8*INC));
+ __m512i a0=_mm512_add_epi64(_mm512_set1_epi64((long long)A),_mm512_mullo_epi64(_mm512_set1_epi64((long long)INC),_mm512_setr_epi64(0,1,2,3,4,5,6,7))); // lane j: A + j*INC, wrapping as the scalar A does
+ for(;c+32<=e;c+=32,A+=32*INC){
+  const __m512i a1=_mm512_add_epi64(a0,v8),a2=_mm512_add_epi64(a1,v8),a3=_mm512_add_epi64(a2,v8);
+  const __m512i p0=_mm512_mullo_epi64(_mm512_xor_si512(vD,a0),vI),p1=_mm512_mullo_epi64(_mm512_xor_si512(vD,a1),vI);
+  const __m512i p2=_mm512_mullo_epi64(_mm512_xor_si512(vD,a2),vI),p3=_mm512_mullo_epi64(_mm512_xor_si512(vD,a3),vI);
+  a0=_mm512_add_epi64(a3,v8);
+  // one compare for the 32: the smallest of the four products per lane (the four masks are only made when one passes)
+  if(__builtin_expect(_mm512_cmplt_epu64_mask(_mm512_min_epu64(_mm512_min_epu64(p0,p1),_mm512_min_epu64(p2,p3)),vL)==0,1))continue; // sample 1 off in all 32
+  const uint32_t m0=_mm512_cmplt_epu64_mask(p0,vL),m1=_mm512_cmplt_epu64_mask(p1,vL),m2=_mm512_cmplt_epu64_mask(p2,vL),m3=_mm512_cmplt_epu64_mask(p3,vL);
+  const uint64_t hit=ks_hits(um,n,limit,A,INC,m0|(m1<<8)|(m2<<16)|(m3<<24));
+  if(hit!=UINT64_MAX)return c+hit;
+ }
+ for(;c<e;++c,A+=INC){ // the tail of the block, as the scalar loop
+  if(__builtin_expect(((D1^A)*I1)>=LIM,1))continue;
+  if(ks_full(um,n,limit,A))return c;
+ }
+ return UINT64_MAX;
+}
 static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,uint64_t& key,int T){
  if(n<6||limit<step)return false;
  const uint64_t cand=limit/step;
@@ -1051,6 +1118,7 @@ static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,ui
  // rule is a valid key; which one is found only matters for speed.
  for(int round=0;round<2;++round){
   atomic<uint64_t> best{UINT64_MAX};
+  const bool ks5=ks_has512();
   #pragma omp parallel num_threads(T)
   {
    const int t=omp_get_thread_num();
@@ -1061,6 +1129,9 @@ static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,ui
     if(round==0&&limit<=MASK){
      // The first round's test with the 40-bit numbers held in the top 40 bits of a word: adding and
      // multiplying then wrap as they should without masks ((x << 24) * I1 = ((x * I1) mod 2^40) << 24).
+     if(ks5){const uint64_t c=ks_block_v5(um,n,limit,inc,b,e);
+      if(c!=UINT64_MAX){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}}
+      continue;}
      const uint64_t D1=(u0^u1)<<24,INC=inc<<24,LIM=limit<<24;uint64_t A=a<<24;
      for(uint64_t c=b;c<e;++c,A+=INC){
       if(__builtin_expect(((D1^A)*I1)>=LIM,1))continue; // sample 1 off
