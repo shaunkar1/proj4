@@ -5761,19 +5761,38 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  static constexpr size_t MERGE_BLOCK=4096;
  const auto write_campaigns=[&]{
   if(!campEarly)merge_totals(0,ncells); // otherwise all threads have added the totals up, a block of cells each
-  string cid,chan;string& csv=campCsv;vector<int32_t> days;vector<int64_t> s,p,r,a;
-  if(campEarly){ // room for a row of every cell, so nothing grows while the rows are appended (SS_CAMPWRITE=end: as before)
+  string& csv=campCsv;
+  const auto open_camp=[&](PqFile& f){f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
+   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});};
+  if(campEarly){
+   // The same column bodies as below, written through pointers into buffers with room for a row of every cell
+   // (a length-prefixed text is its 32-bit little-endian length and its bytes; the numbers are little-endian as stored).
    size_t idBytes=0,chBytes=0;for(size_t ci=0;ci<ncamp;++ci){idBytes+=4+campaigns[ci].id.size();chBytes+=4+campaigns[ci].channel.size();}
-   cid.reserve(idBytes*(size_t)ndays);chan.reserve(chBytes*(size_t)ndays);days.reserve(ncells);s.reserve(ncells);p.reserve(ncells);r.reserve(ncells);a.reserve(ncells);
+   const auto cidBuf=make_unique_for_overwrite<char[]>(idBytes*(size_t)ndays+1),chanBuf=make_unique_for_overwrite<char[]>(chBytes*(size_t)ndays+1);
+   const auto dayBuf=make_unique_for_overwrite<int32_t[]>(ncells+1);
+   const auto sBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),pBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),rBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),aBuf=make_unique_for_overwrite<int64_t[]>(ncells+1);
+   char* pc=cidBuf.get();char* ph=chanBuf.get();size_t n=0;
+   for(size_t ci=0;ci<ncamp;++ci){
+    const string& id=campaigns[ci].id;const string& ch=campaigns[ci].channel;const uint32_t il=(uint32_t)id.size(),cl=(uint32_t)ch.size();
+    for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
+     memcpy(pc,&il,4);memcpy(pc+4,id.data(),il);pc+=4+il;memcpy(ph,&cl,4);memcpy(ph+4,ch.data(),cl);ph+=4+cl;
+     dayBuf[n]=(int32_t)(firstday+d);sBuf[n]=(int64_t)t.sessions;pBuf[n]=(int64_t)t.purchasing_sessions;rBuf[n]=(int64_t)t.revenue;aBuf[n]=(int64_t)t.assists;++n;
+     if(debugCsv){csv+=hexstr(id);csv+=',';csv+=hexstr(ch);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
+    }
+   }
+   PqFile f;open_camp(f);
+   if(n)f.row_group((int64_t)n,{string_view(cidBuf.get(),(size_t)(pc-cidBuf.get())),string_view(chanBuf.get(),(size_t)(ph-chanBuf.get())),string_view((const char*)dayBuf.get(),n*sizeof(int32_t)),
+    string_view((const char*)sBuf.get(),n*sizeof(int64_t)),string_view((const char*)pBuf.get(),n*sizeof(int64_t)),string_view((const char*)rBuf.get(),n*sizeof(int64_t)),string_view((const char*)aBuf.get(),n*sizeof(int64_t))});
+   f.close();
+   return;
   }
+  string cid,chan;vector<int32_t> days;vector<int64_t> s,p,r,a;
   for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
    put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
    s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
    if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
   }
-  PqFile f;
-  f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
-   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});
+  PqFile f;open_camp(f);
   if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
   f.close();
  };
