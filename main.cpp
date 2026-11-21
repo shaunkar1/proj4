@@ -4498,6 +4498,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  auto __sysflt=[&](const char* label){double s;long f;__ru_now(s,f);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\n";__sys0=s;__flt0=f;};
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
+ // SS_FINE=1: FINE lines, the time since the start of run() at points inside the stages (the split of the serial
+ // work before the parse stage, the side thread, the campaign file). Measuring only.
+ static const bool fineLines=getenv("SS_FINE")!=nullptr;
+ static const auto fineT0=chrono::steady_clock::now();
+ const auto __fine=[](const char* label){if(fineLines)fprintf(stderr,"FINE %s %.6f\n",label,chrono::duration<double>(chrono::steady_clock::now()-fineT0).count());};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
  if(const char* v=getenv("SS_FILEALIGN")){const string_view w(v);optFileAlign=w=="2m"?1:w=="2m+huge"?2:0;}
  if(const char* v=getenv("SS_FILEADVISE")){const string_view w(v);optFileAdvise=w=="random"?1:w=="seq"?2:0;}
@@ -4542,7 +4547,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool catalogBg=!(getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="inline");
  exception_ptr catalogErr;thread catalogThread;
  struct Joiner{thread& t;~Joiner(){if(t.joinable())t.join();}} catalogJoiner{catalogThread}; // an exception on the way must not meet a running thread
- if(catalogBg)catalogThread=thread([&]{try{load_catalog();}catch(...){catalogErr=current_exception();}});
+ if(catalogBg)catalogThread=thread([&]{try{load_catalog();}catch(...){catalogErr=current_exception();}__fine("catalog-read-end");});
+ __fine("start");
  // The scorer may limit CPU by quota rather than by affinity, so trust NCPU when it is set.
  int T=max(1,omp_get_max_threads());
  if(const char* n=getenv("NCPU")){int v=atoi(n);if(v>=1&&v<=1024)T=v;}
@@ -4558,7 +4564,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(size_t from=0;from<m.len;from+=CH)chunks.push_back({m.base,m.len,from,from+CH,click});}
  };
  add_files(data/"events",false,eventBytes,eventFiles);
+ __fine("map-events");
  add_files(data/"clicks",true,clickBytes,clickFiles);
+ __fine("map-clicks");
  // Lines per byte, measured on the start of the largest event file, sizes the bucket buffers tightly.
  uint64_t estEvents=eventBytes/70;
  if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
@@ -4588,6 +4596,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   };
   const vector<uint64_t> es=sample(sampleBase,sampleLen,0,'e'),us=sample(sampleBase,sampleLen,1,'u');
   vector<uint64_t> cs;for(const Chunk& c:chunks)if(c.click&&c.from==0){cs=sample(c.base,c.len,0,'k');if(cs.size()>=12)break;}
+  __fine("key-samples");
   dn::Info d;
   d.limE=min<uint64_t>(estEvents+estEvents/8+4096,uint64_t(1)<<31);
   d.limC=min<uint64_t>(estClicks+estClicks/8+4096,uint64_t(1)<<31);
@@ -4632,6 +4641,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   ++linkLines; // a last line without '\n'
   linkBytes+=m.len;++linkFileCount;
   for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+ __fine("map-links");
  static const bool idBlocks=!getenv("SS_NOIDBLOCKS"); // measuring switch: per-thread ID blocks in the links stage
  // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
  // If a dataset has more, the extra ones take the thread-private fallback path (slower, still exact).
@@ -4717,6 +4727,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    apply();out.maxIdx=maxIdx;
   }
  }
+ __fine("link-pass");
  // The pairs to replay: for every complex index, each alias that the simple lines put into a group
  // with a smaller one. (Indexes the test switch marked complex were never noted; they are looked up here.)
  struct Replay{uint32_t idx;uint8_t a,b;};
@@ -4884,7 +4895,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked-idHoles<<"\n";
+ __fine("catalog-join");
  if(catalogBg){catalogThread.join();if(catalogErr)rethrow_exception(catalogErr);}else load_catalog();
+ __fine("catalog-ready");
 
  // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
  const size_t PE=pow2_parts(eventBytes/70),PC=pow2_parts(clickBytes/40);
@@ -4955,6 +4968,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const size_t usedE=DE?min<size_t>(DE,(size_t)((spanE-1)>>dparse.shE)+1):0,usedC=DC?min<size_t>(DC,(size_t)((spanC-1)>>dparse.shC)+1):0;
  if(getenv("SS_STATS")&&(DE||DC))cerr<<"STATS dense buckets events "<<DE<<" (span "<<spanE<<", "<<usedE<<" x "<<rdFull<<" records) clicks "<<DC<<" (span "<<spanC<<", "<<usedC<<" x "<<rdcFull<<" records)\n";
  if(T>65535)throw runtime_error("Too many threads"); // ESlot::thread
+ __fine("parse-region");
  #pragma omp parallel num_threads(T)
  {
   ThreadState& tl=tls[omp_get_thread_num()];
@@ -6417,14 +6431,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   // The loop above ended with a barrier: every thread's totals are final. (A failed write ends the run from
   // inside the region, as a failed write of a user_daily file does.)
   #pragma omp single nowait
-  {if(campEarly)write_campaigns();}
+  {if(campEarly){__fine("campaign-begin");write_campaigns();__fine("campaign-end");}}
   // Every row is in the output buffers now (names are copied there): nothing points into an input file.
-  #pragma omp for schedule(static,1) nowait
+  #pragma omp for schedule(dynamic,1) nowait // whoever is free takes a piece: the thread with the campaign file comes late
   for(size_t i=0;i<unmapLast.size();++i)munmap(unmapLast[i].first,unmapLast[i].second);
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
   if(file.is_open())file.close();
  }
+ __fine("region-end");
  if(!campEarly)write_campaigns();
 __mark("AGGREGATE");
  if(slots&&stats){
