@@ -725,11 +725,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   linkLines+=(uint64_t)count(m.base,m.base+m.len,'\n')+1;
   for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
  const uint64_t maxLinked=2*linkLines; // every link line names at most two IDs
- uint64_t maxNew64=(eventBytes/70+clickBytes/35)/12+4096; // room for IDs that only appear in events and clicks
+ // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
+ // If a dataset has more, the extra ones take the thread-private fallback path (slower, still exact).
+ uint64_t maxNew64=(estEvents+estClicks)/28+4096;
  if(const char* v=getenv("SS_TEST_MAXNEW"))maxNew64=strtoull(v,nullptr,10); // tests force the fallback path with a tiny value
  if(maxLinked+maxNew64>=0x60000000u)throw runtime_error("Too many IDs");
  const uint32_t maxIds=(uint32_t)(maxLinked+maxNew64);
- KeyTable tab((size_t)maxIds*2);
+ KeyTable tab((size_t)maxIds*8/5); // at most 62% full even if every allowed ID shows up
  tab.begin_parallel(0,maxIds);
  // parent[x] <= x always (a root links to a smaller root), so the forest can never form a cycle.
  unique_ptr<atomic<uint32_t>[]> parent(new atomic<uint32_t>[maxLinked+1]);
