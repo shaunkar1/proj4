@@ -762,6 +762,17 @@ static inline void click_insertion_sort(Click* c0,Click* c1){
   if(click_before(*x,x[-1])){const Click v=*x;Click* y=x;do{*y=y[-1];--y;}while(y>c0&&click_before(v,y[-1]));*y=v;}
  }
 }
+// A person's events into time order (ties in any order). Meant for short or nearly ordered runs.
+static inline void ev_time_sort(Ev* e0,Ev* e1){
+ if(e1-e0>64){ // long: only pay for a real sort when the run is not in order already
+  bool ordered=true;for(const Ev* x=e0+1;x<e1;++x)if(x->k<x[-1].k){ordered=false;break;}
+  if(!ordered)sort(e0,e1,[](const Ev& a,const Ev& b){return a.k<b.k;});
+  return;
+ }
+ for(Ev* x=e0+1;x<e1;++x){
+  if(x->k<x[-1].k){const Ev v=*x;Ev* y=x;do{*y=y[-1];--y;}while(y>e0&&v.k<y[-1].k);*y=v;}
+ }
+}
 // Scratch array living in a thread's HugePool. reserve() the largest size up front where it is known;
 // get() beyond that takes a new, larger piece and abandons the old one.
 template<class T> struct Scratch{
@@ -825,6 +836,21 @@ static atomic<uint32_t> denseMaxIdx{0};
 static inline void dense_note_index(uint32_t idx){
  uint32_t cur=denseMaxIdx.load(memory_order_relaxed);
  while(idx>cur&&!denseMaxIdx.compare_exchange_weak(cur,idx,memory_order_relaxed)){}
+}
+// letter + canonical base 36 of y (y < 2^40) into out, which needs room for 9 bytes; returns the length.
+// Same result as dn::text36, without the digit loop: four table lookups of two digits each.
+static constexpr array<char,2592> PAIR36=[]{array<char,2592> a{};const char* dg="0123456789abcdefghijklmnopqrstuvwxyz";
+ for(int i=0;i<1296;++i){a[2*i]=dg[i/36];a[2*i+1]=dg[i%36];}return a;}();
+// The digits of y as eight bytes, first digit in the lowest byte, zero bytes after the last; n = how many.
+static inline uint64_t digits36(uint64_t y,unsigned& n){
+ const uint32_t hi=(uint32_t)(y/1679616u),lo=(uint32_t)(y%1679616u); // 36^4
+ char buf[8];memcpy(buf,&PAIR36[2*(hi/1296u)],2);memcpy(buf+2,&PAIR36[2*(hi%1296u)],2);memcpy(buf+4,&PAIR36[2*(lo/1296u)],2);memcpy(buf+6,&PAIR36[2*(lo%1296u)],2);
+ n=1+(y>=36u)+(y>=1296u)+(y>=46656u)+(y>=1679616u)+(y>=60466176u)+(y>=2176782336ull)+(y>=78364164096ull);
+ uint64_t v;memcpy(&v,buf,8);return v>>(8*(8-n)); // drops the leading zeros
+}
+static inline size_t text36_fast(char letter,uint64_t y,char* out){
+ unsigned n;const uint64_t v=digits36(y,n);
+ out[0]=letter;memcpy(out+1,&v,8);return (size_t)n+1;
 }
 static inline void dense_set_complex(uint64_t idx);
 static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32_t& alias);
@@ -1944,17 +1970,21 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Name of a dense person: the byte-wise smallest text among the aliases grouped with its root alias.
  auto dense_name=[&](uint32_t person,char* buf)->size_t{
   const uint32_t d=person-denseBase,root=d&7;const uint64_t idx=d>>3;
-  const uint32_t w=denseComp[idx].load(memory_order_relaxed)^COMP_IDENT;size_t len=0;
-  for(uint32_t a=0;a<8;++a)if(comp_root(w,a)==root){
-   char t[12];const size_t n=dn::text36('u',dn::value_of((idx<<dn::GEN_ALIAS_BITS)|a,dense.ku),t);
-   if(!len||string_view(t,n)<string_view(buf,len)){memcpy(buf,t,n);len=n;}
+  const uint32_t stored=denseComp[idx].load(memory_order_relaxed);
+  if(__builtin_expect(stored==0,1))return text36_fast('u',dn::value_of((idx<<dn::GEN_ALIAS_BITS)|root,dense.ku),buf); // nothing grouped under this index
+  // Byte-wise order of the texts = numeric order of their digit bytes read first digit highest.
+  const uint32_t w=stored^COMP_IDENT;uint64_t best=~0ull;unsigned bestN=0;
+  for(uint32_t a=root;a<8;++a)if(comp_root(w,a)==root){ // the root is its group's smallest alias
+   unsigned n;const uint64_t key=__builtin_bswap64(digits36(dn::value_of((idx<<dn::GEN_ALIAS_BITS)|a,dense.ku),n));
+   if(key<best){best=key;bestN=n;}
   }
-  return len;
+  best=__builtin_bswap64(best);buf[0]='u';memcpy(buf+1,&best,8);
+  return (size_t)bestN+1;
  };
  auto name_of=[&](uint32_t person)->string_view{
   if(person<totalIds)return personNames[person].view();
   if(person>=denseBase){ // remembered per thread: a person's rows come one after another
-   static thread_local char buf[12];static thread_local uint32_t who=UINT32_MAX;static thread_local size_t len=0;
+   static thread_local char buf[16];static thread_local uint32_t who=UINT32_MAX;static thread_local size_t len=0;
    if(who!=person){len=dense_name(person,buf);who=person;}
    return string_view(buf,len);
   }
@@ -2202,6 +2232,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Measuring switch, off by default: cut a person's events into cells in a separate pass without data-dependent
  // branches. On dev it trades about 29 more instructions per event for 0.35 fewer mispredicted branches.
  static const bool cellPass=getenv("SS_CELLPASS")!=nullptr;
+ // Test switch: every person goes through sessionize_person (the function of the dense fast lane)
+ // instead of the cell loop, which proves that function against the general lane on any data.
+ static const bool personSess=getenv("SS_TEST_PERSONSESS")!=nullptr;
+ if(personSess)cerr<<"test: every person through sessionize_person\n";
  uint64_t num_sessions=0;
  // Input files nobody reads any more are unmapped by the worker threads, a few large pieces each,
  // instead of leaving every page of them to process exit, which tears mappings down on one thread.
@@ -2262,6 +2296,84 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   Cell* const cells=cellBuf.p;
   vector<uint32_t> thist((size_t)maxDigit+2),phist((size_t)W+3),chist((size_t)W+2);
   uint32_t* const th=thist.data();uint32_t* const pp=phist.data();uint32_t* const cp=chist.data();
+  const bool shadow=personSess;
+  // ---- One person at a time (the dense fast lane; SS_TEST_PERSONSESS=1 runs every person through it). ----
+  // A person's name, looked up once: `fixed` names are at most 15 bytes inside a readable 16-byte block.
+  struct NameRef{const char* p;uint32_t L;bool fixed;};
+  // (The three lambdas hold what they can by value, so that they do not pin the cell loop's variables to memory.)
+  auto person_name=[&dense_name,&extraNames,personNames,totalIds,denseBase](uint32_t person,char* tmp16)->NameRef{
+   if(person<totalIds){const PName& n=personNames[person];const unsigned char inl=(unsigned char)n.b[15];
+    if(inl!=0xFF)return {n.b,inl,true};
+    const string_view v=n.view();return {v.data(),(uint32_t)v.size(),false};}
+   if(person>=denseBase){memset(tmp16,0,16);return {tmp16,(uint32_t)dense_name(person,tmp16),true};}
+   const string_view v=extraNames[person-totalIds];return {v.data(),(uint32_t)v.size(),false};
+  };
+  // Appends the finished (person, day) row; the day's category sums are in catsum/touched and are cleared.
+  auto put_row=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&touched,&catv,&dbg,&catnames,catsum=catsum.data(),dayp,revp,sess32p,evs32p,sessp,evsp,catbits,narrow,debugCsv,firstday,tid]
+   (const NameRef& nm,int day,uint64_t dsess,uint64_t devs,uint64_t drev){
+   uint16_t top=0;uint64_t best=0;
+   if(!touched.empty()){
+    for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
+    touched.clear();
+   }
+   const size_t r=nrows++;
+   if(uidCap-uidLen<(size_t)nm.L+64)grow_uid((size_t)nm.L+64);
+   {char* o=uidp+uidLen;memcpy(o,&nm.L,4);if(nm.fixed)memcpy(o+4,nm.p,16);else memcpy(o+4,nm.p,nm.L);uidLen+=4+nm.L;}
+   dayp[r]=(int32_t)(firstday+day);revp[r]=(int64_t)drev;
+   if(narrow){sess32p[r]=(int32_t)dsess;evs32p[r]=(int32_t)devs;}else{sessp[r]=(int64_t)dsess;evsp[r]=(int64_t)devs;}
+   if(best!=0){catbits[r>>3]|=(uint8_t)(1u<<(r&7));put_bytes(catv,catnames[top]);}
+   if(debugCsv){string& o=dbg[tid];
+    o+=hexstr(string_view(nm.p,nm.L));o+=',';o+=to_string(firstday+day);o+=',';o+=to_string(dsess);o+=',';o+=to_string(devs);o+=',';o+=to_string(drev);o+=',';
+    o+=best==0?string("NULL"):hexstr(catnames[top]);o+='\n';
+   }
+  };
+  // All rows and campaign totals of one person. E[0..ne): the person's events in time order (ne > 0; the
+  // order of events with the same time does not matter). cb..ce: the person's clicks in click_before order.
+  // The rules are those of the cell loop below: a session starts at the first event and after every gap
+  // of more than GAP; it belongs to the UTC day of its first event and is credited to the last click of
+  // the seven days up to that event (both ends inclusive), every campaign clicked in those days gets an assist.
+  auto sessionize_person=[&put_row,&touched,&num_sessions,&nrows,&flush_rows,catsum=catsum.data(),dOff=dayOff,nCamp=ncamp,org=organic,totals=tot,assist=assists,
+   fr=freq.data(),pos=positions.data(),act=active.data()](const NameRef& nm,const Ev* E,size_t ne,const Click* cb,const Click* ce){
+   size_t na=0; // the active-campaign list is empty between persons
+   const Click *add=cb,*expire=cb;
+   int currentday=-1;uint64_t dsess=0,drev=0,nsess=0;size_t rowStart=0; // rowStart: first event of the current row
+   uint64_t prev=(E->k>>EV_TS)+1; // makes the first event start a session: its distance from `prev` wraps to 2^64-1
+   Totals* cur=nullptr;bool purchasing=false;
+   const Ev* const Eend=E+ne;
+   for(const Ev* e=E;e<Eend;++e){
+    const uint64_t x=e->k,ts=x>>EV_TS;
+    if(__builtin_expect(ts-prev>(uint64_t)GAP,0)){
+     const int d=(int)((ts+dOff)/(uint64_t)DAY);
+     if(d!=currentday){
+      const size_t at=(size_t)(e-E);
+      if(currentday>=0){put_row(nm,currentday,dsess,at-rowStart,drev);dsess=0;drev=0;}
+      currentday=d;rowStart=at;
+     }
+     ++dsess;++nsess;
+     const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
+     while(add<ce&&add->key<addLim){const uint16_t c=(uint16_t)add->key;if(fr[c]++==0){pos[c]=(uint32_t)na;act[na++]=c;}++add;}
+     while(expire<add&&expire->key<expLim){const uint16_t c=(uint16_t)expire->key;if(--fr[c]==0){const uint32_t at=pos[c];const uint16_t back=act[--na];act[at]=back;pos[back]=at;}++expire;}
+     uint16_t credited=org;
+     if(add>expire)credited=(uint16_t)add[-1].key;
+     cur=&totals[(size_t)d*nCamp+credited];cur->sessions++;purchasing=false;
+     uint64_t* const arow=assist+(size_t)d*nCamp;
+     #pragma GCC unroll 4
+     for(size_t q=0;q<na;++q)++arow[act[q]];
+    }
+    prev=ts;
+    if(__builtin_expect((x&EV_PURCHASE)!=0,0)){const uint64_t price=x&EV_PRICE;const uint16_t cat=e->cat;
+     drev+=price;cur->revenue+=price;
+     if(!purchasing){purchasing=true;cur->purchasing_sessions++;}
+     if(catsum[cat]==0)touched.push_back(cat);
+     catsum[cat]+=price;
+    }
+   }
+   const uint64_t devs=ne-rowStart;
+   put_row(nm,currentday,dsess,devs,drev);
+   for(size_t q=0;q<na;++q)fr[act[q]]=0;
+   num_sessions+=nsess;
+   if(nrows>=FLUSH)flush_rows();
+  };
   #pragma omp for schedule(dynamic,1)
   for(size_t up=0;up<UPn;++up){
    size_t nE=0,nC=0;
@@ -2355,6 +2467,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       }
      }
      cb=c0;ce=c1;
+    }
+    if(shadow){ // test: this person through the per-person function instead of the cell loop
+     const size_t n=ee-es;Ev* const P=A; // A is free once the events are grouped by person in B
+     memcpy((void*)P,(const void*)(E+es),n*sizeof(Ev));
+     ev_time_sort(P,P+n);
+     char tmp[16];sessionize_person(person_name(person,tmp),P,n,cb,ce);
+     continue;
     }
     const Click *add=cb,*expire=cb;
     int currentday=-1;uint64_t dsess=0,devs=0,drev=0;
