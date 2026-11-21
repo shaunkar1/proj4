@@ -171,20 +171,27 @@ static inline bool take_fields(const char* p,const char* lineEnd,const char* con
  }
  return nquote==2*quoted; // any other quote sits inside a field, which is malformed
 }
-// Like for_lines, but hands fn the split fields of every well-formed n-field line that begins in [from,to).
-template<int N,class FN> static void for_records(const char* base,size_t len,size_t from,size_t to,FN&& fn){
+// Like for_lines, but hands fn the split fields of every well-formed N-field line that begins in [from,to).
+// Lines are handled in small batches: pre(fields) runs for the whole batch first so it can prefetch
+// the memory fn(fields) is going to touch.
+template<int N,class PRE,class FN> static void for_records(const char* base,size_t len,size_t from,size_t to,PRE&& pre,FN&& fn){
  if(from>=len)return;
  const char* end=base+len;
  const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
  if(!nl)return;
  const char* p=nl+1;
  const char* lim=base+min(to,len);
- const char* comma[N];string_view f[N];
+ static constexpr int BATCH=12;
+ const char* comma[N];string_view f[BATCH][N];
  while(p<lim){
-  int ncomma,nquote;const char* lineEnd;
-  const char* next=scan_line(p,end,comma,N,ncomma,nquote,lineEnd);
-  if(take_fields(p,lineEnd,comma,ncomma,nquote,N,f))fn(f);
-  p=next;
+  int nb=0;
+  while(nb<BATCH&&p<lim){
+   int ncomma,nquote;const char* lineEnd;
+   const char* next=scan_line(p,end,comma,N,ncomma,nquote,lineEnd);
+   if(take_fields(p,lineEnd,comma,ncomma,nquote,N,f[nb])){pre(f[nb]);++nb;}
+   p=next;
+  }
+  for(int i=0;i<nb;++i)fn(f[i]);
  }
 }
 template<class FN> static void read_lines(const fs::path& path,FN&& fn){
@@ -281,6 +288,7 @@ struct KeyTable{
   if((count+maxNew)*2>cap)grow((count+maxNew)*2);
  }
  uint32_t end_parallel(){uint32_t n=min(nextId.load(),idLimit);count+=n;return n;}
+ void prefetch(string_view s)const{uint64_t k0;uint32_t k1;if(pack(s,k0,k1))__builtin_prefetch(&slots[hash_packed(k0,k1)&mask],0,1);}
  // The key's value; a key nobody has seen gets the next ID. NONE if the key is new and the table is full.
  uint32_t find_or_add(string_view s){
   const auto R=memory_order_relaxed;
@@ -328,6 +336,7 @@ struct SmallTable{
  unordered_map<string_view,uint32_t> m;vector<string_view> keys;
  uint32_t intern(string_view s){auto [it,isnew]=m.try_emplace(s,(uint32_t)keys.size());if(isnew)keys.push_back(s);return it->second;}
 };
+template<class T> using AVec=vector<T>;
 static constexpr uint8_t F_VALID=1,F_PURCHASE=2,F_DEAD=4;
 static constexpr uint32_t LOCAL_USER=0x80000000u;
 // One parsed event line, bucketed by event_id hash so duplicates meet in one bucket.
@@ -342,8 +351,8 @@ static inline bool operator<(const Ev& x,const Ev& y){return x.a!=y.a?x.a<y.a:x.
 struct Click{int64_t ts;uint32_t user;uint16_t campaign;string_view id;};
 struct alignas(64) ThreadState{
  SmallTable users; // IDs that did not fit in the shared table
- vector<vector<PRec>> eb;vector<vector<CRec>> cb; // parsed lines by event/click ID hash
- vector<vector<Ev>> uev;vector<vector<Click>> ucl; // survivors by person
+ vector<AVec<PRec>> eb;vector<AVec<CRec>> cb; // parsed lines by event/click ID hash
+ vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
 };
 static size_t pow2_parts(uint64_t est){size_t p=1;while(p<2048&&p*32768<est)p<<=1;return p;}
 struct Camp{string id,channel;};
@@ -560,6 +569,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(g!=KeyTable::NONE)return g;
    return LOCAL_USER|tl.users.intern(u);
   };
+  auto warm_user=[&](const string_view* f){tab.prefetch(f[1]);}; // user_id is field 1 in both files
   auto on_event=[&](const string_view* f){
    if(f[0].empty())return;
    int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
@@ -587,8 +597,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
-   if(ck.click)for_records<4>(ck.base,ck.len,ck.from,ck.to,on_click);
-   else for_records<7>(ck.base,ck.len,ck.from,ck.to,on_event);
+   if(ck.click)for_records<4>(ck.base,ck.len,ck.from,ck.to,warm_user,on_click);
+   else for_records<7>(ck.base,ck.len,ck.from,ck.to,warm_user,on_event);
   }
  }
  const uint32_t totalIds=tab.end_parallel();
@@ -618,6 +628,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks)
  {
   ThreadState& me=tls[omp_get_thread_num()];
+  {size_t r=(size_t)(eventBytes/70/((uint64_t)T*UP)*5/4)+16;for(auto& v:me.uev)v.reserve(r);}
+  {size_t r=(size_t)(clickBytes/40/((uint64_t)T*UP)*5/4)+16;for(auto& v:me.ucl)v.reserve(r);}
   vector<uint64_t> slots;vector<size_t> off(T+1);
   #pragma omp for schedule(dynamic,1) nowait
   for(size_t p=0;p<PE;++p){
@@ -648,7 +660,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      me.uev[person_bucket(u)].push_back({((uint64_t)u<<32)|(rel>>8),((rel&255)<<56)|((uint64_t)(uint32_t)r.price<<24)|((uint64_t)r.cat<<8)|((r.flags&F_PURCHASE)?1u:0u)});
      ++surviving;
     }
-    vector<PRec>().swap(v);
+    v=AVec<PRec>();
    }
    dedupCount+=alive;
   }
@@ -675,7 +687,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      me.ucl[person_bucket(u)].push_back({r.ts,u,r.campaign,string_view(r.id,r.idlen)});
      ++survivingClicks;
     }
-    vector<CRec>().swap(v);
+    v=AVec<CRec>();
    }
   }
  }
@@ -717,8 +729,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   #pragma omp for schedule(dynamic,1)
   for(size_t up=0;up<UP;++up){
    events.clear();clicks.clear();
-   for(int t=0;t<T;++t){auto& v=tls[t].uev[up];events.insert(events.end(),v.begin(),v.end());vector<Ev>().swap(v);
-    auto& c=tls[t].ucl[up];clicks.insert(clicks.end(),c.begin(),c.end());vector<Click>().swap(c);}
+   for(int t=0;t<T;++t){auto& v=tls[t].uev[up];events.insert(events.end(),v.begin(),v.end());v=AVec<Ev>();
+    auto& c=tls[t].ucl[up];clicks.insert(clicks.end(),c.begin(),c.end());c=AVec<Click>();}
    if(events.empty())continue;
    sort(events.begin(),events.end());
    sort(clicks.begin(),clicks.end(),[](const Click& a,const Click& b){
