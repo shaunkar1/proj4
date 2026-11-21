@@ -663,8 +663,17 @@ template<class T> struct Bucket{
   if(have)memcpy((void*)nb,(const void*)b,have*sizeof(T));
   b=nb;e=nb+have;c=nb+n;
  }
- __attribute__((always_inline)) void append(const T& r){*e++=r;} // there must be room
- __attribute__((always_inline)) void push_back(const T& r){if(__builtin_expect(e==c,0))reserve(max<size_t>(16,2*capacity()));*e++=r;}
+// After each append the cache line after the one just written is requested: a bucket is one of many
+ // slow write streams, too many for the hardware prefetcher, so without this every second record
+ // waits for a line of fresh memory. (Measured: PARSE processor time -20% on dev and on 20M events.)
+ // A prefetch never faults, so running past the end of the storage is harmless.
+#ifdef SS_NO_PFNEXT
+ __attribute__((always_inline)) static void want_next(const T*){}
+#else
+ __attribute__((always_inline)) static void want_next(const T* e){__builtin_prefetch((const char*)e+64,1,3);}
+#endif
+ __attribute__((always_inline)) void append(const T& r){*e++=r;want_next(e);} // there must be room
+ __attribute__((always_inline)) void push_back(const T& r){if(__builtin_expect(e==c,0))reserve(max<size_t>(16,2*capacity()));*e++=r;want_next(e);}
 };
 [[maybe_unused]] static void unmap_regions(vector<Region> regions){for(const Region& r:regions)munmap(r.base,r.len);}
 static constexpr uint32_t LOCAL_USER=0x80000000u;
@@ -1047,6 +1056,16 @@ SS_V5I WinMasks win_masks_avx512y(const char* p){
          _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(x1,vq),_mm256_cmpeq_epi8_mask(x0,vq))),
          _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(x1,vnl),_mm256_cmpeq_epi8_mask(x0,vnl)))};
 }
+// Newlines only, for the line index (see SS_EVENT_LOOP_IX).
+SS_V3I uint64_t nl_mask_avx2(const char* p){
+ const __m256i vnl=_mm256_set1_epi8('\n');
+ return mask64_v3(_mm256_loadu_si256((const __m256i*)p),_mm256_loadu_si256((const __m256i*)(p+32)),vnl);
+}
+SS_V5I uint64_t nl_mask_avx512z(const char* p){return _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)p),_mm512_set1_epi8('\n'));}
+SS_V5I uint64_t nl_mask_avx512y(const char* p){
+ const __m256i vnl=_mm256_set1_epi8('\n');
+ return _cvtmask64_u64(_mm512_kunpackd(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256((const __m256i*)(p+32)),vnl),_mm256_cmpeq_epi8_mask(_mm256_loadu_si256((const __m256i*)p),vnl)));
+}
 // A line the short path passed on: the portable splitter and the general handler decide. Kept out of
 // line and compiled without any vector extension, so the loops stay small and no wide register is used here.
 template<int N,class GEN> [[gnu::noinline]] static const char* line_general(const char* p,const char* end,GEN&& general){
@@ -1174,6 +1193,29 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,general);} \
  resolve_users(pend,pp,tab,tl); \
 }
+// The same loop with a line index (SS_LINES=index): the newlines of the next IX_BLOCK bytes are located
+// first, so where a line starts no longer waits for the previous line's fields to be cut - consecutive
+// lines become independent work for the processor. p is always the first line not handled yet, and
+// every newline before `scan` has been turned into a line start.
+static constexpr size_t IX_BLOCK=1024;
+#define SS_EVENT_LOOP_IX(NAME,TARGET,MASKS,NLMASK) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const char* const end=base+len; \
+ const EvLoop lp(tl,tab,products,PE,end);PendUser<PRec> pend[V3_BATCH];PendUser<PRec>* pp=pend; \
+ const char* starts[IX_BLOCK+64];const char* scan=p; \
+ while(p<lim){ \
+  size_t n=0; \
+  for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
+  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,general);p=starts[i];} \
+  if(scan>=end&&p<lim){ /* the last line has no newline */ \
+   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,general);break;} \
+ } \
+ resolve_users(pend,pp,tab,tl); \
+}
+SS_EVENT_LOOP_IX(events_avx2_ix,SS_V3,win_masks_avx2,nl_mask_avx2)
+SS_EVENT_LOOP_IX(events_avx512z_ix,SS_V5,win_masks_avx512z,nl_mask_avx512z)
+SS_EVENT_LOOP_IX(events_avx512y_ix,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 SS_EVENT_LOOP(events_avx2,SS_V3,win_masks_avx2)
 SS_EVENT_LOOP(events_avx512z,SS_V5,win_masks_avx512z)
 SS_EVENT_LOOP(events_avx512y,SS_V5,win_masks_avx512y)
@@ -1239,6 +1281,23 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  while(p<lim)p=click_line_v3(p,MASKS(p),lp,pend,pp,general); \
  resolve_users(pend,pp,tab,tl); \
 }
+#define SS_CLICK_LOOP_IX(NAME,TARGET,MASKS,NLMASK) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const char* const end=base+len; \
+ const ClLoop lp(tl,tab,camps,PC,end,clickStart);PendUser<CRec> pend[V3_BATCH];PendUser<CRec>* pp=pend; \
+ const char* starts[IX_BLOCK+64];const char* scan=p; \
+ while(p<lim){ \
+  size_t n=0; \
+  for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
+  for(size_t i=0;i<n&&p<lim;++i){click_line_v3(p,MASKS(p),lp,pend,pp,general);p=starts[i];} \
+  if(scan>=end&&p<lim){p=click_line_v3(p,MASKS(p),lp,pend,pp,general);break;} \
+ } \
+ resolve_users(pend,pp,tab,tl); \
+}
+SS_CLICK_LOOP_IX(clicks_avx2_ix,SS_V3,win_masks_avx2,nl_mask_avx2)
+SS_CLICK_LOOP_IX(clicks_avx512z_ix,SS_V5,win_masks_avx512z,nl_mask_avx512z)
+SS_CLICK_LOOP_IX(clicks_avx512y_ix,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 SS_CLICK_LOOP(clicks_avx2,SS_V3,win_masks_avx2)
 SS_CLICK_LOOP(clicks_avx512z,SS_V5,win_masks_avx512z)
 SS_CLICK_LOOP(clicks_avx512y,SS_V5,win_masks_avx512y)
@@ -1476,7 +1535,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(w=="sse2")isaUse=ISA_SSE2;
   else if(w=="avx512z"&&hasV5)isaUse=ISA_AVX512Z;
   else if(w=="avx512y"&&hasV5)isaUse=ISA_AVX512Y;}
- cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<"\n";
+ // SS_LINES=index: the vector loops locate line starts ahead of cutting the lines (see SS_EVENT_LOOP_IX).
+ const bool lineIndex=isaUse!=ISA_SSE2&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="index";
+ cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -1539,7 +1600,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
-   if(isaUse==ISA_AVX2){
+   if(lineIndex){
+    if(isaUse==ISA_AVX2){
+     if(ck.click)clicks_avx2_ix(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
+     else events_avx2_ix(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
+    }else if(isaUse==ISA_AVX512Z){
+     if(ck.click)clicks_avx512z_ix(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
+     else events_avx512z_ix(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
+    }else{
+     if(ck.click)clicks_avx512y_ix(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
+     else events_avx512y_ix(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
+    }
+   }else if(isaUse==ISA_AVX2){
     if(ck.click)clicks_avx2(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
     else events_avx2(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);
    }else if(isaUse==ISA_AVX512Z){
