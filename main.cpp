@@ -318,7 +318,10 @@ struct TransparentHash {
  size_t operator()(string_view x)const noexcept {return hash<string_view>{}(x);}
 };
 template <class V> using FastMap=unordered_map<string,V,TransparentHash,equal_to<>>;
-static uint64_t mix64(uint64_t x){x^=x>>32;x*=0xd6e8feb86659fd93ULL;x^=x>>32;x*=0xd6e8feb86659fd93ULL;return x^(x>>32);}
+// 64 -> 64 bit mixer: the full 128-bit product with an odd constant, high half folded onto the low half.
+// Every output bit gets a well-mixed contributor: the product's top low-half bits and bottom high-half
+// bits depend on all input bits. Used for table slots (low bits), bucket choice (top bits) and tags.
+static inline uint64_t mix64(uint64_t x){const unsigned __int128 m=(unsigned __int128)x*0x9E3779B97F4A7C15ULL;return (uint64_t)m^(uint64_t)(m>>64);}
 // Low n bytes of a little-endian word. Views into the mapped inputs may be read up to 16 bytes past
 // their end (see map_file), so short strings are loaded whole and masked instead of copied byte by byte.
 static constexpr uint64_t LOW_BYTES[9]={0,0xFFULL,0xFFFFULL,0xFFFFFFULL,0xFFFFFFFFULL,0xFFFFFFFFFFULL,0xFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFULL,~0ULL};
@@ -564,7 +567,7 @@ static constexpr uint32_t LOCAL_USER=0x80000000u;
 //        INGEST_SIDE means "out of that range": the true value is then in the thread's ingestSide list
 //        under this id pointer. Only the general parser path stores such records.
 struct PRec{const char* id;uint64_t k;uint32_t user;uint16_t cat;uint16_t hx;uint64_t ih;};
-static_assert(sizeof(PRec)==32);
+static_assert(sizeof(PRec)==32&&offsetof(PRec,user)==16&&offsetof(PRec,cat)==20&&offsetof(PRec,hx)==22);
 static constexpr uint64_t PR_KBIAS=1ull<<25; // = 1 << EV_TS; relative time + 1 still fits (window < 2^37 ms)
 static constexpr unsigned PR_HBITS=25;
 static constexpr uint64_t PR_HMASK=(1ull<<PR_HBITS)-1;
@@ -578,7 +581,8 @@ static inline uint64_t ingest_code(int64_t ms){
 }
 // h = hkey(event_id); code = ingest code; k and cat as described above.
 static inline __attribute__((always_inline)) PRec make_prec(const char* id,uint64_t h,uint64_t code,uint64_t k,unsigned cat){
- PRec r;r.id=id;r.k=k;r.user=0;r.cat=(uint16_t)cat;r.hx=(uint16_t)(h>>PR_HBITS);
+ PRec r;r.id=id;r.k=k;
+ const uint64_t w=((uint64_t)(uint16_t)cat<<32)|((h>>PR_HBITS)<<48);memcpy((void*)&r.user,&w,8); // user 0, cat, hx in one store
  r.ih=(code<<PR_HBITS)|(h&PR_HMASK);return r;
 }
 // True if the event IDs starting at a and b are the same text (each ends at its first ',' or '"').
@@ -599,7 +603,9 @@ static inline bool same_event_id(const char* a,const char* b){
  }
 }
 // One valid click line, bucketed by click_id hash.
-struct CRec{const char* id;uint64_t h;int64_t ts;uint32_t idlen;uint32_t user;uint16_t campaign;uint8_t flags;};
+// key is already Click::key: (ts - (window_start - 7 days))<<16 | campaign.
+struct CRec{const char* id;uint64_t h;uint64_t key;uint32_t idlen;uint32_t user;};
+static_assert(sizeof(CRec)==32);
 struct Chunk{const char* base;size_t len,from,to;bool click;};
 // One surviving event, 16 bytes. k = tsrel<<25 | purchase<<24 | price, with tsrel = ts - window_start
 // (< 2^37 ms: the window is at most 1000 days) and price <= 10,000,000 < 2^24. person is the compact person number.
@@ -628,21 +634,17 @@ template<class T> struct Scratch{
  ~Scratch(){free(p);}
  T* get(size_t n){if(n>cap){free(p);cap=n+n/4+64;p=(T*)malloc(cap*sizeof(T));if(!p)throw bad_alloc();}return p;}
 };
-// Memory for the block lists below: handed out from 4 MB slabs owned by one thread, given back all at once.
-// The slabs come straight from mmap (2 MB aligned, huge pages where allowed) like the bucket arenas.
+// Memory for the block lists below: handed out from 1 MB slabs owned by one thread, freed all at once.
+// (Plain malloc: slabs mapped one by one, with or without huge pages, measured slower in the dedup stage.)
 struct SlabPool{
- char* cur=nullptr;char* end=nullptr;vector<Region> slabs;
+ char* cur=nullptr;char* end=nullptr;vector<void*> slabs;
  SlabPool()=default;SlabPool(const SlabPool&)=delete;SlabPool& operator=(const SlabPool&)=delete;
- ~SlabPool(){release();}
- void release(){for(const Region& r:slabs)munmap(r.base,r.len);slabs.clear();cur=end=nullptr;}
+ ~SlabPool(){for(void* p:slabs)free(p);}
  __attribute__((noinline,cold)) void* take(size_t bytes){
   if((size_t)(end-cur)<bytes){
-   static constexpr size_t SLAB=size_t(4)<<20,HUGE=size_t(2)<<20;
-   void* mem=mmap(nullptr,SLAB+HUGE,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
-   if(mem==MAP_FAILED){fprintf(stderr,"ERROR out of memory\n");_exit(1);}
-   char* a=(char*)(((uintptr_t)mem+HUGE-1)&~(uintptr_t)(HUGE-1));
-   if(optHuge)madvise(a,SLAB,MADV_HUGEPAGE);
-   slabs.push_back({mem,SLAB+HUGE});cur=a;end=a+SLAB;
+   static constexpr size_t SLAB=size_t(1)<<20;
+   void* p=malloc(SLAB);if(!p){fprintf(stderr,"ERROR out of memory\n");_exit(1);}
+   slabs.push_back(p);cur=(char*)p;end=cur+SLAB;
   }
   void* r=cur;cur+=bytes;return r;
  }
@@ -652,7 +654,7 @@ template<class T,size_t BYTES> struct Blocks{
  static constexpr size_t PER=(BYTES-16)/sizeof(T);
  struct Block{Block* next;size_t pad;T items[PER];};
  T* cur=nullptr;T* end=nullptr;Block* head=nullptr;Block* tail=nullptr;size_t nblocks=0;
- __attribute__((noinline,cold)) void grow(SlabPool& pool){
+ void grow(SlabPool& pool){
   Block* b=(Block*)pool.take(sizeof(Block));
   b->next=nullptr;if(tail)tail->next=b;else head=b;
   tail=b;++nblocks;cur=b->items;end=b->items+PER;
@@ -937,15 +939,18 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
    const uint64_t q1=qa&m1,st1=((c^cB)<<1)|1,en1=c^cR;
    uint64_t sq1,op1;const uint64_t err1=quote_errors_v3(q1,st1,en1,sq1,op1);
    // Window 2: 64 bytes from the start of field 3; must hold the last three commas and the newline.
-   const char* const b=p+_tzcnt_u64(cB)+1;
+   const uint64_t e2=_tzcnt_u64(cB); // 64 if there is no third comma
+   const char* const b=p+e2+1;
    const __m256i y0=_mm256_loadu_si256((const __m256i*)b),y1=_mm256_loadu_si256((const __m256i*)(b+32));
    const uint64_t nb=mask64_v3(y0,y1,vnl);
    const uint64_t keep=_blsmsk_u64(nb)>>1; // bytes before the newline
    const uint64_t d=mask64_v3(y0,y1,vc)&keep,qb=mask64_v3(y0,y1,vq)&keep;
    const uint64_t st2=(d<<1)|1,en2=d|_blsi_u64(nb);
    uint64_t sq2,op2;const uint64_t err2=quote_errors_v3(qb,st2,en2,sq2,op2);
-   if(__builtin_expect(cB==0||nb==0||_mm_popcnt_u64(d)!=3||(err1|err2|(na&m1))!=0,0))break;
-   next=b+_tzcnt_u64(nb)+1;done=true; // from here on the line is well-formed, 7 fields
+   const uint64_t L=_tzcnt_u64(nb); // 64 if there is no newline in the window
+   // one test: quote errors, a newline before the third comma, not exactly three more commas, a missing comma or newline
+   if(__builtin_expect((err1|err2|(na&m1)|(uint64_t)(_mm_popcnt_u64(d)^3)|((e2|L)>>6))!=0,0))break;
+   next=b+L+1;done=true; // from here on the line is well-formed, 7 fields
    // Content of each field: starts move one up past an opening quote, ends one down onto a closing quote.
    uint64_t B1=st1+sq1,E1=en1-(op1>>1),B2=st2+sq2,E2=en2-(op2>>1);
    const unsigned z0=(unsigned)(q1&1);
@@ -971,7 +976,7 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
    const char* const s1=p+b1;const char* const s2=p+b2;
    const uint64_t h=hkey_v3(s0,l0);
    const unsigned kind=event_kind(string_view(b+b4,l4));
-   bool valid=false;uint64_t k=0;unsigned cat=0;
+   uint64_t k=0;unsigned cat=0; // k stays 0 unless the line is a valid event
    if(kind&&l1!=0&&has5){
     int64_t ts;bool tsOk;
     uint64_t a8,b8;uint16_t a2,b2_;
@@ -990,15 +995,15 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
       const unsigned b6=(unsigned)_tzcnt_u64(B2),l6=(unsigned)_tzcnt_u64(E2)-b6;
       if(price_value(string_view(b+b6,l6),price)){
        const uint32_t ci=products.find(string_view(b+b5,l5));
-       cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;k=((tsrel+1)<<EV_TS)|EV_PURCHASE|(uint64_t)(uint32_t)price;valid=true;
+       cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;k=((tsrel+1)<<EV_TS)|EV_PURCHASE|(uint64_t)(uint32_t)price;
       }
-     }else{k=(tsrel+1)<<EV_TS;valid=true;}
+     }else k=(tsrel+1)<<EV_TS;
     }
    }
    const PRec r=make_prec(s0,h,icode,k,cat);
    AVec<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
    if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
-   if(valid){
+   if(k){
     uint64_t k0;uint32_t k1;
     if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID: nothing has been stored yet
     const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
@@ -1041,8 +1046,9 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
    const uint64_t c=mask64_v3(x0,x1,vc)&keep,q=mask64_v3(x0,x1,vq)&keep;
    const uint64_t st=(c<<1)|1,en=c|_blsi_u64(nb);
    uint64_t sq,op;const uint64_t err=quote_errors_v3(q,st,en,sq,op);
-   if(__builtin_expect(nb==0||_mm_popcnt_u64(c)!=3||err!=0,0))break;
-   next=p+_tzcnt_u64(nb)+1;done=true; // well-formed, 4 fields
+   const uint64_t L=_tzcnt_u64(nb); // 64 if there is no newline in the window
+   if(__builtin_expect((err|(uint64_t)(_mm_popcnt_u64(c)^3)|(L>>6))!=0,0))break;
+   next=p+L+1;done=true; // well-formed, 4 fields
    uint64_t B=st+sq,E=en-(op>>1);
    const unsigned z0=(unsigned)(q&1);
    const char* const s0=p+z0;const unsigned l0=(unsigned)_tzcnt_u64(E)-z0;
@@ -1055,7 +1061,8 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
    const unsigned b3=(unsigned)_tzcnt_u64(B),l3=(unsigned)_tzcnt_u64(E)-b3;
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
-   if(!ts_v3(p+b3,l3,memo,ts)||(uint64_t)ts-(uint64_t)clickStart>=wlen)break; // clickStart <= ts < window_end
+   uint64_t trel;
+   if(!ts_v3(p+b3,l3,memo,ts)||(trel=(uint64_t)ts-(uint64_t)clickStart)>=wlen)break; // clickStart <= ts < window_end
    uint64_t k0;uint32_t k1;
    const string_view camp(p+b2,l2);
    const uint32_t ci=__builtin_expect(KeyTable::pack(camp,k0,k1),1)?camps.find_packed(k0,k1):camps.find(camp);if(ci==KeyTable::NONE)break;
@@ -1063,7 +1070,7 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
    if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID
    const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
    __builtin_prefetch(&slots[j],0,1);
-   CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.ts=ts;r.user=0;r.campaign=(uint16_t)ci;r.flags=0;
+   CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=(trel<<16)|(uint16_t)ci;r.user=0;
    AVec<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
    if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
    PendUser<CRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.data()+vec.size();pu.k1=k1;
@@ -1127,33 +1134,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const uint32_t maxIds=(uint32_t)(maxLinked+maxNew64);
  KeyTable tab((size_t)maxIds*8/5); // at most 62% full even if every allowed ID shows up
  tab.begin_parallel(0,maxIds);
- // Union-find over linked IDs. Both arrays hold "value XOR index", so an untouched (all-zero) entry
- // means "itself": they come from mmap as zero pages, need no initialising pass, and the part beyond
- // the IDs actually seen is never touched. parent(x) <= x always (a root links to a smaller root), so
- // the forest can never form a cycle. best(r): the ID with the byte-wise smallest name seen so far in root r's group.
- struct ZeroPages{
-  void* p;size_t n;
-  explicit ZeroPages(size_t bytes):n(bytes){p=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);if(p==MAP_FAILED)throw bad_alloc();}
-  void release(){if(p){munmap(p,n);p=nullptr;}}
-  ~ZeroPages(){release();}
-  ZeroPages(const ZeroPages&)=delete;ZeroPages& operator=(const ZeroPages&)=delete;
- };
- static_assert(sizeof(atomic<uint32_t>)==4);
- ZeroPages parentMem((maxLinked+1)*sizeof(uint32_t)),bestMem((maxLinked+1)*sizeof(uint32_t));
- atomic<uint32_t>* const parentX=(atomic<uint32_t>*)parentMem.p;atomic<uint32_t>* const bestX=(atomic<uint32_t>*)bestMem.p;
+ // parent[x] <= x always (a root links to a smaller root), so the forest can never form a cycle.
+ // (Initialised by a pass below. Mapping the two arrays as zero pages with "value XOR index" entries,
+ // to skip that pass, measured slower: every page then takes its faults in the middle of the hot loops.)
+ unique_ptr<atomic<uint32_t>[]> parent(new atomic<uint32_t>[maxLinked+1]);
  auto find_root=[&](uint32_t u)->uint32_t{
   for(;;){
-   uint32_t su=parentX[u].load(memory_order_relaxed);if(!su)return u;
-   const uint32_t p=su^u;
-   const uint32_t sp=parentX[p].load(memory_order_relaxed);if(!sp)return p;
-   const uint32_t gp=sp^p;
-   parentX[u].compare_exchange_weak(su,gp^u); // path halving; losing the race is harmless
+   uint32_t p=parent[u].load(memory_order_relaxed);if(p==u)return u;
+   uint32_t gp=parent[p].load(memory_order_relaxed);if(gp==p)return p;
+   parent[u].compare_exchange_weak(p,gp); // path halving; losing the race is harmless
    u=gp;
   }
  };
+ // best[r]: the ID with the byte-wise smallest name seen so far in root r's group.
+ unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[maxLinked+1]);
  atomic<size_t> nextLink{0};
  #pragma omp parallel num_threads(T)
  {
+  #pragma omp for schedule(static)
+  for(uint64_t i=0;i<maxLinked;++i){parent[i].store((uint32_t)i,memory_order_relaxed);best[i].store((uint32_t)i,memory_order_relaxed);}
   // Lines are handled in small batches so the table slots of a batch, and then the parent entries of
   // its IDs, are on their way into the cache before they are needed.
   static constexpr int LB=16;
@@ -1165,14 +1164,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     // cannot be full: the table holds 2 IDs per link line
     const uint32_t a=q.k1[0]?tab.find_or_add_packed(q.k0[0],q.k1[0],q.j[0],q.f[0]):tab.find_or_add_long(q.f[0]);
     const uint32_t b=q.k1[1]?tab.find_or_add_packed(q.k0[1],q.k1[1],q.j[1],q.f[1]):tab.find_or_add_long(q.f[1]);
-    ida[i]=a;idb[i]=b;__builtin_prefetch(&parentX[a],1,1);__builtin_prefetch(&parentX[b],1,1);
+    ida[i]=a;idb[i]=b;__builtin_prefetch(&parent[a],1,1);__builtin_prefetch(&parent[b],1,1);
    }
    for(int i=0;i<nb;++i){
     uint32_t a=ida[i],b=idb[i];
     for(;;){
      a=find_root(a);b=find_root(b);if(a==b)break;
      if(a<b)swap(a,b);
-     uint32_t expect=0;if(parentX[a].compare_exchange_strong(expect,b^a))break; // a is still a root: link it under b
+     uint32_t expect=a;if(parent[a].compare_exchange_strong(expect,b))break;
     }
    }
   };
@@ -1233,18 +1232,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    #pragma omp for schedule(static)
    for(uint32_t i=0;i<nlinked;++i){
     const uint32_t r=find_root(i);if(r==i)continue;
-    uint32_t sc=bestX[r].load(memory_order_relaxed);
-    while(name_less(names[i],names[sc^r])&&!bestX[r].compare_exchange_weak(sc,i^r)){}
+    uint32_t cur=best[r].load(memory_order_relaxed);
+    while(name_less(names[i],names[cur])&&!best[r].compare_exchange_weak(cur,i)){}
     uint64_t k0;uint32_t k1;
     if(KeyTable::pack(names[i].view(),k0,k1))tab.set_packed(k0,k1,r); // longer keys are in tab.longs, below
    }
    // A root's own name is no longer needed once every member has been compared, and no other person reads it.
    #pragma omp for schedule(static)
-   for(uint32_t i=0;i<nlinked;++i)if(!parentX[i].load(memory_order_relaxed)){const uint32_t sb=bestX[i].load(memory_order_relaxed);if(sb)names[i]=names[sb^i];}
+   for(uint32_t i=0;i<nlinked;++i)if(parent[i].load(memory_order_relaxed)==i){const uint32_t bi=best[i].load(memory_order_relaxed);if(bi!=i)names[i]=names[bi];}
   }
   for(auto& l:tab.longs)if(l.v<nlinked)l.v=find_root(l.v);
  }
- parentMem.release();bestMem.release();
+ parent.reset();best.reset();
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
@@ -1333,7 +1332,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    int64_t ts=0;
    if(f[1].empty()||!parse_ts_fast(f[3],ts)||ts<clickStart||ts>=window_end)return;
    const uint32_t ci=camps.find(f[2]);if(ci==KeyTable::NONE)return;
-   CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ts=ts;r.user=user_of(f[1]);r.campaign=(uint16_t)ci;r.flags=0;
+   CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.key=((uint64_t)(ts-clickStart)<<16)|(uint16_t)ci;r.user=user_of(f[1]);
    tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
   };
   for(;;){
@@ -1350,6 +1349,22 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  const uint32_t totalIds=tab.end_parallel();
  __mark("PARSE");
+ // SS_STATS=1 prints how well the hashes spread: table displacement (0 = key sits in its home slot),
+ // bucket sizes, and tag matches between different IDs. Costs nothing when off.
+ const bool stats=getenv("SS_STATS")!=nullptr;
+ if(stats){
+  uint64_t used=0,sum=0,mx=0;
+  for(size_t j=0;j<tab.cap;++j){const uint32_t c=tab.slots[j].k1.load(memory_order_relaxed);if(!c)continue;
+   const uint64_t k0=tab.slots[j].k0.load(memory_order_relaxed);
+   const size_t home=(c==KeyTable::LONGK?k0:KeyTable::hash_packed(k0,c))&tab.mask,d=(j-home)&tab.mask;
+   ++used;sum+=d;mx=max<uint64_t>(mx,d);}
+  fprintf(stderr,"STATS user table: %llu of %llu slots used, displacement avg %.3f max %llu\n",(unsigned long long)used,(unsigned long long)tab.cap,used?(double)sum/used:0.0,(unsigned long long)mx);
+  for(int kind=0;kind<2;++kind){
+   const size_t P=kind?PC:PE;uint64_t tot=0,big=0,small=UINT64_MAX;
+   for(size_t p=0;p<P;++p){uint64_t n=0;for(int t=0;t<T;++t)n+=kind?(p<tls[t].cb.size()?tls[t].cb[p].size():0):(p<tls[t].eb.size()?tls[t].eb[p].size():0);tot+=n;big=max(big,n);small=min(small,n);}
+   fprintf(stderr,"STATS %s buckets: %llu, records %llu, mean %.1f min %llu max %llu\n",kind?"click":"event",(unsigned long long)P,(unsigned long long)tot,(double)tot/P,(unsigned long long)small,(unsigned long long)big);
+  }
+ }
  // ---- Fallback only: IDs that did not fit in the shared table get their person number here. ----
  // From here on a person is a compact number: shared-table IDs keep theirs (< totalIds), fallback IDs follow.
  vector<vector<uint32_t>> trans(T);vector<string_view> extraNames;
@@ -1394,7 +1409,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  for(int t=0;t<T;++t){surv[t].ev.resize(UPn);surv[t].cl.resize(UPn);tls[t].uev.clear();tls[t].ucl.clear();}
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
- #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks)
+ uint64_t stEvN=0,stEvDisp=0,stEvMax=0,stEvFalse=0,stClN=0,stClDisp=0,stClMax=0,stClFalse=0; // SS_STATS (the two "False" counts are always kept: they cost nothing)
+ #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks,stEvN,stEvDisp,stEvFalse,stClN,stClDisp,stClFalse) reduction(max:stEvMax,stClMax)
  {
   const int tid=omp_get_thread_num();
   EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();SlabPool& pool=surv[tid].pool;
@@ -1436,6 +1452,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         if(o.k){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
+       ++stEvFalse; // same tag, other ID
       }
       if(++j==cap)j=0;
      }
@@ -1453,6 +1470,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      next_event:;
     }
    }
+   if(stats)for(size_t j=0;j<cap;++j){const uint32_t e=S[j];if(!e)continue;
+    const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
+    const size_t home=(size_t)(((uint64_t)(uint32_t)(tls[ot].eb[p][og-off[ot]].ih&PR_HMASK)*cap)>>PR_HBITS),d=j>=home?j-home:j+cap-home;
+    ++stEvN;stEvDisp+=d;stEvMax=max<uint64_t>(stEvMax,d);}
    for(int t=0;t<T;++t)if(p<tls[t].eb.size())tls[t].eb[p]=AVec<PRec>();
    surviving-=dead;dedupCount+=n-dups;
   }
@@ -1476,6 +1497,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const CRec& o=tls[ot].cb[p][og-off[ot]];
        if(o.idlen==r->idlen&&memcmp(o.id,r->id,r->idlen)==0)goto next_click;
+       ++stClFalse;
       }
       if(++j==cap)j=0;
      }
@@ -1483,14 +1505,20 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
       Click* const out=myCl[u>>pshift].slot(pool);
-      out->key=((uint64_t)(r->ts-clickStart)<<16)|r->campaign;out->id=r->id;out->person=u;out->idlen=r->idlen;
+      out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
      }
      next_click:;
     }
    }
+   if(stats)for(size_t j=0;j<cap;++j){const uint32_t e=S[j];if(!e)continue;
+    const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
+    const size_t home=(size_t)(((tls[ot].cb[p][og-off[ot]].h&0xffffffffu)*cap)>>32),d=j>=home?j-home:j+cap-home;
+    ++stClN;stClDisp+=d;stClMax=max<uint64_t>(stClMax,d);}
    for(int t=0;t<T;++t)if(p<tls[t].cb.size())tls[t].cb[p]=AVec<CRec>();
   }
  }
+ if(stats)fprintf(stderr,"STATS event dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\nSTATS click dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\n",
+  (unsigned long long)stEvN,stEvN?(double)stEvDisp/stEvN:0.0,(unsigned long long)stEvMax,(unsigned long long)stEvFalse,(unsigned long long)stClN,stClN?(double)stClDisp/stClN:0.0,(unsigned long long)stClMax,(unsigned long long)stClFalse);
  for(int t=0;t<T;++t){for(const auto& L:surv[t].ev)surviving+=L.size();for(const auto& L:surv[t].cl)survivingClicks+=L.size();}
  cerr<<"deduplicated events: "<<dedupCount<<", surviving: "<<surviving<<"\n";
  cerr<<"surviving clicks: "<<survivingClicks<<"\n";
@@ -1735,9 +1763,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
-  // Every bucket is done (the loop above ends with a barrier): each thread hands back its own survivor
-  // lists here, in parallel, instead of leaving all of it to process exit.
-  if((size_t)tid<surv.size())surv[(size_t)tid].pool.release();
   if(file.is_open())file.close();
  }
  vector<Totals> campTotals(ncamp*(size_t)ndays);
