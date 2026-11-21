@@ -289,14 +289,15 @@ int main(){
  struct Var{const char* label;vector<pair<string,string>> env;const char* bin="";bool hugeSet=false;};
  #define N8 {"NCPU","8"}
  const vector<Var> vars={
-  {"d1",{N8}},{"q1",{N8},"core-v32"},{"p1",{N8},"core-v31"},{"d2",{N8}},{"q2",{N8},"core-v32"},{"p2",{N8},"core-v31"},{"d3",{N8}},{"q3",{N8},"core-v32"},{"p3",{N8},"core-v31"},
+  {"d1",{N8}},{"r1",{N8},"core-v33"},{"q1",{N8},"core-v32"},{"p1",{N8},"core-v31"},{"d2",{N8}},{"r2",{N8},"core-v33"},{"q2",{N8},"core-v32"},{"p2",{N8},"core-v31"},{"d3",{N8}},{"r3",{N8},"core-v33"},{"q3",{N8},"core-v32"},{"p3",{N8},"core-v31"},
+  {"idx",{N8,{"SS_LINES","index"}}},{"idxz",{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}}},{"idx2",{N8,{"SS_LINES","index"}}},{"idxz2",{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}}},
   {"tabfull",{N8,{"SS_TABLE_FULL","1"}}},{"noidblk",{N8,{"SS_NOIDBLOCKS","1"}}},{"tabfull2",{N8,{"SS_TABLE_FULL","1"}}},{"noidblk2",{N8,{"SS_NOIDBLOCKS","1"}}},
   {"abl1",{N8,{"SS_ABL","1"}},"core-abl"},{"abl2",{N8,{"SS_ABL","2"}},"core-abl"},{"abl6",{N8,{"SS_ABL","6"}},"core-abl"},{"abl3",{N8,{"SS_ABL","3"}},"core-abl"},
   {"abl4",{N8,{"SS_ABL","4"}},"core-abl"},{"abl5",{N8,{"SS_ABL","5"}},"core-abl"},
   {"x0",{N8},"core-x"},
-  {"per16k",{N8,{"SS_PER","16384"}},"core-x"},{"per8k",{N8,{"SS_PER","8192"},{"SS_CAP","8192"}},"core-x"},{"per4k",{N8,{"SS_PER","4096"},{"SS_CAP","16384"}},"core-x"},{"per64k",{N8,{"SS_PER","65536"}},"core-x"},
-  {"uper4k",{N8,{"SS_UPER","4096"}},"core-x"},{"uper8k",{N8,{"SS_UPER","8192"}},"core-x"},{"uper32k",{N8,{"SS_UPER","32768"}},"core-x"},
-  {"pfw64",{N8,{"SS_PFW","64"}},"core-x"},{"pfw128",{N8,{"SS_PFW","128"}},"core-x"},{"pfw256",{N8,{"SS_PFW","256"}},"core-x"},
+  {"per16k",{N8,{"SS_PER","16384"}},"core-x"},{"per8k",{N8,{"SS_PER","8192"},{"SS_CAP","8192"}},"core-x"},{"per4k",{N8,{"SS_PER","4096"},{"SS_CAP","16384"}},"core-x"},
+  {"uper8k",{N8,{"SS_UPER","8192"}},"core-x"},{"uper32k",{N8,{"SS_UPER","32768"}},"core-x"},
+  {"pfw128",{N8,{"SS_PFW","128"}},"core-x"},{"pfw256",{N8,{"SS_PFW","256"}},"core-x"},
   {"pfe128",{N8,{"SS_PFE","128"}},"core-x"},{"pfe256",{N8,{"SS_PFE","256"}},"core-x"},
   {"combo",{N8,{"SS_PER","8192"},{"SS_CAP","8192"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x"},
   {"avx512z",{N8,{"SS_ISA","avx512z"}}},{"avx512y",{N8,{"SS_ISA","avx512y"}}},
@@ -304,7 +305,7 @@ int main(){
   {"abl1b",{N8,{"SS_ABL","1"}},"core-abl"},{"abl2b",{N8,{"SS_ABL","2"}},"core-abl"},{"abl6b",{N8,{"SS_ABL","6"}},"core-abl"},{"abl3b",{N8,{"SS_ABL","3"}},"core-abl"},
   {"abl4b",{N8,{"SS_ABL","4"}},"core-abl"},{"abl5b",{N8,{"SS_ABL","5"}},"core-abl"},
   // final-sized set
-  {"Hd1",{N8},"",true},{"Hq1",{N8},"core-v32",true},{"Hp1",{N8},"core-v31",true},{"Hd2",{N8},"",true},{"Hx0",{N8},"core-x",true},{"Htabfull",{N8,{"SS_TABLE_FULL","1"}},"",true},
+  {"Hd1",{N8},"",true},{"Hr1",{N8},"core-v33",true},{"Hq1",{N8},"core-v32",true},{"Hp1",{N8},"core-v31",true},{"Hd2",{N8},"",true},{"Hx0",{N8},"core-x",true},{"Htabfull",{N8,{"SS_TABLE_FULL","1"}},"",true},
   {"Hper16k",{N8,{"SS_PER","16384"},{"SS_CAP","8192"}},"core-x",true},{"Hper8k",{N8,{"SS_PER","8192"},{"SS_CAP","16384"}},"core-x",true},
   {"Huper8k",{N8,{"SS_UPER","8192"}},"core-x",true},{"Hpf",{N8,{"SS_PFW","128"},{"SS_PFE","128"}},"core-x",true},
   {"Hcombo",{N8,{"SS_PER","8192"},{"SS_CAP","16384"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x",true},
@@ -314,10 +315,8 @@ int main(){
   {"combob",{N8,{"SS_PER","8192"},{"SS_CAP","8192"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x"},
   {"avx512z2",{N8,{"SS_ISA","avx512z"}}},{"avx512y2",{N8,{"SS_ISA","avx512y"}}},{"noearly2",{N8,{"SS_NOEARLYUNMAP","1"}}},
   {"nohuge",{N8,{"SS_NOHUGE","1"}}},{"prefault",{N8,{"SS_PREFAULT","1"}}},
-  {"n4",{{"NCPU","4"}}},{"n1",{{"NCPU","1"}}},{"n2",{{"NCPU","2"}}},{"n6",{{"NCPU","6"}}},{"n16",{{"NCPU","16"}}},
-  {"4abl1",{{"NCPU","4"},{"SS_ABL","1"}},"core-abl"},{"4abl2",{{"NCPU","4"},{"SS_ABL","2"}},"core-abl"},{"4abl3",{{"NCPU","4"},{"SS_ABL","3"}},"core-abl"},{"4abl4",{{"NCPU","4"},{"SS_ABL","4"}},"core-abl"},
+  {"n4",{{"NCPU","4"}}},{"n1",{{"NCPU","1"}}},{"n2",{{"NCPU","2"}}},{"n6",{{"NCPU","6"}}},
   {"1abl1",{{"NCPU","1"},{"SS_ABL","1"}},"core-abl"},{"1abl2",{{"NCPU","1"},{"SS_ABL","2"}},"core-abl"},{"1abl3",{{"NCPU","1"},{"SS_ABL","3"}},"core-abl"},{"1abl4",{{"NCPU","1"},{"SS_ABL","4"}},"core-abl"},
-  {"n8bind",{N8,{"OMP_PLACES","threads"},{"OMP_PROC_BIND","close"}}},{"n8active",{N8,{"OMP_WAIT_POLICY","active"}}},
   {"d4",{N8}},{"p4",{N8},"core-v31"},{"d5",{N8}},{"p5",{N8},"core-v31"}};
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
@@ -341,23 +340,24 @@ int main(){
    snprintf(one,sizeof one,"%s=%.0f(%.0f/%.0f/%.0f) ",l,r->wall*1e3,g1(*r,"PARSE"),g1(*r,"DEDUP"),g1(*r,"AGGREGATE"));return one;};
   // row 0: v32 against v31 on both sizes; best default run in full with hardware counters
   {const RunResult* d=bestd();RunResult z;if(!d)d=&z;char pc[160];snprintf(pc,sizeof pc," | perf err%d ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",d->perfErr,d->pc[0]/1e9,d->pc[1]/1e9,d->pc[2]/1e6,d->pc[3]/1e6);
-   string all;for(const char* l:{"d1","d2","d3","d4","d5","q1","q2","q3","p1","p2","p3","p4","p5","Hd1","Hd2","Hd3","Hq1","Hp1"}){const RunResult* r=get(l);char one[32];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);all+=one;}
+   string all;for(const char* l:{"d1","d2","d3","d4","d5","r1","r2","r3","q1","q2","q3","p1","p2","p3","p4","p5","Hd1","Hd2","Hd3","Hr1","Hq1","Hp1"}){const RunResult* r=get(l);char one[32];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);all+=one;}
    string det=stages(*d)+pc;
    {const RunResult* pb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='p'&&r.rc==0&&(!pb||r.wall<pb->wall))pb=&r;if(pb)det+=" || v31: "+stages(*pb);}
    {const RunResult* h=get("Hd1");const RunResult* h2=get("Hd2");if(h2&&(!h||h2->wall<h->wall))h=h2;if(h)det+=" || 60x: "+stages(*h);}
    {const RunResult* qb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='q'&&r.rc==0&&(!qb||r.wall<qb->wall))qb=&r;if(qb)det+=" || v32: "+stages(*qb);}
-   row("v33 d*, v32 q*, v31 p*, H=60x: "+all,det,us(d->wall),us(d->user),us(d->sys),d->minflt);}
+   {const RunResult* qb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='r'&&r.rc==0&&(!qb||r.wall<qb->wall))qb=&r;if(qb)det+=" || v33: "+stages(*qb);}
+   row("v34 d*, v33 r*, v32 q*, v31 p*, H=60x: "+all,det,us(d->wall),us(d->user),us(d->sys),d->minflt);}
   // row 1: tuning experiments, wall(parse/dedup/agg)
-  {string a,b2;for(const char* l:{"x0","x0b","per64k","per16k","per8k","per8kb","per4k","uper4k","uper8k","uper32k","pfw64","pfw128","pfw128b","pfw256","pfe128","pfe128b","pfe256","combo","combob"})a+=brief(l);
-   for(const char* l:{"Hd1","Hd2","Hd3","Hq1","Hp1","Hx0","Htabfull","Hper16k","Hper8k","Huper8k","Hpf","Hcombo","Havx512z","Hnoearly"})b2+=brief(l);
+  {string a,b2;for(const char* l:{"x0","x0b","per16k","per8k","per8kb","per4k","uper8k","uper32k","pfw128","pfw128b","pfw256","pfe128","pfe128b","pfe256","combo","combob"})a+=brief(l);
+   for(const char* l:{"Hd1","Hd2","Hd3","Hr1","Hq1","Hp1","Hx0","Htabfull","Hper16k","Hper8k","Huper8k","Hpf","Hcombo","Havx512z","Hnoearly"})b2+=brief(l);
    row("tuning 20x wall(P/D/A): "+a,"60x: "+b2,0,0,0,0);}
   // row 2: parser ablation (PARSE stage ms; the run stops after that stage)
   {string a,detail;for(auto& r:results)if(r.label.find("abl")!=string::npos){char one[64];snprintf(one,sizeof one,"%s=%.0f ",r.label.c_str(),g1(r,"PARSE"));a+=one;
     char d2[96];snprintf(d2,sizeof d2,"%s:u%.0f,s%.0f,f%ld,w%.0f ",r.label.c_str(),r.user*1e3,r.sys*1e3,r.minflt,r.wall*1e3);detail+=d2;}
    row("ablation PARSE ms (1 scan,2 +fields,6 +record to a ring,3 +bucket push,4 +users,5 clicks only): "+a,detail,0,0,0,0);}
   // row 3: switches and thread counts
-  {string a,b2;for(const char* l:{"tabfull","tabfull2","noidblk","noidblk2","avx512z","avx512z2","avx512y","avx512y2","noearly","noearly2","nowill","nohuge","prefault"})a+=brief(l);
-   for(const char* l:{"n1","n2","n4","n6","n16","n8bind","n8active"})b2+=brief(l);
+  {string a,b2;for(const char* l:{"idx","idx2","idxz","idxz2","tabfull","tabfull2","noidblk","noidblk2","avx512z","avx512z2","avx512y","avx512y2","noearly","noearly2","nowill","nohuge","prefault"})a+=brief(l);
+   for(const char* l:{"n1","n2","n4","n6"})b2+=brief(l);
    const RunResult* n1=get("n1");if(n1){char pc[160];snprintf(pc,sizeof pc," || n1: u%.0f s%.0f perf ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",n1->user*1e3,n1->sys*1e3,n1->pc[0]/1e9,n1->pc[1]/1e9,n1->pc[2]/1e6,n1->pc[3]/1e6);b2+=pc;}
    row("switches: "+a,"threads: "+b2,0,0,0,0);}
   // row 4: every run, compact
