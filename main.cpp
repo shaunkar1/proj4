@@ -1634,6 +1634,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const char* const dumpDir=getenv("SS_DENSE_DUMP");
  if(dparse.users||dparse.events||dparse.clicks)cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<"\n";
  cerr<<"dense: events "<<dense.events<<" clicks "<<dense.clicks<<"\n";
+ if(getenv("SS_STATS"))cerr<<"STATS dense keys "<<dense.ke<<" "<<dense.ku<<" "<<dense.kc<<" limits "<<dense.limE<<" "<<dense.limC<<" "<<dense.limI<<"\n";
  __mark("KEYS");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0;
