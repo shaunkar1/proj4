@@ -3491,6 +3491,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  {const char* v=getenv("SS_DENSE_USERS");
   const uint64_t idBound=2*(linkBytes/4+linkFileCount)+(uint64_t)T*KeyTable::ID_BLOCK+maxNew64;
   denseUsers=denseLinks&&idBound<DENSE_USER&&(dense.limI<<dn::ALIAS_BITS)<=DENSE_USER&&!(v&&v[0]=='0');}
+ // With dense users only the IDs that cannot take the dense route are new to the ID table (generated data
+ // has a few hundred of them at 20M events), so an eighth of the room is still several hundred times what is
+ // needed - and the table, whose slots are touched at random, is an eighth as large: its first touches
+ // (whole huge pages, zeroed) are most of the LINKREAD stage. More new IDs than that take the fallback
+ // path as before. SS_ROOMY_IDS=1 keeps the full room.
+ if(denseUsers&&!getenv("SS_TEST_MAXNEW")&&!getenv("SS_ROOMY_IDS"))maxNew64=maxNew64/8+4096;
  if(denseUsers)denseComp=(atomic<uint32_t>*)map_huge((dense.limI+1)*sizeof(uint32_t));
  dparse.users=denseUsers;
  if(!denseUsers)dparse.events=dparse.clicks=false; // the record loops decode both IDs of a line together
@@ -4732,7 +4738,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    RawCtx rawCtx;rawCtx.v3=hasV3;
    const auto ucode=[&rawCtx,rawSlots](const ESmall& sl)->uint32_t{return rawSlots?rawCtx.code(sl):sl.user;};
    // A click of the fast lane: time and campaign as in Click, and its counter, which stands for its ID.
-   struct FClick{uint64_t key;uint32_t user;uint32_t ctr;};
+   // (A click slot itself; in a gathered copy `present` holds the counter. When an index's clicks fill their
+   // stretch of counters without a gap - no empty slot, nobody else's click: as many clicks as slots - the
+   // slots are used where they lie, nothing is copied, and the counter of a click is its place in the stretch.)
+   using FClick=CSlot;
+   static const bool noDirectClicks=getenv("SS_TEST_NODIRECT")!=nullptr; // test switch: always gather
+   const bool wideWindow=(uint64_t)(window_end-clickStart)>>32!=0; // click times beyond 32 bits: the clicks themselves are sorted, in a copy
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
    // One index's sessions (start time; number of its rows before the session) and purchases
    // (session<<40 | category<<24 | price), written by the walk over its event slots.
@@ -4769,7 +4780,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      bool fast=!general;
      int why=5; // why the index is handed over, if it is
      if(noFastN&&ix%noFastN==0){if(fast)why=7;fast=false;}
-     size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;
+     size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;bool direct=false;
+     const auto ctr_of=[&C,&direct,cf](uint32_t i)->uint32_t{return direct?(uint32_t)cf+i:C[i].present;}; // the counter of click i of C (before C is put in order)
      const uint64_t* SL=nullptr;uint64_t* mySL=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0; // SL: session entries "start << 24 | rows before", then the row count
      // The sweep's session list, if the index is one run of rows in time order.
      const uint64_t* const sweepList=f.multi.load(memory_order_relaxed)?nullptr:f.sess.load(memory_order_relaxed);
@@ -4797,12 +4809,23 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        ++n;
       }
       if(!listed){mySL[ns]=n;myPur[np]=~0ull;pur=myPur;}
-      C=fastC.get((size_t)cc+1);
-      for(size_t c=cf;c<cl;++c){
-       const CSlot& sl=denseCl[c];const uint32_t u=sl.user;
-       const uint32_t ok=(uint32_t)(sl.present!=0)&(uint32_t)((u^code)<8);
-       _mm_storeu_si128((__m128i*)(void*)(C+m),_mm_loadu_si128((const __m128i*)(const void*)&sl));C[m].ctr=(uint32_t)c; // key and user as they are
-       mask|=ok<<(u&7);m+=ok;
+      direct=cc&&cl-cf==(size_t)cc&&cc<=4096u&&!wideWindow&&!noDirectClicks;
+      if(direct){ // every slot of [cf, cl) is a click of this index (the sweep counted cc of them in there)
+       C=denseCl+cf;m=cc;
+       static constexpr uint8_t BIT8[8]={1,2,4,8,16,32,64,128}; // (a table: a shift by a variable count costs more here)
+       uint32_t m0=0,m1=0;size_t i=0;
+       for(;i+2<=m;i+=2){m0|=BIT8[C[i].user&7];m1|=BIT8[C[i+1].user&7];}
+       if(i<m)m0|=BIT8[C[i].user&7];
+       mask|=m0|m1;
+      }
+      else{
+       C=fastC.get((size_t)cc+1);
+       for(size_t c=cf;c<cl;++c){
+        const CSlot& sl=denseCl[c];const uint32_t u=sl.user;
+        const uint32_t ok=(uint32_t)(sl.present!=0)&(uint32_t)((u^code)<8);
+        _mm_storeu_si128((__m128i*)(void*)(C+m),_mm_loadu_si128((const __m128i*)(const void*)&sl));C[m].present=(uint32_t)c; // key and user as they are
+        mask|=ok<<(u&7);m+=ok;
+       }
       }
       if(__builtin_expect(n!=ec||m!=cc,0)){fprintf(stderr,"ERROR dense slots changed under the reader\n");_exit(1);}
       // One person: every alias in use has the same smallest alias of its group.
@@ -4853,7 +4876,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         for(size_t i=0;i<m;++i){const unsigned r=rnk[i];keys[r+taken[r]++]=((C[i].key>>16)<<32)|i;}}
        // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
        for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
-        const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
+        const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)key),dense.kc));};
         const uint64_t key=keys[i];size_t j=i;
         while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
         keys[j]=key;
@@ -4878,15 +4901,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        uint64_t* const keys=clickKeys.get(m);
        const bool wide=(C[0].key>>16)>>32!=0||(uint64_t)(window_end-clickStart)>>32!=0; // times that do not fit 32 bits: sort the clicks themselves
        if(wide||m>4096){
+        if(direct){FClick* const G=fastC.get(m+1);for(size_t i=0;i<m;++i){G[i]=C[i];G[i].present=(uint32_t)(cf+i);}C=G;direct=false;} // sorted in a copy that carries the counters
         const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
-         return ta!=tb?ta<tb:order36(dn::value_of(a.ctr,kc))>order36(dn::value_of(b.ctr,kc));};
+         return ta!=tb?ta<tb:order36(dn::value_of(a.present,kc))>order36(dn::value_of(b.present,kc));};
         sort(C,C+m,before);
        }
        else{
         for(size_t i=0;i<m;++i)keys[i]=((C[i].key>>16)<<32)|i;
         click_key_sort(keys,m,clickKeys2.get(m),sortCnt);
         for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
-         const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
+         const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)key),dense.kc));};
          const uint64_t key=keys[i];size_t j=i;
          while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
          keys[j]=key;
