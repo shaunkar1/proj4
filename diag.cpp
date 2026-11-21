@@ -334,19 +334,13 @@ int main(){
  auto add=[&](const char* group,int reps,vector<pair<string,string>> env,const char* bin="",bool hs=false){for(int i=0;i<reps;++i)vars.push_back({string(group)+"#"+to_string(i),env,bin,hs});};
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
- auto slots=[&](const char* name,const char* ahead,bool hs,int reps,const char* ncpu="8"){add(name,reps,{{"NCPU",ncpu},{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD",ahead}},"",hs);};
- for(int r=0;r<2;++r){
-  add("B",1,{N8});add("nod",1,{N8,{"SS_NODENSE","1"}});add("u0",1,{N8,{"SS_DENSE_USERS","0"}});
-  slots("s0","0",false,1);slots("s1","1",false,1);slots("s2","2",false,1);slots("s3","3",false,1);slots("s4","4",false,1);
-  slots("s6","6",false,1);slots("s8","8",false,1);slots("s12","12",false,1);slots("s16","16",false,1);
- }
- add("B",1,{N8});add("nod",1,{N8,{"SS_NODENSE","1"}});
- add("sz4",2,{N8,{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD","4"},{"SS_ISA","avx512z"}});
- add("sp4",1,{N8,{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD","4"},{"SS_LINES","plain"}});
- add("4B",1,{{"NCPU","4"}});slots("4s4","4",false,1,"4");slots("1s4","4",false,1,"1");
+ for(int r=0;r<3;++r){add("B",1,{N8});add("nod",1,{N8,{"SS_NODENSE","1"}});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("z",1,{N8,{"SS_ISA","avx512z"}});}
+ add("nohuge",1,{N8,{"SS_NOHUGE","1"}});add("n4",1,{{"NCPU","4"}});add("n6",1,{{"NCPU","6"}});add("n1",1,{{"NCPU","1"}});add("n16",1,{{"NCPU","16"}});
+ add("B",1,{N8});
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);slots("Hs2","2",true,1);slots("Hs4","4",true,1);slots("Hs8","8",true,1);slots("Hs16","16",true,1);}
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);}
+ add("Hz",1,{N8,{"SS_ISA","avx512z"}},"",true);add("Hn16",1,{{"NCPU","16"}},"",true);
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -367,19 +361,16 @@ int main(){
   // Smallest value over the repeats of a run group; -1 if the group never ran.
   auto mn=[&](const string& grp,const char* key)->long{double best=-1;for(auto& r:results){if(r.rc!=0||r.label.compare(0,grp.size()+1,grp+"#")!=0)continue;
     double v;const string k=key;
-    if(k=="w")v=r.wall;else if(k=="u")v=r.user;else if(k=="s")v=r.sys;
+    if(k=="w")v=r.wall;else if(k=="u")v=r.user;else if(k=="s")v=r.sys;else if(k=="f")v=r.minflt/1e3;else if(k=="r")v=r.maxrssMB/1e3;
     else if(k=="L"){v=0;for(auto& kv:r.t)if(kv.first.rfind("LINK",0)==0||kv.first=="FLATTEN")v+=kv.second;}
-    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":key);v=it==r.t.end()?0:it->second;}
+    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="K"?"KEYS":k=="W"?"WRITE":key);v=it==r.t.end()?0:it->second;}
     if(best<0||v<best)best=v;}
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=fmt("dense-users B wPDALus","B","wPDALus")+fmt("| nodense wPDALus","nod","wPDALus")+fmt("| users0 wPDAL","u0","wPDAL");
-  a+="| slots PARSE by AHEAD: ";for(const char* g:{"s0","s1","s2","s3","s4","s6","s8","s12","s16"})a+=fmt(g+1,g,"P");
-  a+=fmt("| s4 us","s4","us")+fmt("s4 avx512z P","sz4","P")+fmt("s4 plain P","sp4","P")+fmt("n4: B P","4B","P")+fmt("s4 P","4s4","P")+fmt("n1 s4 P","1s4","P");
-  c+="60x: "+fmt("B wPDALus","HB","wPDALus")+fmt("| nodense wPDALus","Hnod","wPDALus")+"| slots PARSE: ";
-  for(const char* g:{"Hs2","Hs4","Hs8","Hs16"})c+=fmt(g+2,g,"P");
-  c+=fmt("| Hs4 us","Hs4","us");
+  a+=fmt("dense B w/PARSE/DEDUP/DENSE/AGG/links/keys/write/user/sys/kfaults/rssGB","B","wPDXALKWusfr")+fmt("| nodense wPDALus","nod","wPDALusfr")+fmt("| records0 wPDXAL","rec0","wPDXAL");
+  a+=fmt("| avx512z wPX","z","wPX")+fmt("nohuge wPX","nohuge","wPX")+fmt("n4 wPXA","n4","wPXA")+fmt("n6 wPXA","n6","wPXA")+fmt("n16 wPXA","n16","wPXA")+fmt("n1 wPXAus","n1","wPXAus");
+  c+="60x: "+fmt("dense wPDXALKWusfr","HB","wPDXALKWusfr")+fmt("| nodense wPDALusfr","Hnod","wPDALusfr")+fmt("| avx512z wPX","Hz","wPX")+fmt("n16 wPX","Hn16","wPX");
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
