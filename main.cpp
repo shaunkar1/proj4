@@ -30,7 +30,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <emmintrin.h>
+#include <immintrin.h>
 using namespace std;
 namespace fs=std::filesystem;
 static constexpr int64_t DAY=86400000LL, WEEK=7*DAY, GAP=1800000LL;
@@ -68,6 +68,49 @@ static bool parse_ts(string_view s,int64_t& out){
  }
  out=days_from_civil(y,m,d)*DAY+((h*60LL+mi)*60+se)*1000-offset;
  return true;
+}
+// Eight ASCII digits to a number without a loop (little-endian SWAR). False if any byte is not 0-9.
+static inline bool parse8(const char* p,uint64_t& v){
+ uint64_t x;memcpy(&x,p,8);
+ if(((x&0xF0F0F0F0F0F0F0F0ULL)|(((x+0x0606060606060606ULL)&0xF0F0F0F0F0F0F0F0ULL)>>4))!=0x3333333333333333ULL)return false;
+ x=((x&0x0F0F0F0F0F0F0F0FULL)*2561)>>8;
+ x=((x&0x00FF00FF00FF00FFULL)*6553601)>>16;
+ x=((x&0x0000FFFF0000FFFFULL)*42949672960001ULL)>>32;
+ v=x;return true;
+}
+// Same result as parse_ts. The two common shapes (F1 and 13-digit F3) take a branch-light path;
+// anything they do not recognise as well-formed goes to parse_ts, which decides.
+static inline bool parse_ts_fast(string_view s,int64_t& out){
+ const char* p=s.data();
+ if(s.size()==20){
+  const bool seps=(p[4]=='-')&(p[7]=='-')&(p[10]=='T')&(p[13]==':')&(p[16]==':')&(p[19]=='Z');
+  static constexpr unsigned char pos[14]={0,1,2,3,5,6,8,9,11,12,14,15,17,18};
+  unsigned d[14];unsigned bad=0;
+  for(int i=0;i<14;++i){d[i]=(unsigned)(unsigned char)p[pos[i]]-'0';bad|=d[i]>9;}
+  if(seps&&!bad){
+   const int y=(int)(d[0]*1000+d[1]*100+d[2]*10+d[3]),m=(int)(d[4]*10+d[5]),dd=(int)(d[6]*10+d[7]);
+   const int h=(int)(d[8]*10+d[9]),mi=(int)(d[10]*10+d[11]),se=(int)(d[12]*10+d[13]);
+   static constexpr int mlen[13]={0,31,28,31,30,31,30,31,31,30,31,30,31};
+   if(m<1||m>12||dd<1||h>23||mi>59||se>59)return false;
+   if(dd>mlen[m]+((m==2&&leap(y))?1:0))return false;
+   out=days_from_civil(y,(unsigned)m,(unsigned)dd)*DAY+((h*60LL+mi)*60+se)*1000;
+   return true;
+  }
+ }else if(s.size()==13){
+  uint64_t lo;
+  if(parse8(p+5,lo)){
+   unsigned bad=0;uint64_t hi=0;
+   for(int i=0;i<5;++i){const unsigned c=(unsigned)(unsigned char)p[i]-'0';bad|=c>9;hi=hi*10+c;}
+   if(!bad){out=(int64_t)(hi*100000000ULL+lo);return true;}
+  }
+ }
+ return parse_ts(s,out);
+}
+// 1 view, 2 cart, 3 purchase, 0 anything else (exact, case-sensitive).
+static inline unsigned event_kind(string_view t){
+ if(t.size()==4){uint32_t w;memcpy(&w,t.data(),4);return w==0x77656976u?1u:(w==0x74726163u?2u:0u);}
+ if(t.size()==8){uint64_t w;memcpy(&w,t.data(),8);return w==0x6573616863727570ULL?3u:0u;}
+ return 0;
 }
 // The challenge's CSV dialect has no embedded separators or quotes, even in quoted fields.
 // We explicitly preserve CR as data and never trim whitespace.
@@ -189,6 +232,72 @@ template<int N,class PRE,class FN> static void for_records(const char* base,size
    int ncomma,nquote;const char* lineEnd;
    const char* next=scan_line(p,end,comma,N,ncomma,nquote,lineEnd);
    if(take_fields(p,lineEnd,comma,ncomma,nquote,N,f[nb])){pre(f[nb]);++nb;}
+   p=next;
+  }
+  for(int i=0;i<nb;++i)fn(f[i]);
+ }
+}
+// AVX2 version of the splitter for CPUs that have it (checked once at start-up).
+// The whole line (up to 128 bytes) is turned into newline/comma/quote bit masks with no data-dependent
+// branches, and the fields are cut from the masks. Longer lines and the last bytes of a file use the
+// SSE2/scalar path, which gives the same answer.
+#define SS_V3 __attribute__((target("avx2,bmi,bmi2,popcnt,lzcnt")))
+template<int N> SS_V3 static inline bool split_line_v3(const char* p,const char* end,string_view* out,const char*& next){
+ if(end-p>=128){
+  const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
+  const __m256i x0=_mm256_loadu_si256((const __m256i*)p),x1=_mm256_loadu_si256((const __m256i*)(p+32));
+  uint64_t nl0=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0,vnl))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1,vnl))<<32);
+  uint64_t c0=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0,vc))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1,vc))<<32);
+  uint64_t q0=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0,vq))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1,vq))<<32);
+  uint64_t nl1=0,c1=0,q1=0;unsigned L;
+  if(nl0){L=(unsigned)_tzcnt_u64(nl0);const uint64_t keep=_blsmsk_u64(nl0)>>1;c0&=keep;q0&=keep;}
+  else{
+   const __m256i x2=_mm256_loadu_si256((const __m256i*)(p+64)),x3=_mm256_loadu_si256((const __m256i*)(p+96));
+   nl1=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2,vnl))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3,vnl))<<32);
+   if(nl1){
+    c1=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2,vc))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3,vc))<<32);
+    q1=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2,vq))|((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3,vq))<<32);
+    L=64+(unsigned)_tzcnt_u64(nl1);const uint64_t keep=_blsmsk_u64(nl1)>>1;c1&=keep;q1&=keep;
+   }
+  }
+  if(nl0|nl1){
+   next=p+L+1;
+   const int ncomma=(int)(_mm_popcnt_u64(c0)+_mm_popcnt_u64(c1)),nquote=(int)(_mm_popcnt_u64(q0)+_mm_popcnt_u64(q1));
+   if(ncomma!=N-1||L==0)return false;
+   auto qbit=[&](unsigned off)->unsigned{return (unsigned)(((off<64?q0>>off:q1>>(off-64)))&1);};
+   unsigned s=0,quoted=0,ok=1;
+   for(int j=0;j<N;++j){
+    unsigned e;
+    if(j==N-1)e=L;
+    else if(c0){e=(unsigned)_tzcnt_u64(c0);c0=_blsr_u64(c0);}
+    else{e=64+(unsigned)_tzcnt_u64(c1);c1=_blsr_u64(c1);}
+    const unsigned len=e-s,qd=qbit(s); // an empty last field has s==L, where the bit is the newline: not a quote
+    const unsigned endq=len?qbit(e-1):0;
+    ok&=(qd^1)|((len>=2)&endq);
+    out[j]=string_view(p+s+qd,(size_t)(len-2*qd)); // only used when ok
+    quoted+=qd;s=e+1;
+   }
+   return ok&&nquote==(int)(2*quoted);
+  }
+ }
+ const char* comma[N];int ncomma,nquote;const char* lineEnd;
+ next=scan_line(p,end,comma,N,ncomma,nquote,lineEnd);
+ return take_fields(p,lineEnd,comma,ncomma,nquote,N,out);
+}
+template<int N,class PRE,class FN> SS_V3 static void for_records_v3(const char* base,size_t len,size_t from,size_t to,PRE&& pre,FN&& fn){
+ if(from>=len)return;
+ const char* end=base+len;
+ const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
+ if(!nl)return;
+ const char* p=nl+1;
+ const char* lim=base+min(to,len);
+ static constexpr int BATCH=12;
+ string_view f[BATCH][N];
+ while(p<lim){
+  int nb=0;
+  while(nb<BATCH&&p<lim){
+   const char* next;
+   if(split_line_v3<N>(p,end,f[nb],next)){pre(f[nb]);++nb;}
    p=next;
   }
   for(int i=0;i<nb;++i)fn(f[i]);
@@ -555,6 +664,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
  const size_t PE=pow2_parts(eventBytes/70),PC=pow2_parts(clickBytes/40);
  const size_t UP=pow2_parts(eventBytes/70); // person buckets for the last stage
+ // SS_ISA=sse2 forces the portable splitter (used by tests to check both paths give the same tables).
+ bool useV3=__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("popcnt")&&__builtin_cpu_supports("lzcnt");
+ if(const char* isa=getenv("SS_ISA"))if(string_view(isa)=="sse2")useV3=false;
+ cerr<<"splitter: "<<(useV3?"avx2":"sse2")<<"\n";
  vector<ThreadState> tls(T);
  atomic<size_t> nextChunk{0};
  const int64_t clickStart=window_start-WEEK;
@@ -572,12 +685,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   auto warm_user=[&](const string_view* f){tab.prefetch(f[1]);}; // user_id is field 1 in both files
   auto on_event=[&](const string_view* f){
    if(f[0].empty())return;
-   int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
+   int64_t ingest=0;if(!parse_ts_fast(f[3],ingest))return; // ingest is guaranteed to be valid F1
    PRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
-   int64_t ts;
-   if(!f[1].empty()&&!f[5].empty()&&parse_ts(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY&&
-     (f[4]=="view"||f[4]=="cart"||f[4]=="purchase")){
-    int32_t price=0;bool purchase=f[4]=="purchase";
+   int64_t ts;const unsigned kind=event_kind(f[4]);
+   if(kind&&!f[1].empty()&&!f[5].empty()&&parse_ts_fast(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY){
+    int32_t price=0;const bool purchase=kind==3;
     if(!purchase||price_value(f[6],price)){
      r.flags=F_VALID|(purchase?F_PURCHASE:0);r.ts=ts;r.price=price;r.user=user_of(f[1]);
      if(purchase){auto prod=products.find(f[5]);r.cat=prod==products.end()?0:prod->second;}
@@ -589,7 +701,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(f[0].empty())return;
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
-   if(f[1].empty()||!parse_ts(f[3],ts)||ts<clickStart||ts>=window_end)return;
+   if(f[1].empty()||!parse_ts_fast(f[3],ts)||ts<clickStart||ts>=window_end)return;
    auto ci=camps.find(f[2]);if(ci==camps.end())return;
    CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ts=ts;r.user=user_of(f[1]);r.campaign=ci->second;r.flags=0;
    tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
@@ -597,8 +709,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
-   if(ck.click)for_records<4>(ck.base,ck.len,ck.from,ck.to,warm_user,on_click);
-   else for_records<7>(ck.base,ck.len,ck.from,ck.to,warm_user,on_event);
+   if(useV3){
+    if(ck.click)for_records_v3<4>(ck.base,ck.len,ck.from,ck.to,warm_user,on_click);
+    else for_records_v3<7>(ck.base,ck.len,ck.from,ck.to,warm_user,on_event);
+   }else{
+    if(ck.click)for_records<4>(ck.base,ck.len,ck.from,ck.to,warm_user,on_click);
+    else for_records<7>(ck.base,ck.len,ck.from,ck.to,warm_user,on_event);
+   }
   }
  }
  const uint32_t totalIds=tab.end_parallel();
