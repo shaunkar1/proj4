@@ -1151,7 +1151,7 @@ static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32
 //           decoded and write it at the end of the line, or `ahead` dense rows later (SS_DENSE_AHEAD, 1-16).
 //   bucket  the row is appended to a per-thread bucket by counter range (counter >> shE / shC); a later pass
 //           fills the slot arrays bucket by bucket, so the random writes stay inside a small range.
-struct DenseParse{bool users=false,events=false,clicks=false,bucket=false;unsigned ahead=0,shE=14,shC=14;};
+struct DenseParse{bool users=false,events=false,clicks=false,bucket=false;unsigned ahead=8,shE=14,shC=14;};
 // A dense event line in bucket form, valid or not. k as in PRec (0 = not a valid event), ingest = exact
 // ingest_ts in ms, lo = the low shE bits of the counter: counter = (bucket index << shE) | lo.
 struct DRec{uint64_t k;int64_t ingest;uint32_t user;uint16_t cat;uint16_t lo;};
@@ -1889,12 +1889,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  //                       slot (default)  the parse stage writes them straight into the slot arrays denseEv / denseCl
  //                       bucket          per-thread buckets by counter range (DRec / DCRec); a later pass fills the slots
  //                       0               the general buckets, as for every other ID
- //   SS_DENSE_AHEAD=n    slot form: write a slot n dense rows after asking for its memory (0-16, default 0 = at the end of the line)
+ //   SS_DENSE_AHEAD=n    slot form: write a slot n dense rows after asking for its memory (0-16, default 8; 0 = at the end of
+ //                       the line). Measured on the scoring machine at 20M events: parse stage 525 ms at 0, 355 at 2, 341 at 8.
  //   SS_DSHIFT, SS_CSHIFT  bucket form: log2 of the counters per event / click bucket (4-16 / 4-24, default 14)
  //   SS_DENSE_DUMP=dir   test only: writes every record of the parse stage as text and stops after the parse stage ("-": only stops)
  {const char* rec=getenv("SS_DENSE_RECORDS");const bool recOn=!(rec&&rec[0]=='0');
   dparse.events=dense.events&&recOn;dparse.clicks=dense.clicks&&recOn;
-  dparse.bucket=!(rec&&string_view(rec)=="slot");} // bucket form unless SS_DENSE_RECORDS=slot
+  dparse.bucket=rec&&string_view(rec)=="bucket";}
  if(const char* v=getenv("SS_DENSE_AHEAD")){const int x=atoi(v);if(x>=0&&x<=(int)RING_MAX)dparse.ahead=(unsigned)x;}
  if(const char* v=getenv("SS_DSHIFT")){const int x=atoi(v);if(x>=4&&x<=16)dparse.shE=(unsigned)x;}
  if(const char* v=getenv("SS_CSHIFT")){const int x=atoi(v);if(x>=4&&x<=24)dparse.shC=(unsigned)x;}
