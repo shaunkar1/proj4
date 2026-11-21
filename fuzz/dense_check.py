@@ -65,14 +65,14 @@ def run(name, env, threads, sub="dump"):
     e.update(DATA_DIR=data, OUTPUT_DIR=o, SCRATCH_DIR=o, NCPU=str(threads), SS_DENSE_DUMP=out, SS_STATS="1")
     p = subprocess.run([core], env=e, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if p.returncode != 0: sys.exit("run %s failed with code %d" % (name, p.returncode))
-    keys = None; on = [0, 0]; sw = [0, 0, 0]
+    keys = None; on = [0, 0]; sw = [0, 0, 0, 0]
     for line in p.stderr.decode("latin-1").split("\n"):
         if line.startswith("STATS dense keys"):
             w = line.split(); keys = [int(x) for x in w[3:6] + w[7:10]] + on
         elif line.startswith("dense: events"):       # whether the keys were found at all (printed before the STATS line)
             w = line.split(); on = [int(w[2]), int(w[4])]
         elif line.startswith("dense parse: users"):  # what the parse stage really does (printed after the links stage)
-            w = line.split(); sw = [int(w[3]), int(w[6]), int(w[9])]
+            w = line.split(); sw = [int(w[3]), int(w[6]), int(w[9]), int(w[11]) if len(w) > 11 else 0]
     if keys: keys = keys + sw
     return out, keys
 
@@ -96,7 +96,7 @@ def diff(what, a, b):
     for x in list(only_a)[:3]: print("   first :", x)
     for x in list(only_b)[:3]: print("   second:", x)
 
-dense_env = dict(extra); dense_env.update(SS_DENSE_RECORDS="1")
+dense_env = dict(extra); dense_env.setdefault("SS_DENSE_RECORDS", "slot")   # or bucket, from the command line
 A, _ = run("A-nodense-sse2", {"SS_NODENSE": "1", "SS_ISA": "sse2"}, 1, "dumpA")
 plan = [("sse2", 1), ("sse2", 3), ("avx2", 1), ("avx2", 2), ("avx2", 3), ("avx2", 8), ("avx512z", 1), ("avx512z", 3), ("avx512y", 1), ("avx512y", 3), ("sse2", 8)]
 if os.environ.get("DC_PLAN"):   # e.g. DC_PLAN=avx2:8,avx2:8,sse2:2
@@ -110,12 +110,13 @@ for isa, threads in plan:
     if keys is None:
         # ---- what the parse stage must leave behind, from the reference rows ----
         keys = k
-        KE, KU, KC, LIME, LIMC, LIMI, ON_E, ON_C, SW_U, SW_E, SW_C = keys
+        KE, KU, KC, LIME, LIMC, LIMI, ON_E, ON_C, SW_U, SW_E, SW_C, BUCKET = keys
         if not (ON_E and SW_E): LIME = 0   # keys not found for a column, or its dense route not in use
         if not (ON_C and SW_C): LIMC = 0
         if not SW_U: LIMI = 0
         exp_ev, exp_cl = {}, {}            # dense ID -> [ingest, k, cat, user text, undefined?] / [key, user text, undefined?]
         gen_rows = []                      # rows of the general route: (E, id, ingest, k, cat, user text) / (C, id, key, user text)
+        den_rows = []                      # bucket form: every row with a dense ID, same shape
         nE = nC = 0
         for f in lines(A, "rows", 1):
             if f[1] != b"P" or f[-1][:2] == b"U:": fail("dense route in the SS_NODENSE run: %r" % f)
@@ -125,6 +126,7 @@ for isa, threads in plan:
                 c = counter(idt, 0x65, KE)
                 row = [int(f[3]), f[4], f[5], f[6], False]
                 if c is not None and c < LIME:
+                    if BUCKET: den_rows.append((b"E", f[2], f[3], f[4], f[5], f[6]))
                     e = exp_ev.get(f[2])
                     if e is None or row[0] < e[0]: exp_ev[f[2]] = row     # (a smaller copy also clears an earlier tie)
                     elif row[0] == e[0] and row[1:4] != e[1:4]: e[4] = True
@@ -133,6 +135,7 @@ for isa, threads in plan:
                 nC += 1
                 c = counter(idt, 0x6B, KC)
                 if c is not None and c < LIMC:
+                    if BUCKET: den_rows.append((b"C", f[2], f[3], f[4]))
                     e = exp_cl.get(f[2])
                     if e is None: exp_cl[f[2]] = [f[3], f[4], False]
                     elif e[0] != f[3] or e[1] != f[4]: e[2] = True
@@ -171,21 +174,29 @@ for isa, threads in plan:
                 if e is None: fail("%s: click slot in use for an ID without a dense valid click: %r" % (name, f)); continue
                 if e[2]: continue
                 if f[3] != e[0] or shown(f[4]) != user_label(e[1]): fail("%s: click slot %r, expected key %s user %s" % (name, f, e[0].decode(), user_label(e[1]).decode()))
-    if seenE != len(exp_ev): fail("%s: %d event slots in use, expected %d" % (name, seenE, len(exp_ev)))
-    if seenC != len(exp_cl): fail("%s: %d click slots in use, expected %d" % (name, seenC, len(exp_cl)))
+    if not BUCKET:
+        if seenE != len(exp_ev): fail("%s: %d event slots in use, expected %d" % (name, seenE, len(exp_ev)))
+        if seenC != len(exp_cl): fail("%s: %d click slots in use, expected %d" % (name, seenC, len(exp_cl)))
+    elif seenE or seenC: fail("%s: slots written in bucket form" % name)
     # 3. the bucket records
     want = Counter()
     for g in gen_rows:
         if g[0] == b"E": want[(b"E", g[1], g[2], g[3], g[4], user_label(g[5]) if g[3] != b"0" else b"-")] += 1
         else: want[(b"C", g[1], g[2], user_label(g[3]))] += 1
-    got = Counter()
+    wantB = Counter()               # bucket form: every dense row must be there, each exactly once
+    for g in den_rows:
+        if g[0] == b"E": wantB[(b"E", g[1], g[2], g[3], g[4] if g[3] != b"0" else b"0", user_label(g[5]) if g[3] != b"0" else b"-")] += 1
+        else: wantB[(b"C", g[1], g[2], user_label(g[3]))] += 1
+    got = Counter(); gotB = Counter()
     for f in lines(R, "recs", threads):
-        if f[1] != b"P": fail("%s: unknown record %r" % (name, f)); continue
-        got[(f[0],) + tuple(f[2:-1]) + (shown(f[-1]),)] += 1
-    diff("%s: bucket records, expected vs found" % name, want, got)
+        if f[1] == b"P": got[(f[0],) + tuple(f[2:-1]) + (shown(f[-1]),)] += 1
+        elif f[1] == b"B": gotB[(f[0],) + tuple(f[2:-1]) + (shown(f[-1]),)] += 1
+        else: fail("%s: unknown record %r" % (name, f))
+    diff("%s: general bucket records, expected vs found" % name, want, got)
+    diff("%s: dense bucket records, expected vs found" % name, wantB, gotB)
     done.append(name)
 
-print("events %d rows (%d dense IDs, %d undefined), clicks %d rows (%d dense IDs, %d undefined), general-route rows %d; keys found: events %d clicks %d; in use: users %d events %d clicks %d; limits %d %d %d; runs: %s"
-      % (nE, len(exp_ev), undefE, nC, len(exp_cl), undefC, len(gen_rows), ON_E, ON_C, SW_U, SW_E, SW_C, LIME, LIMC, LIMI, " ".join(done)))
+print("events %d rows (%d dense IDs, %d undefined), clicks %d rows (%d dense IDs, %d undefined), general-route rows %d; keys found: events %d clicks %d; in use: users %d events %d clicks %d bucket form %d; limits %d %d %d; runs: %s"
+      % (nE, len(exp_ev), undefE, nC, len(exp_cl), undefC, len(gen_rows), ON_E, ON_C, SW_U, SW_E, SW_C, BUCKET, LIME, LIMC, LIMI, " ".join(done)))
 print("DENSE_PARSE_OK" if not bad else "DENSE_PARSE_FAIL (%d)" % bad)
 sys.exit(1 if bad else 0)
