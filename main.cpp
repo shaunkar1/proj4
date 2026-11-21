@@ -78,22 +78,36 @@ static inline bool parse8(const char* p,uint64_t& v){
  x=((x&0x0000FFFF0000FFFFULL)*42949672960001ULL)>>32;
  v=x;return true;
 }
-// Same result as parse_ts. The two common shapes (F1 and 13-digit F3) take a branch-light path;
+// "YYYY-MM-DD" -> milliseconds at 00:00 UTC, remembered per thread: a window holds few distinct dates,
+// so almost every lookup is two compares. Only valid dates are remembered.
+struct DateMemo{uint64_t k8;uint16_t k2;int64_t ms;};
+static thread_local DateMemo dateMemo[64];
+static inline bool f1_date(const char* p,int64_t& dayms){
+ uint64_t k8;uint16_t k2;memcpy(&k8,p,8);memcpy(&k2,p+8,2);
+ DateMemo& e=dateMemo[(((uint32_t)k2*2654435761u)^((uint32_t)(k8>>32)*40503u))>>26];
+ if(e.k8==k8&&e.k2==k2){dayms=e.ms;return true;} // k8 is never 0 for a real date, so an empty entry cannot match
+ if(p[4]!='-'||p[7]!='-')return false;
+ static constexpr unsigned char pos[8]={0,1,2,3,5,6,8,9};
+ unsigned d[8];for(int i=0;i<8;++i){d[i]=(unsigned)(unsigned char)p[pos[i]]-'0';if(d[i]>9)return false;}
+ const int y=(int)(d[0]*1000+d[1]*100+d[2]*10+d[3]),m=(int)(d[4]*10+d[5]),dd=(int)(d[6]*10+d[7]);
+ static constexpr int mlen[13]={0,31,28,31,30,31,30,31,31,30,31,30,31};
+ if(m<1||m>12||dd<1||dd>mlen[m]+((m==2&&leap(y))?1:0))return false;
+ dayms=days_from_civil(y,(unsigned)m,(unsigned)dd)*DAY;
+ e.k8=k8;e.k2=k2;e.ms=dayms;return true;
+}
+// Same result as parse_ts. The two common shapes (F1 and 13-digit F3) take a short path;
 // anything they do not recognise as well-formed goes to parse_ts, which decides.
 static inline bool parse_ts_fast(string_view s,int64_t& out){
  const char* p=s.data();
  if(s.size()==20){
-  const bool seps=(p[4]=='-')&(p[7]=='-')&(p[10]=='T')&(p[13]==':')&(p[16]==':')&(p[19]=='Z');
-  static constexpr unsigned char pos[14]={0,1,2,3,5,6,8,9,11,12,14,15,17,18};
-  unsigned d[14];unsigned bad=0;
-  for(int i=0;i<14;++i){d[i]=(unsigned)(unsigned char)p[pos[i]]-'0';bad|=d[i]>9;}
-  if(seps&&!bad){
-   const int y=(int)(d[0]*1000+d[1]*100+d[2]*10+d[3]),m=(int)(d[4]*10+d[5]),dd=(int)(d[6]*10+d[7]);
-   const int h=(int)(d[8]*10+d[9]),mi=(int)(d[10]*10+d[11]),se=(int)(d[12]*10+d[13]);
-   static constexpr int mlen[13]={0,31,28,31,30,31,30,31,31,30,31,30,31};
-   if(m<1||m>12||dd<1||h>23||mi>59||se>59)return false;
-   if(dd>mlen[m]+((m==2&&leap(y))?1:0))return false;
-   out=days_from_civil(y,(unsigned)m,(unsigned)dd)*DAY+((h*60LL+mi)*60+se)*1000;
+  uint64_t t;memcpy(&t,p+11,8); // "HH:MM:SS": digits must be 0-9 and both colons in place
+  const bool shape=(p[10]=='T')&(p[19]=='Z')&((t&0xF0F0FFF0F0FFF0F0ULL)==0x30303A30303A3030ULL)
+   &(((t+0x0606000606000606ULL)&0xF0F000F0F000F0F0ULL)==0x3030003030003030ULL);
+  int64_t dayms;
+  if(shape&&f1_date(p,dayms)){
+   const unsigned h=(unsigned)((t&15)*10+((t>>8)&15)),mi=(unsigned)(((t>>24)&15)*10+((t>>32)&15)),se=(unsigned)(((t>>48)&15)*10+((t>>56)&15));
+   if(h>23||mi>59||se>59)return false;
+   out=dayms+((h*60LL+mi)*60+se)*1000;
    return true;
   }
  }else if(s.size()==13){
@@ -157,9 +171,14 @@ static Mapped map_file(const fs::path& path){
  struct stat st{};if(fstat(fd,&st)!=0){close(fd);throw runtime_error("Cannot stat "+path.string());}
  size_t len=st.st_size;
  if(len==0){close(fd);return {};}
- void* base=mmap(nullptr,len,PROT_READ,MAP_PRIVATE,fd,0);
+ // Reserve one extra zero page after the file so word and vector loads may run a little past
+ // the last byte (bytes after EOF read as zero). The file is mapped over the start of the reservation.
+ const size_t maplen=(len+4095)&~size_t(4095);
+ void* base=mmap(nullptr,maplen+4096,PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+ if(base==MAP_FAILED){close(fd);throw runtime_error("Cannot reserve "+path.string());}
+ void* got=mmap(base,len,PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
  close(fd);
- if(base==MAP_FAILED)throw runtime_error("Cannot map "+path.string());
+ if(got==MAP_FAILED)throw runtime_error("Cannot map "+path.string());
  madvise(base,len,MADV_WILLNEED);
  return {(const char*)base,len};
 }
@@ -264,17 +283,21 @@ template<int N> SS_V3 static inline bool split_line_v3(const char* p,const char*
    next=p+L+1;
    const int ncomma=(int)(_mm_popcnt_u64(c0)+_mm_popcnt_u64(c1)),nquote=(int)(_mm_popcnt_u64(q0)+_mm_popcnt_u64(q1));
    if(ncomma!=N-1||L==0)return false;
-   auto qbit=[&](unsigned off)->unsigned{return (unsigned)(((off<64?q0>>off:q1>>(off-64)))&1);};
+   // p[s] and p[e-1] decide whether a field is wrapped in quotes. For an empty field both are a
+   // comma or a newline (p[-1] is the previous line's newline), so it is never taken as quoted.
    unsigned s=0,quoted=0,ok=1;
    for(int j=0;j<N;++j){
     unsigned e;
     if(j==N-1)e=L;
-    else if(c0){e=(unsigned)_tzcnt_u64(c0);c0=_blsr_u64(c0);}
-    else{e=64+(unsigned)_tzcnt_u64(c1);c1=_blsr_u64(c1);}
-    const unsigned len=e-s,qd=qbit(s); // an empty last field has s==L, where the bit is the newline: not a quote
-    const unsigned endq=len?qbit(e-1):0;
-    ok&=(qd^1)|((len>=2)&endq);
-    out[j]=string_view(p+s+qd,(size_t)(len-2*qd)); // only used when ok
+    else{
+     const bool lowHalf=c0!=0;
+     e=lowHalf?(unsigned)_tzcnt_u64(c0):64+(unsigned)_tzcnt_u64(c1);
+     const uint64_t rest1=_blsr_u64(c1);
+     c1=lowHalf?c1:rest1;c0=_blsr_u64(c0);
+    }
+    const unsigned qd=p[s]=='"',endq=p[(ptrdiff_t)e-1]=='"';
+    ok&=qd==endq;
+    out[j]=string_view(p+s+qd,(size_t)(e-s-2*qd)); // only used when the line is well-formed
     quoted+=qd;s=e+1;
    }
    return ok&&nquote==(int)(2*quoted);
@@ -321,13 +344,29 @@ struct TransparentHash {
 };
 template <class V> using FastMap=unordered_map<string,V,TransparentHash,equal_to<>>;
 static uint64_t mix64(uint64_t x){x^=x>>32;x*=0xd6e8feb86659fd93ULL;x^=x>>32;x*=0xd6e8feb86659fd93ULL;return x^(x>>32);}
-static uint64_t hkey(string_view s){
+// Low n bytes of a little-endian word. Views into the mapped inputs may be read up to 16 bytes past
+// their end (see map_file), so short strings are loaded whole and masked instead of copied byte by byte.
+static constexpr uint64_t LOW_BYTES[9]={0,0xFFULL,0xFFFFULL,0xFFFFFFULL,0xFFFFFFFFULL,0xFFFFFFFFFFULL,0xFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFULL,~0ULL};
+static inline uint64_t hkey(string_view s){ // s must be a view into a mapped input
  const unsigned char* p=(const unsigned char*)s.data();size_t n=s.size();
  uint64_t h=0x9e3779b97f4a7c15ULL ^ (n*0xbf58476d1ce4e5b9ULL);
  while(n>=8){uint64_t w;memcpy(&w,p,8);h=(h^w)*0xa0761d6478bd642fULL;p+=8;n-=8;}
- uint64_t tail=0;memcpy(&tail,p,n);
+ uint64_t tail;memcpy(&tail,p,8);tail&=LOW_BYTES[n];
  return mix64(h^tail);
 }
+// An ID's text in 16 bytes: up to 15 bytes are stored in place (one cache miss to read a name),
+// longer ones keep a pointer into the mapped input.
+struct PName{
+ char b[16];
+ void set(string_view s){
+  if(s.size()<=15){memset(b,0,16);memcpy(b,s.data(),s.size());b[15]=(char)s.size();}
+  else{const char* p=s.data();uint32_t n=(uint32_t)s.size();memcpy(b,&p,8);memcpy(b+8,&n,4);b[15]=(char)0xFF;}
+ }
+ string_view view()const{
+  if((unsigned char)b[15]!=0xFF)return string_view(b,(size_t)(unsigned char)b[15]);
+  const char* p;uint32_t n;memcpy(&p,b,8);memcpy(&n,b+8,4);return string_view(p,n);
+ }
+};
 // Open-addressing string -> uint32 table built for one cache miss per lookup:
 // keys of up to 11 bytes (every generated user ID) live inside the 16-byte slot,
 // so a probe never follows a pointer. Longer keys fall back to a side list.
@@ -339,7 +378,7 @@ struct KeyTable{
  static constexpr uint32_t NONE=UINT32_MAX,BUSY=0xFE000000u,LONGK=0xFF000000u;
  Slot* slots=nullptr;size_t cap=0,mask=0,count=0;vector<Long> longs;
  // lock-free mode: new keys get idBase+0, idBase+1, ... up to idLimit keys; newNames keeps their text
- atomic<uint32_t> nextId{0};uint32_t idBase=0,idLimit=0;string_view* newNames=nullptr;mutex longMu;
+ atomic<uint32_t> nextId{0};uint32_t idBase=0,idLimit=0;PName* newNames=nullptr;mutex longMu;
  explicit KeyTable(size_t want=1024){alloc(want);}
  KeyTable(const KeyTable&)=delete;KeyTable& operator=(const KeyTable&)=delete;
  ~KeyTable(){if(slots)munmap((void*)slots,cap*sizeof(Slot));free(newNames);}
@@ -350,10 +389,10 @@ struct KeyTable{
   madvise(mem,c*sizeof(Slot),MADV_HUGEPAGE); // fewer page faults and TLB misses where the kernel allows it
   slots=(Slot*)mem;cap=c;mask=c-1;
  }
- static bool pack(string_view s,uint64_t& k0,uint32_t& k1){
-  size_t n=s.size();if(n>11)return false;
-  k0=0;k1=0;
-  if(n>=8){memcpy(&k0,s.data(),8);memcpy(&k1,s.data()+8,n-8);}else memcpy(&k0,s.data(),n);
+ static bool pack(string_view s,uint64_t& k0,uint32_t& k1){ // s must be a view into a mapped input
+  const size_t n=s.size();if(n>11)return false;
+  uint64_t lo;uint32_t hi;memcpy(&lo,s.data(),8);memcpy(&hi,s.data()+8,4);
+  if(n<8){k0=lo&LOW_BYTES[n];k1=0;}else{k0=lo;k1=hi&(uint32_t)LOW_BYTES[n-8];}
   k1|=(uint32_t)(n+1)<<24;return true;
  }
  static uint64_t hash_packed(uint64_t k0,uint32_t k1){return mix64(k0^((uint64_t)k1*0xa0761d6478bd642fULL));}
@@ -393,10 +432,26 @@ struct KeyTable{
  // ---- lock-free mode ----
  void begin_parallel(uint32_t base,uint32_t maxNew){
   idBase=base;idLimit=maxNew;nextId.store(0);
-  newNames=(string_view*)calloc((size_t)maxNew+1,sizeof(string_view));if(!newNames)throw bad_alloc();
+  newNames=(PName*)calloc((size_t)maxNew+1,sizeof(PName));if(!newNames)throw bad_alloc();
   if((count+maxNew)*2>cap)grow((count+maxNew)*2);
  }
  uint32_t end_parallel(){uint32_t n=min(nextId.load(),idLimit);count+=n;return n;}
+ // Lookup only (no insert). Safe from many threads as long as nobody is adding keys.
+ uint32_t find(string_view s)const{
+  const auto R=memory_order_relaxed;
+  uint64_t k0;uint32_t k1;
+  if(pack(s,k0,k1)){
+   for(size_t j=hash_packed(k0,k1)&mask;;j=(j+1)&mask){const Slot& e=slots[j];const uint32_t c=e.k1.load(R);
+    if(c==k1&&e.k0.load(R)==k0)return e.v.load(R);
+    if(!c)return NONE;
+   }
+  }
+  const uint64_t h=hkey(s);
+  for(size_t j=h&mask;;j=(j+1)&mask){const Slot& e=slots[j];const uint32_t c=e.k1.load(R);
+   if(!c)return NONE;
+   if(c==LONGK&&e.k0.load(R)==h&&longs[e.v.load(R)].key==s)return longs[e.v.load(R)].v;
+  }
+ }
  void prefetch(string_view s)const{uint64_t k0;uint32_t k1;if(pack(s,k0,k1))__builtin_prefetch(&slots[hash_packed(k0,k1)&mask],0,1);}
  // The key's value; a key nobody has seen gets the next ID. NONE if the key is new and the table is full.
  uint32_t find_or_add(string_view s){
@@ -412,7 +467,7 @@ struct KeyTable{
     if(!e.k1.compare_exchange_strong(expect,BUSY,memory_order_acquire))continue; // somebody took the slot: look at it again
     uint32_t id=nextId.fetch_add(1,R);
     if(id>=idLimit){e.k1.store(0,memory_order_release);return NONE;}
-    newNames[id]=s;e.k0.store(k0,R);e.v.store(idBase+id,R);e.k1.store(k1,memory_order_release);
+    newNames[id].set(s);e.k0.store(k0,R);e.v.store(idBase+id,R);e.k1.store(k1,memory_order_release);
     return idBase+id;
    }
    else if(c==BUSY){__builtin_ia32_pause();continue;}
@@ -431,7 +486,7 @@ struct KeyTable{
     if(!e.k1.compare_exchange_strong(expect,BUSY,memory_order_acquire))continue;
     uint32_t id=nextId.fetch_add(1,R);
     if(id>=idLimit){e.k1.store(0,memory_order_release);return NONE;}
-    newNames[id]=s;longs.push_back({s,idBase+id});
+    newNames[id].set(s);longs.push_back({s,idBase+id});
     e.k0.store(h,R);e.v.store((uint32_t)longs.size()-1,R);e.k1.store(LONGK,memory_order_release);
     return idBase+id;
    }
@@ -458,6 +513,29 @@ struct Chunk{const char* base;size_t len,from,to;bool click;};
 struct Ev{uint64_t a,b;};
 static inline bool operator<(const Ev& x,const Ev& y){return x.a!=y.a?x.a<y.a:x.b<y.b;}
 struct Click{int64_t ts;uint32_t user;uint16_t campaign;string_view id;};
+// Orders events by (person, ts): byte-wise LSD radix sort over the bytes that actually differ.
+static void sort_events(vector<Ev>& v,vector<Ev>& tmp){
+ const size_t n=v.size();
+ if(n<512){sort(v.begin(),v.end());return;}
+ uint32_t cnt[9][256];memset(cnt,0,sizeof cnt);
+ for(const Ev& e:v){
+  const uint64_t a=e.a;
+  ++cnt[0][e.b>>56];++cnt[1][a&255];++cnt[2][(a>>8)&255];++cnt[3][(a>>16)&255];++cnt[4][(a>>24)&255];
+  ++cnt[5][(a>>32)&255];++cnt[6][(a>>40)&255];++cnt[7][(a>>48)&255];++cnt[8][a>>56];
+ }
+ tmp.resize(n);
+ Ev* src=v.data();Ev* dst=tmp.data();
+ for(int pass=0;pass<9;++pass){
+  uint32_t* c=cnt[pass];
+  const unsigned first=pass==0?(unsigned)(src[0].b>>56):(unsigned)((src[0].a>>(8*(pass-1)))&255);
+  if(c[first]==n)continue; // every element has the same byte here
+  uint32_t sum=0;for(int i=0;i<256;++i){const uint32_t k=c[i];c[i]=sum;sum+=k;}
+  if(pass==0)for(size_t i=0;i<n;++i)dst[c[src[i].b>>56]++]=src[i];
+  else{const int sh=8*(pass-1);for(size_t i=0;i<n;++i)dst[c[(src[i].a>>sh)&255]++]=src[i];}
+  swap(src,dst);
+ }
+ if(src!=v.data())memcpy(v.data(),src,n*sizeof(Ev));
+}
 struct alignas(64) ThreadState{
  SmallTable users; // IDs that did not fit in the shared table
  vector<AVec<PRec>> eb;vector<AVec<CRec>> cb; // parsed lines by event/click ID hash
@@ -628,7 +706,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Flatten, then name each person by the byte-wise smallest of their IDs.
  vector<uint32_t> root(nlinked);
  {
-  string_view* names=tab.newNames;
+  PName* names=tab.newNames;
   unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[(size_t)nlinked+1]);
   #pragma omp parallel num_threads(T)
   {
@@ -638,7 +716,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(uint32_t i=0;i<nlinked;++i){
     const uint32_t r=root[i];if(r==i)continue;
     uint32_t cur=best[r].load();
-    while(names[i]<names[cur]&&!best[r].compare_exchange_weak(cur,i)){}
+    while(names[i].view()<names[cur].view()&&!best[r].compare_exchange_weak(cur,i)){}
    }
    // A root's own name is no longer needed once every member has been compared, and no other person reads it.
    #pragma omp for schedule(static)
@@ -655,10 +733,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
  cat_id("unknown",categories,catnames);
- FastMap<uint16_t> products;
- read_lines(data/"products.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean products.csv");products.emplace(string(f[0]),cat_id(f[1],categories,catnames));});
- vector<Camp> campaigns;FastMap<uint16_t> camps;
- read_lines(data/"campaigns.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean campaigns.csv");if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");camps.emplace(string(f[0]),(uint16_t)campaigns.size());campaigns.push_back({string(f[0]),string(f[1])});});
+ KeyTable products(1<<17); // product_id -> category number
+ read_lines(data/"products.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean products.csv");products.intern(f[0],cat_id(f[1],categories,catnames));});
+ vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
+ read_lines(data/"campaigns.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean campaigns.csv");if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
+  const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
  uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
 
  // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
@@ -692,7 +771,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     int32_t price=0;const bool purchase=kind==3;
     if(!purchase||price_value(f[6],price)){
      r.flags=F_VALID|(purchase?F_PURCHASE:0);r.ts=ts;r.price=price;r.user=user_of(f[1]);
-     if(purchase){auto prod=products.find(f[5]);r.cat=prod==products.end()?0:prod->second;}
+     if(purchase){const uint32_t c=products.find(f[5]);r.cat=c==KeyTable::NONE?0:(uint16_t)c;}
     }
    }
    tl.eb[(size_t)(((r.h>>40)*PE)>>24)].push_back(r);
@@ -702,8 +781,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
    if(f[1].empty()||!parse_ts_fast(f[3],ts)||ts<clickStart||ts>=window_end)return;
-   auto ci=camps.find(f[2]);if(ci==camps.end())return;
-   CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ts=ts;r.user=user_of(f[1]);r.campaign=ci->second;r.flags=0;
+   const uint32_t ci=camps.find(f[2]);if(ci==KeyTable::NONE)return;
+   CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ts=ts;r.user=user_of(f[1]);r.campaign=(uint16_t)ci;r.flags=0;
    tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
   };
   for(;;){
@@ -732,9 +811,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    trans[t][i]=id;
   }
  }
- const string_view* personNames=tab.newNames;
+ const PName* personNames=tab.newNames;
  auto name_of=[&](uint32_t person)->string_view{
-  if(person<extraBase)return personNames[person];
+  if(person<extraBase)return personNames[person].view();
   return extraNames[person-extraBase];
  };
  const uint32_t newCount=totalIds-nlinked;
@@ -831,7 +910,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   PqFile file;
   auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
   string uid,catv,catbody,levels;vector<int32_t> days;vector<int64_t> sess,evs,rev;vector<uint8_t> hascat;
-  vector<Ev> events;vector<Click> clicks;
+  vector<Ev> events,evtmp;vector<Click> clicks;
   auto flush_rows=[&]{
    if(days.empty())return;
    // top_category page: 1-bit definition levels as one bit-packed run, then the non-null values.
@@ -849,13 +928,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(int t=0;t<T;++t){auto& v=tls[t].uev[up];events.insert(events.end(),v.begin(),v.end());v=AVec<Ev>();
     auto& c=tls[t].ucl[up];clicks.insert(clicks.end(),c.begin(),c.end());c=AVec<Click>();}
    if(events.empty())continue;
-   sort(events.begin(),events.end());
+   sort_events(events,evtmp);
    sort(clicks.begin(),clicks.end(),[](const Click& a,const Click& b){
     if(a.user!=b.user)return a.user<b.user;
     if(a.ts!=b.ts)return a.ts<b.ts;
     return a.id>b.id; // last click at equal timestamp has lexicographically smallest ID
    });
    const size_t nE=events.size(),nC=clicks.size();
+   // Ask for every person's name now; the misses overlap instead of being paid one row at a time.
+   {uint32_t prev=UINT32_MAX;for(size_t i=0;i<nE;++i){const uint32_t u=(uint32_t)(events[i].a>>32);if(u!=prev){prev=u;if(u<extraBase)__builtin_prefetch(&personNames[u],0,1);}}}
    auto ts_of=[&](const Ev& e)->int64_t{return window_start+(int64_t)(((e.a&0xffffffffu)<<8)|(e.b>>56));};
    size_t ei=0,cptr=0;
    while(ei<nE){
