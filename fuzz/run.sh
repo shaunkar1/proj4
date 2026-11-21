@@ -3,7 +3,8 @@
 # (a reused folder keeps part files of a run with more threads).
 #   new AVX2 1 thread vs new SSE2 1 thread: must match.
 #   new AVX2 1 thread vs HEAD-baseline SSE2 1 thread: must match when FZ_NONUL=1 (the baseline keeps NUL-dated lines).
-#   new AVX2 3 threads vs 1 thread: meaningful with FZ_UNIQ=1 (otherwise changed copies of a click make the answer order-dependent).
+#   new AVX2 3 threads vs 1 thread: only meaningful with FZ_UNIQ=1. Without it a changed line can share its ID with an unchanged
+#   copy, and then the surviving copy depends on thread timing (the v20 baseline behaves the same way).
 W=/home/claude/wtA; CMP=/home/claude/bb/starter-pyspark/starter-pyspark/scripts/compare.py; D=$W/fz_data
 mkdir -p $W/fzo
 for seed in "$@"; do

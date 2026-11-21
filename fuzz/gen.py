@@ -69,8 +69,8 @@ def proc(path,dst,kind,rate):
         if r<rate:
             f=l.split(b','); f=mutate(f,kind)
             if R.random()<0.3: f=mutate(f,kind)
-            if UNIQ and kind=='c' and f:   # a changed click must not collide with an unchanged copy of itself
-                uniq[0]+=1; f[0]=b'kz%07d'%uniq[0]
+            if UNIQ and f:   # a changed line must not collide with an unchanged copy of itself (same ID, other content: which one wins is order-dependent)
+                uniq[0]+=1; f[0]=(b'kz%07d' if kind=='c' else b'ez%07d')%uniq[0]
             l=b','.join(f)
         elif r<rate+0.03 and prev is not None and not NODUP:
             f=prev.split(b','); g=l.split(b',')   # same id, other content: exercises dedup
