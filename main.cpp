@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <fcntl.h>
@@ -202,16 +203,46 @@ static Mapped map_file(const fs::path& path){
 // followed by at least one page of zeros (as in map_file). One mmap per file instead of two, and the
 // whole folder can be unmapped later in a few large pieces.
 struct FileGroup{char* base=nullptr;size_t len=0;vector<size_t> ends;}; // ends: offset just past each mapped file's slot
+// ---- Switches for the kernel's share of the run (system time). All are off by default and none can change
+// the output: they only change where the input's pages sit in the address space and when they are mapped.
+// The active ones are listed in the "STATS kernel switches" line (SS_STATS=1).
+//  SS_FILEALIGN=2m      every input file starts at a 2 MB boundary of the reservation (default: 4 KB). File
+//                       offsets and addresses are then congruent modulo 2 MB, which the kernel requires before it
+//                       maps a 2 MB folio of the page cache with one PMD entry (one fault and one rmap step per
+//                       2 MB instead of 32 faults and 512 page-table entries). Costs address space only.
+//                       SS_FILEALIGN=2m+huge also advises MADV_HUGEPAGE on the file mappings.
+//  SS_POPULATE=ahead    each parser thread asks for its next 2 MB chunk with one madvise(MADV_POPULATE_READ)
+//                       before it parses it (one system call instead of ~32 fault traps per chunk).
+//  SS_POPULATE=all      all threads populate the whole input right after it is mapped (inside the MAP stage).
+//  SS_POPULATE=bg[n]    n (default 2) extra threads populate the input in the background from the end of MAP on;
+//                       they stop when the parse stage ends.
+//  SS_FILEADVISE=random|seq  MADV_RANDOM / MADV_SEQUENTIAL on the file mappings (after MADV_WILLNEED). Either one
+//                       tells the kernel the mapping says nothing about page recency, so unmapping skips the
+//                       per-page folio_mark_accessed step; seq may also change read-ahead decisions.
+//  SS_SMAPS=1          measuring only: after PARSE, print Rss / Anonymous / AnonHugePages / FilePmdMapped of the
+//                       process (SMAPS lines) - FilePmdMapped > 0 means SS_FILEALIGN=2m took effect.
+//  Older ones: SS_NOWILLNEED=1 (no MADV_WILLNEED on the files), SS_NOEARLYUNMAP=1 (inputs and slot arrays stay
+//  mapped until exit), SS_NOHUGE=1 (no MADV_HUGEPAGE on anonymous memory), SS_PREFAULT=1 (MADV_POPULATE_WRITE on
+//  the arenas), SS_ASYNCFREE=1.
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+static int optFileAlign=2; // 0 = 4 KB (SS_FILEALIGN=off), 1 = 2 MB, 2 = 2 MB + MADV_HUGEPAGE (default: lets the kernel map 2 MB page-cache folios with one entry)
+static int optFileAdvise=0; // 0 none, 1 MADV_RANDOM, 2 MADV_SEQUENTIAL
+static int optPopulate=0,optPopulateBg=2; // 0 off, 1 ahead, 2 all, 3 bg
 static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
+ const size_t HUGE2M=size_t(2)<<20;
+ const auto slot_of=[&](size_t len){const size_t s=((len+4095)&~size_t(4095))+4096;return optFileAlign?(s+HUGE2M-1)&~(HUGE2M-1):s;};
  vector<size_t> lens(paths.size(),0);size_t total=0;
  for(size_t i=0;i<paths.size();++i){
   struct stat st{};if(stat(paths[i].c_str(),&st)!=0)throw runtime_error("Cannot stat "+paths[i].string());
-  lens[i]=(size_t)st.st_size;if(lens[i])total+=((lens[i]+4095)&~size_t(4095))+4096;
+  lens[i]=(size_t)st.st_size;if(lens[i])total+=slot_of(lens[i]);
  }
  vector<Mapped> out(paths.size());
  if(!total)return out;
- void* base=mmap(nullptr,total,PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+ void* base=mmap(nullptr,total+(optFileAlign?HUGE2M:0),PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
  if(base==MAP_FAILED)throw runtime_error("Cannot reserve address space for the input files");
+ if(optFileAlign)base=(void*)(((uintptr_t)base+HUGE2M-1)&~(uintptr_t)(HUGE2M-1)); // the unused edges stay reserved, without pages
  g.base=(char*)base;g.len=total;size_t off=0;
  static const bool willNeed=!getenv("SS_NOWILLNEED"); // measuring switch
  for(size_t i=0;i<paths.size();++i){
@@ -222,8 +253,10 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
   close(fd);
   if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
   if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
+  if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
+  if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
   out[i]={g.base+off,lens[i]};
-  off+=((lens[i]+4095)&~size_t(4095))+4096;g.ends.push_back(off);
+  off+=slot_of(lens[i]);g.ends.push_back(off);
  }
  return out;
 }
@@ -3400,9 +3433,20 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool __cpuLines=getenv("SS_STATS")!=nullptr;
  auto __cpu_now=[]{timespec t;clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;};
  double __cpu0=__cpu_now();
+ // ... and by a SYS line (system CPU of the whole process in that stage, seconds) and a FLT line (minor page faults).
+ // SYS/FLT EXITPREP at the very end cover what runs after the last mark.
+ auto __ru_now=[](double& sys,long& flt){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;};
+ double __sys0=0;long __flt0=0;if(__cpuLines)__ru_now(__sys0,__flt0);
+ auto __sysflt=[&](const char* label){double s;long f;__ru_now(s,f);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\n";__sys0=s;__flt0=f;};
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
-  if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;}};
+  if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
+ if(const char* v=getenv("SS_FILEALIGN")){const string_view w(v);optFileAlign=w=="2m"?1:w=="2m+huge"?2:0;}
+ if(const char* v=getenv("SS_FILEADVISE")){const string_view w(v);optFileAdvise=w=="random"?1:w=="seq"?2:0;}
+ if(const char* v=getenv("SS_POPULATE")){const string_view w(v);optPopulate=w=="ahead"?1:w=="all"?2:w.substr(0,2)=="bg"?3:0;
+  if(optPopulate==3&&w.size()>2){const int n=atoi(v+2);if(n>=1&&n<=64)optPopulateBg=n;}}
+ if(__cpuLines)cerr<<"STATS kernel switches: SS_FILEALIGN="<<(optFileAlign==2?"2m+huge":optFileAlign?"2m":"off")<<" SS_POPULATE="<<(optPopulate==1?"ahead":optPopulate==2?"all":optPopulate==3?"bg"+to_string(optPopulateBg):string("off"))
+  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
@@ -3429,7 +3473,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
+ // SS_POPULATE=all|bg: the input's pages are entered into the page tables by madvise calls, a chunk at a time.
+ const auto populate_chunk=[&chunks](size_t c){const Chunk& ck=chunks[c];if(ck.from<ck.len)madvise((void*)(ck.base+ck.from),min(ck.to,ck.len)-ck.from,MADV_POPULATE_READ);};
+ static atomic<size_t> populateNext{0};static atomic<bool> populateStop{false};
+ if(optPopulate==2){
+  #pragma omp parallel for num_threads(T) schedule(dynamic,1)
+  for(size_t c=0;c<chunks.size();++c)populate_chunk(c);
+ }
  __mark("MAP");
+ if(optPopulate==3)for(int i=0;i<optPopulateBg;++i)thread([&chunks,populate_chunk]{ // chunks outlives the threads' work: they stop before PARSE ends and the process leaves through _exit
+  for(;;){if(populateStop.load(memory_order_relaxed))break;const size_t c=populateNext.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;populate_chunk(c);}}).detach();
  // ---- Dense IDs: find the generator's keys from the first lines of one event file and one click file. ----
  // (SS_NODENSE=1 turns the dense route off.)
  if(!getenv("SS_NODENSE")&&sampleLen){
@@ -3917,6 +3970,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
+   if(__builtin_expect(optPopulate==1,0)&&ck.from<ck.len)madvise((void*)(ck.base+ck.from),min(ck.to,ck.len)-ck.from,MADV_POPULATE_READ); // SS_POPULATE=ahead
    // Dense records (DREC loops) exist with the line index only; SS_LINES=plain then applies to the other kind of file.
    const bool drec=ck.click?dparse.clicks:dparse.events;
    const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
@@ -3947,7 +4001,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   dense_note_end(denseEvEnd,tl.evEnd);dense_note_end(denseClEnd,tl.clEnd);
   tl.slotWaits=eslotWaits;
  }
+ populateStop.store(true,memory_order_relaxed);
  __mark("PARSE");
+ if(getenv("SS_SMAPS")){ // measuring switch: how the kernel mapped things by the end of the parse stage (file PMD maps, anonymous huge pages)
+  ifstream f("/proc/self/smaps_rollup");string l;
+  while(getline(f,l))if(l.rfind("Rss:",0)==0||l.rfind("AnonHugePages:",0)==0||l.rfind("FilePmdMapped:",0)==0||l.rfind("ShmemPmdMapped:",0)==0||l.rfind("Anonymous:",0)==0)cerr<<"SMAPS "<<l<<"\n";
+  __mark("SMAPS");
+ }
  // ---- Raw users in the event slots (see DENSE_USER_RAW). The ID table still takes new IDs here. ----
  // Folded form (default): the event sweep of the DENSE stage runs here and reads the raw texts as it
  // goes; no slot is rewritten, so the slot array is read-only from here on and every later reader of
@@ -5297,6 +5357,7 @@ __mark("AGGREGATE");
 __mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
  // Every output file is written and closed. Leave at once: unwinding would only hand gigabytes of
  // mappings back piece by piece before the kernel drops them anyway.
+ if(__cpuLines)__sysflt("EXITPREP");
  cerr.flush();fflush(nullptr);
  _exit(0);
 }
