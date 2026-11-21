@@ -289,7 +289,9 @@ int main(){
  struct Var{const char* label;vector<pair<string,string>> env;const char* bin="";bool hugeSet=false;};
  #define N8 {"NCPU","8"}
  const vector<Var> vars={
-  {"d1",{N8}},{"r1",{N8},"core-v33"},{"q1",{N8},"core-v32"},{"p1",{N8},"core-v31"},{"d2",{N8}},{"r2",{N8},"core-v33"},{"q2",{N8},"core-v32"},{"p2",{N8},"core-v31"},{"d3",{N8}},{"r3",{N8},"core-v33"},{"q3",{N8},"core-v32"},{"p3",{N8},"core-v31"},
+  {"d1",{N8}},{"s1",{N8},"core-v35"},{"r1",{N8},"core-v33"},{"q1",{N8},"core-v32"},{"p1",{N8},"core-v31"},{"d2",{N8}},{"s2",{N8},"core-v35"},{"r2",{N8},"core-v33"},{"q2",{N8},"core-v32"},{"d3",{N8}},{"s3",{N8},"core-v35"},{"r3",{N8},"core-v33"},
+  {"snoprobe",{N8,{"SS_NOSIMDPROBE","1"}},"core-v35"},{"sslot150",{N8,{"SS_SLOTPCT","150"}},"core-v35"},{"spfe0",{N8,{"SS_PFE","0"}},"core-v35"},{"spfa128",{N8,{"SS_PFA","128"}},"core-v35"},
+  {"snoprobe2",{N8,{"SS_NOSIMDPROBE","1"}},"core-v35"},{"sslot1502",{N8,{"SS_SLOTPCT","150"}},"core-v35"},{"spfe02",{N8,{"SS_PFE","0"}},"core-v35"},{"spfa1282",{N8,{"SS_PFA","128"}},"core-v35"},
   {"idx",{N8,{"SS_LINES","index"}}},{"idxz",{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}}},{"idx2",{N8,{"SS_LINES","index"}}},{"idxz2",{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}}},
   {"tabfull",{N8,{"SS_TABLE_FULL","1"}}},{"noidblk",{N8,{"SS_NOIDBLOCKS","1"}}},{"tabfull2",{N8,{"SS_TABLE_FULL","1"}}},{"noidblk2",{N8,{"SS_NOIDBLOCKS","1"}}},
   {"abl1",{N8,{"SS_ABL","1"}},"core-abl"},{"abl2",{N8,{"SS_ABL","2"}},"core-abl"},{"abl6",{N8,{"SS_ABL","6"}},"core-abl"},{"abl3",{N8,{"SS_ABL","3"}},"core-abl"},
@@ -302,10 +304,8 @@ int main(){
   {"combo",{N8,{"SS_PER","8192"},{"SS_CAP","8192"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x"},
   {"avx512z",{N8,{"SS_ISA","avx512z"}}},{"avx512y",{N8,{"SS_ISA","avx512y"}}},
   {"noearly",{N8,{"SS_NOEARLYUNMAP","1"}}},{"nowill",{N8,{"SS_NOWILLNEED","1"}}},
-  {"abl1b",{N8,{"SS_ABL","1"}},"core-abl"},{"abl2b",{N8,{"SS_ABL","2"}},"core-abl"},{"abl6b",{N8,{"SS_ABL","6"}},"core-abl"},{"abl3b",{N8,{"SS_ABL","3"}},"core-abl"},
-  {"abl4b",{N8,{"SS_ABL","4"}},"core-abl"},{"abl5b",{N8,{"SS_ABL","5"}},"core-abl"},
   // final-sized set
-  {"Hd1",{N8},"",true},{"Hr1",{N8},"core-v33",true},{"Hq1",{N8},"core-v32",true},{"Hp1",{N8},"core-v31",true},{"Hd2",{N8},"",true},{"Hx0",{N8},"core-x",true},{"Htabfull",{N8,{"SS_TABLE_FULL","1"}},"",true},
+  {"Hd1",{N8},"",true},{"Hs1",{N8},"core-v35",true},{"Hsnoprobe",{N8,{"SS_NOSIMDPROBE","1"}},"core-v35",true},{"Hr1",{N8},"core-v33",true},{"Hq1",{N8},"core-v32",true},{"Hp1",{N8},"core-v31",true},{"Hd2",{N8},"",true},{"Hx0",{N8},"core-x",true},{"Htabfull",{N8,{"SS_TABLE_FULL","1"}},"",true},
   {"Hper16k",{N8,{"SS_PER","16384"},{"SS_CAP","8192"}},"core-x",true},{"Hper8k",{N8,{"SS_PER","8192"},{"SS_CAP","16384"}},"core-x",true},
   {"Huper8k",{N8,{"SS_UPER","8192"}},"core-x",true},{"Hpf",{N8,{"SS_PFW","128"},{"SS_PFE","128"}},"core-x",true},
   {"Hcombo",{N8,{"SS_PER","8192"},{"SS_CAP","16384"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x",true},
@@ -317,7 +317,7 @@ int main(){
   {"nohuge",{N8,{"SS_NOHUGE","1"}}},{"prefault",{N8,{"SS_PREFAULT","1"}}},
   {"n4",{{"NCPU","4"}}},{"n1",{{"NCPU","1"}}},{"n2",{{"NCPU","2"}}},{"n6",{{"NCPU","6"}}},
   {"1abl1",{{"NCPU","1"},{"SS_ABL","1"}},"core-abl"},{"1abl2",{{"NCPU","1"},{"SS_ABL","2"}},"core-abl"},{"1abl3",{{"NCPU","1"},{"SS_ABL","3"}},"core-abl"},{"1abl4",{{"NCPU","1"},{"SS_ABL","4"}},"core-abl"},
-  {"d4",{N8}},{"p4",{N8},"core-v31"},{"d5",{N8}},{"p5",{N8},"core-v31"}};
+  {"d4",{N8}},{"s4",{N8},"core-v35"},{"d5",{N8}},{"s5",{N8},"core-v35"}};
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -340,16 +340,17 @@ int main(){
    snprintf(one,sizeof one,"%s=%.0f(%.0f/%.0f/%.0f) ",l,r->wall*1e3,g1(*r,"PARSE"),g1(*r,"DEDUP"),g1(*r,"AGGREGATE"));return one;};
   // row 0: v32 against v31 on both sizes; best default run in full with hardware counters
   {const RunResult* d=bestd();RunResult z;if(!d)d=&z;char pc[160];snprintf(pc,sizeof pc," | perf err%d ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",d->perfErr,d->pc[0]/1e9,d->pc[1]/1e9,d->pc[2]/1e6,d->pc[3]/1e6);
-   string all;for(const char* l:{"d1","d2","d3","d4","d5","r1","r2","r3","q1","q2","q3","p1","p2","p3","p4","p5","Hd1","Hd2","Hd3","Hr1","Hq1","Hp1"}){const RunResult* r=get(l);char one[32];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);all+=one;}
+   string all;for(const char* l:{"d1","d2","d3","d4","d5","s1","s2","s3","s4","s5","r1","r2","r3","q1","q2","p1","Hd1","Hd2","Hd3","Hs1","Hr1","Hq1","Hp1"}){const RunResult* r=get(l);char one[32];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);all+=one;}
    string det=stages(*d)+pc;
    {const RunResult* pb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='p'&&r.rc==0&&(!pb||r.wall<pb->wall))pb=&r;if(pb)det+=" || v31: "+stages(*pb);}
    {const RunResult* h=get("Hd1");const RunResult* h2=get("Hd2");if(h2&&(!h||h2->wall<h->wall))h=h2;if(h)det+=" || 60x: "+stages(*h);}
    {const RunResult* qb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='q'&&r.rc==0&&(!qb||r.wall<qb->wall))qb=&r;if(qb)det+=" || v32: "+stages(*qb);}
    {const RunResult* qb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='r'&&r.rc==0&&(!qb||r.wall<qb->wall))qb=&r;if(qb)det+=" || v33: "+stages(*qb);}
-   row("v34 d*, v33 r*, v32 q*, v31 p*, H=60x: "+all,det,us(d->wall),us(d->user),us(d->sys),d->minflt);}
+   {const RunResult* qb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='s'&&r.rc==0&&(!qb||r.wall<qb->wall))qb=&r;if(qb)det+=" || v35: "+stages(*qb);}
+   row("v35 s*, v34 d*, v33 r*, v32 q*, v31 p*, H=60x: "+all,det,us(d->wall),us(d->user),us(d->sys),d->minflt);}
   // row 1: tuning experiments, wall(parse/dedup/agg)
-  {string a,b2;for(const char* l:{"x0","x0b","per16k","per8k","per8kb","per4k","uper8k","uper32k","pfw128","pfw128b","pfw256","pfe128","pfe128b","pfe256","combo","combob"})a+=brief(l);
-   for(const char* l:{"Hd1","Hd2","Hd3","Hr1","Hq1","Hp1","Hx0","Htabfull","Hper16k","Hper8k","Huper8k","Hpf","Hcombo","Havx512z","Hnoearly"})b2+=brief(l);
+  {string a,b2;for(const char* l:{"snoprobe","snoprobe2","sslot150","sslot1502","spfe0","spfe02","spfa128","spfa1282","x0","x0b","per16k","per8k","per8kb","per4k","uper8k","uper32k","pfw128","pfw128b","pfw256","pfe128","pfe128b","pfe256","combo","combob"})a+=brief(l);
+   for(const char* l:{"Hd1","Hd2","Hd3","Hs1","Hsnoprobe","Hr1","Hq1","Hp1","Hx0","Htabfull","Hper16k","Hper8k","Huper8k","Hpf","Hcombo","Havx512z","Hnoearly"})b2+=brief(l);
    row("tuning 20x wall(P/D/A): "+a,"60x: "+b2,0,0,0,0);}
   // row 2: parser ablation (PARSE stage ms; the run stops after that stage)
   {string a,detail;for(auto& r:results)if(r.label.find("abl")!=string::npos){char one[64];snprintf(one,sizeof one,"%s=%.0f ",r.label.c_str(),g1(r,"PARSE"));a+=one;
