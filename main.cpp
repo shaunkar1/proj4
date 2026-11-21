@@ -201,6 +201,15 @@ static Mapped map_file(const fs::path& path){
 // followed by at least one page of zeros (as in map_file). One mmap per file instead of two, and the
 // whole folder can be unmapped later in a few large pieces.
 struct FileGroup{char* base=nullptr;size_t len=0;vector<size_t> ends;}; // ends: offset just past each mapped file's slot
+// Measuring switch SS_INPUT for how the pages of the event/click/link files get into the page table
+// (default: on first touch, with the kernel's fault-around):
+//   populate  the whole file when it is mapped (MAP_POPULATE; serial, in the MAP stage)
+//   seq       as default plus MADV_SEQUENTIAL
+//   chunk     each 2 MB chunk in one call right before the thread parses it (MADV_POPULATE_READ, Linux 5.14+)
+static int optInput=0;
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
 static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
  vector<size_t> lens(paths.size(),0);size_t total=0;
  for(size_t i=0;i<paths.size();++i){
@@ -217,10 +226,11 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
   if(!lens[i])continue;
   int fd=open(paths[i].c_str(),O_RDONLY);
   if(fd<0)throw runtime_error("Cannot open "+paths[i].string());
-  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
+  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED|(optInput==1?MAP_POPULATE:0),fd,0);
   close(fd);
   if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
   if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
+  if(optInput==2)madvise(got,lens[i],MADV_SEQUENTIAL);
   out[i]={g.base+off,lens[i]};
   off+=((lens[i]+4095)&~size_t(4095))+4096;g.ends.push_back(off);
  }
@@ -998,6 +1008,49 @@ SS_V3I bool ts_v3(const char* p,unsigned n,DateMemo3* memo,int64_t& out){
  }
  return parse_ts(string_view(p,n),out);
 }
+// Two experiments for the branch predictor, off by default (compile with -DSS_TS_SELECT / -DSS_KIND_ARITH).
+// Simulated on dev (callgrind --branch-sim): SS_TS_SELECT removes 0.49 mispredicts per event line for 54
+// more instructions, SS_KIND_ARITH 0.14 for 8.5; on the development machine both measured equal or slower.
+// The same answer as ts_v3, organised for the branch predictor: which form a ts has (F1, epoch
+// milliseconds, F2) changes from line to line with no pattern, so the two common forms are both worked
+// out without a branch and one is selected; only what is neither (F2, other lengths, a date not in the
+// memo yet, bad text) takes a branch, to ts_v3, which decides everything.
+SS_V3I bool ts_v3b(const char* p,unsigned n,DateMemo3* memo,int64_t& out){
+ // F1: time of day and memo lookup, valid or not
+ const __m128i x=_mm_loadu_si128((const __m128i*)(p+3));
+ const __m128i tmpl=_mm_setr_epi8(0,0,0,0,0,0,0,'T','0','0',':','0','0',':','0','0');
+ const __m128i lim=_mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,0,2,9,0,5,9,0,5,9);
+ const __m128i v=_mm_sub_epi8(x,tmpl);
+ const unsigned shape=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(v,lim),lim));
+ const __m128i sm=_mm_madd_epi16(_mm_maddubs_epi16(v,_mm_setr_epi8(0,0,0,0,0,0,0,0,10,1,0,10,1,0,10,1)),_mm_setr_epi16(0,0,0,0,3600,60,60,1));
+ const uint64_t r=(uint64_t)_mm_extract_epi64(sm,1);
+ const uint64_t tod=((uint64_t)(uint32_t)r+(r>>32))*1000u; // exact whenever shape is all ones (see tod_v3); otherwise unused
+ uint64_t k;uint16_t cc;memcpy(&k,p+2,8);memcpy(&cc,p,2);
+ const DateMemo3& e=memo[((k&0x0F03000F01000000ULL)*((1ULL<<4)|(1ULL<<22)|(1ULL<<34)))>>52];
+ const uint64_t dayms=(uint64_t)e.ms; // read whether or not it is the right entry
+ // all-ones if the text is a valid F1 stamp whose date the memo knows, else zero (plain arithmetic, so it stays branch-free)
+ const uint64_t f1=0-(uint64_t)((unsigned)(n==20)&(unsigned)(p[19]=='Z')&(unsigned)(shape==0xFFFFu)&(unsigned)(tod<86400000ULL)&(unsigned)(e.k==k)&(unsigned)(e.cc==cc));
+ // epoch milliseconds: thirteen digits
+ const __m128i d=_mm_sub_epi8(_mm_loadu_si128((const __m128i*)p),_mm_set1_epi8('0'));
+ const __m128i dlim=_mm_setr_epi8(9,9,9,9,9,9,9,9,9,9,9,9,9,-1,-1,-1);
+ const unsigned digits=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(d,dlim),dlim));
+ const __m128i a=_mm_maddubs_epi16(d,_mm_setr_epi8(10,1,10,1,10,1,10,1,10,1,10,1,1,0,0,0));
+ const __m128i b=_mm_madd_epi16(a,_mm_setr_epi16(100,1,100,1,100,1,1,0));
+ const __m128i c=_mm_packus_epi32(b,b);
+ const uint64_t q=(uint64_t)_mm_cvtsi128_si64(_mm_madd_epi16(c,_mm_setr_epi16(10000,1,10,1,0,0,0,0)));
+ const int64_t epoch=(int64_t)((q&0xFFFFFFFFULL)*100000ULL+(q>>32)); // exact whenever digits is all ones (see epoch13_v3)
+ const uint64_t f3=0-(uint64_t)((unsigned)(n==13)&(unsigned)(digits==0xFFFFu));
+ out=(int64_t)(((dayms+tod)&f1)|((uint64_t)epoch&~f1));
+ if(__builtin_expect((f1|f3)!=0,1))return true;
+ return ts_v3(p,n,memo,out);
+}
+// event_kind() with the view/cart choice as arithmetic: which of the two a line is has no pattern,
+// while "four letters" is almost always true and predicts well.
+static inline __attribute__((always_inline)) unsigned event_kind_b(const char* p,unsigned n){
+ if(__builtin_expect(n==4,1)){uint32_t w;memcpy(&w,p,4);return (unsigned)(w==0x77656976u)+2u*(unsigned)(w==0x74726163u);}
+ if(n==8){uint64_t w;memcpy(&w,p,8);return w==0x6573616863727570ULL?3u:0u;}
+ return 0;
+}
 // hkey() of the n bytes at p, without the loop for the usual short IDs.
 // HKEY_START[n] is hkey's starting value for length n.
 static constexpr array<uint64_t,16> HKEY_START=[]{array<uint64_t,16> a{};for(uint64_t n=0;n<16;++n)a[n]=0x9e3779b97f4a7c15ULL^(n*0xbf58476d1ce4e5b9ULL);return a;}();
@@ -1140,16 +1193,26 @@ template<class GEN> SS_V3I const char* event_line_v3(const char* const p,const c
    const bool has5=(_blsi_u64(B2)&E2)==0;
    const char* const s1=p+b1;const char* const s2=p+b2;
    const uint64_t h=hkey_v3(s0,l0);
+#ifdef SS_KIND_ARITH
+   const unsigned kind=event_kind_b(b+b4,l4);
+#else
    const unsigned kind=event_kind(string_view(b+b4,l4));
+#endif
    uint64_t k=0;unsigned cat=0; // k stays 0 unless the line is a valid event
    if(kind&&l1!=0&&has5){
     int64_t ts;bool tsOk;
-    uint64_t a8,b8;uint16_t a2,b2_;
-    // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
-    if(l2==20&&s2[19]=='Z'&&(memcpy(&a8,s2,8),memcpy(&b8,s3,8),memcpy(&a2,s2+8,2),memcpy(&b2_,s3+8,2),((a8^b8)|(uint64_t)(a2^b2_))==0)){
-     const int64_t tod2=tod_v3(s2);
-     if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
-    }else tsOk=ts_v3(s2,l2,memo,ts);
+#ifdef SS_TS_SELECT
+    tsOk=ts_v3b(s2,l2,memo,ts);
+#else
+    {
+     uint64_t a8,b8;uint16_t a2,b2_;
+     // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
+     if(l2==20&&s2[19]=='Z'&&(memcpy(&a8,s2,8),memcpy(&b8,s3,8),memcpy(&a2,s2+8,2),memcpy(&b2_,s3+8,2),((a8^b8)|(uint64_t)(a2^b2_))==0)){
+      const int64_t tod2=tod_v3(s2);
+      if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
+     }else tsOk=ts_v3(s2,l2,memo,ts);
+    }
+#endif
     // window_start <= ts < window_end as one unsigned compare (the window is far shorter than 2^63 ms)
     uint64_t tsrel;
     if(tsOk&&(tsrel=(uint64_t)ts-(uint64_t)wstart)<wlen&&ingest-ts<=DAY){
@@ -1253,7 +1316,12 @@ template<class GEN> SS_V3I const char* click_line_v3(const char* const p,const W
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
    uint64_t trel;
-   if(!ts_v3(p+b3,l3,memo,ts)||(trel=(uint64_t)ts-(uint64_t)clickStart)>=wlen)break; // clickStart <= ts < window_end
+#ifdef SS_TS_SELECT
+   const bool tsOk=ts_v3b(p+b3,l3,memo,ts);
+#else
+   const bool tsOk=ts_v3(p+b3,l3,memo,ts);
+#endif
+   if(!tsOk||(trel=(uint64_t)ts-(uint64_t)clickStart)>=wlen)break; // clickStart <= ts < window_end
    uint64_t k0;uint32_t k1;
    const string_view camp(p+b2,l2);
    const uint32_t ci=__builtin_expect(KeyTable::pack(camp,k0,k1),1)?camps.find_packed(k0,k1):camps.find(camp);if(ci==KeyTable::NONE)break;
@@ -1311,6 +1379,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;}};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
+ if(const char* v=getenv("SS_INPUT")){const string_view w(v);optInput=w=="populate"?1:w=="seq"?2:w=="chunk"?3:0;}
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
@@ -1538,7 +1607,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   else if(w=="avx512y"&&hasV5)isaUse=ISA_AVX512Y;}
  // SS_LINES=index: the vector loops locate line starts ahead of cutting the lines (see SS_EVENT_LOOP_IX).
  const bool lineIndex=isaUse!=ISA_SSE2&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="index";
- cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")<<"\n";
+ cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
+#ifdef SS_TS_SELECT
+  <<"+tsselect"
+#endif
+#ifdef SS_KIND_ARITH
+  <<"+kindarith"
+#endif
+  <<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -1601,6 +1677,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
+   if(optInput==3){ // files start on a page boundary, so chunk offsets are page offsets
+    const size_t a=ck.from&~size_t(4095),b=min(ck.to,ck.len);
+    if(b>a)madvise((void*)(ck.base+a),(b-a+4095)&~size_t(4095),MADV_POPULATE_READ); // only a hint: any failure is ignored
+   }
    if(lineIndex){
     if(isaUse==ISA_AVX2){
      if(ck.click)clicks_avx2_ix(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
