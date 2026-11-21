@@ -140,6 +140,7 @@ struct PqFile{
 static void put_bytes(string& o,string_view s){put_le32(o,(uint32_t)s.size());o.append(s);}
 template<class V> static string_view raw(const V& v){return string_view((const char*)v.data(),v.size()*sizeof(v[0]));}
 
+static uint64_t gKe=0,gKu=0,gKc=0;static bool gKeys=false; // the generator's ID keys, read from the pipeline's STATS line
 struct RunResult{string label;double wall=0,user=0,sys=0;long minflt=0,majflt=0,maxrssMB=0,nvcsw=0,nivcsw=0;int rc=0;map<string,double> t;uint64_t pc[4]={0,0,0,0};int perfErr=0;};
 static vector<RunResult> results;
 static int perf_open(pid_t pid,uint32_t type,uint64_t config){
@@ -166,13 +167,47 @@ static void run_child(const string& bin,vector<pair<string,string>> env,RunResul
  r.minflt=ru.ru_minflt;r.majflt=ru.ru_majflt;r.maxrssMB=ru.ru_maxrss/1024;r.nvcsw=ru.ru_nvcsw;r.nivcsw=ru.ru_nivcsw;
  fwrite(out.data(),1,out.size(),stderr);
  size_t p=0;while(p<out.size()){size_t e=out.find('\n',p);if(e==string::npos)e=out.size();string line=out.substr(p,e-p);p=e+1;
-  if(line.rfind("TIME ",0)==0){size_t sp=line.find(' ',5);if(sp!=string::npos)r.t[line.substr(5,sp-5)]+=atof(line.c_str()+sp+1);}}
+  if(line.rfind("TIME ",0)==0){size_t sp=line.find(' ',5);if(sp!=string::npos)r.t[line.substr(5,sp-5)]+=atof(line.c_str()+sp+1);}
+  if(line.rfind("STATS dense keys ",0)==0){unsigned long long a=0,b=0,c=0;if(sscanf(line.c_str(),"STATS dense keys %llu %llu %llu",&a,&b,&c)==3&&(a|b|c)){gKe=a;gKu=b;gKc=c;gKeys=true;}}}
  r.rc=WIFEXITED(st)?WEXITSTATUS(st):-1;
 }
-// Writes each CSV of `src` into `dst` as `parts` files, each holding the header and `reps` tagged copies of the
-// data lines (a two-character replica tag goes in front of the given ID fields, so every copy has its own
-// events and people). Files of part 0 are named *-0.csv, so a smaller set can link to them.
-static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int parts,int idFields){
+// ---- The generator's ID scheme (see the dn:: block in main.cpp): needed to make replicas whose IDs are
+// still counters, so the pipeline's dense route sees them the way it sees real generated data. ----
+static const uint64_t DM=(1ull<<40)-1,DM1=0x9E3779B97F4Bull&DM,DM2=0xD6E8FEB86659ull&DM;
+static uint64_t dinv(uint64_t a){uint64_t x=a;for(int i=0;i<6;++i)x*=2-a*x;return x&DM;}
+static const uint64_t DI1=dinv(DM1),DI2=dinv(DM2);
+static inline uint64_t d_index(uint64_t y,uint64_t key){uint64_t m=(y*DI2)&DM;m=m^(m>>17)^(m>>34);return ((m^key)*DI1)&DM;}
+static inline uint64_t d_value(uint64_t index,uint64_t key){uint64_t m=((index*DM1)^key)&DM;m^=m>>17;return (m*DM2)&DM;}
+static inline bool d_parse36(const char* s,size_t n,uint64_t& y){if(n-1>7)return false;if(s[0]=='0'&&n>1)return false;uint64_t v=0;
+ for(size_t i=0;i<n;++i){unsigned d=(unsigned char)s[i]-(unsigned)'0';if(d>9){d=(unsigned char)s[i]-(unsigned)'a';if(d>25)return false;d+=10;}v=v*36+d;}
+ if(v>DM)return false;y=v;return true;}
+static inline void d_text36(string& out,char letter,uint64_t y){char buf[8];int at=8;do{const unsigned d=(unsigned)(y%36);buf[--at]=(char)(d<10?'0'+d:'a'+(d-10));y/=36;}while(y);out.push_back(letter);out.append(buf+at,(size_t)(8-at));}
+static atomic<uint64_t> gMaxE{0},gMaxC{0},gMaxI{0}; // largest counters / user index in the source data (plausible ones only)
+static uint64_t gOffE=0,gOffC=0,gOffI=0;            // counter distance between two copies
+// Counter of an ID field (quotes already removed) if it is a canonical ID with this letter; false otherwise.
+static inline bool d_counter(const char* s,size_t n,char letter,uint64_t& v){
+ if(!gKeys||n<2||s[0]!=letter)return false;uint64_t y;if(!d_parse36(s+1,n-1,y))return false;
+ v=d_index(y,letter=='e'?gKe:letter=='k'?gKc:gKu);return true;}
+static void d_scan_max(const fs::path& dir,char l0,char l1){
+ vector<fs::path> files;for(auto& f:fs::directory_iterator(dir))if(f.path().extension()==".csv")files.push_back(f.path());
+ atomic<size_t> next{0};
+ par(8,[&](int){uint64_t mE=0,mC=0,mI=0;for(;;){size_t j=next.fetch_add(1);if(j>=files.size())break;
+   string in;{ifstream f(files[j],ios::binary);in.assign(istreambuf_iterator<char>(f),{});}
+   size_t p=in.find('\n');if(p==string::npos)continue;++p;
+   while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();size_t q=p;
+    for(int k=0;k<2&&q<=e;++k){size_t c=in.find(',',q);if(c==string::npos||c>e)c=e;size_t a=q,b=c;if(b-a>=2&&in[a]=='"'&&in[b-1]=='"'){++a;--b;}
+     const char letter=k?l1:l0;uint64_t v;
+     if(d_counter(in.data()+a,b-a,letter,v)){if(letter=='u'){if((v>>9)<(1ull<<26))mI=max(mI,v>>9);}else if(v<(1ull<<31)){if(letter=='e')mE=max(mE,v);else mC=max(mC,v);}}
+     q=c+1;}
+    p=e+1;}}
+  for(auto pr:{make_pair(&gMaxE,mE),make_pair(&gMaxC,mC),make_pair(&gMaxI,mI)}){uint64_t cur=pr.first->load();while(pr.second>cur&&!pr.first->compare_exchange_weak(cur,pr.second)){}}});
+}
+// Writes each CSV of `src` into `dst` as `parts` files, each holding the header and `reps` copies of the data
+// lines. In copy r every dense ID in the first two fields is moved r steps up its counter space (events and
+// clicks by the number of counters in the source, users by the number of user indexes), so the copies are
+// distinct and the whole replica is again dense; any other ID gets a two-character replica tag in front.
+// Files of part 0 are named *-0.csv, so a smaller set can link to them.
+static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int parts,char l0,char l1){
  fs::create_directories(dst);
  vector<fs::path> files;for(auto& f:fs::directory_iterator(src))if(f.path().extension()==".csv")files.push_back(f.path());
  sort(files.begin(),files.end());
@@ -186,14 +221,25 @@ static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int p
     FILE* f=fopen((dst/name).c_str(),"wb");if(!f)continue;
     fwrite(in.data(),1,hdr,f);uint64_t wrote=hdr;
     for(int r0=0;r0<reps;++r0){
-     const int rep=part*reps+r0;
+     const uint64_t rep=(uint64_t)part*reps+r0;
      out.clear();const char tag=(char)('A'+rep%26),tag2=(char)('a'+rep/26);
      size_t p=hdr;
      while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
       size_t q=p;
-      for(int k=0;k<idFields&&q<=e;++k){ // tag the start of field k unless it is empty
+      for(int k=0;k<2&&q<=e;++k){
        size_t c=in.find(',',q);if(c==string::npos||c>e)c=e;
-       if(c>q){if(in[q]=='"'){out.push_back('"');if(c-q>2){out.push_back(tag);out.push_back(tag2);}out.append(in,q+1,c-q-1);}else{out.push_back(tag);out.push_back(tag2);out.append(in,q,c-q);}}
+       if(c>q){size_t a=q,b=c;const bool quoted=b-a>=2&&in[a]=='"'&&in[b-1]=='"';if(quoted){++a;--b;}
+        const char letter=k?l1:l0;uint64_t v;bool dense=false;
+        if(rep&&d_counter(in.data()+a,b-a,letter,v)){
+         if(letter=='u'){if((v>>9)<gOffI){v+=(rep*gOffI)<<9;dense=true;}}
+         else{const uint64_t off=letter=='e'?gOffE:gOffC;if(v<off){v+=rep*off;dense=true;}}}
+        if(in[q]=='"'&&!quoted){out.append(in,q,c-q);} // a lone quote: leave the field alone
+        else{if(quoted)out.push_back('"');
+         if(!rep)out.append(in,a,b-a);
+         else if(dense)d_text36(out,letter,d_value(v,letter=='e'?gKe:letter=='k'?gKc:gKu));
+         else{if(b>a){out.push_back(tag);out.push_back(tag2);}out.append(in,a,b-a);}
+         if(quoted)out.push_back('"');}
+       }
        if(c<e)out.push_back(',');
        q=c+1;
       }
@@ -317,9 +363,13 @@ int main(){
  const int BIG=getenv("SS_DIAG_BIG")?atoi(getenv("SS_DIAG_BIG")):20;
  const int PARTS=getenv("SS_DIAG_PARTS")?atoi(getenv("SS_DIAG_PARTS")):3;
  const fs::path big=fs::path(scratch)/"big",huge=fs::path(scratch)/"huge";
+ pipeline("keys",data,od(),{{"NCPU","8"},{"SS_STATS","1"}}); // the pipeline finds the generator's keys; its STATS line gives them to us
+ if(gKeys){d_scan_max(fs::path(data)/"events",'e','u');d_scan_max(fs::path(data)/"clicks",'k','u');d_scan_max(fs::path(data)/"links",'u','u');
+  gOffE=gMaxE.load()+1;gOffC=gMaxC.load()+1;gOffI=gMaxI.load()+1;}
+ fprintf(stderr,"DIAG keys %d: counters per copy: events %llu clicks %llu user indexes %llu\n",(int)gKeys,(unsigned long long)gOffE,(unsigned long long)gOffC,(unsigned long long)gOffI);
  {double t=now();uint64_t b=0;
   for(const char* sub:{"events","clicks","links"}){
-   b+=replicate(fs::path(data)/sub,huge/sub,BIG,PARTS,2);
+   b+=replicate(fs::path(data)/sub,huge/sub,BIG,PARTS,sub[0]=='e'?'e':sub[0]=='c'?'k':'u','u');
    fs::create_directories(big/sub);
    for(auto& f:fs::directory_iterator(huge/sub)){const string n=f.path().filename().string();if(n.size()>6&&n.compare(n.size()-6,6,"-0.csv")==0)fs::create_symlink(f.path(),big/sub/n);}
   }
