@@ -2054,7 +2054,7 @@ SS_EVENT_LOOP_BATCH(events_avx512z_bt,SS_V5,win_masks_avx512z,nl_mask_avx512z)
 SS_EVENT_LOOP_BATCH(events_avx512y_bt,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 // ---- ev8 event loop (SS_LINES=ev8) ----
 // The lines are taken eight at a time straight from the line index: a kernel works out everything about the
-// eight rows from the line text (vert::ev8_v5, AVX-512, eight 64-bit lanes; vert::ev8_ref is its scalar twin
+// eight rows from the line text (vert::scan8_v5 + dec8_v5, AVX-512, eight 64-bit lanes; vert::ev8_ref is the scalar twin
 // with the same decisions, used by the avx2 loop), the slots of the group are asked for, and then the group
 // before it is finished in line order, so every slot has had at least eight lines of time. A row the kernel
 // does not decide (ok bit clear) goes through event_line_v3 unchanged when its group is finished. The
@@ -2099,16 +2099,16 @@ VERT_T5 static inline __m512i id8k_v5(__m512i W,__m512i N,uint64_t key,uint64_t 
  // MIN36[n] picked by the low three bits of n (n == 8 -> entry 0); n == 0 and n > 8 are refused by the length test
  const __m512i min36=_mm512_permutexvar_epi64(N,_mm512_setr_epi64(78364164096LL,0,36,1296,46656,1679616,60466176,2176782336LL));
  __mmask8 ok=_mm512_testn_epi64_mask(bad,bad);
- ok&=_mm512_cmple_epu64_mask(_mm512_sub_epi64(N,_mm512_set1_epi64(1)),_mm512_set1_epi64(7));
- ok&=_mm512_cmpge_epu64_mask(val,min36);
- ok&=_mm512_cmple_epu64_mask(val,_mm512_set1_epi64((long long)MASK40));
+ // (each test is a compare under the mask of the ones before: the mask never leaves the mask registers)
+ ok=_mm512_mask_cmple_epu64_mask(ok,_mm512_sub_epi64(N,_mm512_set1_epi64(1)),_mm512_set1_epi64(7));
+ ok=_mm512_mask_cmpge_epu64_mask(ok,val,min36);
+ ok=_mm512_mask_cmple_epu64_mask(ok,val,_mm512_set1_epi64((long long)MASK40));
  const __m512i mask=_mm512_set1_epi64((long long)MASK40);
  __m512i m=_mm512_and_si512(_mm512_mullo_epi64(val,_mm512_set1_epi64((long long)I2)),mask);
  m=_mm512_ternarylogic_epi64(m,_mm512_srli_epi64(m,17),_mm512_srli_epi64(m,34),0x96);
  m=_mm512_xor_si512(m,_mm512_set1_epi64((long long)key));
  const __m512i c=_mm512_and_si512(_mm512_mullo_epi64(m,_mm512_set1_epi64((long long)I1)),mask);
- ok&=_mm512_cmplt_epu64_mask(c,_mm512_set1_epi64((long long)limit));
- okOut=ok;return c;
+ okOut=_mm512_mask_cmplt_epu64_mask(ok,c,_mm512_set1_epi64((long long)limit));return c;
 }
 struct DateEnt{uint64_t k;uint32_t cc;uint32_t pad;int64_t ms;};
 static_assert(sizeof(DateEnt)==24);
@@ -2162,13 +2162,13 @@ VERT_T5 static inline __m512i tod8k_v5(__m512i a,__m512i b,__mmask8& ok){
  const __m512i pb=_mm512_madd_epi16(_mm512_maddubs_epi16(vb,VERT_C5(0x00010A00010A0001ULL)),VERT_C5(0x00010001003C0E10ULL));
  const __m512i s=_mm512_add_epi32(pa,pb);
  const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(s,_mm512_srli_epi64(s,32)),VERT_C5(1000));
- ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(va,la),la)&_mm512_cmpeq_epi64_mask(_mm512_max_epu8(vb,lb),lb)&_mm512_cmplt_epu64_mask(ms,VERT_C5(86400000));
+ ok=_mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(va,la),la),_mm512_max_epu8(vb,lb),lb),ms,VERT_C5(86400000));
  return ms;
 }
 VERT_T5 static inline __m512i epoch8k_v5(__m512i w0,__m512i w1,__mmask8& ok){
  const __m512i z=_mm512_set1_epi8('0'),nine=_mm512_set1_epi8(9);
  const __m512i v0=_mm512_sub_epi8(w0,z),v1=_mm512_sub_epi8(w1,z);
- ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v0,nine),nine)&_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v1,nine),nine);
+ ok=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v0,nine),nine),_mm512_max_epu8(v1,nine),nine);
  const __m512i p0=_mm512_madd_epi16(_mm512_maddubs_epi16(v0,VERT_C5(0x010A010A010A010AULL)),VERT_C5(0x0001006400010064ULL));
  const __m512i p1=_mm512_madd_epi16(_mm512_maddubs_epi16(v1,VERT_C5(0x010A010A01000000ULL)),VERT_C5(0x0001006400010000ULL));
  const __m512i tenk=VERT_C5(10000);
@@ -2180,7 +2180,7 @@ VERT_T5 static inline __m512i off8k_v5(__m512i w3,__mmask8& ok){
  const __m512i v=_mm512_sub_epi8(w3,VERT_C5(0x30303A3030000000ULL)),l=VERT_C5(0x0905000902FFFFFFULL);
  const __m512i p=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_C5(0x010A00010A000000ULL)),VERT_C5(0x0001003C003C0000ULL));
  const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(p,_mm512_srli_epi64(p,32)),VERT_C5(60000));
- ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,l),l)&_mm512_cmplt_epu64_mask(ms,VERT_C5(86400000));
+ ok=_mm512_mask_cmplt_epu64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,l),l),ms,VERT_C5(86400000));
  return ms;
 }
 VERT_T5 static inline __m512i day8k_v5(__m512i w0,__m512i w1,const DateEnt* memo,__mmask8& hit){
@@ -2189,7 +2189,7 @@ VERT_T5 static inline __m512i day8k_v5(__m512i w0,__m512i w1,const DateEnt* memo
  const long long* base=(const long long*)memo;
  const __m512i gk=_mm512_i64gather_epi64(i3,base,8),gc=_mm512_i64gather_epi64(i3,base+1,8),gm=_mm512_i64gather_epi64(i3,base+2,8);
  const __m512i k=_mm512_or_si512(_mm512_srli_epi64(w0,16),_mm512_slli_epi64(w1,48));
- hit=_mm512_cmpeq_epi64_mask(gk,k)&_mm512_cmpeq_epi64_mask(_mm512_and_si512(gc,VERT_C5(0xFFFFFFFFULL)),_mm512_and_si512(w0,VERT_C5(0xFFFF)));
+ hit=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(gk,k),_mm512_and_si512(gc,VERT_C5(0xFFFFFFFFULL)),_mm512_and_si512(w0,VERT_C5(0xFFFF)));
  return gm;
 }
 VERT_T5 static inline __m512i kind8k_v5(__m512i w,__m512i n,__mmask8& nz){
@@ -2295,19 +2295,21 @@ static inline void ev8_ref(const char* const* ls,const char* const* nx,const EvC
  }
  o.ok=(uint8_t)okm;o.idok=(uint8_t)idm;o.pur=(uint8_t)pum;
 }
-VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
- // ---- horizontal: the two 64-byte windows of every line -> comma and quote masks ----
- alignas(64) uint64_t aC1[8],aQ1[8],aC2[8],aQ2[8],aB[8];
- {const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"');
-  for(int i=0;i<8;++i){
-   const char* const p=ls[i];
-   const __m512i x=_mm512_loadu_si512((const void*)p);
-   const uint64_t cm=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));
-   aC1[i]=cm;aQ1[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq));
-   const char* const b=p+_tzcnt_u64(_blsr_u64(_blsr_u64(cm)))+1; // one past the third comma (p+65 if there is none)
-   const __m512i y=_mm512_loadu_si512((const void*)b);
-   aC2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc));aQ2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));aB[i]=(uint64_t)b;
-  }}
+struct alignas(64) Ev8Scan{uint64_t c1[8],q1[8],c2[8],q2[8],b[8];};
+VERT_T5 static inline void scan8_v5(const char* const* ls,Ev8Scan& s){
+ const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"');
+ for(int i=0;i<8;++i){
+  const char* const p=ls[i];
+  const __m512i x=_mm512_loadu_si512((const void*)p);
+  const uint64_t cm=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));
+  s.c1[i]=cm;s.q1[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq));
+  const char* const b=p+_tzcnt_u64(_blsr_u64(_blsr_u64(cm)))+1; // one past the third comma (p+65 if there is none)
+  const __m512i y=_mm512_loadu_si512((const void*)b);
+  s.c2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc));s.q2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));s.b[i]=(uint64_t)b;
+ }
+}
+VERT_T5 static inline void dec8_v5(const char* const* ls,const char* const* nx,const Ev8Scan& s,const EvConst& c,Ev8Out& o){
+ const uint64_t* const aC1=s.c1;const uint64_t* const aQ1=s.q1;const uint64_t* const aC2=s.c2;const uint64_t* const aQ2=s.q2;const uint64_t* const aB=s.b;
  // ---- vertical ----
  const __m512i one=VERT_C5(1),ones=VERT_C5(-1),c63=VERT_C5(63),c64=VERT_C5(64);
  #define VERT_TZ5(x,xm) _mm512_sub_epi64(c63,_mm512_lzcnt_epi64(_mm512_xor_si512(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
@@ -2330,9 +2332,10 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
  const __m512i u0=_mm512_add_epi64(d,ones),d0=VERT_TZ5(d,u0),dA=_mm512_and_si512(d,u0);
  const __m512i u1=_mm512_add_epi64(dA,ones),d1=VERT_TZ5(dA,u1),dB=_mm512_and_si512(dA,u1);
  const __m512i u2=_mm512_add_epi64(dB,ones),d2=VERT_TZ5(dB,u2),dR=_mm512_and_si512(dB,u2);
- const __m512i err=_mm512_or_si512(err1,err2);
- __mmask8 ok=_mm512_testn_epi64_mask(err,err)&_mm512_testn_epi64_mask(dR,dR)&_mm512_test_epi64_mask(dB,dB); // no quote error, exactly three commas
- ok&=_mm512_cmplt_epu64_mask(c2,c64)&_mm512_cmplt_epu64_mask(L,c64);                                           // third comma and newline inside their windows
+ const __m512i err=_mm512_ternarylogic_epi64(err1,err2,dR,0xFE);            // a quote error, or a fourth comma before the newline
+ __mmask8 ok=_mm512_testn_epi64_mask(err,err);
+ ok=_mm512_mask_test_epi64_mask(ok,dB,dB);                                    // at least three commas
+ ok=_mm512_mask_cmplt_epu64_mask(ok,_mm512_or_si512(c2,L),c64);               // third comma and newline inside their windows ((e2|L)>>6 == 0)
  // fields: a quoted field starts one later and is two shorter
  const __m512i z0=_mm512_and_si512(Q1,one);
  const __m512i a1=_mm512_add_epi64(c0,one),z1=_mm512_and_si512(_mm512_srlv_epi64(q1,a1),one),o1=_mm512_add_epi64(a1,z1),l1=_mm512_sub_epi64(_mm512_sub_epi64(c1,o1),z1);
@@ -2348,12 +2351,12 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
  const __m512i W0=VERT_G5(S0),IDW=VERT_G5(_mm512_add_epi64(S0,one));
  __mmask8 idok;const __m512i ve=id8k_v5(IDW,idn,c.ke,c.limE,idok);
  const __m512i lowbyte=VERT_C5(0xFF);
- idok&=_mm512_cmpeq_epi64_mask(_mm512_and_si512(W0,lowbyte),VERT_C5('e'));
+ idok=_mm512_mask_cmpeq_epi64_mask(idok,_mm512_and_si512(W0,lowbyte),VERT_C5('e'));
  // user: empty, or 'u' + 0..8 bytes kept as text
  const __m512i S1=_mm512_add_epi64(P,o1);
  const __m512i U0=VERT_G5(S1),UW=VERT_G5(_mm512_add_epi64(S1,one));
  const __mmask8 hasu=_mm512_test_epi64_mask(l1,l1);
- ok&=(__mmask8)(~hasu|(_mm512_cmpeq_epi64_mask(_mm512_and_si512(U0,lowbyte),VERT_C5('u'))&_mm512_cmple_epu64_mask(l1,VERT_C5(9))));
+ ok=_kand_mask8(ok,_kor_mask8(_knot_mask8(hasu),_mm512_mask_cmple_epu64_mask(_mm512_cmpeq_epi64_mask(_mm512_and_si512(U0,lowbyte),VERT_C5('u')),l1,VERT_C5(9))));
  const __m512i un=_mm512_maskz_sub_epi64(hasu,l1,one);
  const __m512i uw=_mm512_and_si512(UW,_mm512_srlv_epi64(ones,_mm512_sub_epi64(c64,_mm512_slli_epi64(un,3)))); // un == 0: shift by 64 gives 0
  // ingest_ts: 20 bytes, Z form
@@ -2363,7 +2366,7 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
  const __m512i todi=tod8k_v5(ig1,ig2,oki);
  const __m512i dayi=day8k_v5(ig0,ig1,c.memo,hiti);
  const __m512i ingest=_mm512_add_epi64(dayi,todi);
- ok&=oki&hiti&_mm512_cmpeq_epi64_mask(_mm512_srli_epi64(ig2,56),VERT_C5('Z'))&_mm512_cmpeq_epi64_mask(l3,VERT_C5(20));
+ ok=_mm512_mask_cmpeq_epi64_mask(_mm512_mask_cmpeq_epi64_mask(_kand_mask8(ok,_kand_mask8(oki,hiti)),_mm512_srli_epi64(ig2,56),VERT_C5('Z')),l3,VERT_C5(20));
  // ts: 20 (Z), 13 (digits), 25 (offset)
  const __mmask8 is20=_mm512_cmpeq_epi64_mask(l2,VERT_C5(20)),is25=_mm512_cmpeq_epi64_mask(l2,VERT_C5(25)),is13=_mm512_cmpeq_epi64_mask(l2,VERT_C5(13));
  const __m512i S2=_mm512_add_epi64(P,o2);
@@ -2374,32 +2377,33 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
  const __m512i off=off8k_v5(ts3,okoff);
  const __m512i ep=epoch8k_v5(ts0,ts1,okep);
  const __m512i b19=_mm512_srli_epi64(ts2,56);
- const __mmask8 isZ=_mm512_cmpeq_epi64_mask(b19,VERT_C5('Z')),isP=_mm512_cmpeq_epi64_mask(b19,VERT_C5('+')),isM=_mm512_cmpeq_epi64_mask(b19,VERT_C5('-'));
+ const __mmask8 z20=_mm512_mask_cmpeq_epi64_mask(is20,b19,VERT_C5('Z')),p25=_mm512_mask_cmpeq_epi64_mask(is25,b19,VERT_C5('+')),m25=_mm512_mask_cmpeq_epi64_mask(is25,b19,VERT_C5('-'));
  __m512i ts=_mm512_add_epi64(days,tods);
- ts=_mm512_mask_sub_epi64(ts,(__mmask8)(is25&isP),ts,off);
- ts=_mm512_mask_add_epi64(ts,(__mmask8)(is25&isM),ts,off);
+ ts=_mm512_mask_sub_epi64(ts,p25,ts,off);
+ ts=_mm512_mask_add_epi64(ts,m25,ts,off);
  ts=_mm512_mask_mov_epi64(ts,is13,ep);
- ok&=(__mmask8)((is13&okep)|(oks&hits&((is20&isZ)|(is25&okoff&(isP|isM)))));
+ // ts decided: 13 digits, or (valid time and known date) and (Z form, or offset form with a valid offset)
+ ok=_kand_mask8(ok,_kor_mask8(_kand_mask8(is13,okep),_kand_mask8(_kand_mask8(oks,hits),_kor_mask8(z20,_kand_mask8(okoff,_kor_mask8(p25,m25))))));
  // kind, validity, k
  const __m512i kind=kind8k_v5(VERT_G5(_mm512_add_epi64(Bv,o4)),l4,knz);
  const __m512i tsrel=_mm512_sub_epi64(ts,VERT_C5(c.wstart));
- __mmask8 valid=knz&hasu&_mm512_test_epi64_mask(l5,l5)&_mm512_cmplt_epu64_mask(tsrel,VERT_C5(c.wlen));
- valid&=_mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest,ts),VERT_C5(DAYMS));
+ __mmask8 valid=_mm512_mask_cmplt_epu64_mask(_mm512_mask_test_epi64_mask(_kand_mask8(knz,hasu),l5,l5),tsrel,VERT_C5(c.wlen));
+ valid=_mm512_mask_cmple_epi64_mask(valid,_mm512_sub_epi64(ingest,ts),VERT_C5(DAYMS));
  __m512i k=_mm512_slli_epi64(_mm512_add_epi64(tsrel,one),EV_TS_SHIFT);
  // purchases: the price as price_value takes it, for fields of up to 8 bytes (right-aligned over '0' like the ID digits)
  const __m512i S6=_mm512_add_epi64(Bv,o6);
- const __mmask8 pv=valid&_mm512_cmpeq_epi64_mask(kind,VERT_C5(3));
- __mmask8 pur=pv;
+ const __mmask8 pv=_mm512_mask_cmpeq_epi64_mask(valid,kind,VERT_C5(3));
+ __mmask8 pur;
  {const __m512i n8=_mm512_slli_epi64(l6,3);
   const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(VERT_G5(S6),_mm512_sub_epi64(c64,n8)),_mm512_srlv_epi64(_mm512_set1_epi8(0x30),n8));
   const __m512i v=_mm512_sub_epi8(x,_mm512_set1_epi8('0')),nine=_mm512_set1_epi8(9);
   const __m512i p4=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_C5(0x010A010A010A010AULL)),VERT_C5(0x0001006400010064ULL));
   const __m512i price=_mm512_add_epi64(_mm512_mul_epu32(p4,VERT_C5(10000)),_mm512_srli_epi64(p4,32));
-  pur&=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,nine),nine)&_mm512_cmple_epu64_mask(_mm512_sub_epi64(price,one),VERT_C5(PRICE_MAX-1)); // digits, 1..10000000 (an empty field gives 0)
-  ok&=(__mmask8)~(pv&_mm512_cmplt_epu64_mask(VERT_C5(8),l6));                                                                     // a longer price field: the row code decides
+  pur=_mm512_mask_cmple_epu64_mask(_mm512_mask_cmpeq_epi64_mask(pv,_mm512_max_epu8(v,nine),nine),_mm512_sub_epi64(price,one),VERT_C5(PRICE_MAX-1)); // digits, 1..10000000 (an empty field gives 0)
+  ok=_kandn_mask8(_mm512_mask_cmplt_epu64_mask(pv,VERT_C5(8),l6),ok);                                                             // a longer price field: the row code decides
   k=_mm512_mask_or_epi64(k,pur,k,_mm512_or_si512(price,VERT_C5(EV_PURCHASE_BIT)));
  }
- valid&=(__mmask8)(~pv|pur); // a purchase with a bad price is not a valid event
+ valid=_kand_mask8(valid,_kor_mask8(_knot_mask8(pv),pur)); // a purchase with a bad price is not a valid event
  const __m512i tid=VERT_C5(c.tid48);
  _mm512_store_si512((void*)o.ve,ve);_mm512_store_si512((void*)o.so,_mm512_slli_epi64(ve,5));
  _mm512_store_si512((void*)o.kk,_mm512_mask_mov_epi64(VERT_C5(ESLOT_INVALID_K),valid,k));
@@ -2408,10 +2412,13 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
  _mm512_store_si512((void*)o.uw,_mm512_maskz_mov_epi64(valid,uw));
  _mm512_store_si512((void*)o.s5,_mm512_add_epi64(Bv,o5));_mm512_store_si512((void*)o.l5,l5);
  _mm512_store_si512((void*)o.s6,S6);_mm512_store_si512((void*)o.l6,l6);
- ok&=idok;
- o.idok=(uint8_t)idok;o.ok=(uint8_t)ok;o.pur=(uint8_t)(pur&ok);
+ ok=_kand_mask8(ok,idok);
+ o.idok=(uint8_t)idok;o.ok=(uint8_t)ok;o.pur=(uint8_t)_kand_mask8(pur,ok);
  #undef VERT_G5
  #undef VERT_TZ5
+}
+VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
+ Ev8Scan s;scan8_v5(ls,s);dec8_v5(ls,nx,s,c,o);
 }
 #undef VERT_C5
 #undef VERT_LD5
@@ -2419,8 +2426,10 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
 static_assert(sizeof(vert::DateEnt)==sizeof(DateMemo3)&&offsetof(vert::DateEnt,k)==offsetof(DateMemo3,k)&&offsetof(vert::DateEnt,cc)==offsetof(DateMemo3,cc)&&offsetof(vert::DateEnt,ms)==offsetof(DateMemo3,ms));
 static_assert(vert::ESLOT_INVALID_K==ESLOT_INVALID&&vert::EV_PURCHASE_BIT==EV_PURCHASE&&vert::RAW_USER==DENSE_USER_RAW&&sizeof(ESlot)==32);
 static_assert(vert::MASK40==dn::MASK&&vert::I1==dn::I1&&vert::I2==dn::I2&&vert::EV_TS_SHIFT==EV_TS&&vert::DAYMS==DAY);
-// The scalar kernel as a call of its own (the avx2 loop; also what callgrind and the sanitizer runs see).
-[[gnu::noinline]] static void ev8_ref_call(const char* const* ls,const char* const* nx,const vert::EvConst& c,vert::Ev8Out& o){vert::ev8_ref(ls,nx,c,o);}
+// The scalar kernel in the two-step shape of the vector one (nothing to scan), as a call of its own: the avx2
+// loop, a test stand-in only (also what callgrind and the sanitizer runs see).
+static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
+[[gnu::noinline]] static void ev8_dec_ref(const char* const* ls,const char* const* nx,const vert::Ev8Scan&,const vert::EvConst& c,vert::Ev8Out& o){vert::ev8_ref(ls,nx,c,o);}
 // Finishing the first N rows of a group in line order. Purchases first get their category (reads only).
 // A group whose eight rows are all ok takes the short way: no row test, and the highest counter of the group
 // goes into vmx (the low halves of four 64-bit lanes; fastAny says that vmx holds anything).
@@ -2440,53 +2449,63 @@ static_assert(vert::MASK40==dn::MASK&&vert::I1==dn::I1&&vert::I2==dn::I2&&vert::
     event_line_v3<true,true>(q_,bb_,w1_,MASKS(bb_),X_[i_]-1,pre_,lp,pend,pp,dmax,send,ring,rpos,general);}} }
 // The line index of this loop. ls[pos..m]: the starts of the lines not yet in a group; ls[pos..m-1] have their
 // newline (ls[i+1]-1), the line at ls[m] not yet (the index has not got that far, or the file ends without
-// one). The group that is waiting to be finished keeps its eight starts right before ls[pos].
+// one). Three groups are under way at any time, each one step further than the next:
+//   N  just formed from the index: SCAN (the window masks of its lines, kept in one of two Ev8Scan)
+//   D  formed a turn ago: DEC (everything else, from its own scan) and the requests for its slots
+//   F  decoded a turn ago: finished (SS_EV8_FINISH), so every slot has had eight lines and a kernel call of time
+// The masks a DEC loads were stored a whole turn earlier (a load right behind its eight stores would wait for
+// them). The groups that are under way keep their eight starts each right before ls[pos]; a group's scan is
+// always the scan of exactly its lines.
 static constexpr size_t EV8_BLOCK=4096; // bytes indexed at a time
 #define SS_EV8_PF(O_,i_) __builtin_prefetch(&SS_EV8_SLOT(O_,i_),1,3);
-#define SS_EVENT_LOOP_EV8(NAME,TARGET,MASKS,NLMASK,KERNEL) \
+#define SS_EVENT_LOOP_EV8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC) \
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
  const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;ERing* const ring=nullptr;unsigned rpos=0; /* no pending batch, no ring here */ \
- const char* ls[EV8_BLOCK+64+32];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
+ const char* ls[EV8_BLOCK+64+64];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
  const vert::EvConst ec{lp.ke,lp.limE,lp.wstart,lp.wlen,(const vert::DateEnt*)lp.memo,lp.tid48}; \
- vert::Ev8Out out[2];const char* tls[8];const char* tnx[8];const char* const* gl[2]={ls,ls};const char* const* gx[2]={ls,ls};unsigned gn[2]={0,0};int cur=0;bool more=true; \
+ vert::Ev8Out out[2];vert::Ev8Scan sc[2];const char* tls[8];const char* tnx[8]; \
+ const char* const* gl[3]={ls,ls,ls};const char* const* gx[3]={ls,ls,ls};unsigned gn[3]={0,0,0}; /* lines, next lines and number of rows of N, D, F */ \
+ unsigned iN=0,iD=1,iF=2,sN=0,oD=0;bool more=true; /* sc[sN]: N's scan, sc[sN^1]: D's; out[oD]: D's results, out[oD^1]: F's */ \
  __m256i vmx=_mm256_setzero_si256();bool fastAny=false; \
- while(more||gn[cur^1]){ \
+ while(more||gn[iD]||gn[iF]){ \
   unsigned n=0; \
   if(more){ \
    if(pos+8>m){ /* fewer than eight whole lines known: what is still needed moves to the front and the index goes on */ \
-    const size_t s_=pos-(gn[cur^1]?8:0); \
-    if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_;gl[cur^1]=ls;gx[cur^1]=ls+1;} \
+    const size_t s_=pos-(gn[iD]?8:0)-(gn[iF]?8:0); \
+    if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_; \
+     if(gn[iD]){gl[iD]-=s_;gx[iD]-=s_;} if(gn[iF]){gl[iF]-=s_;gx[iF]-=s_;}} \
     while(m-pos<8&&scan<end&&ls[m]<lim){ \
      const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
      do{uint64_t x_=NLMASK(scan);while(x_){ls[++m]=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);}scan+=64;}while(scan<stop);} \
    } \
-   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[cur]=ls+pos;gx[cur]=ls+pos+1;} \
+   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[iN]=ls+pos;gx[iN]=ls+pos+1;} \
    else{ /* the last lines of the chunk: a short group, filled up with copies of its last line (results not used) */ \
     more=false; \
     while(pos+n<m&&ls[pos+n]<lim)++n; \
-    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}gl[cur]=tls;gx[cur]=tnx;} \
+    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}gl[iN]=tls;gx[iN]=tnx;} \
    } \
    pos+=n; \
-   if(n){ \
-    vert::Ev8Out& o_=out[cur]; \
-    KERNEL(gl[cur],gx[cur],ec,o_); \
-    if(__builtin_expect((n==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
-    else for(unsigned x_=o_.idok&((1u<<n)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
-   } \
+   if(n)SCAN(gl[iN],sc[sN]); \
   } \
-  gn[cur]=n; \
-  if(gn[cur^1])SS_EV8_FINISH(out[cur^1],gl[cur^1],gx[cur^1],gn[cur^1],MASKS) \
-  cur^=1; \
+  gn[iN]=n; \
+  if(gn[iD]){ \
+   vert::Ev8Out& o_=out[oD];const unsigned nd_=gn[iD]; \
+   DEC(gl[iD],gx[iD],sc[sN^1],ec,o_); \
+   if(__builtin_expect((nd_==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&((1u<<nd_)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
+  } \
+  if(gn[iF])SS_EV8_FINISH(out[oD^1],gl[iF],gx[iF],gn[iF],MASKS) \
+  {const unsigned t_=iF;iF=iD;iD=iN;iN=t_;sN^=1;oD^=1;} \
  } \
  if(pos==m&&ls[m]<lim)line_general<7>(ls[m],end,general); /* the last line has no newline */ \
  if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
  tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send); \
 }
-SS_EVENT_LOOP_EV8(events_avx2_e8,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_ref_call)
-SS_EVENT_LOOP_EV8(events_avx512z_e8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::ev8_v5)
-SS_EVENT_LOOP_EV8(events_avx512y_e8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert::ev8_v5)
+SS_EVENT_LOOP_EV8(events_avx2_e8,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_scan_none,ev8_dec_ref)
+SS_EVENT_LOOP_EV8(events_avx512z_e8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::scan8_v5,vert::dec8_v5)
+SS_EVENT_LOOP_EV8(events_avx512y_e8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert::scan8_v5,vert::dec8_v5)
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
