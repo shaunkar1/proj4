@@ -399,12 +399,12 @@ int main(){
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  for(int r=0;r<5;++r){
   add("B",1,{N8});add("c62",1,{N8},"core-b");add("c61",1,{N8},"core-c");
-  add("ub",1,{N8,UB});add("ubp",1,{N8,UB,{"SS_POOLPRE","1"}});add("l2",1,{N8,L2});add("l2w",1,{N8,L2,{"SS_PF","w"}});add("all",1,{N8,L2,UB});
-  if(r<3){add("mt4",1,{N8,{"SS_MAPTHREADS","4"}});add("Bs",1,{N8,ST});add("ubs",1,{N8,ST,UB});}
+  add("ub",1,{N8,UB});add("ubp",1,{N8,UB,{"SS_POOLPRE","1"}});add("l2",1,{N8,L2});add("l2w",1,{N8,L2,{"SS_PF","w"}});add("all",1,{N8,L2,UB});add("ln",1,{N8},"core-l");add("b4",1,{N8},"core-d");
+  if(r<3){add("Bs",1,{N8,ST});add("ubs",1,{N8,ST,UB});add("pB",1,{N8,PO},"core-b");add("pL",1,{N8,PO},"core-l");}
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("H61",1,{N8},"core-c",true);add("Hub",1,{N8,UB},"",true);add("Hl2",1,{N8,L2},"",true);add("Hall",1,{N8,L2,UB},"",true);
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("H61",1,{N8},"core-c",true);add("Hub",1,{N8,UB},"",true);add("Hl2",1,{N8,L2},"",true);add("Hall",1,{N8,L2,UB},"",true);add("Hln",1,{N8},"core-l",true);add("Hb4",1,{N8},"core-d",true);
   if(r<2)add("HBs",1,{N8,ST},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
@@ -482,11 +482,11 @@ int main(){
     const string k=key;double x;if(k=="w")x=r.wall;else{auto it=r.t.find(k=="P"?"PARSE":k=="X"?"DENSE":k=="R"?"RESOLVE":k=="A"?"AGGREGATE":key);x=it==r.t.end()?0:it->second;}v.push_back(x);}
    if(v.empty())return -1;sort(v.begin(),v.end());return (long)(v[v.size()/2]*1e3+0.5);};
   auto mm=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wPRXA";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one))+"~"+to_string(med(grp,one));}return o+" ";};
-  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c63","B")+mm("c62","c62")+mm("c61","c61")+mm("c63-unmap-bg","ub")+mm("unmap-bg+poolpre","ubp")+mm("lead2","l2")+mm("lead2+pfw","l2w")+mm("lead2+unmap-bg","all")+mm("mapthreads4","mt4");
+  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c63","B")+mm("c62","c62")+mm("c61","c61")+mm("c63-unmap-bg","ub")+mm("unmap-bg+poolpre","ubp")+mm("lead2","l2")+mm("lead2+pfw","l2w")+mm("lead2+unmap-bg","all")+mm("LANES(on c62)","ln")+mm("B4-indexpass(on c62+B3)","b4")+"| parse-only P/us: "+fmt("c62","pB","Pus")+fmt("lanes","pL","Pus");
   a+="| c63 small stages MAP/KEYS/LINK+FLATTEN/DEDUP/DENSE1/WRITE/exit: "+fmt("","Bs","MKLDYWE")+"u/s "+fmt("c63","B","us")+fmt("c62","c62","us")+fmt("c61","c61","us");
   {const RunResult* r=get("Bs#0");if(r)a+="| DENSE threads c63:"+squeeze(r->dth)+" csw "+r->csw+" ";}
   {const RunResult* r=get("ubs#0");if(r)a+="| unmap-bg:"+squeeze(r->dth)+" csw "+r->csw+" ";}
-  c+="60M min~median w/P/R/X/A: "+mm("c63","HB")+mm("c62","H62")+mm("c61","H61")+mm("unmap-bg","Hub")+mm("lead2","Hl2")+mm("lead2+unmap-bg","Hall");
+  c+="60M min~median w/P/R/X/A: "+mm("c63","HB")+mm("c62","H62")+mm("c61","H61")+mm("unmap-bg","Hub")+mm("lead2","Hl2")+mm("lead2+unmap-bg","Hall")+mm("LANES","Hln")+mm("B4","Hb4");
   {const RunResult* r=get("HBs#0");if(r)c+="| DENSE threads c63 60M:"+squeeze(r->dth)+" ";}
   c+="| "+floorText+"|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
