@@ -1,6 +1,9 @@
 // Shopping Sessions: exact CSV / identity / attribution core.
 // No third-party C++ libraries, intermediate output is hex-encoded to preserve raw identifiers.
 #include <algorithm>
+#include <atomic>
+#include <memory>
+#include <omp.h>
 #include <parallel/algorithm>
 #include <array>
 #include <charconv>
@@ -99,27 +102,38 @@ static vector<fs::path> csv_files(const fs::path& dir){
  for(auto& f:fs::directory_iterator(dir))if(f.is_regular_file()&&f.path().extension()==".csv")out.push_back(f.path());
  sort(out.begin(),out.end());return out;
 }
-static vector<pair<void*,size_t>> held_mmaps;
-static void release_mmaps(){for(auto [p,n]:held_mmaps)munmap(p,n);held_mmaps.clear();}
-template<class FN> static void read_lines(const fs::path& path,FN&& fn,bool hold=false){
+// Every input file stays mapped until exit: IDs are kept as views into the maps.
+struct Mapped{const char* base=nullptr;size_t len=0;};
+static Mapped map_file(const fs::path& path){
  int fd=open(path.c_str(),O_RDONLY);
  if(fd<0)throw runtime_error("Cannot open "+path.string());
  struct stat st{};if(fstat(fd,&st)!=0){close(fd);throw runtime_error("Cannot stat "+path.string());}
  size_t len=st.st_size;
- if(len==0){close(fd);return;}
+ if(len==0){close(fd);return {};}
  void* base=mmap(nullptr,len,PROT_READ,MAP_PRIVATE,fd,0);
  close(fd);
  if(base==MAP_FAILED)throw runtime_error("Cannot map "+path.string());
- const char* p=(const char*)base,*end=p+len;
- const char* nl=(const char*)memchr(p,'\n',end-p);
- if(!nl){if(hold)held_mmaps.push_back({base,len});else munmap(base,len);return;}
- p=nl+1;
- while(p<end){const char* begin=p;
+ madvise(base,len,MADV_WILLNEED);
+ return {(const char*)base,len};
+}
+// Calls fn for every data line that begins in [from,to). The header line (offset 0) is never passed.
+// Only '\n' ends a line; a final line without '\n' still counts.
+template<class FN> static void for_lines(const char* base,size_t len,size_t from,size_t to,FN&& fn){
+ if(from>=len)return;
+ const char* end=base+len;
+ const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
+ if(!nl)return;
+ const char* p=nl+1;
+ const char* lim=base+min(to,len);
+ while(p<lim){
   nl=(const char*)memchr(p,'\n',end-p);
-  if(nl){fn(string_view(begin,(size_t)(nl-begin)));p=nl+1;}
-  else{fn(string_view(begin,(size_t)(end-begin)));break;}
+  if(nl){fn(string_view(p,(size_t)(nl-p)));p=nl+1;}
+  else{fn(string_view(p,(size_t)(end-p)));break;}
  }
- if(hold)held_mmaps.push_back({base,len});else munmap(base,len);
+}
+template<class FN> static void read_lines(const fs::path& path,FN&& fn){
+ Mapped m=map_file(path);if(!m.len)return;
+ for_lines(m.base,m.len,0,m.len,fn);
 }
 static string read_all(const fs::path& path){ifstream in(path,ios::binary);if(!in)throw runtime_error("Cannot open "+path.string());return string(istreambuf_iterator<char>(in),{});}
 static string json_string(const string& s,const string& key){
@@ -134,71 +148,74 @@ struct TransparentHash {
  size_t operator()(string_view x)const noexcept {return hash<string_view>{}(x);}
 };
 template <class V> using FastMap=unordered_map<string,V,TransparentHash,equal_to<>>;
-using FastSet=unordered_set<string,TransparentHash,equal_to<>>;
+static uint64_t mix64(uint64_t x){x^=x>>32;x*=0xd6e8feb86659fd93ULL;x^=x>>32;x*=0xd6e8feb86659fd93ULL;return x^(x>>32);}
+static uint64_t hkey(string_view s){
+ const unsigned char* p=(const unsigned char*)s.data();size_t n=s.size();
+ uint64_t h=0x9e3779b97f4a7c15ULL ^ (n*0xbf58476d1ce4e5b9ULL);
+ while(n>=8){uint64_t w;memcpy(&w,p,8);h=(h^w)*0xa0761d6478bd642fULL;p+=8;n-=8;}
+ uint64_t tail=0;memcpy(&tail,p,n);
+ return mix64(h^tail);
+}
+// Open-addressing string -> dense id table. Keys are views into the mapped inputs.
+// find() is const and safe to call from many threads while nobody inserts.
+struct StrTable{
+ vector<uint64_t> slots; // (hash32<<32)|(id+1), 0 = empty
+ vector<string_view> keys;vector<uint32_t> hs;size_t mask=0;
+ explicit StrTable(size_t cap=1024){size_t c=1024;while(c<cap)c<<=1;slots.assign(c,0);mask=c-1;}
+ size_t size()const{return keys.size();}
+ uint32_t find(string_view s,uint32_t h)const{
+  for(size_t j=h&mask;;j=(j+1)&mask){
+   uint64_t e=slots[j];if(!e)return UINT32_MAX;
+   if((uint32_t)(e>>32)==h){const string_view& k=keys[(uint32_t)e-1];if(k.size()==s.size()&&memcmp(k.data(),s.data(),s.size())==0)return (uint32_t)e-1;}
+  }
+ }
+ uint32_t intern(string_view s,uint32_t h){
+  size_t j=h&mask;
+  for(;;j=(j+1)&mask){
+   uint64_t e=slots[j];if(!e)break;
+   if((uint32_t)(e>>32)==h){const string_view& k=keys[(uint32_t)e-1];if(k.size()==s.size()&&memcmp(k.data(),s.data(),s.size())==0)return (uint32_t)e-1;}
+  }
+  if(keys.size()>=0x7ffffff0u)throw runtime_error("Too many IDs");
+  uint32_t id=(uint32_t)keys.size();keys.push_back(s);hs.push_back(h);
+  slots[j]=((uint64_t)h<<32)|(id+1);
+  if(keys.size()*2>slots.size())grow();
+  return id;
+ }
+ void grow(){
+  size_t c=slots.size()*2;slots.assign(c,0);mask=c-1;
+  for(uint32_t id=0;id<keys.size();++id){size_t j=hs[id]&mask;while(slots[j])j=(j+1)&mask;slots[j]=((uint64_t)hs[id]<<32)|(id+1);}
+ }
+};
 struct IdGraph{
- FastMap<uint32_t> keys;
+ StrTable tab{1<<16};
  vector<uint32_t> parent,sz;
- vector<string> names;
- uint32_t intern(string_view s){auto it=keys.find(s);if(it!=keys.end())return it->second;
-  uint32_t n=parent.size(); keys.emplace(string(s),n);parent.push_back(n);sz.push_back(1);names.emplace_back(s);return n;
+ vector<string_view> names; // at a root: byte-wise smallest ID of the person
+ uint32_t intern(string_view s){uint32_t n=(uint32_t)tab.size();uint32_t id=tab.intern(s,(uint32_t)hkey(s));
+  if(id==n){parent.push_back(n);sz.push_back(1);names.push_back(s);}return id;
  }
  uint32_t find(uint32_t x){uint32_t y=x;while(parent[y]!=y)y=parent[y];while(parent[x]!=x){auto z=parent[x];parent[x]=y;x=z;}return y;}
  void link(string_view a,string_view b){uint32_t x=find(intern(a)),y=find(intern(b));if(x==y)return;
   if(sz[x]<sz[y])swap(x,y);parent[y]=x;sz[x]+=sz[y];if(names[y]<names[x])names[x]=names[y];
  }
 };
-struct EventRecord{int64_t ingest=0,ts=0;uint32_t user=0;int32_t price=0;uint16_t cat=0;bool purchase=false,valid=false;};
-struct DenseEvents {
- struct Entry {EventRecord rec{};const char* ptr=nullptr;uint32_t len=0;bool assigned=false;};
- struct Slot {uint32_t hash=0;uint32_t index=0;};
- vector<Slot> slots;
- vector<Entry> entries;
- void reserve(size_t n){size_t cap=1;while(cap<n*1.35+8)cap*=2;slots.resize(cap);entries.reserve((size_t)(n*1.75));}
- static uint64_t mix(uint64_t x){x^=x>>32;x*=0xd6e8feb86659fd93ULL;x^=x>>32;x*=0xd6e8feb86659fd93ULL;return x^(x>>32);}
- static uint64_t hkey(string_view s){
-   const unsigned char* p=(const unsigned char*)s.data();size_t n=s.size();
-   uint64_t h=0x9e3779b97f4a7c15ULL ^ (n*0xbf58476d1ce4e5b9ULL);
-   while(n>=8){uint64_t w;memcpy(&w,p,8);h=(h^w)*0xa0761d6478bd642fULL;p+=8;n-=8;}
-   uint64_t tail=0;memcpy(&tail,p,n);h=mix(h^tail);
-   return h?h:1;
- }
- Entry* slot(string_view id,uint64_t h){
-  h |= 1ULL; // exact same home bucket before/after rehash; 0 denotes empty
-  if((entries.size()+1)*10>slots.size()*8){auto old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);
-   size_t mask=slots.size()-1;for(auto const&e:old)if(e.hash){size_t j=e.hash&mask;while(slots[j].hash)j=(j+1)&mask;slots[j]=e;}}
-  size_t mask=slots.size()-1,j=h&mask;
-  for(;;){auto& e=slots[j];
-   if(!e.hash){e.hash=(uint32_t)h|1u;e.index=entries.size();entries.emplace_back();entries.back().ptr=id.data();entries.back().len=(uint32_t)id.size();return &entries.back();}
-   if(e.hash==((uint32_t)h|1u) && entries[e.index].len==id.size()&&memcmp(entries[e.index].ptr,id.data(),id.size())==0)return &entries[e.index];
-   j=(j+1)&mask;
-  }
- }
- size_t size() const{return entries.size();}
- void clear(){vector<Slot>().swap(slots);vector<Entry>().swap(entries);}
+static constexpr uint8_t F_VALID=1,F_PURCHASE=2,F_DEAD=4;
+static constexpr uint32_t LOCAL_USER=0x80000000u;
+// One parsed event line, bucketed by event_id hash so duplicates meet in one bucket.
+struct PRec{const char* id;uint64_t h;int64_t ingest;int64_t ts;uint32_t idlen;uint32_t user;int32_t price;uint16_t cat;uint8_t flags;};
+// One valid click line, bucketed by click_id hash.
+struct CRec{const char* id;uint64_t h;int64_t ts;uint32_t idlen;uint32_t user;uint16_t campaign;uint8_t flags;};
+struct Chunk{const char* base;size_t len,from,to;bool click;};
+struct alignas(64) ThreadState{
+ StrTable users{1<<12}; // IDs seen in events/clicks that no link mentions
+ vector<vector<PRec>> eb;vector<vector<CRec>> cb;
 };
-struct DenseSet {
- struct Entry {const char* ptr=nullptr;uint32_t len=0,hash=0;};
- vector<Entry> slots;size_t count=0;
- void reserve(size_t n){size_t cap=1;while(cap<n*1.35+8)cap*=2;slots.resize(cap);}
- bool insert(string_view id){
-  uint32_t h=(uint32_t)DenseEvents::hkey(id)|1u;
-  size_t mask=slots.size()-1,j=h&mask;
-  while(slots[j].hash){auto &e=slots[j];
-   if(e.hash==h&&e.len==id.size()&&memcmp(e.ptr,id.data(),id.size())==0)return false;
-   j=(j+1)&mask;
-  }
-  if((count+1)*10>slots.size()*8){auto old=std::move(slots);slots.resize(old.size()?old.size()*2:1024);count=0;
-   for(const auto&e:old)if(e.hash)place(string_view(e.ptr,e.len),e.hash);
-   mask=slots.size()-1;j=h&mask;while(slots[j].hash)j=(j+1)&mask;
-  }
-  slots[j]={id.data(),(uint32_t)id.size(),h};++count;return true;
- }
- void place(string_view id,uint32_t h){size_t mask=slots.size()-1,j=h&mask;
-   while(slots[j].hash)j=(j+1)&mask;
-   slots[j]={id.data(),(uint32_t)id.size(),h};++count;
- }
- void clear(){vector<Entry> t;t.swap(slots);count=0;}
+template<class T> struct Arr{ // uninitialised buffer, so pages are first touched by the threads that fill it
+ unique_ptr<T[]> p;size_t n=0;
+ void alloc(size_t k){p.reset(new T[k]);n=k;}
+ size_t size()const{return n;}T& operator[](size_t i){return p[i];}const T& operator[](size_t i)const{return p[i];}
+ T* begin(){return p.get();}T* end(){return p.get()+n;}
 };
+static size_t pow2_parts(uint64_t est){size_t p=1;while(p<2048&&p*32768<est)p<<=1;return p;}
 struct Event{int64_t ts;uint32_t user;int32_t price;uint16_t cat;bool purchase;};
 struct Click{int64_t ts;uint32_t user;uint16_t campaign;string_view id;};
 struct Camp{string id,channel;};
@@ -218,9 +235,23 @@ static void run(const fs::path& data,const fs::path& scratch){
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  int nday=(int)((window_end-window_start+DAY-1)/DAY);
  if(nday<=0||nday>1000)throw runtime_error("Unreasonable window length");
+ const int T=max(1,omp_get_max_threads());
+ // Map the big inputs up front so the kernel starts reading them while links are processed.
+ vector<Chunk> chunks;uint64_t eventBytes=0,clickBytes=0;
+ static constexpr size_t CH=size_t(2)<<20;
+ auto add_files=[&](const fs::path& dir,bool click,uint64_t& bytes){
+  for(const auto& p:csv_files(dir)){Mapped m=map_file(p);if(!m.len)continue;bytes+=m.len;
+   for(size_t from=0;from<m.len;from+=CH)chunks.push_back({m.base,m.len,from,from+CH,click});}
+ };
+ add_files(data/"events",false,eventBytes);
+ add_files(data/"clicks",true,clickBytes);
  IdGraph graph;
  for(const auto& p:csv_files(data/"links"))read_lines(p,[&](string_view line){string_view f[2];if(fields(line,2,f)&&!f[0].empty()&&!f[1].empty())graph.link(f[0],f[1]);});
- __mark("LINKS"); cerr<<"linked IDs: "<<graph.parent.size()<<"\n";
+ // Flatten: root[id] is the person of a linked ID. Read-only from here on.
+ const uint32_t nlinked=(uint32_t)graph.parent.size();
+ vector<uint32_t> root(nlinked);
+ for(uint32_t i=0;i<nlinked;++i)root[i]=graph.find(i);
+ __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
  cat_id("unknown",categories,catnames);
  FastMap<uint16_t> products;
@@ -228,57 +259,153 @@ static void run(const fs::path& data,const fs::path& scratch){
  vector<Camp> campaigns;FastMap<uint16_t> camps;
  read_lines(data/"campaigns.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean campaigns.csv");if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");camps.emplace(string(f[0]),(uint16_t)campaigns.size());campaigns.push_back({string(f[0]),string(f[1])});});
  uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
- // Earliest parseable duplicate, including one that later fails validation.
- DenseEvents eventmap;
- const auto eventFiles=csv_files(data/"events");
- uint64_t eventBytes=0;for(const auto& p:eventFiles)eventBytes+=fs::file_size(p);
- eventmap.reserve((size_t)(eventBytes/65+1));
- for(const auto& p:eventFiles)read_lines(p,[&](string_view line){
-  string_view f[7];if(!fields(line,7,f)||f[0].empty())return;
-  auto key=f[0];auto h=DenseEvents::hkey(key);
-  __builtin_prefetch(&eventmap.slots[h&(eventmap.slots.size()-1)],1,1);
-  int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
-  auto it=eventmap.slot(key,h);
-  if(it->assigned && it->rec.ingest<=ingest)return;
-  EventRecord rec;rec.ingest=ingest;
-  int64_t ts;
-  if(!f[1].empty()&&!f[5].empty()&&parse_ts(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY&&
-    (f[4]=="view"||f[4]=="cart"||f[4]=="purchase")){
+
+ // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
+ const size_t PE=pow2_parts(eventBytes/70),PC=pow2_parts(clickBytes/40);
+ vector<ThreadState> tls(T);
+ atomic<size_t> nextChunk{0};
+ const int64_t clickStart=window_start-WEEK;
+ #pragma omp parallel num_threads(T)
+ {
+  ThreadState& tl=tls[omp_get_thread_num()];
+  tl.eb.resize(PE);tl.cb.resize(PC);
+  {size_t r=(size_t)(eventBytes/70/((uint64_t)T*PE)*5/4)+16;for(auto& v:tl.eb)v.reserve(r);}
+  {size_t r=(size_t)(clickBytes/40/((uint64_t)T*PC)*5/4)+16;for(auto& v:tl.cb)v.reserve(r);}
+  auto user_of=[&](string_view u)->uint32_t{
+   uint32_t h=(uint32_t)hkey(u);uint32_t g=graph.tab.find(u,h);
+   if(g!=UINT32_MAX)return root[g];
+   return LOCAL_USER|tl.users.intern(u,h);
+  };
+  auto on_event=[&](string_view line){
+   string_view f[7];if(!fields(line,7,f)||f[0].empty())return;
+   int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
+   PRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
+   int64_t ts;
+   if(!f[1].empty()&&!f[5].empty()&&parse_ts(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY&&
+     (f[4]=="view"||f[4]=="cart"||f[4]=="purchase")){
     int32_t price=0;bool purchase=f[4]=="purchase";
     if(!purchase||price_value(f[6],price)){
-      rec.valid=true;rec.ts=ts;rec.user=graph.intern(f[1]);rec.price=price;rec.purchase=purchase;
-      if(purchase){auto prod=products.find(f[5]);rec.cat=prod==products.end()?0:prod->second;}
+     r.flags=F_VALID|(purchase?F_PURCHASE:0);r.ts=ts;r.price=price;r.user=user_of(f[1]);
+     if(purchase){auto prod=products.find(f[5]);r.cat=prod==products.end()?0:prod->second;}
     }
+   }
+   tl.eb[(size_t)(((r.h>>40)*PE)>>24)].push_back(r);
+  };
+  auto on_click=[&](string_view line){
+   string_view f[4];if(!fields(line,4,f)||f[0].empty())return;
+   // Copies of a click are identical, so validating before the dedup keeps the same clicks.
+   int64_t ts=0;
+   if(f[1].empty()||!parse_ts(f[3],ts)||ts<clickStart||ts>=window_end)return;
+   auto ci=camps.find(f[2]);if(ci==camps.end())return;
+   CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ts=ts;r.user=user_of(f[1]);r.campaign=ci->second;r.flags=0;
+   tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
+  };
+  for(;;){
+   size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
+   const Chunk& ck=chunks[c];
+   if(ck.click)for_lines(ck.base,ck.len,ck.from,ck.to,on_click);
+   else for_lines(ck.base,ck.len,ck.from,ck.to,on_event);
   }
-  it->rec=rec;it->assigned=true;
- },true);
-__mark("EVENT_READ"); vector<Event> events;events.reserve(eventmap.size());
- for(const auto& entry:eventmap.entries){const auto& e=entry.rec;if(e.valid)events.push_back({e.ts,graph.find(e.user),e.price,e.cat,e.purchase});}
- cerr<<"deduplicated events: "<<eventmap.size()<<", surviving: "<<events.size()<<"\n";
- eventmap.clear();release_mmaps();
-__mark("EVENT_COPY_FREE"); // A click's duplicates are identical; the first parseable occurrence is enough.
- vector<Click> clicks;DenseSet seen;
- const auto clickFiles=csv_files(data/"clicks");
- uint64_t clickBytes=0;for(const auto& p:clickFiles)clickBytes+=fs::file_size(p);
- seen.reserve((size_t)(clickBytes/36+1));
- for(const auto& p:clickFiles)read_lines(p,[&](string_view line){
-  string_view f[4];if(!fields(line,4,f)||f[0].empty())return;
-  auto key=f[0];if(!seen.insert(key))return;
-  int64_t ts=0;auto ci=camps.find(f[2]);
-  if(f[1].empty()||ci==camps.end()||!parse_ts(f[3],ts)||ts<window_start-WEEK||ts>=window_end)return;
-  clicks.push_back({ts,graph.find(graph.intern(f[1])),ci->second,key});
- },true);
+ }
+ __mark("PARSE");
+ // ---- Give IDs that no link mentions a global person number. ----
+ vector<vector<uint32_t>> trans(T);
+ for(int t=0;t<T;++t){auto& u=tls[t].users;trans[t].resize(u.size());
+  for(uint32_t i=0;i<u.size();++i){uint32_t n=(uint32_t)graph.tab.size();uint32_t id=graph.tab.intern(u.keys[i],u.hs[i]);
+   if(id==n)graph.names.push_back(u.keys[i]);
+   trans[t][i]=id; // not linked, so the ID is its own person
+  }
+ }
+ __mark("USER_MERGE");
+ // ---- Dedup each bucket on its own. ----
+ vector<vector<Event>> eouts(PE);vector<vector<Click>> couts(PC);
+ uint64_t dedupCount=0;
+ #pragma omp parallel num_threads(T) reduction(+:dedupCount)
+ {
+  vector<uint64_t> slots;vector<size_t> off(T+1);
+  #pragma omp for schedule(dynamic,1) nowait
+  for(size_t p=0;p<PE;++p){
+   size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=tls[t].eb[p].size();}off[T]=n;
+   if(!n)continue;
+   size_t cap=16;while(cap<n*2)cap<<=1;slots.assign(cap,0);const size_t mask=cap-1;
+   auto at=[&](uint32_t g)->PRec&{int t=0;while(g>=off[t+1])++t;return tls[t].eb[p][g-off[t]];};
+   size_t alive=0,valid=0;
+   for(int t=0;t<T;++t){auto& v=tls[t].eb[p];
+    for(size_t i=0;i<v.size();++i){PRec& r=v[i];const uint32_t g=(uint32_t)(off[t]+i);const uint32_t tag=(uint32_t)(r.h>>18);
+     for(size_t j=r.h&mask;;j=(j+1)&mask){
+      uint64_t e=slots[j];
+      if(!e){slots[j]=((uint64_t)tag<<32)|(g+1);++alive;break;}
+      if((uint32_t)(e>>32)==tag){PRec& o=at((uint32_t)e-1);
+       if(o.idlen==r.idlen&&memcmp(o.id,r.id,r.idlen)==0){
+        // Keep the earliest ingested copy; copies with equal ingest_ts are identical.
+        if(r.ingest<o.ingest){o.flags|=F_DEAD;slots[j]=((uint64_t)tag<<32)|(g+1);}else r.flags|=F_DEAD;
+        break;
+       }
+      }
+     }
+    }
+   }
+   for(int t=0;t<T;++t)for(const PRec& r:tls[t].eb[p])valid+=(r.flags&(F_DEAD|F_VALID))==F_VALID;
+   auto& out=eouts[p];out.reserve(valid);
+   for(int t=0;t<T;++t){auto& v=tls[t].eb[p];
+    for(const PRec& r:v)if((r.flags&(F_DEAD|F_VALID))==F_VALID){
+     uint32_t u=r.user;if(u&LOCAL_USER)u=trans[t][u&~LOCAL_USER];
+     out.push_back({r.ts,u,r.price,r.cat,(r.flags&F_PURCHASE)!=0});
+    }
+    vector<PRec>().swap(v);
+   }
+   dedupCount+=alive;
+  }
+  #pragma omp for schedule(dynamic,1)
+  for(size_t p=0;p<PC;++p){
+   size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=tls[t].cb[p].size();}off[T]=n;
+   if(!n)continue;
+   size_t cap=16;while(cap<n*2)cap<<=1;slots.assign(cap,0);const size_t mask=cap-1;
+   auto at=[&](uint32_t g)->CRec&{int t=0;while(g>=off[t+1])++t;return tls[t].cb[p][g-off[t]];};
+   size_t alive=0;
+   for(int t=0;t<T;++t){auto& v=tls[t].cb[p];
+    for(size_t i=0;i<v.size();++i){CRec& r=v[i];const uint32_t g=(uint32_t)(off[t]+i);const uint32_t tag=(uint32_t)(r.h>>18);
+     for(size_t j=r.h&mask;;j=(j+1)&mask){
+      uint64_t e=slots[j];
+      if(!e){slots[j]=((uint64_t)tag<<32)|(g+1);++alive;break;}
+      if((uint32_t)(e>>32)==tag){const CRec& o=at((uint32_t)e-1);
+       if(o.idlen==r.idlen&&memcmp(o.id,r.id,r.idlen)==0){r.flags|=F_DEAD;break;}
+      }
+     }
+    }
+   }
+   auto& out=couts[p];out.reserve(alive);
+   for(int t=0;t<T;++t){auto& v=tls[t].cb[p];
+    for(const CRec& r:v)if(!(r.flags&F_DEAD)){
+     uint32_t u=r.user;if(u&LOCAL_USER)u=trans[t][u&~LOCAL_USER];
+     out.push_back({r.ts,u,r.campaign,string_view(r.id,r.idlen)});
+    }
+    vector<CRec>().swap(v);
+   }
+  }
+ }
+ Arr<Event> events;Arr<Click> clicks;
+ {
+  vector<size_t> eoff(PE+1,0),coff(PC+1,0);
+  for(size_t p=0;p<PE;++p)eoff[p+1]=eoff[p]+eouts[p].size();
+  for(size_t p=0;p<PC;++p)coff[p+1]=coff[p]+couts[p].size();
+  events.alloc(eoff[PE]);clicks.alloc(coff[PC]);
+  #pragma omp parallel num_threads(T)
+  {
+   #pragma omp for schedule(dynamic,8) nowait
+   for(size_t p=0;p<PE;++p){if(!eouts[p].empty())memcpy(&events[eoff[p]],eouts[p].data(),eouts[p].size()*sizeof(Event));vector<Event>().swap(eouts[p]);}
+   #pragma omp for schedule(dynamic,8)
+   for(size_t p=0;p<PC;++p){copy(couts[p].begin(),couts[p].end(),clicks.begin()+coff[p]);vector<Click>().swap(couts[p]);}
+  }
+ }
+ cerr<<"deduplicated events: "<<dedupCount<<", surviving: "<<events.size()<<"\n";
  cerr<<"surviving clicks: "<<clicks.size()<<"\n";
- seen.clear(); // Preserve click ID mmap until after sorting tie-breaks.
- {decltype(products) empty;products.swap(empty);} {decltype(categories) empty;categories.swap(empty);}
- {decltype(graph.keys) empty;graph.keys.swap(empty);}
-__mark("CLICK_READ"); // graph must stay alive for canonical names; no new users are interned after this point.
+ __mark("DEDUP");
  __gnu_parallel::sort(events.begin(),events.end(),[](const Event& a,const Event& b){if(a.user!=b.user)return a.user<b.user;return a.ts<b.ts;});
  __gnu_parallel::sort(clicks.begin(),clicks.end(),[](const Click& a,const Click& b){
   if(a.user!=b.user)return a.user<b.user;if(a.ts!=b.ts)return a.ts<b.ts;
   return a.id>b.id; // last click at equal timestamp has lexicographically smallest ID
  });
- release_mmaps();
 __mark("SORT"); fs::create_directories(scratch);
  ofstream uout(scratch/"user_rows.csv",ios::binary|ios::trunc);
  ofstream cout(scratch/"campaign_rows.csv",ios::binary|ios::trunc);

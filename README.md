@@ -30,4 +30,6 @@ Do not add datasets, generated outputs, or starter ZIPs to the public repository
 
 ## Performance notes
 
-The current core is single-threaded for parsing and sorting, and stores an event hash table during deduplication. Its expected runtime and compliance with all hidden edge cases are **unverified**. Profile on the real 1M dev set and then tune parallel input parsing, dedup memory, and sort if needed. Correctness must precede optimization because incorrect rows receive no score.
+Event and click files are split into 2 MB chunks and parsed on all cores. Each parsed line goes into a bucket chosen by the hash of its event or click ID, so duplicates always land in the same bucket and each bucket is deduplicated on its own with a small cache-friendly table. Linked IDs are resolved through a read-only table during parsing; IDs that no link mentions are numbered per thread and merged afterwards. Sorting uses the parallel sort; sessionizing and the Parquet writer are still single-threaded.
+
+Checked against the organizer's 36 fixtures and the published 1M-event dev answer (seed 1).
