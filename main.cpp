@@ -1934,18 +1934,19 @@ struct RawCtx{
 // keys), std::sort does it. tmp: room for m keys; cnt: room for CLICK_SORT_BUCKETS + 1 counters.
 static constexpr unsigned CLICK_SORT_BITS=13;static constexpr size_t CLICK_SORT_BUCKETS=size_t(1)<<CLICK_SORT_BITS;
 static const uint32_t clickSortMax=[]{const char* v=getenv("SS_TEST_SORTMAX");return v?(uint32_t)strtoul(v,nullptr,10):16u;}(); // tests: 0 = always std::sort, 1 = on any shared bucket
-[[gnu::noinline]] static void click_key_sort(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){
+// (TS: where the time starts in a key: 32 for "time << 32 | position", 28 for "time << 28 | position << 16 | campaign".)
+template<unsigned TS> static inline __attribute__((always_inline)) void click_key_sort_t(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){
  uint64_t mn=a[0],mx=a[0];
  for(size_t i=1;i<m;++i){mn=min(mn,a[i]);mx=max(mx,a[i]);}
- const uint64_t t0=mn>>32,range=(mx>>32)-t0;
+ const uint64_t t0=mn>>TS,range=(mx>>TS)-t0;
  const unsigned lb=min<unsigned>((unsigned)bit_width(m-1)+1,CLICK_SORT_BITS),rb=(unsigned)bit_width(range),sh=rb>lb?rb-lb:0;
  const size_t B=(size_t)(range>>sh)+1; // buckets in use, at most 1 << lb
  memset(cnt,0,(B+1)*sizeof(uint32_t));
  uint32_t most=0;
- for(size_t i=0;i<m;++i){const uint32_t c=++cnt[(((a[i]>>32)-t0)>>sh)+1];most=max(most,c);}
+ for(size_t i=0;i<m;++i){const uint32_t c=++cnt[(((a[i]>>TS)-t0)>>sh)+1];most=max(most,c);}
  if(__builtin_expect(most>clickSortMax,0)){sort(a,a+m);return;}
  for(size_t b=1;b<B;++b)cnt[b]+=cnt[b-1]; // cnt[b]: where bucket b starts
- for(size_t i=0;i<m;++i){const uint64_t k=a[i];tmp[cnt[((k>>32)-t0)>>sh]++]=k;}
+ for(size_t i=0;i<m;++i){const uint64_t k=a[i];tmp[cnt[((k>>TS)-t0)>>sh]++]=k;}
  a[0]=tmp[0];
  for(size_t i=1;i<m;++i){ // keys only move inside their bucket
   const uint64_t k=tmp[i];size_t j=i;
@@ -1953,6 +1954,8 @@ static const uint32_t clickSortMax=[]{const char* v=getenv("SS_TEST_SORTMAX");re
   a[j]=k;
  }
 }
+[[gnu::noinline]] static void click_key_sort(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){click_key_sort_t<32>(a,m,tmp,cnt);}
+[[gnu::noinline]] static void click_key_sort28(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){click_key_sort_t<28>(a,m,tmp,cnt);}
 // Where one thread puts the session lists of the runs it reads (blocks of its pool) and a run's purchases.
 struct SessArena{uint64_t* cur=nullptr;uint64_t* end=nullptr;vector<uint64_t> pur;};
 // The event sweep of the counters [lo,hi) of an event slot array (stride 1 << evShift bytes, layout ESmall
@@ -5963,7 +5966,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
    // One index's sessions (start time; number of its rows before the session) and purchases
    // (session<<40 | category<<24 | price), written by the walk over its event slots.
-   Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;fastC2.pool=&pool;
+   Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2,clickKeys3;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;clickKeys3.pool=&pool;fastC2.pool=&pool;
    uint32_t* const sortCnt=(uint32_t*)pool.take((CLICK_SORT_BUCKETS+1)*sizeof(uint32_t)); // click_key_sort's counters
    vector<uint8_t> lastOfV(ncamp+1,0xFF);uint8_t* const lastOf=lastOfV.data(); // small click sets: last position of a campaign
    // The 32-bit click arithmetic below counts times from the window start (clicks: -7 days and up), so
@@ -5975,9 +5978,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // into the window and when a row begins); when its last click leaves the window, and when the row is
    // closed, the sessions since then are added in one step. No list of active campaigns is kept: a row
    // is closed by a walk over the clicks in the window, which leaves since[c] at the closing session, so
-   // a second click of a campaign adds nothing. SS_LARGEASSIST=old: the active list, one ++ per session
-   // and active campaign.
+   // a second click of a campaign adds nothing. The window runs over 8-byte keys "time << 28 | position
+   // << 16 | campaign", which are also what is sorted (up to 4096 clicks; the position is only looked at
+   // for clicks of one moment, to order them by their ID texts): the clicks are not copied in order.
+   // SS_LARGEASSIST=old: keys with positions, clicks copied out in order, the
+   // active list, one ++ per session and active campaign.
    static const bool largeOld=[]{const char* v=getenv("SS_LARGEASSIST");return v&&!strcmp(v,"old");}();
+   static const bool assistLoop=[]{const char* v=getenv("SS_SMALLASSIST");return v&&!strcmp(v,"loop");}(); // small sets: the row's counters added by a loop over the clicks (old) instead of eight at a time
    vector<uint32_t> sinceV(ncamp+1,0);uint32_t* const since=sinceV.data();
    vector<RowOut> rowsOut((size_t)ndays+2);
    const atomic<uint32_t>* const comp=denseComp;const uint32_t dBase=denseBase;
@@ -6084,7 +6091,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       // is that of the last one, and the assists are counted in one byte per click (bumped only for the
       // first click of its campaign inside the window) and added to the totals when the row is done.
       // A larger set takes the sliding window over the sorted clicks, as the general lane does.
-      enum{NONE,SMALL,LARGE,LARGEOLD} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:largeOld?LARGEOLD:LARGE;
+      enum{NONE,SMALL,LARGE,LARGEOLD} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:(largeOld||wideWindow)?LARGEOLD:LARGE; // (LARGE keeps times in 36 bits)
       alignas(16) int32_t cts[16];uint16_t ccamp[16],credit[17];uint16_t dupMask[17];size_t nvec=0;uint64_t cntLo=0,cntHi=0;
       if(mode==SMALL){
        uint64_t keys[16];
@@ -6109,6 +6116,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        bool dup=false;uint16_t nextMask[16];
        for(size_t i=0;i<16;++i){cts[i]=INT32_MAX;nextMask[i]=0;}
+       memset(ccamp,0,sizeof ccamp); // (count_assists reads all sixteen places)
        for(size_t i=0;i<m;++i){const FClick& x=C[(uint32_t)keys[i]];const uint16_t c=(uint16_t)x.key;
         cts[i]=(int32_t)((int64_t)(keys[i]>>32)-WEEK);ccamp[i]=c;credit[i+1]=c; // times from the window start, like session times
         const uint8_t p=lastOf[c];if(p!=0xFF){nextMask[p]|=(uint16_t)(1u<<i);dup=true;}
@@ -6120,7 +6128,28 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        else memset(dupMask,0,sizeof dupMask);
        nvec=(m+3)/4;
       }
-      else if(mode>=LARGE&&m>1){
+      const uint64_t* LK=nullptr; // large sets: the clicks' keys "time << 28 | position << 16 | campaign", in order
+      if(mode==LARGE){
+       uint64_t* const K=clickKeys3.get(m+1);LK=K;
+       uint64_t all=0;
+       if(m<=4096){const FClick* q=C;const FClick* const qe=q+m;uint64_t* o=K;uint64_t at=0;
+        for(;q<qe;++q,++o,at+=0x10000u){const uint64_t k=q->key;all|=k;*o=((k>>16)<<28)|at|(uint16_t)k;__asm__("");}} // (the empty statement keeps the loop scalar)
+       if(__builtin_expect(m>4096||(all>>48)!=0,0)){if(all>>48)mode=LARGEOLD;goto large_by_text;} // too many for a 12-bit position: the old order, keys made below (a time beyond 32 bits cannot be in a window this short, but would not fit the key)
+       if(m>1){
+        click_key_sort28(K,m,clickKeys2.get(m),sortCnt);
+        // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
+        uint64_t prev=K[0]>>28;
+        for(size_t i=1;i<m;++i){const uint64_t t=K[i]>>28;const bool same=t==prev;prev=t;
+         if(__builtin_expect(same,0)){
+          const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)(key>>16)&0xFFFu),dense.kc));};
+          const uint64_t key=K[i];size_t j=i;
+          while(j>0&&(K[j-1]>>28)==t&&text_order(K[j-1])<text_order(key)){K[j]=K[j-1];--j;}
+          K[j]=key;
+         }}
+       }
+      }
+      else if(mode==LARGEOLD&&m>1){
+       large_by_text:;
        // Order by time through 8-byte keys (time, position), which sort faster than the clicks
        // themselves; clicks of one moment are then put in text order, and the clicks are copied out
        // in the final order.
@@ -6145,9 +6174,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         for(size_t i=0;i<m;++i)S[i]=C[(uint32_t)keys[i]];
         C=S;
        }
+       if(mode==LARGE){uint64_t* const K=clickKeys3.get(m+1);for(size_t i=0;i<m;++i)K[i]=((C[i].key&~0xFFFFull)<<12)|(C[i].key&0xFFFFu);LK=K;} // (more than 4096 clicks)
       }
       char tmp[16];const NameRef nm=person_name(person,tmp);
       const FClick *add=C,*expire=C,*const ce=C+m;size_t na=0;
+      const uint64_t *add8=LK,*exp8=LK,*const ce8=LK+(mode==LARGE?m:0);
       int currentday=-1;uint64_t dsess=0,drev=0;uint32_t rowStart=0;size_t pi=0;
       RowOut* const R=rowsOut.data();size_t nr=0;
       const auto close_row=[&](uint32_t evs){ // the finished row with its top category; written out after the person's last session
@@ -6160,12 +6191,20 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       const auto count_assists=[&](int day){ // the row's byte counters into the totals
        if(!(cntLo|cntHi))return;
        uint64_t* const arow=assists+(size_t)day*ncamp;
-       for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));
+       if(assistLoop){for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));}
+       else{ // eight at a time without a loop: the places after the last click hold campaign 0 and a zero count
+        const uint64_t lo=cntLo;
+        arow[ccamp[0]]+=(uint8_t)lo;arow[ccamp[1]]+=(uint8_t)(lo>>8);arow[ccamp[2]]+=(uint8_t)(lo>>16);arow[ccamp[3]]+=(uint8_t)(lo>>24);
+        arow[ccamp[4]]+=(uint8_t)(lo>>32);arow[ccamp[5]]+=(uint8_t)(lo>>40);arow[ccamp[6]]+=(uint8_t)(lo>>48);arow[ccamp[7]]+=(uint8_t)(lo>>56);
+        if(const uint64_t hi=cntHi){
+         arow[ccamp[8]]+=(uint8_t)hi;arow[ccamp[9]]+=(uint8_t)(hi>>8);arow[ccamp[10]]+=(uint8_t)(hi>>16);arow[ccamp[11]]+=(uint8_t)(hi>>24);
+         arow[ccamp[12]]+=(uint8_t)(hi>>32);arow[ccamp[13]]+=(uint8_t)(hi>>40);arow[ccamp[14]]+=(uint8_t)(hi>>48);arow[ccamp[15]]+=(uint8_t)(hi>>56);}
+       }
        cntLo=0;cntHi=0;};
       // Large sets: the sessions [since, sn) of the row of `day` for every campaign in the window.
       const auto flush_window=[&](int day,uint32_t sn){
        uint64_t* const arow=assists+(size_t)day*ncamp;
-       for(const FClick* q=expire;q<add;++q){const uint16_t c=(uint16_t)q->key;arow[c]+=sn-since[c];since[c]=sn;}};
+       for(const uint64_t* q=exp8;q<add8;++q){const uint16_t c=(uint16_t)*q;arow[c]+=sn-since[c];since[c]=sn;}};
       for(size_t sn=0;sn<ns;++sn){
        const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);const int d=(int)((ts+dayOff)/(uint64_t)DAY);
        if(d!=currentday){
@@ -6190,17 +6229,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         cntLo+=SPREAD8[firsts&255];cntHi+=SPREAD8[(firsts>>8)&255];
        }
        else if(mode==LARGE){
-        const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;const uint32_t s32=(uint32_t)sn;
+        const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<28,expLim=ts<<28;const uint32_t s32=(uint32_t)sn;
         uint64_t* const arow=assists+(size_t)d*ncamp;
         // (masks, not ?: - first / last click of a campaign in the window is as good as random)
-        while(add<ce&&add->key<addLim){
-         const uint16_t c=(uint16_t)add->key;const uint32_t f=fr[c],s=since[c];uint32_t first=0u-(uint32_t)(f==0);
+        while(add8<ce8&&*add8<addLim){
+         const uint16_t c=(uint16_t)*add8;const uint32_t f=fr[c],s=since[c];uint32_t first=0u-(uint32_t)(f==0);
          __asm__("":"+r"(first)); // (hidden from the compiler, which otherwise turns the mask back into a branch)
-         fr[c]=f+1;since[c]=s^((s^s32)&first);++add;}
-        while(expire<add&&expire->key<expLim){
-         const uint16_t c=(uint16_t)expire->key;const uint32_t f=fr[c]-1;
-         fr[c]=f;arow[c]+=(s32-since[c])&(0u-(uint32_t)(f==0));++expire;} // (a campaign that came and went with this session: nothing)
-        if(add>expire)credited=(uint16_t)add[-1].key;
+         fr[c]=f+1;since[c]=s^((s^s32)&first);++add8;}
+        while(exp8<add8&&*exp8<expLim){
+         const uint16_t c=(uint16_t)*exp8;const uint32_t f=fr[c]-1;
+         fr[c]=f;arow[c]+=(s32-since[c])&(0u-(uint32_t)(f==0));++exp8;} // (a campaign that came and went with this session: nothing)
+        if(add8>exp8)credited=(uint16_t)add8[-1];
        }
        else if(mode==LARGEOLD){
         const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
@@ -6231,7 +6270,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
       }
       if(mode==SMALL)count_assists(currentday);
-      else if(mode==LARGE){flush_window(currentday,(uint32_t)ns);for(const FClick* q=expire;q<add;++q)fr[(uint16_t)q->key]=0;}
+      else if(mode==LARGE){flush_window(currentday,(uint32_t)ns);for(const uint64_t* q=exp8;q<add8;++q)fr[(uint16_t)*q]=0;}
       close_row((uint32_t)n-rowStart);
       put_rows(nm,R,nr);
       for(size_t q=0;q<na;++q)fr[act[q]]=0;
