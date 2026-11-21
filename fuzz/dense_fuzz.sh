@@ -14,7 +14,7 @@ for seed in "$@"; do
  A=$(mktemp -d $W/fzo/sa.XXXXXX); SS_NODENSE=1 SS_ISA=sse2 NCPU=1 DATA_DIR=$D OUTPUT_DIR=$A SCRATCH_DIR=$A $W/core 2>/dev/null; ra=$?
  L=$(mktemp -d $W/fzo/sl.XXXXXX); SS_DENSE_DUMP=- NCPU=1 DATA_DIR=$D OUTPUT_DIR=$L SCRATCH_DIR=$L $W/core 2>$L/log
  on=$(grep -o "event records [01]" $L/log | head -1); res=""
- for cfg in "NCPU=1" "NCPU=3" "NCPU=2 SS_ISA=avx512z" "NCPU=1 SS_ISA=avx512y" "NCPU=3 SS_TEST_MAXNEW=5" "NCPU=3 SS_DENSE_AHEAD=3" "NCPU=2 SS_DENSE_RECORDS=0"; do
+ for cfg in "NCPU=1" "NCPU=3" "NCPU=2 SS_ISA=avx512z" "NCPU=1 SS_ISA=avx512y" "NCPU=3 SS_TEST_MAXNEW=5" "NCPU=3 SS_DENSE_AHEAD=3" "NCPU=2 SS_DENSE_RECORDS=0" "NCPU=3 SS_LINES=batch" "NCPU=1 SS_LINES=batch SS_ISA=avx512z" "NCPU=3 SS_LINES=ev8" "NCPU=1 SS_LINES=ev8 SS_ISA=avx512z" "NCPU=2 SS_LINES=ev8 SS_ISA=avx512y" "NCPU=3 SS_LINES=2p" "NCPU=2 SS_ISA=avx2"; do
   B=$(mktemp -d $W/fzo/sb.XXXXXX); env $cfg DATA_DIR=$D OUTPUT_DIR=$B SCRATCH_DIR=$B $W/core 2>/dev/null; rb=$?
   res="$res | $cfg: rc $rb $(python3 $CMP $A $B 2>&1 | tail -1)"
  done
