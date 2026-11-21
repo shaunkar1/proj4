@@ -394,10 +394,11 @@ int main(){
  #define ST {"SS_STATS","1"}
  for(int r=0;r<4;++r){
   add("B",1,{N8});add("v3",1,{N8,V3});add("O",1,{N8});add("Bs",1,{N8,ST});add("Os",1,{N8,ST});
+  add("pB",1,{N8,{"SS_DENSE_DUMP","-"}});add("pN",1,{N8,{"SS_DENSE_DUMP","-"}},"core-n");add("pK",1,{N8,{"SS_DENSE_DUMP","-"}},"core-k");
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hv3",1,{N8,V3},"",true);add("HO",1,{N8},"",true);add("HBs",1,{N8,ST},"",true);add("HOs",1,{N8,ST},"",true);}
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hv3",1,{N8,V3},"",true);add("HO",1,{N8},"",true);add("HBs",1,{N8,ST},"",true);add("HOs",1,{N8,ST},"",true);add("HpB",1,{N8,{"SS_DENSE_DUMP","-"}},"",true);add("HpN",1,{N8,{"SS_DENSE_DUMP","-"}},"core-n",true);add("HpK",1,{N8,{"SS_DENSE_DUMP","-"}},"core-k",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
@@ -452,6 +453,7 @@ int main(){
   a+="| stats w/sysP,R,X,A/cpuP,R,X,A: "+fmt("v4","Bs","wyhzgpqxa")+fmt("v4 to /output","Os","wyhzgpqxa");
   c+="60x wPRYXAW/us/exit: "+fmt("v4","HB","wPRYXAWusE")+fmt("v3","Hv3","wPRYXAWusE")+fmt("v4 to /output","HO","wPRYXAWusE");
   c+="| stats w/sysP,R,X,A/cpuP,R,X,A: "+fmt("v4","HBs","wyhzgpqxa")+fmt("v4 to /output","HOs","wyhzgpqxa");
+  c+="| parse-only P/us: "+fmt("base","pB","Pus")+fmt("nolock","pN","Pus")+fmt("nocommit","pK","Pus")+fmt("60x base","HpB","Pus")+fmt("60x nolock","HpN","Pus")+fmt("60x nocommit","HpK","Pus");
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
