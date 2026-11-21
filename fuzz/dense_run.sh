@@ -12,7 +12,7 @@ n=0
 for e in "SS_TEST_LIME=$LE SS_TEST_LIMC=$LC SS_TEST_LIMI=$LI" \
          "SS_TEST_LIME=$((LE+1)) SS_TEST_LIMC=$((LC+1)) SS_TEST_LIMI=$((LI+1)) SS_TEST_COMPLEX=3 SS_DENSE_AHEAD=3" \
          "SS_TEST_LIME=$((LE-1)) SS_TEST_LIMC=$((LC-1)) SS_TEST_LIMI=$((LI-1)) SS_TEST_COMPLEX=2 SS_TEST_SIDE=1" \
-         "SS_TEST_MAXNEW=50 SS_TEST_COMPLEX=5" "SS_LINES=index"; do
+         "SS_TEST_MAXNEW=50 SS_TEST_COMPLEX=5" "SS_LINES=plain"; do
   n=$((n+1)); r=$(python3 $H/dense_check.py $C $W/data $W/chk $e 2>&1 | tail -6)
   case "$r" in *DENSE_PARSE_OK) echo "ok: $e | $(echo "$r" | tail -2 | head -1 | cut -c1-150)";; *) echo "FAIL: $e"; echo "$r"; fail=1;; esac
 done
