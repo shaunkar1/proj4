@@ -337,13 +337,13 @@ struct KeyTable{
   if(optHuge)madvise(mem,c*sizeof(Slot),MADV_HUGEPAGE); // fewer page faults and TLB misses where the kernel allows it
   slots=(Slot*)mem;cap=c;mask=c-1;
  }
- static bool pack(string_view s,uint64_t& k0,uint32_t& k1){ // s must be a view into a mapped input
+ __attribute__((always_inline)) static bool pack(string_view s,uint64_t& k0,uint32_t& k1){ // s must be a view into a mapped input
   const size_t n=s.size();if(n>11)return false;
   uint64_t lo;uint32_t hi;memcpy(&lo,s.data(),8);memcpy(&hi,s.data()+8,4);
   if(n<8){k0=lo&LOW_BYTES[n];k1=0;}else{k0=lo;k1=hi&(uint32_t)LOW_BYTES[n-8];}
   k1|=(uint32_t)(n+1)<<24;return true;
  }
- static uint64_t hash_packed(uint64_t k0,uint32_t k1){return mix64(k0^((uint64_t)k1*0xa0761d6478bd642fULL));}
+ __attribute__((always_inline)) static uint64_t hash_packed(uint64_t k0,uint32_t k1){return mix64(k0^((uint64_t)k1*0xa0761d6478bd642fULL));}
  // ---- serial mode ----
  // Returns the stored value, or stores v and returns it if the key is new (compare with v to tell).
  uint32_t intern(string_view s,uint32_t v){
@@ -385,15 +385,18 @@ struct KeyTable{
  }
  uint32_t end_parallel(){uint32_t n=min(nextId.load(),idLimit);count+=n;return n;}
  // Lookup only (no insert). Safe from many threads as long as nobody is adding keys.
+ // Lookup of a key that is already packed (k0,k1 from pack()).
+ __attribute__((always_inline)) uint32_t find_packed(uint64_t k0,uint32_t k1)const{
+  const auto R=memory_order_relaxed;
+  for(size_t j=hash_packed(k0,k1)&mask;;j=(j+1)&mask){const Slot& e=slots[j];const uint32_t c=e.k1.load(R);
+   if(c==k1&&e.k0.load(R)==k0)return e.v.load(R);
+   if(!c)return NONE;
+  }
+ }
  uint32_t find(string_view s)const{
   const auto R=memory_order_relaxed;
   uint64_t k0;uint32_t k1;
-  if(pack(s,k0,k1)){
-   for(size_t j=hash_packed(k0,k1)&mask;;j=(j+1)&mask){const Slot& e=slots[j];const uint32_t c=e.k1.load(R);
-    if(c==k1&&e.k0.load(R)==k0)return e.v.load(R);
-    if(!c)return NONE;
-   }
-  }
+  if(pack(s,k0,k1))return find_packed(k0,k1);
   const uint64_t h=hkey(s);
   for(size_t j=h&mask;;j=(j+1)&mask){const Slot& e=slots[j];const uint32_t c=e.k1.load(R);
    if(!c)return NONE;
@@ -769,9 +772,11 @@ SS_V3I bool ts_v3(const char* p,unsigned n,DateMemo3* memo,int64_t& out){
  return parse_ts(string_view(p,n),out);
 }
 // hkey() of the n bytes at p, without the loop for the usual short IDs.
+// HKEY_START[n] is hkey's starting value for length n.
+static constexpr array<uint64_t,16> HKEY_START=[]{array<uint64_t,16> a{};for(uint64_t n=0;n<16;++n)a[n]=0x9e3779b97f4a7c15ULL^(n*0xbf58476d1ce4e5b9ULL);return a;}();
 SS_V3I uint64_t hkey_v3(const char* p,size_t n){
  if(__builtin_expect(n>=16,0))return hkey(string_view(p,n));
- uint64_t h=0x9e3779b97f4a7c15ULL^(n*0xbf58476d1ce4e5b9ULL),w0,w1,tail;
+ uint64_t h=HKEY_START[n],w0,w1,tail;
  memcpy(&w0,p,8);memcpy(&w1,p+8,8);
  if(n>=8){h=(h^w0)*0xa0761d6478bd642fULL;tail=_bzhi_u64(w1,(unsigned)(8*(n-8)));}
  else tail=_bzhi_u64(w0,(unsigned)(8*n));
@@ -809,6 +814,7 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
  const int64_t wstart=window_start;const uint64_t wlen=(uint64_t)(window_end-window_start);
  const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
  PendUser<PRec> pend[V3_BATCH];PendUser<PRec>* pp=pend;
+ AVec<PRec>* const buckets=tl.eb.data();KeyTable::Slot* const slots=tab.slots;const size_t tmask=tab.mask;
  while(p<lim){
   const char* next=nullptr;bool done=false;
   do{
@@ -847,12 +853,14 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
    B2=_blsr_u64(B2);E2=_blsr_u64(E2);
    const unsigned b4=(unsigned)_tzcnt_u64(B2),l4=(unsigned)_tzcnt_u64(E2)-b4;
    B2=_blsr_u64(B2);E2=_blsr_u64(E2);
-   const unsigned b5=(unsigned)_tzcnt_u64(B2),l5=(unsigned)_tzcnt_u64(E2)-b5;
+   // field 5 (product_id) is empty iff its start mark and end mark are the same bit: the lowest bit of
+   // B2 is its start mark, and no end mark of a later field can sit that low.
+   const bool has5=(_blsi_u64(B2)&E2)==0;
    const char* const s1=p+b1;const char* const s2=p+b2;
    PRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
    const unsigned kind=event_kind(string_view(b+b4,l4));
    bool valid=false;
-   if(kind&&l1!=0&&l5!=0){
+   if(kind&&l1!=0&&has5){
     int64_t ts;bool tsOk;
     uint64_t a8,b8;uint16_t a2,b2_;
     // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
@@ -864,6 +872,7 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
     if(tsOk&&(uint64_t)ts-(uint64_t)wstart<wlen&&ingest-ts<=DAY){
      int32_t price=0;const bool purchase=kind==3;
      if(purchase){
+      const unsigned b5=(unsigned)_tzcnt_u64(B2),l5=(unsigned)_tzcnt_u64(E2)-b5;
       B2=_blsr_u64(B2);E2=_blsr_u64(E2);
       const unsigned b6=(unsigned)_tzcnt_u64(B2),l6=(unsigned)_tzcnt_u64(E2)-b6;
       if(price_value(string_view(b+b6,l6),price)){
@@ -873,13 +882,13 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
      }else{r.flags=F_VALID;r.ts=ts;valid=true;}
     }
    }
-   AVec<PRec>& vec=tl.eb[(size_t)(((r.h>>40)*PE)>>24)];
+   AVec<PRec>& vec=buckets[(size_t)(((r.h>>40)*PE)>>24)];
    if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
    if(valid){
     uint64_t k0;uint32_t k1;
     if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID: nothing has been stored yet
-    const size_t j=KeyTable::hash_packed(k0,k1)&tab.mask;
-    __builtin_prefetch(&tab.slots[j],0,1);
+    const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
+    __builtin_prefetch(&slots[j],0,1);
     PendUser<PRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.data()+vec.size();pu.k1=k1;
    }
    vec.push_back(r);
@@ -908,6 +917,7 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
  const uint64_t wlen=(uint64_t)(window_end-clickStart);
  const __m256i vnl=_mm256_set1_epi8('\n'),vc=_mm256_set1_epi8(','),vq=_mm256_set1_epi8('"');
  PendUser<CRec> pend[V3_BATCH];PendUser<CRec>* pp=pend;
+ AVec<CRec>* const buckets=tl.cb.data();KeyTable::Slot* const slots=tab.slots;const size_t tmask=tab.mask;
  while(p<lim){
   const char* next=nullptr;bool done=false;
   do{
@@ -932,14 +942,15 @@ template<class GEN> SS_V3 static void clicks_v3(const char* base,size_t len,size
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
    if(!ts_v3(p+b3,l3,memo,ts)||(uint64_t)ts-(uint64_t)clickStart>=wlen)break; // clickStart <= ts < window_end
-   const uint32_t ci=camps.find(string_view(p+b2,l2));if(ci==KeyTable::NONE)break;
-   const char* const s1=p+b1;
    uint64_t k0;uint32_t k1;
+   const string_view camp(p+b2,l2);
+   const uint32_t ci=__builtin_expect(KeyTable::pack(camp,k0,k1),1)?camps.find_packed(k0,k1):camps.find(camp);if(ci==KeyTable::NONE)break;
+   const char* const s1=p+b1;
    if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID
-   const size_t j=KeyTable::hash_packed(k0,k1)&tab.mask;
-   __builtin_prefetch(&tab.slots[j],0,1);
+   const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
+   __builtin_prefetch(&slots[j],0,1);
    CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.ts=ts;r.user=0;r.campaign=(uint16_t)ci;r.flags=0;
-   AVec<CRec>& vec=tl.cb[(size_t)(((r.h>>40)*PC)>>24)];
+   AVec<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
    if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
    PendUser<CRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.data()+vec.size();pu.k1=k1;
    vec.push_back(r);
