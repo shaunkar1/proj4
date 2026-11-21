@@ -207,6 +207,48 @@ static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int p
  }});
  return bytes.load();
 }
+// ---- Micro-benchmark for the dense route: what is the cheapest way to get rows into an array indexed by
+// event counter? (a) scatter 32-byte records into buckets of 16384 counters, then a second pass that
+// writes each bucket's winners by direct index; (b) write each row straight into a global slot array with a
+// software prefetch issued d rows earlier. Rows arrive in random counter order, 3% are second copies, and a
+// dependent multiply chain of about 120 cycles stands in for parsing the line. Times in ms, T threads.
+struct BRec{uint64_t k;int64_t ing;uint32_t ve;uint32_t user;uint32_t cat;uint32_t pad;};
+struct BSlot{atomic<uint64_t> k;uint64_t uc;int64_t ing;};
+static void* hmap(size_t bytes){const size_t H=size_t(2)<<20,want=(bytes+H-1)&~(H-1);void* m=mmap(nullptr,want+H,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+ if(m==MAP_FAILED)return nullptr;char* a=(char*)(((uintptr_t)m+H-1)&~(uintptr_t)(H-1));madvise(a,want,MADV_HUGEPAGE);return a;}
+static inline uint64_t bwork(uint64_t x){for(int i=0;i<24;++i){x*=0x9E3779B97F4A7C15ull;x^=x>>29;}return x;}
+static inline BRec brow(uint64_t i,uint64_t N){ // row i of the stream
+ uint64_t ve=(i*1000003ull)%N;if((i&31)==7)ve=((i-5)*1000003ull)%N; // a copy of a row five lines earlier
+ const uint64_t w=bwork(i+ve);BRec r;r.k=w|1;r.ing=(int64_t)(w>>20);r.ve=(uint32_t)ve;r.user=(uint32_t)w;r.cat=(uint32_t)(w>>40)&0xffff;r.pad=0;return r;}
+static vector<double> bench_dense(uint64_t N,int T){
+ vector<double> out;atomic<uint64_t> sink{0};
+ out.push_back(1e3*par(T,[&](int t){uint64_t s=0;for(uint64_t i=N*t/T,e=N*(t+1)/T;i<e;++i)s+=brow(i,N).k;sink+=s;}));
+ { // (a) scatter, then direct-index pass per bucket
+  const uint64_t NB=(N>>14)+1,per=(N/T/NB)*5/4+64;
+  vector<BRec*> base(T),tails(T*NB);
+  for(int t=0;t<T;++t){base[t]=(BRec*)hmap(NB*per*sizeof(BRec));if(!base[t])return out;for(uint64_t b=0;b<NB;++b)tails[t*NB+b]=base[t]+b*per;}
+  out.push_back(1e3*par(T,[&](int t){BRec** tl=&tails[t*NB];BRec* const b0=base[t];
+   for(uint64_t i=N*t/T,e=N*(t+1)/T;i<e;++i){const BRec r=brow(i,N);const uint64_t b=r.ve>>14;BRec* p=tl[b];if(p<b0+(b+1)*per){*p=r;__builtin_prefetch((const char*)p+64,1,3);tl[b]=p+1;}}}));
+  uint64_t* D=(uint64_t*)hmap(N*16);if(!D)return out;atomic<uint64_t> next{0};
+  out.push_back(1e3*par(T,[&](int){vector<int64_t> ing(16384);
+   for(;;){const uint64_t b=next.fetch_add(1);if(b>=NB)break;fill(ing.begin(),ing.end(),INT64_MAX);
+    for(int t=0;t<T;++t)for(BRec* p=base[t]+b*per,*e=tails[t*NB+b];p<e;++p){const uint32_t i=p->ve&16383;if(p->ing<ing[i]){ing[i]=p->ing;D[2*(uint64_t)p->ve]=p->k;D[2*(uint64_t)p->ve+1]=((uint64_t)p->cat<<32)|p->user;}}}}));
+  sink+=D[2*(N/2)];munmap(D,N*16);for(int t=0;t<T;++t)munmap(base[t],NB*per*sizeof(BRec));
+ }
+ for(int d:{1,2,4,8}){ // (b) straight into the global slot array, prefetch d rows ahead
+  BSlot* S=(BSlot*)hmap(N*sizeof(BSlot));if(!S)return out;
+  out.push_back(1e3*par(T,[&](int t){BRec ring[8];const uint64_t i0=N*t/T,e=N*(t+1)/T;
+   auto commit=[&](const BRec& r){BSlot& sl=S[r.ve];uint64_t cur=sl.k.load(memory_order_relaxed);
+    for(;;){if(cur==0){if(sl.k.compare_exchange_weak(cur,1)){sl.uc=((uint64_t)r.cat<<32)|r.user;sl.ing=r.ing;sl.k.store(r.k,memory_order_release);return;}}
+     else if(cur==1){cur=sl.k.load(memory_order_relaxed);} // another thread is writing this slot
+     else{if(sl.k.compare_exchange_weak(cur,1)){if(r.ing<sl.ing){sl.uc=((uint64_t)r.cat<<32)|r.user;sl.ing=r.ing;sl.k.store(r.k,memory_order_release);}else sl.k.store(cur,memory_order_release);return;}}}};
+   for(uint64_t i=i0;i<e;++i){const BRec r=brow(i,N);__builtin_prefetch(&S[r.ve],1,3);if(i-i0>=(uint64_t)d)commit(ring[(i-d)&7]);ring[i&7]=r;}
+   for(uint64_t i=(e-i0>=(uint64_t)d?e-d:i0);i<e;++i)commit(ring[i&7]);}));
+  sink+=S[N/2].uc;munmap(S,N*sizeof(BSlot));
+ }
+ fprintf(stderr,"DIAG bench_dense N=%llu T=%d:",(unsigned long long)N,T);for(double v:out)fprintf(stderr," %.0f",v);fprintf(stderr," (sink %llu)\n",(unsigned long long)sink.load());
+ return out;
+}
 static double gMemsetGBs=0,gTouchUsPage=0,gPopulateRc=-9,gTouch8[4]={0,0,0,0},gSpin[3]={0,0,0},gReadGBs[2]={0,0},gReplicaSec=0,gMunmap[4]={0,0,0,0};
 static string gCpu,gKernel,gThp,gDefrag,gFs;static int gAff=0,gFlags=0;
 int main(){
@@ -317,6 +359,8 @@ int main(){
  add("HB",1,{N8},"",true);add("Hz",1,{N8,{"SS_ISA","avx512z"}},"",true);
  // thread counts, practice-sized
  add("n4",1,{{"NCPU","4"}});add("n1",1,{{"NCPU","1"}});add("n6",1,{{"NCPU","6"}});add("B",1,{N8});
+ const uint64_t benchN=getenv("SS_DIAG_BENCHN")?strtoull(getenv("SS_DIAG_BENCHN"),nullptr,10):20000000ull;
+ const vector<double> bench8=bench_dense(benchN,8),bench8b=bench_dense(benchN,8),bench4=bench_dense(benchN,4),bench8x=bench_dense(benchN*3,8);
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -354,6 +398,8 @@ int main(){
   c+="| 60x: "+fmt("B wPDALus","HB","wPDALus")+fmt("z wP","Hz","wP")+fmt("chk wP","Hchk","wP")+fmt("tabfull wP","Htabfull","wP");
   for(const char* g:{"Hpb8k","Hpb32k","Hpb49k","Hcell","Hslot150","Hnoprobe"})c+=fmt(string(g+1)+" wDA",g,"wDA");
   for(const char* g:{"Hev1k","Hev4k","Hev8k"})c+=fmt(string(g+1)+" wPDA",g,"wPDA");
+  {auto bs=[&](const char* name,const vector<double>& v){string o=string(name)+"=";for(size_t i=0;i<v.size();++i){if(i)o+="/";o+=to_string((long)(v[i]+0.5));}return o+" ";};
+   c+="| bench work/scatter/pass/direct1/2/4/8: "+bs("t8",bench8)+bs("t8b",bench8b)+bs("t4",bench4)+bs("t8x3",bench8x);}
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
