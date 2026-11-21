@@ -227,7 +227,7 @@ struct FileGroup{char* base=nullptr;size_t len=0;vector<size_t> ends;}; // ends:
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22
 #endif
-static int optFileAlign=0; // 0 = 4 KB, 1 = 2 MB, 2 = 2 MB + MADV_HUGEPAGE
+static int optFileAlign=2; // 0 = 4 KB (SS_FILEALIGN=off), 1 = 2 MB, 2 = 2 MB + MADV_HUGEPAGE (default: lets the kernel map 2 MB page-cache folios with one entry)
 static int optFileAdvise=0; // 0 none, 1 MADV_RANDOM, 2 MADV_SEQUENTIAL
 static int optPopulate=0,optPopulateBg=2; // 0 off, 1 ahead, 2 all, 3 bg
 static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
