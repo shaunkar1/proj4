@@ -12,6 +12,7 @@
 #include <vector>
 using namespace std;
 struct Rec{uint64_t a,b,c,d;};
+static int PFDIST=64;
 static inline uint64_t mix(uint64_t x){x^=x>>32;x*=0xd6e8feb86659fd93ULL;x^=x>>32;return x;}
 __attribute__((target("avx2"))) static double run(int mode,size_t N,size_t P,int work,bool huge,uint64_t& sink){
  const size_t per=N/P*9/8+16,bytes=P*per*sizeof(Rec);
@@ -31,6 +32,7 @@ __attribute__((target("avx2"))) static double run(int mode,size_t N,size_t P,int
   const size_t p=(size_t)(((x>>40)*P)>>24);
   const __m256i r=_mm256_set_epi64x((long long)w,(long long)x,(long long)i,(long long)p);
   if(mode==0){_mm256_storeu_si256((__m256i*)pos[p],r);++pos[p];}
+  else if(mode==2){Rec* d=pos[p];_mm256_storeu_si256((__m256i*)d,r);__builtin_prefetch((const char*)d+PFDIST,1,3);pos[p]=d+1;} // plain store, next line fetched early
   else{
    const uint32_t n=cnt[p]++;
    _mm256_store_si256((__m256i*)(stage+2*p+(n&1)),r);
@@ -44,11 +46,11 @@ __attribute__((target("avx2"))) static double run(int mode,size_t N,size_t P,int
  sink+=acc;free(stage);munmap(mem,bytes+(2<<20));return s;
 }
 int main(int argc,char** argv){
- const size_t N=argc>1?strtoull(argv[1],0,10):20000000;const int reps=argc>2?atoi(argv[2]):5;uint64_t sink=0;
- for(int huge=1;huge>=0;--huge)for(size_t P:{(size_t)1024,(size_t)2048})for(int work:{0,40}){
-  double best[2]={1e9,1e9};
-  for(int r=0;r<reps;++r)for(int mode=0;mode<2;++mode){double s=run(mode,N,P,work,huge,sink);if(s<best[mode])best[mode]=s;}
-  printf("huge=%d buckets=%zu work=%2d: plain %.3f s, staged+NT %.3f s (min of %d)  NT/plain=%.2f\n",huge,P,work,best[0],best[1],reps,best[1]/best[0]);fflush(stdout);
+ const size_t N=argc>1?strtoull(argv[1],0,10):20000000;const int reps=argc>2?atoi(argv[2]):5;uint64_t sink=0;if(argc>3)PFDIST=atoi(argv[3]);
+ for(int huge=1;huge>=0;--huge)for(size_t P:{(size_t)64,(size_t)1024,(size_t)2048})for(int work:{0,40}){
+  double best[3]={1e9,1e9,1e9};
+  for(int r=0;r<reps;++r)for(int mode=0;mode<3;++mode){double s=run(mode,N,P,work,huge,sink);if(s<best[mode])best[mode]=s;}
+  printf("huge=%d buckets=%zu work=%2d: plain %.3f s, staged+NT %.3f s, plain+prefetch(+%d) %.3f s (min of %d)\n",huge,P,work,best[0],best[1],PFDIST,best[2],reps);fflush(stdout);
  }
  return (int)(sink&1);
 }
