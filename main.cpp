@@ -1205,24 +1205,30 @@ SS_V3I uint64_t hkey_v3(const char* p,size_t n){
 // dn::parse36 for the vector loops: canonical base 36 of the n bytes at s (which may be read up to 8).
 // The text is moved so that its last character is the top byte of a word and the bytes below its first
 // character are '0'; then all eight are checked and turned into digits at once and combined with two
-// multiply-adds. "No leading zero" is the same as "the value has n digits", i.e. value >= 36^(n-1).
-static constexpr uint64_t MIN36[9]={0,0,36ULL,1296ULL,46656ULL,1679616ULL,60466176ULL,2176782336ULL,78364164096ULL};
+// multiply-adds. "No leading zero" is the same as "the value has n digits", i.e. value >= 36^(n-1); that and
+// value < 2^40 are one unsigned compare with per-length constants (lengths 0 and 9+ can never pass it).
+// The vector constants are written with different halves on purpose: a constant of sixteen equal bytes is
+// rebuilt in a register on every use (three instructions each), an uneven one is read from memory.
+static constexpr uint64_t MIN36[10]={~0ULL,0,36ULL,1296ULL,46656ULL,1679616ULL,60466176ULL,2176782336ULL,78364164096ULL,~0ULL};
+static constexpr uint64_t SPAN36[10]={0,dn::MASK,dn::MASK-36ULL,dn::MASK-1296ULL,dn::MASK-46656ULL,dn::MASK-1679616ULL,dn::MASK-60466176ULL,dn::MASK-2176782336ULL,dn::MASK-78364164096ULL,0};
 SS_V3I bool parse36_v3(const char* s,unsigned n,uint64_t& y){
- if(__builtin_expect(n-1u>7u,0))return false;
+ const unsigned m=n<9u?n:9u;
  uint64_t w;memcpy(&w,s,8);
- const unsigned sh=64-8*n; // 0..56
+ const unsigned sh=(64u-8u*m)&63u; // 0..56 for lengths 1-8
  const uint64_t x=(w<<sh)|_bzhi_u64(0x3030303030303030ULL,sh);
- const __m128i v=_mm_cvtsi64_si128((long long)x);
- const __m128i t=_mm_sub_epi8(v,_mm_set1_epi8('0')),u=_mm_sub_epi8(v,_mm_set1_epi8('a'));
- const __m128i isd=_mm_cmpeq_epi8(_mm_min_epu8(t,_mm_set1_epi8(9)),t),isl=_mm_cmpeq_epi8(_mm_min_epu8(u,_mm_set1_epi8(25)),u);
- const unsigned ok=(unsigned)_mm_movemask_epi8(_mm_or_si128(isd,isl))&0xFFu;
- const __m128i d=_mm_min_epu8(t,_mm_add_epi8(u,_mm_set1_epi8(10))); // the digit of a 0-9 or a-z byte; meaningless otherwise
+ const __m128i v=_mm_cvtsi64_si128((long long)x); // upper half zero
+ #define SS_LOW8(c) _mm_setr_epi8((char)(c),(char)(c),(char)(c),(char)(c),(char)(c),(char)(c),(char)(c),(char)(c),0,0,0,0,0,0,0,0)
+ const __m128i t=_mm_add_epi8(v,SS_LOW8(-'0')),u=_mm_add_epi8(v,SS_LOW8(-'a'));
+ // a byte is fine if it is 0-9 (t <= 9) or a-z (u <= 25): one of the two saturating differences is zero
+ const __m128i bad=_mm_min_epu8(_mm_subs_epu8(t,SS_LOW8(9)),_mm_subs_epu8(u,SS_LOW8(25)));
+ const __m128i d=_mm_min_epu8(t,_mm_add_epi8(v,SS_LOW8(10-'a'))); // the digit of a 0-9 or a-z byte; meaningless otherwise
+ #undef SS_LOW8
  const __m128i p2=_mm_maddubs_epi16(d,_mm_setr_epi8(36,1,36,1,36,1,36,1,0,0,0,0,0,0,0,0));
  const __m128i p4=_mm_madd_epi16(p2,_mm_setr_epi16(1296,1,1296,1,0,0,0,0));
  const uint64_t r=(uint64_t)_mm_cvtsi128_si64(p4);
  const uint64_t val=(r&0xFFFFFFFFULL)*1679616ULL+(r>>32);
  y=val;
- return (ok==0xFFu)&(val>=MIN36[n])&(val<=dn::MASK);
+ return (bool)_mm_testz_si128(bad,bad)&(val-MIN36[m]<=SPAN36[m]);
 }
 // A pushed record that still needs its user: the packed user key, its table slot, and the record.
 // A bucket is only ever grown right after the waiting records have been finished (see the capacity
@@ -1622,16 +1628,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(const char* v=getenv("SS_TEST_LIMC"))dense.limC=min<uint64_t>(dense.limC,strtoull(v,nullptr,10));
  if(const char* v=getenv("SS_TEST_LIMI"))dense.limI=min<uint64_t>(dense.limI,strtoull(v,nullptr,10));
  if(dense.events||dense.clicks)denseComplex=(uint64_t*)map_huge(((dense.limI+63)/64+1)*8);
+ // Test only: marks every n-th user index complex before anything else does, so that both user routes occur for dense-looking IDs.
+ if(const char* v=getenv("SS_TEST_COMPLEX"))if(denseComplex){const uint64_t n=max<uint64_t>(1,strtoull(v,nullptr,10));for(uint64_t i=0;i<dense.limI;i+=n)denseComplex[i>>6]|=1ull<<(i&63);}
  // Parse-stage dense records are off until their consumers exist (DENSE.md stages 4-7):
  //   SS_DENSE_USERS=1    dense user IDs get DENSE_USER codes instead of ID-table numbers
  //   SS_DENSE_RECORDS=1  event / click lines with a dense ID go to the DRec / DCRec buckets
  //   SS_DSHIFT, SS_CSHIFT  log2 of the counters per event / click bucket (default 14)
- //   SS_DENSE_DUMP=dir   test only: writes every record of the parse stage as text and stops after the parse stage
+ //   SS_DENSE_DUMP=dir   test only: writes every record of the parse stage as text and stops after the parse stage ("-": only stops)
  dparse.users=(dense.events||dense.clicks)&&getenv("SS_DENSE_USERS");
  dparse.events=dense.events&&getenv("SS_DENSE_RECORDS");dparse.clicks=dense.clicks&&getenv("SS_DENSE_RECORDS");
  if(const char* v=getenv("SS_DSHIFT")){const int x=atoi(v);if(x>=4&&x<=24)dparse.shE=(unsigned)x;}
  if(const char* v=getenv("SS_CSHIFT")){const int x=atoi(v);if(x>=4&&x<=24)dparse.shC=(unsigned)x;}
  const char* const dumpDir=getenv("SS_DENSE_DUMP");
+ const bool dumpText=dumpDir&&strcmp(dumpDir,"-"); // "-": write nothing, only stop after the parse stage (for measuring it)
  if(dparse.users||dparse.events||dparse.clicks)cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<"\n";
  cerr<<"dense: events "<<dense.events<<" clicks "<<dense.clicks<<"\n";
  if(getenv("SS_STATS"))cerr<<"STATS dense keys "<<dense.ke<<" "<<dense.ku<<" "<<dense.kc<<" limits "<<dense.limE<<" "<<dense.limC<<" "<<dense.limI<<"\n";
@@ -1854,6 +1863,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const int64_t clickStart=window_start-WEEK;
  // Dense buckets: one per 2^sh counters (none unless the dense records are on).
  const size_t DE=dparse.events?(size_t)(dense.limE>>dparse.shE)+1:0,DC=dparse.clicks?(size_t)(dense.limC>>dparse.shC)+1:0;
+ // How full the dense buckets get: counters are 0 .. D-1 with D = number of distinct IDs, which is smaller than the
+ // number of lines (copies) and well below the limit. The generator shuffles the lines, so the largest counter in
+ // the first lines of a file gives D closely; lines per bucket = lines * 2^sh / D. A wrong guess only costs growth.
+ auto dense_span=[&](const char* base,size_t len,char letter,uint64_t key,uint64_t limit)->uint64_t{
+  if(!base)return limit;
+  uint64_t n=0,m=0;
+  for(uint64_t y:dn::sample_ids(base,min<size_t>(len,size_t(256)<<10),0,letter,SIZE_MAX)){const uint64_t c=dn::index_of(y,key);if(c<limit){++n;m=max(m,c);}}
+  return n<256?limit:min(limit,m+1+4*(m+1)/n);
+ };
+ const char* clickBase=nullptr;size_t clickLen=0;
+ for(const Chunk& c:chunks)if(c.click&&c.from==0&&c.len>clickLen){clickBase=c.base;clickLen=c.len;}
+ const uint64_t spanE=DE?max<uint64_t>(1,dense_span(sampleBase,sampleLen,'e',dense.ke,dense.limE)):1;
+ const uint64_t spanC=DC?max<uint64_t>(1,dense_span(clickBase,clickLen,'k',dense.kc,dense.limC)):1;
+ // Records per bucket and thread: the expected number, 3% for the line estimate, five standard deviations.
+ auto dense_reserve=[&](uint64_t lines,uint64_t span,unsigned sh)->size_t{
+  const double lam=(double)lines*(double)(uint64_t(1)<<sh)/((double)span*(double)T);
+  return (size_t)(lam*1.03+5.0*sqrt(lam))+16;
+ };
+ const size_t rdFull=DE?dense_reserve(estEvents,spanE,dparse.shE):0,rdcFull=DC?dense_reserve(estClicks,spanC,dparse.shC):0;
+ const size_t usedE=DE?min<size_t>(DE,(size_t)((spanE-1)>>dparse.shE)+1):0,usedC=DC?min<size_t>(DC,(size_t)((spanC-1)>>dparse.shC)+1):0;
+ if(getenv("SS_STATS")&&(DE||DC))cerr<<"STATS dense buckets events "<<DE<<" (span "<<spanE<<", "<<usedE<<" x "<<rdFull<<" records) clicks "<<DC<<" (span "<<spanC<<", "<<usedC<<" x "<<rdcFull<<" records)\n";
  #pragma omp parallel num_threads(T)
  {
   ThreadState& tl=tls[omp_get_thread_num()];
@@ -1862,13 +1892,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   {// With the dense buckets on, the hash buckets only get the few general rows: start them small (they grow).
    const size_t re=DE?(size_t)(estEvents/((uint64_t)T*PE)/64)+16:(size_t)(estEvents/((uint64_t)T*PE)*9/8)+16;
    const size_t rc=DC?(size_t)(estClicks/((uint64_t)T*PC)/64)+16:(size_t)(estClicks/((uint64_t)T*PC)*9/8)+16;
-   const size_t rd=DE?(size_t)(estEvents/((uint64_t)T*DE)*9/8)+16:0,rdc=DC?(size_t)(estClicks/((uint64_t)T*DC)*9/8)+16:0;
-   const size_t need=PE*(re*sizeof(PRec)+64)+PC*(rc*sizeof(CRec)+64)+DE*(rd*sizeof(DRec)+64)+DC*(rdc*sizeof(DCRec)+64);
+   // Dense buckets past the counters in use stay small.
+   const size_t need=PE*(re*sizeof(PRec)+64)+PC*(rc*sizeof(CRec)+64)
+    +usedE*(rdFull*sizeof(DRec)+64)+(DE-usedE)*(16*sizeof(DRec)+64)+usedC*(rdcFull*sizeof(DCRec)+64)+(DC-usedC)*(16*sizeof(DCRec)+64);
    tlArena.stage=0;tlArena.add_region(need+(size_t(4)<<20),need); // one pre-faulted block per thread for its buckets
    for(auto& v:tl.eb)v.reserve(re);
    for(auto& v:tl.cb)v.reserve(rc);
-   for(auto& v:tl.db)v.reserve(rd);
-   for(auto& v:tl.dcb)v.reserve(rdc);}
+   for(size_t i=0;i<DE;++i)tl.db[i].reserve(i<usedE?rdFull:16);
+   for(size_t i=0;i<DC;++i)tl.dcb[i].reserve(i<usedC?rdcFull:16);}
   // SS_DENSE_DUMP: text forms for the test dump (IDs can hold any byte, so they are written in hex).
   auto dump_user=[&](uint32_t user)->string{ // what a record's user field stands for
    if(user&LOCAL_USER)return "L:"+to_string(user&~LOCAL_USER);
@@ -1908,7 +1939,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // The route depends on the event_id text only (DENSE.md), so every copy of an event takes the same one.
    uint64_t ve=0;
    const bool dEv=dparse.events&&dense_counter(f[0].data(),f[0].size(),'e',dense.ke,dense.limE,ve);
-   if(dumpDir){tl.dumpRows+=string("E\t")+(dEv?"D":"P")+"\t"+hexstr(f[0])+"\t"+to_string(ingest)+"\t"+to_string(k)+"\t"+to_string(cat)+"\t"+(k?hexstr(f[1])+"\t"+dump_user(user):string("-\t-"))+"\n";}
+   if(dumpText){tl.dumpRows+=string("E\t")+(dEv?"D":"P")+"\t"+hexstr(f[0])+"\t"+to_string(ingest)+"\t"+to_string(k)+"\t"+to_string(cat)+"\t"+(k?hexstr(f[1])+"\t"+dump_user(user):string("-\t-"))+"\n";}
    if(dEv){
     DRec r;r.k=k;r.ingest=ingest;r.ve=(uint32_t)ve;r.user=user;r.cat=(uint16_t)cat;r.pad=0;r.pad2=0;
     tl.db[(size_t)(ve>>dparse.shE)].push_back(r);
@@ -1928,7 +1959,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const uint64_t ckey=((uint64_t)(ts-clickStart)<<16)|(uint16_t)ci;const uint32_t user=user_of(f[1]);
    uint64_t kcn=0;
    const bool dCl=dparse.clicks&&dense_counter(f[0].data(),f[0].size(),'k',dense.kc,dense.limC,kcn);
-   if(dumpDir){tl.dumpRows+=string("C\t")+(dCl?"D":"P")+"\t"+hexstr(f[0])+"\t"+to_string(ckey)+"\t"+hexstr(f[1])+"\t"+dump_user(user)+"\n";}
+   if(dumpText){tl.dumpRows+=string("C\t")+(dCl?"D":"P")+"\t"+hexstr(f[0])+"\t"+to_string(ckey)+"\t"+hexstr(f[1])+"\t"+dump_user(user)+"\n";}
    if(dCl){DCRec r;r.key=ckey;r.kc=(uint32_t)kcn;r.user=user;tl.dcb[(size_t)(kcn>>dparse.shC)].push_back(r);return;}
    CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.key=ckey;r.user=user;
    tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
@@ -1968,6 +1999,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  const uint32_t totalIds=tab.end_parallel();
  __mark("PARSE");
+ if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
  if(dumpDir){
   // Test only (fuzz/dense_check.py): rows-T.txt = what the general handlers saw (raw texts, written above),
   // recs-T.txt = every record of every bucket with its ID text rebuilt from the record alone.
@@ -1985,7 +2017,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(const auto& v:tls[t].eb)for(size_t i=0;i<v.size();++i){const PRec& r=v[i];
     size_t n=0;while(r.id[n]!=','&&r.id[n]!='"')++n;
     const uint64_t c=r.ih>>PR_HBITS;const int64_t ing=c==INGEST_SIDE?side.at(r.id):(int64_t)(c+(uint64_t)ingestBase);
-    o<<"E\tP\t"<<hexstr(string_view(r.id,n))<<'\t'<<ing<<'\t'<<(r.k?r.k-PR_KBIAS+PR_KBIAS:0)<<'\t'<<r.cat<<'\t'<<(r.k?user_text(r.user):string("-"))<<'\n';}
+    o<<"E\tP\t"<<hexstr(string_view(r.id,n))<<'\t'<<ing<<'\t'<<r.k<<'\t'<<r.cat<<'\t'<<(r.k?user_text(r.user):string("-"))<<'\n';}
    for(const auto& v:tls[t].db)for(size_t i=0;i<v.size();++i){const DRec& r=v[i];char tx[9];
     const size_t n=dn::text36('e',dn::value_of(r.ve,dense.ke),tx);
     o<<"E\tD\t"<<hexstr(string_view(tx,n))<<'\t'<<r.ingest<<'\t'<<r.k<<'\t'<<r.cat<<'\t'<<(r.k?user_text(r.user):string("-"))<<'\n';}
@@ -1994,6 +2026,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(const auto& v:tls[t].dcb)for(size_t i=0;i<v.size();++i){const DCRec& r=v[i];char tx[9];
     const size_t n=dn::text36('k',dn::value_of(r.kc,dense.kc),tx);
     o<<"C\tD\t"<<hexstr(string_view(tx,n))<<'\t'<<r.key<<'\t'<<user_text(r.user)<<'\n';}
+  }
+  { // users.txt: every ID-table entry (number, text), so that the check can name the person behind a "T:" number;
+    // complex.txt: the user indexes that must not take the dense route.
+   const auto R=memory_order_relaxed;
+   ofstream o(fs::path(dumpDir)/"users.txt",ios::binary);
+   for(size_t i=0;i<tab.cap;++i){const KeyTable::Slot& e=tab.slots[i];const uint32_t c=e.k1.load(R);
+    if(!c||c==KeyTable::LONGK||c==KeyTable::BUSY)continue;
+    char tx[12];const uint64_t k0=e.k0.load(R);const uint32_t k1=c&0xFFFFFFu;memcpy(tx,&k0,8);memcpy(tx+8,&k1,4);
+    o<<e.v.load(R)<<'\t'<<hexstr(string_view(tx,(c>>24)-1))<<'\n';}
+   for(const auto& l:tab.longs)o<<l.v<<'\t'<<hexstr(l.key)<<'\n';
+   ofstream oc(fs::path(dumpDir)/"complex.txt",ios::binary);
+   if(denseComplex)for(uint64_t i=0;i<dense.limI;++i)if(dense_complex(i))oc<<i<<'\n';
   }
   cerr<<"dense dump written to "<<dumpDir<<"; stopping after the parse stage\n";
   cerr.flush();_exit(0);
