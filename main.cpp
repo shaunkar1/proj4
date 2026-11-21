@@ -2,6 +2,7 @@
 // No third-party C++ libraries; the two Parquet tables are written directly.
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <memory>
 #include <mutex>
 #include <omp.h>
@@ -28,6 +29,7 @@
 #include <vector>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <immintrin.h>
@@ -517,34 +519,62 @@ struct PRec{const char* id;uint64_t h;int64_t ingest;int64_t ts;uint32_t idlen;u
 // One valid click line, bucketed by click_id hash.
 struct CRec{const char* id;uint64_t h;int64_t ts;uint32_t idlen;uint32_t user;uint16_t campaign;uint8_t flags;};
 struct Chunk{const char* base;size_t len,from,to;bool click;};
-// One surviving event, 16 bytes, ordered by (person, ts) when compared as (a,b).
-// a = person<<32 | tsrel>>8, b = (tsrel&255)<<56 | price<<24 | category<<8 | purchase; tsrel = ts - window_start (< 2^40 ms).
-struct Ev{uint64_t a,b;};
-static inline bool operator<(const Ev& x,const Ev& y){return x.a!=y.a?x.a<y.a:x.b<y.b;}
-struct Click{int64_t ts;uint32_t user;uint16_t campaign;string_view id;};
-// Orders events by (person, ts): byte-wise LSD radix sort over the bytes that actually differ.
-static void sort_events(vector<Ev>& v,vector<Ev>& tmp){
- const size_t n=v.size();
- if(n<512){sort(v.begin(),v.end());return;}
- uint32_t cnt[9][256];memset(cnt,0,sizeof cnt);
- for(const Ev& e:v){
-  const uint64_t a=e.a;
-  ++cnt[0][e.b>>56];++cnt[1][a&255];++cnt[2][(a>>8)&255];++cnt[3][(a>>16)&255];++cnt[4][(a>>24)&255];
-  ++cnt[5][(a>>32)&255];++cnt[6][(a>>40)&255];++cnt[7][(a>>48)&255];++cnt[8][a>>56];
- }
- tmp.resize(n);
- Ev* src=v.data();Ev* dst=tmp.data();
- for(int pass=0;pass<9;++pass){
-  uint32_t* c=cnt[pass];
-  const unsigned first=pass==0?(unsigned)(src[0].b>>56):(unsigned)((src[0].a>>(8*(pass-1)))&255);
-  if(c[first]==n)continue; // every element has the same byte here
-  uint32_t sum=0;for(int i=0;i<256;++i){const uint32_t k=c[i];c[i]=sum;sum+=k;}
-  if(pass==0)for(size_t i=0;i<n;++i)dst[c[src[i].b>>56]++]=src[i];
-  else{const int sh=8*(pass-1);for(size_t i=0;i<n;++i)dst[c[(src[i].a>>sh)&255]++]=src[i];}
-  swap(src,dst);
- }
- if(src!=v.data())memcpy(v.data(),src,n*sizeof(Ev));
+// One surviving event, 16 bytes. k = tsrel<<25 | purchase<<24 | price, with tsrel = ts - window_start
+// (< 2^37 ms: the window is at most 1000 days) and price <= 10,000,000 < 2^24. person is the compact person number.
+struct Ev{uint64_t k;uint32_t person;uint16_t cat;uint16_t pad;};
+static constexpr uint64_t EV_PURCHASE=1ull<<24,EV_PRICE=EV_PURCHASE-1;
+static constexpr unsigned EV_TS=25;
+static_assert(((uint64_t)F_PURCHASE<<23)==EV_PURCHASE); // the flag bit is shifted straight into place
+// One surviving click, 24 bytes. key = (ts - (window_start - 7 days))<<16 | campaign.
+struct Click{uint64_t key;const char* id;uint32_t person;uint32_t idlen;};
+// Order of a person's clicks: by ts, and at equal ts the byte-wise larger ID first, so the last click
+// at or before a moment is the latest one with the smallest ID.
+static inline bool click_before(const Click& a,const Click& b){
+ const uint64_t x=a.key>>16,y=b.key>>16;
+ if(x!=y)return x<y;
+ return string_view(a.id,a.idlen)>string_view(b.id,b.idlen);
 }
+static inline void click_insertion_sort(Click* c0,Click* c1){
+ for(Click* x=c0+1;x<c1;++x){
+  if(click_before(*x,x[-1])){const Click v=*x;Click* y=x;do{*y=y[-1];--y;}while(y>c0&&click_before(v,y[-1]));*y=v;}
+ }
+}
+// Grow-only scratch array that is never zero-filled.
+template<class T> struct Scratch{
+ T* p=nullptr;size_t cap=0;
+ Scratch()=default;Scratch(const Scratch&)=delete;Scratch& operator=(const Scratch&)=delete;
+ ~Scratch(){free(p);}
+ T* get(size_t n){if(n>cap){free(p);cap=n+n/4+64;p=(T*)malloc(cap*sizeof(T));if(!p)throw bad_alloc();}return p;}
+};
+// Memory for the block lists below: handed out from 1 MB slabs owned by one thread, freed all at once.
+struct SlabPool{
+ char* cur=nullptr;char* end=nullptr;vector<void*> slabs;
+ SlabPool()=default;SlabPool(const SlabPool&)=delete;SlabPool& operator=(const SlabPool&)=delete;
+ ~SlabPool(){for(void* p:slabs)free(p);}
+ void* take(size_t bytes){
+  if((size_t)(end-cur)<bytes){
+   static constexpr size_t SLAB=size_t(1)<<20;
+   void* p=malloc(SLAB);if(!p){fprintf(stderr,"ERROR out of memory\n");_exit(1);}
+   slabs.push_back(p);cur=(char*)p;end=cur+SLAB;
+  }
+  void* r=cur;cur+=bytes;return r;
+ }
+};
+// Append-only list of fixed-size blocks: nothing is ever copied when it grows, and an element's address stays valid.
+template<class T,size_t BYTES> struct Blocks{
+ static constexpr size_t PER=(BYTES-16)/sizeof(T);
+ struct Block{Block* next;size_t pad;T items[PER];};
+ T* cur=nullptr;T* end=nullptr;Block* head=nullptr;Block* tail=nullptr;size_t nblocks=0;
+ void grow(SlabPool& pool){
+  Block* b=(Block*)pool.take(sizeof(Block));
+  b->next=nullptr;if(tail)tail->next=b;else head=b;
+  tail=b;++nblocks;cur=b->items;end=b->items+PER;
+ }
+ T* slot(SlabPool& pool){if(cur==end)grow(pool);return cur++;} // the place for the next element
+ size_t size()const{return nblocks?(nblocks-1)*PER+(size_t)(cur-tail->items):0;}
+ size_t count(const Block* b)const{return b==tail?(size_t)(cur-b->items):PER;}
+};
+using EvList=Blocks<Ev,4096>;using ClickList=Blocks<Click,4096>;
 struct alignas(64) ThreadState{
  SmallTable users; // IDs that did not fit in the shared table
  vector<AVec<PRec>> eb;vector<AVec<CRec>> cb; // parsed lines by event/click ID hash
@@ -595,20 +625,35 @@ struct PqFile{
   write_all("PAR1",4);pos=4;
  }
  // bodies[i] is the finished page body of column i: optional definition levels, then PLAIN values.
+ // The bodies are written from where they are (writev); only the small page headers are built here.
  void row_group(int64_t nrows,const vector<string_view>& bodies){
   buf.clear();Group g;g.rows=nrows;g.bytes=0;
-  for(size_t i=0;i<cols.size();++i){
-   size_t start=buf.size();
+  const size_t nc=cols.size();vector<size_t> hoff(nc+1);int64_t at=pos;
+  for(size_t i=0;i<nc;++i){
+   hoff[i]=buf.size();
    if(bodies[i].size()>0x7fff0000u)throw runtime_error("Parquet page too large");
    Thrift h(buf);
    h.i32(1,0);h.i32(2,(int64_t)bodies[i].size());h.i32(3,(int64_t)bodies[i].size());
    h.open_struct(5);h.i32(1,nrows);h.i32(2,0);h.i32(3,3);h.i32(4,3);h.close();
    buf.push_back(0);
-   buf.append(bodies[i]);
-   int64_t size=(int64_t)(buf.size()-start);
-   g.cols.push_back({pos+(int64_t)start,size,nrows});g.bytes+=size;
+   const int64_t size=(int64_t)(buf.size()-hoff[i]+bodies[i].size());
+   g.cols.push_back({at,size,nrows});g.bytes+=size;at+=size;
   }
-  write_all(buf.data(),buf.size());pos+=(int64_t)buf.size();rows+=nrows;groups.push_back(std::move(g));
+  hoff[nc]=buf.size();
+  vector<struct iovec> iov;iov.reserve(2*nc);
+  for(size_t i=0;i<nc;++i){
+   iov.push_back({(void*)(buf.data()+hoff[i]),hoff[i+1]-hoff[i]});
+   if(!bodies[i].empty())iov.push_back({(void*)bodies[i].data(),bodies[i].size()});
+  }
+  size_t k=0;
+  while(k<iov.size()){
+   ssize_t w=::writev(fd,iov.data()+k,(int)min<size_t>(iov.size()-k,64));
+   if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}
+   size_t left=(size_t)w;
+   while(k<iov.size()&&left>=iov[k].iov_len){left-=iov[k].iov_len;++k;}
+   if(left){iov[k].iov_base=(char*)iov[k].iov_base+left;iov[k].iov_len-=left;}
+  }
+  pos=at;rows+=nrows;groups.push_back(std::move(g));
  }
  void close(){
   buf.clear();Thrift m(buf);
@@ -711,6 +756,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
  }
  const uint32_t nlinked=tab.nextId.load();
+ if(getenv("SS_TEST_MAXNEW"))tab.idLimit=min<uint64_t>(tab.idLimit,(uint64_t)nlinked+maxNew64); // tests: really force the fallback path
  __mark("LINKREAD");
  // Flatten, then name each person by the byte-wise smallest of their IDs.
  vector<uint32_t> root(nlinked);
@@ -819,6 +865,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const uint32_t totalIds=tab.end_parallel();
  __mark("PARSE");
  // ---- Fallback only: IDs that did not fit in the shared table get their person number here. ----
+ // From here on a person is a compact number: shared-table IDs keep theirs (< totalIds), fallback IDs follow.
  vector<vector<uint32_t>> trans(T);vector<string_view> extraNames;
  const uint32_t extraBase=maxIds;
  for(int t=0;t<T;++t){auto& keys=tls[t].users.keys;trans[t].resize(keys.size());
@@ -827,198 +874,358 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    uint32_t n=extraBase+(uint32_t)extraNames.size();
    uint32_t id=tab.intern(keys[i],n);
    if(id==n)extraNames.push_back(keys[i]);
-   trans[t][i]=id;
+   trans[t][i]=id<extraBase?id:totalIds+(id-extraBase);
   }
  }
  const PName* personNames=tab.newNames;
  auto name_of=[&](uint32_t person)->string_view{
-  if(person<extraBase)return personNames[person].view();
-  return extraNames[person-extraBase];
+  if(person<totalIds)return personNames[person].view();
+  return extraNames[person-totalIds];
  };
  const uint32_t newCount=totalIds-nlinked;
  cerr<<"unlinked IDs: "<<newCount<<" (+"<<extraNames.size()<<" via fallback)\n";
+ // ---- Person buckets: bucket = person >> pshift, so a bucket is a dense range of W person numbers
+ // and the last stage can group by person with one counting pass. Aim for about 16k events per bucket.
+ const uint64_t npersons=(uint64_t)totalIds+extraNames.size();
+ uint64_t parsedEvents=0;
+ for(int t=0;t<T;++t)for(const auto& v:tls[t].eb)parsedEvents+=v.size();
+ unsigned pshift=0;
+ {const uint64_t want=max<uint64_t>(1,parsedEvents/16384);while(pshift<16&&(npersons>>pshift)>want)++pshift;}
+ if(const char* v=getenv("SS_TEST_PSHIFT")){int s=atoi(v);if(s>=0&&s<=16)pshift=(unsigned)s;} // tests force odd bucket widths
+ const uint32_t W=1u<<pshift;
+ const size_t UPn=(size_t)((npersons?npersons-1:0)>>pshift)+1;
+ // Survivors by person bucket, one list per thread and bucket (tls[t].uev/ucl are not used any more).
+ struct Survivors{vector<EvList> ev;vector<ClickList> cl;SlabPool pool;};
+ vector<Survivors> surv(T);
+ for(int t=0;t<T;++t){surv[t].ev.resize(UPn);surv[t].cl.resize(UPn);tls[t].uev.clear();tls[t].ucl.clear();}
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
- auto person_bucket=[UP](uint32_t person)->size_t{return (size_t)(((uint64_t)(person*0x9E3779B1u)*UP)>>32);};
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
  #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks)
  {
-  ThreadState& me=tls[omp_get_thread_num()];
-  {size_t r=(size_t)(eventBytes/70/((uint64_t)T*UP)*5/4)+16;for(auto& v:me.uev)v.reserve(r);}
-  {size_t r=(size_t)(clickBytes/40/((uint64_t)T*UP)*5/4)+16;for(auto& v:me.ucl)v.reserve(r);}
-  vector<uint64_t> slots;vector<size_t> off(T+1);
+  const int tid=omp_get_thread_num();
+  EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();SlabPool& pool=surv[tid].pool;
+  // Slot = tag<<ib | (record number+1), 0 = empty; ib bits are enough for the bucket's record count.
+  // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
+  Scratch<uint32_t> slotBuf;Scratch<Ev*> emitBuf;vector<size_t> off(T+1);
+  auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
+  // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
+  // turns out to be the earlier ingested one, the event already passed on is turned into a tombstone:
+  // its person becomes the first number past its bucket's range, which the last stage never visits.
   #pragma omp for schedule(dynamic,1) nowait
   for(size_t p=0;p<PE;++p){
-   size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=tls[t].eb[p].size();}off[T]=n;
+   size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=bucket_size(tls[t].eb,p);}off[T]=n;
    if(!n)continue;
-   size_t cap=16;while(cap<n*2)cap<<=1;slots.assign(cap,0);const size_t mask=cap-1;
-   auto at=[&](uint32_t g)->PRec&{int t=0;while(g>=off[t+1])++t;return tls[t].eb[p][g-off[t]];};
-   size_t alive=0;
-   for(int t=0;t<T;++t){auto& v=tls[t].eb[p];
-    for(size_t i=0;i<v.size();++i){PRec& r=v[i];const uint32_t g=(uint32_t)(off[t]+i);const uint32_t tag=(uint32_t)(r.h>>18);
-     for(size_t j=r.h&mask;;j=(j+1)&mask){
-      uint64_t e=slots[j];
-      if(!e){slots[j]=((uint64_t)tag<<32)|(g+1);++alive;break;}
-      if((uint32_t)(e>>32)==tag){PRec& o=at((uint32_t)e-1);
-       if(o.idlen==r.idlen&&memcmp(o.id,r.id,r.idlen)==0){
+   if(n>=0x7fffffffu){fprintf(stderr,"ERROR event ID bucket too large\n");_exit(1);}
+   const size_t cap=2*n+2;
+   uint32_t* const S=slotBuf.get(cap);memset(S,0,cap*sizeof(uint32_t));
+   Ev** const emitted=emitBuf.get(n); // where record g's event went (only read for valid winners)
+   const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
+   size_t dups=0,dead=0;
+   const int64_t ws=window_start;
+   for(int t=0;t<T;++t){
+    const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
+    const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
+    for(;r!=rend;++r,++g1){
+     const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
+     size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
+     for(uint32_t e;(e=S[j])!=0;){
+      if((e^tg)<=imask){ // same tag: compare the IDs themselves
+       const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
+       const PRec& o=tls[ot].eb[p][og-off[ot]];
+       if(o.idlen==r->idlen&&memcmp(o.id,r->id,r->idlen)==0){
         // Keep the earliest ingested copy; copies with equal ingest_ts are identical.
-        if(r.ingest<o.ingest){o.flags|=F_DEAD;slots[j]=((uint64_t)tag<<32)|(g+1);}else r.flags|=F_DEAD;
+        ++dups;
+        if(r->ingest>=o.ingest)goto next_event;
+        if(o.flags&F_VALID){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
       }
+      if(++j==cap)j=0;
      }
-    }
-   }
-   for(int t=0;t<T;++t){auto& v=tls[t].eb[p];
-    for(const PRec& r:v)if((r.flags&(F_DEAD|F_VALID))==F_VALID){
-     uint32_t u=r.user;if(u&LOCAL_USER)u=trans[t][u&~LOCAL_USER];
-     const uint64_t rel=(uint64_t)(r.ts-window_start);
-     me.uev[person_bucket(u)].push_back({((uint64_t)u<<32)|(rel>>8),((rel&255)<<56)|((uint64_t)(uint32_t)r.price<<24)|((uint64_t)r.cat<<8)|((r.flags&F_PURCHASE)?1u:0u)});
-     ++surviving;
-    }
-    v=AVec<PRec>();
-   }
-   dedupCount+=alive;
-  }
-  #pragma omp for schedule(dynamic,1)
-  for(size_t p=0;p<PC;++p){
-   size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=tls[t].cb[p].size();}off[T]=n;
-   if(!n)continue;
-   size_t cap=16;while(cap<n*2)cap<<=1;slots.assign(cap,0);const size_t mask=cap-1;
-   auto at=[&](uint32_t g)->CRec&{int t=0;while(g>=off[t+1])++t;return tls[t].cb[p][g-off[t]];};
-   for(int t=0;t<T;++t){auto& v=tls[t].cb[p];
-    for(size_t i=0;i<v.size();++i){CRec& r=v[i];const uint32_t g=(uint32_t)(off[t]+i);const uint32_t tag=(uint32_t)(r.h>>18);
-     for(size_t j=r.h&mask;;j=(j+1)&mask){
-      uint64_t e=slots[j];
-      if(!e){slots[j]=((uint64_t)tag<<32)|(g+1);break;}
-      if((uint32_t)(e>>32)==tag){const CRec& o=at((uint32_t)e-1);
-       if(o.idlen==r.idlen&&memcmp(o.id,r.id,r.idlen)==0){r.flags|=F_DEAD;break;}
+     S[j]=tg|g1;
+     {
+      const unsigned fl=r->flags;
+      if(fl&F_VALID){
+       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
+       Ev* const out=myEv[u>>pshift].slot(pool);
+       emitted[g1-1]=out;
+       out->k=((uint64_t)(r->ts-ws)<<EV_TS)|((uint64_t)(fl&F_PURCHASE)<<23)|(uint64_t)(uint32_t)r->price;
+       const uint64_t w=(uint64_t)u|((uint64_t)r->cat<<32);memcpy((void*)&out->person,&w,8);
       }
      }
+     next_event:;
     }
    }
-   for(int t=0;t<T;++t){auto& v=tls[t].cb[p];
-    for(const CRec& r:v)if(!(r.flags&F_DEAD)){
-     uint32_t u=r.user;if(u&LOCAL_USER)u=trans[t][u&~LOCAL_USER];
-     me.ucl[person_bucket(u)].push_back({r.ts,u,r.campaign,string_view(r.id,r.idlen)});
-     ++survivingClicks;
+   for(int t=0;t<T;++t)if(p<tls[t].eb.size())tls[t].eb[p]=AVec<PRec>();
+   surviving-=dead;dedupCount+=n-dups;
+  }
+  // Copies of a click are identical, so the first one seen is kept.
+  #pragma omp for schedule(dynamic,1)
+  for(size_t p=0;p<PC;++p){
+   size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=bucket_size(tls[t].cb,p);}off[T]=n;
+   if(!n)continue;
+   if(n>=0x7fffffffu){fprintf(stderr,"ERROR click ID bucket too large\n");_exit(1);}
+   const size_t cap=2*n+2;
+   uint32_t* const S=slotBuf.get(cap);memset(S,0,cap*sizeof(uint32_t));
+   const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
+   for(int t=0;t<T;++t){
+    const size_t m=bucket_size(tls[t].cb,p);if(!m)continue;
+    const CRec* r=tls[t].cb[p].data();const CRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
+    for(;r!=rend;++r,++g1){
+     const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
+     size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
+     for(uint32_t e;(e=S[j])!=0;){
+      if((e^tg)<=imask){
+       const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
+       const CRec& o=tls[ot].cb[p][og-off[ot]];
+       if(o.idlen==r->idlen&&memcmp(o.id,r->id,r->idlen)==0)goto next_click;
+      }
+      if(++j==cap)j=0;
+     }
+     S[j]=tg|g1;
+     {
+      uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
+      Click* const out=myCl[u>>pshift].slot(pool);
+      out->key=((uint64_t)(r->ts-clickStart)<<16)|r->campaign;out->id=r->id;out->person=u;out->idlen=r->idlen;
+     }
+     next_click:;
     }
-    v=AVec<CRec>();
    }
+   for(int t=0;t<T;++t)if(p<tls[t].cb.size())tls[t].cb[p]=AVec<CRec>();
   }
  }
+ for(int t=0;t<T;++t){for(const auto& L:surv[t].ev)surviving+=L.size();for(const auto& L:surv[t].cl)survivingClicks+=L.size();}
  cerr<<"deduplicated events: "<<dedupCount<<", surviving: "<<surviving<<"\n";
  cerr<<"surviving clicks: "<<survivingClicks<<"\n";
  __mark("DEDUP");
- // ---- Per person bucket: sort, sessionize, attribute. Each thread writes its own Parquet file. ----
+ // ---- Per person bucket: order, sessionize, attribute. Each thread writes its own Parquet file. ----
  fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");
  const bool debugCsv=getenv("SS_DEBUG_CSV")!=nullptr; // unit tests read these hex rows from SCRATCH_DIR
  const size_t ncamp=campaigns.size();
  const int64_t firstday=divfloor(window_start,DAY);
- vector<vector<Totals>> threadTotals(T);vector<string> dbg(debugCsv?T:0);
+ // UTC days the window touches (same as nday when the window starts at midnight).
+ const int ndays=(int)(divfloor(window_end-1,DAY)-firstday+1);
+ const uint64_t dayOff=(uint64_t)(window_start-firstday*DAY);
+ // Events are only ordered down to "cells" of 2^20 ms of event time. A cell is shorter than the session
+ // gap, so two events in one cell always share a session, and whether a session ends between two
+ // neighbouring cells depends only on the latest time in the first and the earliest time in the second.
+ static constexpr unsigned CELL=20,CSH=EV_TS+CELL;
+ const uint64_t ncell=((uint64_t)(window_end-window_start-1)>>CELL)+1;
+ const unsigned cellBits=ncell>1?(unsigned)bit_width(ncell-1):0;
+ unsigned digitBits=13; // cells are sorted by counting passes of at most this many bits (one pass up to ~97 days)
+ if(const char* v=getenv("SS_TEST_TIMEBITS")){int s=atoi(v);if(s>=1&&s<=16)digitBits=(unsigned)s;} // tests force several passes
+ struct Pass{unsigned sh;uint32_t mask;};
+ vector<Pass> tpass;
+ for(unsigned done=0;done<cellBits||tpass.empty();){const unsigned b=min(digitBits,cellBits-done);tpass.push_back({CSH+done,(uint32_t)((1u<<b)-1)});done+=b;if(!b)break;}
+ uint32_t maxDigit=0;for(const Pass& q:tpass)maxDigit=max(maxDigit,q.mask);
+ // Clicks get the same treatment (their time runs from seven days before the window), then an exact sort
+ // inside each person's cells, which hold only a few clicks.
+ static constexpr unsigned CCSH=16+CELL;
+ const uint64_t nccell=((uint64_t)(window_end-clickStart-1)>>CELL)+1;
+ const unsigned ccellBits=nccell>1?(unsigned)bit_width(nccell-1):0;
+ vector<Pass> cpass;
+ for(unsigned done=0;done<ccellBits||cpass.empty();){const unsigned b=min(digitBits,ccellBits-done);cpass.push_back({CCSH+done,(uint32_t)((1u<<b)-1)});done+=b;if(!b)break;}
+ for(const Pass& q:cpass)maxDigit=max(maxDigit,q.mask);
+ vector<vector<Totals>> threadTotals(T);vector<vector<uint64_t>> threadAssists(T);vector<string> dbg(debugCsv?T:0);
  const vector<PqCol> userCols={{"user_id",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},{"sessions",PQ_INT64,false,CONV_NONE},
   {"events",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"top_category",PQ_BYTES,true,CONV_UTF8}};
  uint64_t num_sessions=0;
  #pragma omp parallel num_threads(T) reduction(+:num_sessions)
  {
   const int tid=omp_get_thread_num();
-  auto& campTotals=threadTotals[tid];campTotals.assign(ncamp*(size_t)nday,Totals{});
-  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active;
+  // Per-thread campaign totals, laid out [day][campaign].
+  auto& tot=threadTotals[tid];tot.assign(ncamp*(size_t)ndays,Totals{});
+  auto& assists=threadAssists[tid];assists.assign(ncamp*(size_t)ndays,0);
+  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp);size_t nact=0;
   vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
-  auto add_campaign=[&](uint16_t c){if(freq[c]++==0){positions[c]=(uint32_t)active.size();active.push_back(c);}};
-  auto remove_campaign=[&](uint16_t c){if(--freq[c]==0){size_t pos=positions[c];uint16_t back=active.back();active[pos]=back;positions[back]=pos;active.pop_back();}};
   PqFile file;
   auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
-  string uid,catv,catbody,levels;vector<int32_t> days;vector<int64_t> sess,evs,rev;vector<uint8_t> hascat;
-  vector<Ev> events,evtmp;vector<Click> clicks;
+  // Row buffers. A person adds at most ndays rows and the buffers are flushed between persons,
+  // so the fixed-width columns never need a capacity check.
+  static constexpr size_t FLUSH=50000;
+  const size_t rowCap=FLUSH+(size_t)ndays;
+  vector<int32_t> days(rowCap);vector<int64_t> sess(rowCap),evs(rowCap),rev(rowCap);
+  vector<uint8_t> catbits((rowCap+7)/8,0);
+  string uid(1<<16,'\0'),catv,catbody;size_t uidLen=0,nrows=0;
+  char* uidp=uid.data();size_t uidCap=uid.size();
+  int32_t* const dayp=days.data();int64_t* const sessp=sess.data();int64_t* const evsp=evs.data();int64_t* const revp=rev.data();
   auto flush_rows=[&]{
-   if(days.empty())return;
+   if(!nrows)return;
    // top_category page: 1-bit definition levels as one bit-packed run, then the non-null values.
-   const size_t n=days.size(),groups=(n+7)/8;
-   levels.clear();put_varint(levels,(groups<<1)|1);size_t at=levels.size();levels.resize(at+groups,0);
-   for(size_t i=0;i<n;++i)if(hascat[i])levels[at+i/8]|=(char)(1<<(i%8));
-   catbody.clear();put_le32(catbody,(uint32_t)levels.size());catbody+=levels;catbody+=catv;
+   const size_t n=nrows,groups=(n+7)/8;
+   catbody.clear();
+   string head;put_varint(head,(groups<<1)|1);
+   put_le32(catbody,(uint32_t)(head.size()+groups));catbody+=head;catbody.append((const char*)catbits.data(),groups);catbody+=catv;
    if(!file.is_open())open_file();
-   file.row_group((int64_t)n,{uid,raw(days),raw(sess),raw(evs),raw(rev),catbody});
-   uid.clear();catv.clear();days.clear();sess.clear();evs.clear();rev.clear();hascat.clear();
+   file.row_group((int64_t)n,{string_view(uid.data(),uidLen),string_view((const char*)days.data(),n*4),string_view((const char*)sess.data(),n*8),
+    string_view((const char*)evs.data(),n*8),string_view((const char*)rev.data(),n*8),catbody});
+   memset(catbits.data(),0,groups);catv.clear();uidLen=0;nrows=0;
   };
+  Scratch<Ev> bufA,bufB;Scratch<Click> bufC,bufD;
+  vector<uint32_t> thist((size_t)maxDigit+2),phist((size_t)W+3),chist((size_t)W+2);
+  uint32_t* const th=thist.data();uint32_t* const pp=phist.data();uint32_t* const cp=chist.data();
   #pragma omp for schedule(dynamic,1)
-  for(size_t up=0;up<UP;++up){
-   events.clear();clicks.clear();
-   for(int t=0;t<T;++t){auto& v=tls[t].uev[up];events.insert(events.end(),v.begin(),v.end());v=AVec<Ev>();
-    auto& c=tls[t].ucl[up];clicks.insert(clicks.end(),c.begin(),c.end());c=AVec<Click>();}
-   if(events.empty())continue;
-   sort_events(events,evtmp);
-   sort(clicks.begin(),clicks.end(),[](const Click& a,const Click& b){
-    if(a.user!=b.user)return a.user<b.user;
-    if(a.ts!=b.ts)return a.ts<b.ts;
-    return a.id>b.id; // last click at equal timestamp has lexicographically smallest ID
-   });
-   const size_t nE=events.size(),nC=clicks.size();
-   // Ask for every person's name now; the misses overlap instead of being paid one row at a time.
-   {uint32_t prev=UINT32_MAX;for(size_t i=0;i<nE;++i){const uint32_t u=(uint32_t)(events[i].a>>32);if(u!=prev){prev=u;if(u<extraBase)__builtin_prefetch(&personNames[u],0,1);}}}
-   auto ts_of=[&](const Ev& e)->int64_t{return window_start+(int64_t)(((e.a&0xffffffffu)<<8)|(e.b>>56));};
-   size_t ei=0,cptr=0;
-   while(ei<nE){
-    const uint32_t person=(uint32_t)(events[ei].a>>32);
-    size_t end=ei+1;while(end<nE&&(uint32_t)(events[end].a>>32)==person)++end;
-    while(cptr<nC&&clicks[cptr].user<person)++cptr;
-    size_t cstart=cptr;while(cptr<nC&&clicks[cptr].user==person)++cptr;
-    size_t add=cstart,expire=cstart;
-    UserTotals userday;int currentday=-1;
-    auto flushday=[&](){
-     if(currentday<0)return;
-     uint16_t top=0;uint64_t best=0;
-     for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
-     touched.clear();
-     const string_view name=name_of(person);
-     put_bytes(uid,name);days.push_back((int32_t)(firstday+currentday));
-     sess.push_back((int64_t)userday.sessions);evs.push_back((int64_t)userday.events);rev.push_back((int64_t)userday.revenue);
-     hascat.push_back(best!=0);if(best!=0)put_bytes(catv,catnames[top]);
-     if(debugCsv){string& o=dbg[tid];
-      o+=hexstr(name);o+=',';o+=to_string(firstday+currentday);o+=',';o+=to_string(userday.sessions);o+=',';o+=to_string(userday.events);o+=',';o+=to_string(userday.revenue);o+=',';
-      o+=best==0?string("NULL"):hexstr(catnames[top]);o+='\n';
-     }
-     userday={};
-    };
-    for(size_t a=ei;a<end;){
-     const int64_t start=ts_of(events[a]);size_t b=a+1;int64_t prev=start;
-     while(b<end){int64_t cur=ts_of(events[b]);if(cur-prev>GAP)break;prev=cur;++b;}
-     int d=(int)(divfloor(start,DAY)-firstday); // in [0,nday): every surviving event is inside the window
-     if(d!=currentday){flushday();currentday=d;}
-     uint64_t revenue=0;bool purchasing=false;
-     for(size_t k=a;k<b;++k){const Ev& e=events[k];
-      if(e.b&1){purchasing=true;const uint64_t price=(e.b>>24)&0xffffffffu;const uint16_t cat=(uint16_t)(e.b>>8);
-       revenue+=price;
-       if(catsum[cat]==0)touched.push_back(cat);
-       catsum[cat]+=price;
+  for(size_t up=0;up<UPn;++up){
+   size_t nE=0,nC=0;
+   for(int t=0;t<T;++t){nE+=surv[t].ev[up].size();nC+=surv[t].cl[up].size();}
+   if(!nE)continue;
+   const uint32_t base=(uint32_t)(up<<pshift);
+   // Counting passes: by cell (lowest digit first), then by person. The first pass reads the per-thread
+   // lists directly, so the events are never gathered separately.
+   const unsigned sh0=tpass[0].sh;const uint32_t m0=tpass[0].mask;
+   memset(th,0,((size_t)m0+2)*sizeof(uint32_t));memset(pp,0,((size_t)W+3)*sizeof(uint32_t));
+   for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
+    for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
+     for(size_t i=0;i<m;++i){++th[((s[i].k>>sh0)&m0)+1];++pp[(s[i].person-base)+2];}}}
+   for(uint32_t d=0;d<m0;++d)th[d+1]+=th[d];
+   // pp[i+1] = where person i's events start; after the person pass pp[i]..pp[i+1] is person i's range.
+   // nE counts tombstones too.
+   for(uint32_t i=0;i<W;++i){
+    if(pp[i+2]&&base+i<totalIds)__builtin_prefetch(&personNames[base+i],0,1); // names are needed when rows are written
+    pp[i+2]+=pp[i+1];
+   }
+   pp[W+2]+=pp[W+1]; // tombstones (person = base+W) are placed after everybody and never looked at
+   Ev* A=bufA.get(nE);Ev* B=bufB.get(nE);
+   for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
+    for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
+     for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));_mm_storeu_si128((__m128i*)(A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++),e);}}}
+   for(size_t q=1;q<tpass.size();++q){
+    const unsigned sh=tpass[q].sh;const uint32_t mk=tpass[q].mask;
+    memset(th,0,((size_t)mk+2)*sizeof(uint32_t));
+    for(size_t i=0;i<nE;++i)++th[((A[i].k>>sh)&mk)+1];
+    for(uint32_t d=0;d<mk;++d)th[d+1]+=th[d];
+    for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh)&mk]++),e);}
+    swap(A,B);
+   }
+   {uint32_t* const pq=pp+1;for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+pq[A[i].person-base]++),e);}}
+   const Ev* const E=B;
+   // Clicks of people with events, grouped by person the same way.
+   Click* C=nullptr;
+   if(nC){
+    const unsigned csh0=cpass[0].sh;const uint32_t cm0=cpass[0].mask;
+    memset(cp,0,((size_t)W+2)*sizeof(uint32_t));memset(th,0,((size_t)cm0+2)*sizeof(uint32_t));
+    for(int t=0;t<T;++t){const ClickList& L=surv[t].cl[up];
+     for(const ClickList::Block* bl=L.head;bl;bl=bl->next){const Click* s=bl->items;const size_t m=L.count(bl);
+      for(size_t i=0;i<m;++i){const uint32_t x=s[i].person-base;const uint32_t keep=pp[x]!=pp[x+1];cp[x+2]+=keep;th[((s[i].key>>csh0)&cm0)+1]+=keep;}}}
+    for(uint32_t d=0;d<cm0;++d)th[d+1]+=th[d];
+    for(uint32_t i=0;i<W;++i)cp[i+2]+=cp[i+1];
+    const size_t nK=cp[W+1]; // clicks kept
+    Click* CA=bufC.get(nC);Click* CB=bufD.get(nC);
+    for(int t=0;t<T;++t){const ClickList& L=surv[t].cl[up];
+     for(const ClickList::Block* bl=L.head;bl;bl=bl->next){const Click* s=bl->items;const size_t m=L.count(bl);
+      for(size_t i=0;i<m;++i){const uint32_t x=s[i].person-base;if(pp[x]!=pp[x+1])memcpy((void*)(CA+th[(s[i].key>>csh0)&cm0]++),(const void*)(s+i),sizeof(Click));}}}
+    for(size_t q=1;q<cpass.size();++q){
+     const unsigned sh=cpass[q].sh;const uint32_t mk=cpass[q].mask;
+     memset(th,0,((size_t)mk+2)*sizeof(uint32_t));
+     for(size_t i=0;i<nK;++i)++th[((CA[i].key>>sh)&mk)+1];
+     for(uint32_t d=0;d<mk;++d)th[d+1]+=th[d];
+     for(size_t i=0;i<nK;++i)memcpy((void*)(CB+th[(CA[i].key>>sh)&mk]++),(const void*)(CA+i),sizeof(Click));
+     swap(CA,CB);
+    }
+    {uint32_t* const cq=cp+1;for(size_t i=0;i<nK;++i)memcpy((void*)(CB+cq[CA[i].person-base]++),(const void*)(CA+i),sizeof(Click));}
+    C=CB;
+   }
+   for(uint32_t pi=0;pi<W;++pi){
+    const size_t es=pp[pi],ee=pp[pi+1];if(es==ee)continue;
+    const uint32_t person=base+pi;
+    const Click *cb=nullptr,*ce=nullptr;
+    if(nC){
+     Click* c0=C+cp[pi];Click* c1=C+cp[pi+1];const size_t n=(size_t)(c1-c0);
+     if(n>1){
+      // The clicks are already in cell order; finish each cell exactly.
+      if(n<=24)click_insertion_sort(c0,c1);
+      else for(Click* r0=c0;r0<c1;){
+       const uint64_t cellEnd=((r0->key>>CCSH)+1)<<CCSH;Click* r1=r0+1;while(r1<c1&&r1->key<cellEnd)++r1;
+       if(r1-r0>1){if(r1-r0<=24)click_insertion_sort(r0,r1);else sort(r0,r1,click_before);}
+       r0=r1;
       }
      }
-     userday.sessions++;userday.events+=b-a;userday.revenue+=revenue;
-     // Sliding seven-day window, inclusive on both ends.
-     while(add<cptr&&clicks[add].ts<=start){add_campaign(clicks[add].campaign);++add;}
-     while(expire<add&&clicks[expire].ts<start-WEEK){remove_campaign(clicks[expire].campaign);++expire;}
-     uint16_t credited=organic;
-     if(add>expire)credited=clicks[add-1].campaign;
-     auto& t=campTotals[(size_t)credited*nday+d];t.sessions++;t.purchasing_sessions+=purchasing;t.revenue+=revenue;
-     for(uint16_t ci:active)campTotals[(size_t)ci*nday+d].assists++;
-     num_sessions++;a=b;
+     cb=c0;ce=c1;
     }
-    flushday();
-    for(uint16_t ci:active)freq[ci]=0;
-    active.clear();ei=end;
+    const Click *add=cb,*expire=cb;
+    int currentday=-1;uint64_t dsess=0,devs=0,drev=0;
+    Totals* cur=nullptr;bool purchasing=false;uint64_t prevmax=0;
+    for(size_t a=es;;){
+     // One cell: earliest and latest time, and whether it holds a purchase. Events are ordered by cell,
+     // so the cell ends at the first key at or past its upper bound.
+     uint64_t mn=0,mx=0,any=0;size_t b=a;bool fresh=false;int d=currentday;
+     if(a<ee){
+      mn=E[a].k;mx=mn;any=mn;const uint64_t cellEnd=((mn>>CSH)+1)<<CSH;
+      for(b=a+1;b<ee;++b){const uint64_t x=E[b].k;if(x>=cellEnd)break;mn=min(mn,x);mx=max(mx,x);any|=x;}
+      // A session starts with this cell if it is the person's first or the gap to the previous cell is too long.
+      // Its day is the UTC date of its first event.
+      if(!cur||(mn>>EV_TS)-prevmax>(uint64_t)GAP){fresh=true;d=(int)(((mn>>EV_TS)+dayOff)/(uint64_t)DAY);}
+     }
+     if(a==ee||d!=currentday){
+      if(currentday>=0){
+       // The (person, day) row is complete.
+       uint16_t top=0;uint64_t best=0;
+       if(!touched.empty()){
+        for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
+        touched.clear();
+       }
+       const size_t r=nrows++;
+       // user_id: names of up to 15 bytes sit inside their PName and are copied as one fixed 16-byte block.
+       if(uidCap-uidLen<64){uid.resize(uid.size()*2);uidp=uid.data();uidCap=uid.size();}
+       unsigned char inl=0xFF;if(person<totalIds)inl=(unsigned char)personNames[person].b[15];
+       if(inl!=0xFF){char* o=uidp+uidLen;const uint32_t L=inl;memcpy(o,&L,4);memcpy(o+4,personNames[person].b,16);uidLen+=4+L;}
+       else{const string_view name=name_of(person);const uint32_t L=(uint32_t)name.size();
+        if(uidCap-uidLen<(size_t)L+64){uid.resize(max(uid.size()*2,uidLen+L+64));uidp=uid.data();uidCap=uid.size();}
+        char* o=uidp+uidLen;memcpy(o,&L,4);memcpy(o+4,name.data(),L);uidLen+=4+L;}
+       dayp[r]=(int32_t)(firstday+currentday);sessp[r]=(int64_t)dsess;evsp[r]=(int64_t)devs;revp[r]=(int64_t)drev;
+       if(best!=0){catbits[r>>3]|=(uint8_t)(1u<<(r&7));put_bytes(catv,catnames[top]);}
+       if(debugCsv){string& o=dbg[tid];const string_view name=name_of(person);
+        o+=hexstr(name);o+=',';o+=to_string(firstday+currentday);o+=',';o+=to_string(dsess);o+=',';o+=to_string(devs);o+=',';o+=to_string(drev);o+=',';
+        o+=best==0?string("NULL"):hexstr(catnames[top]);o+='\n';
+       }
+       dsess=0;devs=0;drev=0;
+      }
+      if(a==ee)break;
+      currentday=d;
+     }
+     if(fresh){
+      const uint64_t tmin=mn>>EV_TS;
+      ++dsess;
+      // Sliding seven-day window, inclusive on both ends.
+      const uint64_t addLim=(tmin+(uint64_t)WEEK+1)<<16,expLim=tmin<<16;
+      while(add<ce&&add->key<addLim){const uint16_t c=(uint16_t)add->key;if(freq[c]++==0){positions[c]=(uint32_t)nact;active[nact++]=c;}++add;}
+      while(expire<add&&expire->key<expLim){const uint16_t c=(uint16_t)expire->key;if(--freq[c]==0){const uint32_t pos=positions[c];const uint16_t back=active[--nact];active[pos]=back;positions[back]=pos;}++expire;}
+      uint16_t credited=organic;
+      if(add>expire)credited=(uint16_t)add[-1].key;
+      cur=&tot[(size_t)d*ncamp+credited];cur->sessions++;purchasing=false;
+      uint64_t* const arow=assists.data()+(size_t)d*ncamp;
+      for(size_t q=0;q<nact;++q)++arow[active[q]];
+      ++num_sessions;
+     }
+     prevmax=mx>>EV_TS;devs+=b-a;
+     if(any&EV_PURCHASE){
+      for(size_t q=a;q<b;++q){const uint64_t x=E[q].k;
+       if(x&EV_PURCHASE){const uint64_t price=x&EV_PRICE;const uint16_t cat=E[q].cat;
+        drev+=price;cur->revenue+=price;
+        if(!purchasing){purchasing=true;cur->purchasing_sessions++;}
+        if(catsum[cat]==0)touched.push_back(cat);
+        catsum[cat]+=price;
+       }
+      }
+     }
+     a=b;
+    }
+    for(size_t q=0;q<nact;++q)freq[active[q]]=0;
+    nact=0;
+    if(nrows>=FLUSH)flush_rows();
    }
-   if(days.size()>=50000)flush_rows();
   }
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
   if(file.is_open())file.close();
  }
- vector<Totals> campTotals(ncamp*(size_t)nday);
- for(const auto& tt:threadTotals)for(size_t i=0;i<tt.size();++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;campTotals[i].assists+=tt[i].assists;}
+ vector<Totals> campTotals(ncamp*(size_t)ndays);
+ for(const auto& tt:threadTotals)for(size_t i=0;i<tt.size();++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
+ for(const auto& ta:threadAssists)for(size_t i=0;i<ta.size();++i)campTotals[i].assists+=ta[i];
 __mark("AGGREGATE");
  {
   string cid,chan,csv;vector<int32_t> days;vector<int64_t> s,p,r,a;
-  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<nday;++d){const auto& t=campTotals[ci*(size_t)nday+d];if(t.sessions==0&&t.assists==0)continue;
+  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
    put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
    s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
    if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
