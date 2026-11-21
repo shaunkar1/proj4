@@ -2219,6 +2219,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  {const char* v=getenv("SS_DENSE_USERS");
   const uint64_t idBound=2*(linkBytes/4+linkFileCount)+(uint64_t)T*KeyTable::ID_BLOCK+maxNew64;
   denseUsers=denseLinks&&idBound<DENSE_USER&&(dense.limI<<dn::ALIAS_BITS)<=DENSE_USER&&!(v&&v[0]=='0');}
+ // With dense users only the IDs that cannot take the dense route are new to the ID table (generated data
+ // has a few hundred of them at 20M events), so an eighth of the room is still several hundred times what is
+ // needed - and the table, whose slots are touched at random, is an eighth as large: its first touches
+ // (whole huge pages, zeroed) are most of the LINKREAD stage. More new IDs than that take the fallback
+ // path as before. SS_ROOMY_IDS=1 keeps the full room.
+ if(denseUsers&&!getenv("SS_TEST_MAXNEW")&&!getenv("SS_ROOMY_IDS"))maxNew64=maxNew64/8+4096;
  if(denseUsers)denseComp=(atomic<uint32_t>*)map_huge((dense.limI+1)*sizeof(uint32_t));
  dparse.users=denseUsers;
  if(!denseUsers)dparse.events=dparse.clicks=false; // the record loops decode both IDs of a line together
