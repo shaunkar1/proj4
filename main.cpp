@@ -795,9 +795,41 @@ struct alignas(64) ThreadState{
  vector<pair<const char*,int64_t>> ingestSide; // (event id pointer, ingest ms) of records whose ingest code is INGEST_SIDE
  vector<Bucket<PRec>> eb;vector<Bucket<CRec>> cb; // parsed lines by event/click ID hash
  vector<Bucket<DRec>> db;vector<Bucket<DCRec>> dcb; // parsed lines with a dense event/click ID, by counter (DENSE.md)
+ uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
  string dumpRows; // SS_DENSE_DUMP only
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
 };
+// ---- Dense route, users (DENSE.md stages 2 and 4) ----
+// These declarations need nothing of the dn:: block; the three functions that do are defined after run().
+// True once the links stage has decided that user IDs may take the dense route (keys found, table limit below DENSE_USER).
+static bool denseUsers=false;
+// Per user index: how its aliases 0-7 are grouped by the simple link lines. Three bits per alias give
+// the smallest alias of its group (so a word is always "flat": no chains to follow). The word is
+// stored XOR the identity, so untouched zero memory means "every alias alone", and the stored field
+// of alias a is a XOR its group's smallest alias.
+static atomic<uint32_t>* denseComp=nullptr; // limI words on a lazily touched mapping
+static constexpr uint32_t COMP_IDENT=0xFAC688u; // alias a at bits 3a..3a+2
+static inline uint32_t comp_root(uint32_t w,uint32_t a){return (w>>(3*a))&7;} // w: a word XOR COMP_IDENT
+static void comp_union(uint64_t idx,uint32_t a,uint32_t b){
+ atomic<uint32_t>& c=denseComp[idx];uint32_t s=c.load(memory_order_relaxed);
+ for(;;){
+  const uint32_t w=s^COMP_IDENT,ra=comp_root(w,a),rb=comp_root(w,b);
+  if(ra==rb)return;
+  const uint32_t lo=min(ra,rb),hi=max(ra,rb);uint32_t w2=w;
+  for(uint32_t x=hi;x<8;++x)if(comp_root(w,x)==hi)w2=(w2&~(7u<<(3*x)))|(lo<<(3*x)); // members of hi's group are >= hi
+  if(c.compare_exchange_weak(s,w2^COMP_IDENT,memory_order_relaxed))return;
+ }
+}
+// index<<3|alias -> index<<3|smallest alias of its group.
+static inline uint32_t dense_root(uint32_t d){return d^((denseComp[d>>3].load(memory_order_relaxed)>>(3*(d&7)))&7);}
+// Highest user index handed out as DENSE_USER so far. It sizes the person number space after parsing,
+// so whoever produces DENSE_USER codes must report their indexes here before the parse stage ends
+// (every index, or a thread's running maximum once per chunk); a code above it stops the run.
+static atomic<uint32_t> denseMaxIdx{0};
+static inline void dense_note_index(uint32_t idx){
+ uint32_t cur=denseMaxIdx.load(memory_order_relaxed);
+ while(idx>cur&&!denseMaxIdx.compare_exchange_weak(cur,idx,memory_order_relaxed)){}
+}
 static size_t pow2_parts(uint64_t est){size_t p=1;while(p<2048&&p*32768<est)p<<=1;return p;}
 struct Camp{string id,channel;};
 struct Totals{uint64_t sessions=0,purchasing_sessions=0,revenue=0,assists=0;};
@@ -1021,6 +1053,15 @@ static_assert(sizeof(DCRec)==16);
 // dense alias 0-7 of the same index. IDs of a complex index resolve through the ID table like general IDs.
 static uint64_t* denseComplex=nullptr; // limI bits, zero-filled; allocated when dense.events or dense.clicks
 static inline __attribute__((always_inline)) bool dense_complex(uint64_t idx){return (denseComplex[idx>>6]>>(idx&63))&1;}
+static inline void dense_set_complex(uint64_t idx){__atomic_fetch_or(&denseComplex[idx>>6],1ull<<(idx&63),__ATOMIC_RELAXED);}
+// Decodes a user ID text: true if it is canonical 'u' + base 36 with a user index below the limit (any alias).
+static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32_t& alias){
+ uint64_t y;
+ if(n<2||s[0]!='u'||!dn::parse36(s+1,n-1,y))return false;
+ const uint64_t num=dn::index_of(y,dense.ku);
+ idx=num>>dn::GEN_ALIAS_BITS;alias=(uint32_t)(num&((1u<<dn::GEN_ALIAS_BITS)-1));
+ return idx<dense.limI;
+}
 // ---- Dense route, parse stage (DENSE.md stage 3) ----
 // Which dense records the parse stage produces; set once in run() before the parse stage.
 //   users   a dense user ID with alias 0-7 of a non-complex index becomes DENSE_USER | (index<<3 | alias)
@@ -1315,7 +1356,7 @@ SS_V3I const char* event_window2(const char* p,uint64_t c){return p+_tzcnt_u64(_
 // One event line at p, given the masks of its two windows (w1 at p, w2 at b=event_window2(p,w1.c)).
 // Does exactly what for_records<7> + the general event handler would do with the line; `general` is
 // that handler and gets the line if the short path passes it on. Returns the start of the next line.
-template<class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const EvLoop& lp,PendUser* const pend,PendUser*& pp,GEN&& general){
+template<class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const EvLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& products=lp.products;const size_t PE=lp.PE;
  DateMemo3* const memo=lp.memo;const int64_t wstart=lp.wstart;const uint64_t wlen=lp.wlen,ibase=lp.ibase;
  Bucket<PRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
@@ -1399,7 +1440,7 @@ template<class GEN> SS_V3I const char* event_line_v3(const char* const p,const c
    }
    // Dense route (DENSE.md): a dense user needs no table, a dense event_id sends the row to the counter buckets.
    uint32_t ucode=0;bool tableUser=k!=0;
-   if(lp.dUsers&&k){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode))tableUser=false;}
+   if(lp.dUsers&&k){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode)){tableUser=false;dmax=max(dmax,ucode);}}
    uint64_t k0=0;uint32_t k1=0;
    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID: nothing has been stored yet
    uint64_t ve=0;bool dEv=false;
@@ -1436,9 +1477,9 @@ template<class GEN> SS_V3I const char* event_line_v3(const char* const p,const c
 #define SS_EVENT_LOOP(NAME,TARGET,MASKS) \
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
- const EvLoop lp(tl,tab,products,PE,base+len);PendUser pend[V3_BATCH];PendUser* pp=pend; \
- while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,general);} \
- resolve_users(pend,pp,tab,tl); \
+ const EvLoop lp(tl,tab,products,PE,base+len);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0; /* dmax: largest dense user code seen */ \
+ while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,dmax,general);} \
+ resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
 }
 // The same loop with a line index (SS_LINES=index): the newlines of the next IX_BLOCK bytes are located
 // first, so where a line starts no longer waits for the previous line's fields to be cut - consecutive
@@ -1449,16 +1490,16 @@ static constexpr size_t IX_BLOCK=1024;
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
- const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend; \
+ const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0; /* dmax: largest dense user code seen */ \
  const char* starts[IX_BLOCK+64];const char* scan=p; \
  while(p<lim){ \
   size_t n=0; \
   for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
-  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,general);p=starts[i];} \
+  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,dmax,general);p=starts[i];} \
   if(scan>=end&&p<lim){ /* the last line has no newline */ \
-   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,general);break;} \
+   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3(p,b,w1,MASKS(b),lp,pend,pp,dmax,general);break;} \
  } \
- resolve_users(pend,pp,tab,tl); \
+ resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
 }
 SS_EVENT_LOOP_IX(events_avx2_ix,SS_V3,win_masks_avx2,nl_mask_avx2)
 SS_EVENT_LOOP_IX(events_avx512z_ix,SS_V5,win_masks_avx512z,nl_mask_avx512z)
@@ -1473,7 +1514,7 @@ struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;cons
   clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask),
   dUsers(dparse.users),dClicks(dparse.clicks),kc(dense.kc),ku(dense.ku),limC(dense.limC),shC(dparse.shC),dbuckets(tl_.dcb.data()){}
 };
-template<class GEN> SS_V3I const char* click_line_v3(const char* const p,const WinMasks w,const ClLoop& lp,PendUser* const pend,PendUser*& pp,GEN&& general){
+template<class GEN> SS_V3I const char* click_line_v3(const char* const p,const WinMasks w,const ClLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& camps=lp.camps;const size_t PC=lp.PC;
  DateMemo3* const memo=lp.memo;const int64_t clickStart=lp.clickStart;const uint64_t wlen=lp.wlen;
  Bucket<CRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
@@ -1513,7 +1554,7 @@ template<class GEN> SS_V3I const char* click_line_v3(const char* const p,const W
    const char* const s1=p+b1;
    // Dense route (DENSE.md): see event_line_v3.
    uint32_t ucode=0;bool tableUser=true;
-   if(lp.dUsers){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode))tableUser=false;}
+   if(lp.dUsers){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode)){tableUser=false;dmax=max(dmax,ucode);}}
    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID
    uint64_t kcn=0;bool dCl=false;
    if(lp.dClicks){uint64_t y;dCl=s0[0]=='k'&&parse36_v3(s0+1,l0-1,y)&&(kcn=dn::index_of(y,lp.kc))<lp.limC;}
@@ -1547,23 +1588,23 @@ template<class GEN> SS_V3I const char* click_line_v3(const char* const p,const W
 #define SS_CLICK_LOOP(NAME,TARGET,MASKS) \
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
- const ClLoop lp(tl,tab,camps,PC,base+len,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend; \
- while(p<lim)p=click_line_v3(p,MASKS(p),lp,pend,pp,general); \
- resolve_users(pend,pp,tab,tl); \
+ const ClLoop lp(tl,tab,camps,PC,base+len,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0; /* dmax: largest dense user code seen */ \
+ while(p<lim)p=click_line_v3(p,MASKS(p),lp,pend,pp,dmax,general); \
+ resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
 }
 #define SS_CLICK_LOOP_IX(NAME,TARGET,MASKS,NLMASK) \
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
- const ClLoop lp(tl,tab,camps,PC,end,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend; \
+ const ClLoop lp(tl,tab,camps,PC,end,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0; /* dmax: largest dense user code seen */ \
  const char* starts[IX_BLOCK+64];const char* scan=p; \
  while(p<lim){ \
   size_t n=0; \
   for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
-  for(size_t i=0;i<n&&p<lim;++i){click_line_v3(p,MASKS(p),lp,pend,pp,general);p=starts[i];} \
-  if(scan>=end&&p<lim){p=click_line_v3(p,MASKS(p),lp,pend,pp,general);break;} \
+  for(size_t i=0;i<n&&p<lim;++i){click_line_v3(p,MASKS(p),lp,pend,pp,dmax,general);p=starts[i];} \
+  if(scan>=end&&p<lim){p=click_line_v3(p,MASKS(p),lp,pend,pp,dmax,general);break;} \
  } \
- resolve_users(pend,pp,tab,tl); \
+ resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
 }
 SS_CLICK_LOOP_IX(clicks_avx2_ix,SS_V3,win_masks_avx2,nl_mask_avx2)
 SS_CLICK_LOOP_IX(clicks_avx512z_ix,SS_V5,win_masks_avx512z,nl_mask_avx512z)
@@ -1622,26 +1663,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   d.events=users&&dn::infer(es,d.limE,1,d.ke,T);
   d.clicks=users&&dn::infer(cs,d.limC,1,d.kc,T);
   dense=d;
+  // Tests shrink the limits to put IDs just at and over them.
+  if(const char* v=getenv("SS_TEST_LIME"))dense.limE=min<uint64_t>(dense.limE,strtoull(v,nullptr,10));
+  if(const char* v=getenv("SS_TEST_LIMC"))dense.limC=min<uint64_t>(dense.limC,strtoull(v,nullptr,10));
+  if(const char* v=getenv("SS_TEST_LIMI"))dense.limI=min<uint64_t>(dense.limI,strtoull(v,nullptr,10));
  }
- // Tests can shrink the limits so that counters near and past them occur in ordinary data.
- if(const char* v=getenv("SS_TEST_LIME"))dense.limE=min<uint64_t>(dense.limE,strtoull(v,nullptr,10));
- if(const char* v=getenv("SS_TEST_LIMC"))dense.limC=min<uint64_t>(dense.limC,strtoull(v,nullptr,10));
- if(const char* v=getenv("SS_TEST_LIMI"))dense.limI=min<uint64_t>(dense.limI,strtoull(v,nullptr,10));
  if(dense.events||dense.clicks)denseComplex=(uint64_t*)map_huge(((dense.limI+63)/64+1)*8);
  // Test only: marks every n-th user index complex before anything else does, so that both user routes occur for dense-looking IDs.
  if(const char* v=getenv("SS_TEST_COMPLEX"))if(denseComplex){const uint64_t n=max<uint64_t>(1,strtoull(v,nullptr,10));for(uint64_t i=0;i<dense.limI;i+=n)denseComplex[i>>6]|=1ull<<(i&63);}
- // Parse-stage dense records are off until their consumers exist (DENSE.md stages 4-7):
- //   SS_DENSE_USERS=1    dense user IDs get DENSE_USER codes instead of ID-table numbers
- //   SS_DENSE_RECORDS=1  event / click lines with a dense ID go to the DRec / DCRec buckets
+ // Parse-stage switches of the dense route:
+ //   SS_DENSE_USERS=0    dense user IDs go through the ID table like all others, links included (default: they get
+ //                       DENSE_USER codes straight from the text if the links stage allows it; see denseUsers)
+ //   SS_DENSE_RECORDS=1  event / click lines with a dense ID go to the DRec / DCRec buckets (off until their consumers exist)
  //   SS_DSHIFT, SS_CSHIFT  log2 of the counters per event / click bucket (default 14)
  //   SS_DENSE_DUMP=dir   test only: writes every record of the parse stage as text and stops after the parse stage ("-": only stops)
- dparse.users=(dense.events||dense.clicks)&&getenv("SS_DENSE_USERS");
  dparse.events=dense.events&&getenv("SS_DENSE_RECORDS");dparse.clicks=dense.clicks&&getenv("SS_DENSE_RECORDS");
  if(const char* v=getenv("SS_DSHIFT")){const int x=atoi(v);if(x>=4&&x<=24)dparse.shE=(unsigned)x;}
  if(const char* v=getenv("SS_CSHIFT")){const int x=atoi(v);if(x>=4&&x<=24)dparse.shC=(unsigned)x;}
  const char* const dumpDir=getenv("SS_DENSE_DUMP");
  const bool dumpText=dumpDir&&strcmp(dumpDir,"-"); // "-": write nothing, only stop after the parse stage (for measuring it)
- if(dparse.users||dparse.events||dparse.clicks)cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<"\n";
  cerr<<"dense: events "<<dense.events<<" clicks "<<dense.clicks<<"\n";
  if(getenv("SS_STATS"))cerr<<"STATS dense keys "<<dense.ke<<" "<<dense.ku<<" "<<dense.kc<<" limits "<<dense.limE<<" "<<dense.limC<<" "<<dense.limI<<"\n";
  __mark("KEYS");
@@ -1650,8 +1690,28 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  for(const Mapped& m:map_files(csv_files(data/"links"),linkFiles)){if(!m.len)continue;
   ++linkLines; // a last line without '\n'
   for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+ // Dense user IDs: this pass also marks every user index that a link line ties to anything but another
+ // alias 0-7 of the same index ("complex"); such an index keeps the general route for all its IDs.
+ // A line is simple if both IDs are dense user IDs with aliases 0-7 of one index.
+ const bool denseLinks=dense.events||dense.clicks;
  #pragma omp parallel for num_threads(T) schedule(dynamic,1) reduction(+:linkLines)
- for(size_t c=0;c<linkChunks.size();++c){const Chunk& ck=linkChunks[c];linkLines+=count_newlines(ck.base+ck.from,min(ck.to,ck.len)-ck.from);}
+ for(size_t c=0;c<linkChunks.size();++c){const Chunk& ck=linkChunks[c];linkLines+=count_newlines(ck.base+ck.from,min(ck.to,ck.len)-ck.from);
+  if(!denseLinks||ck.from>=ck.len)continue;
+  const char* const end=ck.base+ck.len;
+  const char* nl=(const char*)memchr(ck.from?ck.base+ck.from-1:ck.base,'\n',ck.from?ck.len-(ck.from-1):ck.len);
+  if(!nl)continue;
+  const char* const lim=ck.base+min(ck.to,ck.len);
+  for(const char* p=nl+1;p<lim;){
+   const char* comma[2];int ncomma,nquote;const char* lineEnd;string_view f[2];
+   const char* next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
+   if(take_fields(p,lineEnd,comma,ncomma,nquote,2,f)&&!f[0].empty()&&!f[1].empty()){
+    uint64_t ia=0,ib=0;uint32_t aa=0,ab=0;
+    const bool da=dense_decode_user(f[0].data(),f[0].size(),ia,aa),db=dense_decode_user(f[1].data(),f[1].size(),ib,ab);
+    if(!(da&&db&&ia==ib&&aa<8&&ab<8)){if(da)dense_set_complex(ia);if(db)dense_set_complex(ib);}
+   }
+   p=next;
+  }
+ }
  static const bool idBlocks=!getenv("SS_NOIDBLOCKS"); // measuring switch: per-thread ID blocks in the links stage
  // Every link line names at most two IDs; with ID blocks each thread may leave part of its last block unused.
  const uint64_t maxLinked=2*linkLines+(idBlocks?(uint64_t)T*KeyTable::ID_BLOCK:0);
@@ -1662,6 +1722,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(const char* v=getenv("SS_TEST_MAXNEW"))maxNew64=strtoull(v,nullptr,10); // tests force the fallback path with a tiny value
  if(maxLinked+maxNew64>=0x60000000u)throw runtime_error("Too many IDs");
  const uint32_t maxIds=(uint32_t)(maxLinked+maxNew64);
+ // Table numbers must stay below DENSE_USER for the dense user route; otherwise it is off for this run.
+ // (SS_DENSE_USERS=0 turns it off as a whole: the links stage and the parse stage have to agree.)
+ {const char* v=getenv("SS_DENSE_USERS");denseUsers=denseLinks&&maxIds<DENSE_USER&&(dense.limI<<dn::ALIAS_BITS)<=DENSE_USER&&!(v&&v[0]=='0');}
+ if(denseUsers)denseComp=(atomic<uint32_t>*)map_huge((dense.limI+1)*sizeof(uint32_t));
+ dparse.users=denseUsers;
+ cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<"\n";
  // Table size. Link files usually repeat IDs, so the table is sized for three quarters of the IDs the
  // link lines could name plus all allowed new ones, at 62% full. After the links stage the limit for
  // new IDs is set from the linked IDs actually seen; even if every link ID was different the table then
@@ -1751,6 +1817,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      const char* comma[2];int ncomma,nquote;const char* lineEnd;
      next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
      ok=take_fields(p,lineEnd,comma,ncomma,nquote,2,q.f)&&!q.f[0].empty()&&!q.f[1].empty();
+    }
+    if(ok&&denseUsers){ // a simple line of an index that is not complex only groups aliases of that index
+     uint64_t ia=0,ib=0;uint32_t aa=0,ab=0;
+     if(dense_decode_user(q.f[0].data(),q.f[0].size(),ia,aa)&&dense_decode_user(q.f[1].data(),q.f[1].size(),ib,ab)&&ia==ib&&aa<8&&ab<8&&!dense_complex(ia)){
+      comp_union(ia,aa,ab);ok=false; // done: this line does not go through the table
+     }
     }
     if(ok){
      for(int k=0;k<2;++k){
@@ -1908,7 +1980,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    return "T:"+to_string(user);
   };
   auto user_of=[&](string_view u)->uint32_t{
-   if(dparse.users){uint32_t code;if(dense_user(u.data(),u.size(),code))return code;}
+   if(dparse.users){uint32_t code;if(dense_user(u.data(),u.size(),code)){tl.denseMax=max(tl.denseMax,code);return code;}}
    uint32_t g=tab.find_or_add(u);
    if(g!=KeyTable::NONE)return g;
    return LOCAL_USER|tl.users.intern(u);
@@ -1996,6 +2068,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     else for_records<7>(ck.base,ck.len,ck.from,ck.to,warm_user,on_event);
    }
   }
+  if(tl.denseMax)dense_note_index((tl.denseMax&~DENSE_USER)>>dn::ALIAS_BITS); // sizes the person numbers of the dense users
  }
  const uint32_t totalIds=tab.end_parallel();
  __mark("PARSE");
@@ -2072,8 +2145,26 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
  }
  const PName* personNames=tab.newNames;
+ // Dense persons come after all table and fallback persons: denseBase + (user index<<3 | root alias).
+ // (This is the BASE of DENSE.md; it has to clear the fallback numbers, so it is only known here.)
+ const uint32_t denseBase=totalIds+(uint32_t)extraNames.size();
+ // Name of a dense person: the byte-wise smallest text among the aliases grouped with its root alias.
+ auto dense_name=[&](uint32_t person,char* buf)->size_t{
+  const uint32_t d=person-denseBase,root=d&7;const uint64_t idx=d>>3;
+  const uint32_t w=denseComp[idx].load(memory_order_relaxed)^COMP_IDENT;size_t len=0;
+  for(uint32_t a=0;a<8;++a)if(comp_root(w,a)==root){
+   char t[12];const size_t n=dn::text36('u',dn::value_of((idx<<dn::GEN_ALIAS_BITS)|a,dense.ku),t);
+   if(!len||string_view(t,n)<string_view(buf,len)){memcpy(buf,t,n);len=n;}
+  }
+  return len;
+ };
  auto name_of=[&](uint32_t person)->string_view{
   if(person<totalIds)return personNames[person].view();
+  if(person>=denseBase){ // remembered per thread: a person's rows come one after another
+   static thread_local char buf[12];static thread_local uint32_t who=UINT32_MAX;static thread_local size_t len=0;
+   if(who!=person){len=dense_name(person,buf);who=person;}
+   return string_view(buf,len);
+  }
   return extraNames[person-totalIds];
  };
  // Ingest values that did not fit a record (see PRec::ih), by event id pointer. Normally empty.
@@ -2088,7 +2179,22 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  cerr<<"unlinked IDs: "<<newCount<<" (+"<<extraNames.size()<<" via fallback)\n";
  // ---- Person buckets: bucket = person >> pshift, so a bucket is a dense range of W person numbers
  // and the last stage can group by person with one counting pass. Aim for about 16k events per bucket.
- const uint64_t npersons=(uint64_t)totalIds+extraNames.size();
+ // With dense users the number space runs up to the highest user index seen; most of it is empty.
+ const uint64_t npersons=(uint64_t)denseBase+(denseUsers?((uint64_t)denseMaxIdx.load()+1)<<dn::ALIAS_BITS:0);
+ if(npersons>=0xF0000000ull)throw runtime_error("Too many IDs");
+ if(denseUsers&&getenv("SS_STATS"))cerr<<"STATS dense users: base "<<denseBase<<" max index "<<denseMaxIdx.load()<<" limit "<<dense.limI<<" person numbers "<<npersons<<"\n";
+ // The user field of a parsed record -> person number.
+ const uint32_t denseTop=DENSE_USER|(uint32_t)((((uint64_t)denseMaxIdx.load()+1)<<dn::ALIAS_BITS)-1); // highest valid DENSE_USER code
+ // (Everything but `trans` is held by value: each thread works on its own copy, so the hot loops keep these in registers.)
+ const auto person_of_shared=[&trans,comp=(const atomic<uint32_t>*)denseComp,denseBase,denseTop](uint32_t u,int t)->uint32_t{
+  if(u&LOCAL_USER)return trans[t][u&~LOCAL_USER];
+  if(u&DENSE_USER){
+   if(__builtin_expect(u>denseTop,0)){fprintf(stderr,"ERROR dense user index above the reported maximum\n");_exit(1);}
+   const uint32_t d=u&~DENSE_USER; // see dense_root
+   return denseBase+(d^((comp[d>>3].load(memory_order_relaxed)>>(3*(d&7)))&7));
+  }
+  return u;
+ };
  uint64_t parsedEvents=0,parsedClicks=0;
  size_t maxEvBucket=0,maxClBucket=0; // most parsed lines in one ID bucket (all threads together)
  for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
@@ -2126,6 +2232,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   Scratch<uint32_t> slotBuf,emitBuf;vector<size_t> off(T+1);
   slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);emitBuf.reserve(maxEvBucket);
   const bool probe4=simdProbe;const size_t ahead=pfe;const uint32_t tagMask=tagKeep&0xffffu; // plain locals for the hot loops
+  const auto person_of=person_of_shared; // this thread's copy
   auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
   // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
   // turns out to be the earlier ingested one, the event already passed on is turned into a tombstone:
@@ -2143,7 +2250,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t dups=0,dead=0;
    for(int t=0;t<T;++t){
     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
-    const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
+    const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;
     for(;r!=rend;++r,++g1){
      // 41 hash bits per record: the low 25 pick the slot, the other 16 are the tag.
      const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
@@ -2170,7 +2277,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
         const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi;
         if(notEarlier)goto next_event;
-        if(o.k){uint32_t ou=o.user;if(ou&LOCAL_USER)ou=trans[ot][ou&~LOCAL_USER];
+        if(o.k){const uint32_t ou=person_of(o.user,ot);
          Ev* const gone=myEv[ou>>pshift].at_mark(emitted[og]);gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
@@ -2184,7 +2291,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(rk){
        // user, cat and the tag bits sit in the record as the event's second word does (person, cat, unused).
        uint64_t w;memcpy(&w,(const void*)&r->user,8);
-       if(__builtin_expect((w&LOCAL_USER)!=0,0))w=(w&~0xffffffffull)|tr[(uint32_t)w&~LOCAL_USER];
+       if((uint32_t)w&(LOCAL_USER|DENSE_USER))w=(w&~0xffffffffull)|person_of((uint32_t)w,t);
        EvList& L=myEv[(uint32_t)w>>pshift];Ev* const out=L.slot(pool);
        emitted[g1-1]=L.mark(out);
        __builtin_prefetch((const char*)out+ahead,1,3); // every time: testing for a new cache line would be an unpredictable branch
@@ -2214,7 +2321,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
    for(int t=0;t<T;++t){
     const size_t m=bucket_size(tls[t].cb,p);if(!m)continue;
-    const CRec* r=tls[t].cb[p].data();const CRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
+    const CRec* r=tls[t].cb[p].data();const CRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;
     for(;r!=rend;++r,++g1){
      const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
      size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
@@ -2237,7 +2344,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      }
      S[j]=tg|g1;
      {
-      uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
+      const uint32_t u=person_of(r->user,t);
       Click* const out=myCl[u>>pshift].slot(pool);
       __builtin_prefetch((const char*)out+ahead,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;

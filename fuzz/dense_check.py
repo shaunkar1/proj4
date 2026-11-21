@@ -73,12 +73,15 @@ def run(name, env, threads):
     e.update(DATA_DIR=data, OUTPUT_DIR=o, SCRATCH_DIR=o, NCPU=str(threads), SS_DENSE_DUMP=out, SS_STATS="1")
     p = subprocess.run([core], env=e, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if p.returncode != 0: sys.exit("run %s failed with code %d" % (name, p.returncode))
-    keys = None; on = [0, 0]
+    keys = None; on = [0, 0]; sw = [0, 0, 0]
     for line in p.stderr.decode("latin-1").split("\n"):
         if line.startswith("STATS dense keys"):
             w = line.split(); keys = [int(x) for x in w[3:6] + w[7:10]] + on
         elif line.startswith("dense: events"):     # whether the keys were found at all (printed before the STATS line)
             w = line.split(); on = [int(w[2]), int(w[4])]
+        elif line.startswith("dense parse: users"):  # what the parse stage really does (printed after the links stage)
+            w = line.split(); sw = [int(w[3]), int(w[6]), int(w[9])]
+    if keys: keys = keys + sw
     return out, keys
 
 def lines(d, kind):
@@ -129,10 +132,10 @@ for f in lines(A, "rows"):
     rowsA.add((f[0],) + tuple(f[2:-1]))
 B, keys = run("B-dense-sse2", dict(dense_env, SS_ISA="sse2"), 1)
 if not keys: sys.exit("no 'STATS dense keys' line")
-KE, KU, KC, LIME, LIMC, LIMI, ON_E, ON_C = keys
-if not ON_E: LIME = 0          # keys not found for a column: nothing of it may take the dense route
-if not ON_C: LIMC = 0
-if not (ON_E or ON_C): LIMI = 0
+KE, KU, KC, LIME, LIMC, LIMI, ON_E, ON_C, SW_U, SW_E, SW_C = keys
+if not (ON_E and SW_E): LIME = 0   # keys not found for a column, or its dense route not in use: nothing of it may take the dense route
+if not (ON_C and SW_C): LIMC = 0
+if not SW_U: LIMI = 0
 with open(os.path.join(B, "complex.txt")) as f: complex_idx = set(int(x) for x in f.read().split())
 
 # 1. same lines as the reference
@@ -188,7 +191,7 @@ for isa in ("sse2", "avx2", "avx512z", "avx512y"):
         diff("records: dense sse2 vs %s with %d threads" % (isa, t), recB, recs(d))
         done.append("%s/%d(%d general)" % (isa, t, general))
 
-print("events %d (dense %d), clicks %d (dense %d), valid-line users %d (dense %d, complex index %d); dense on: events %d clicks %d; limits %d %d %d; runs: %s"
-      % (nE, nEd, nC, nCd, nU, nUd, nUcomplex, ON_E, ON_C, LIME, LIMC, LIMI, " ".join(done)))
+print("events %d (dense %d), clicks %d (dense %d), valid-line users %d (dense %d, complex index %d); keys found: events %d clicks %d; in use: users %d events %d clicks %d; limits %d %d %d; runs: %s"
+      % (nE, nEd, nC, nCd, nU, nUd, nUcomplex, ON_E, ON_C, SW_U, SW_E, SW_C, LIME, LIMC, LIMI, " ".join(done)))
 print("DENSE_PARSE_OK" if not bad else "DENSE_PARSE_FAIL (%d)" % bad)
 sys.exit(1 if bad else 0)
