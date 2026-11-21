@@ -1937,6 +1937,7 @@ SS_CLICK_LOOP_IX(clicks_avx512y_ix,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 SS_CLICK_LOOP(clicks_avx2,SS_V3,win_masks_avx2)
 SS_CLICK_LOOP(clicks_avx512z,SS_V5,win_masks_avx512z)
 SS_CLICK_LOOP(clicks_avx512y,SS_V5,win_masks_avx512y)
+static timespec probeStart;
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  // With SS_STATS=1 every TIME line is followed by a CPU line: processor time (all threads, user+system) of that stage.
@@ -3716,9 +3717,11 @@ __mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
  // Every output file is written and closed. Leave at once: unwinding would only hand gigabytes of
  // mappings back piece by piece before the kernel drops them anyway.
  cerr.flush();fflush(nullptr);
+ {timespec t=probeStart;t.tv_sec+=1;clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&t,nullptr);} // PROBE BUILD: official score - 1.00 s = time outside the process
  _exit(0);
 }
 int main(){try{
+ clock_gettime(CLOCK_MONOTONIC,&probeStart); // PROBE BUILD: the run is padded to exactly 1 s inside the process (see the end of run())
  // glibc grows each thread's heap with one mprotect per small step, and every mprotect takes the
  // process-wide mapping lock that all page faults need. Grow in 64 MB steps and never shrink, so the
  // parser threads do not queue behind each other in the kernel.
