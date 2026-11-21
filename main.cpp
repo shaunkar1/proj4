@@ -380,6 +380,11 @@ struct HugePool{
   if((size_t)(lim-cur)<bytes)grow(bytes);
   void* r=cur;cur+=bytes;return r;
  }
+ void* take_page(size_t bytes){ // a multiple of 4096 bytes, starting at a 4096-byte boundary
+  cur=(char*)(((uintptr_t)cur+4095)&~(uintptr_t)4095);
+  if(cur>lim||(size_t)(lim-cur)<bytes)grow(bytes); // regions start 2 MB aligned
+  void* r=cur;cur+=bytes;return r;
+ }
 };
 struct TransparentHash {
  using is_transparent=void;
@@ -743,19 +748,24 @@ template<class T> struct Scratch{
  void reserve(size_t n){if(n>cap){cap=n;p=(T*)pool->take(cap*sizeof(T));}}
  T* get(size_t n){if(n>cap)reserve(n+n/4+64);return p;}
 };
-// Append-only list of fixed-size blocks: nothing is ever copied when it grows, and an element's address stays valid.
+// Append-only list of 4096-byte blocks at 4096-byte boundaries: nothing is ever copied when it grows,
+// an element's address stays valid, and (block count at the time, index in the block) names an element.
 template<class T,size_t BYTES> struct Blocks{
  static constexpr size_t PER=(BYTES-16)/sizeof(T);
- struct Block{Block* next;size_t pad;T items[PER];};
+ struct Block{Block* next;Block* prev;T items[PER];};
+ static_assert(BYTES==4096&&sizeof(Block)<=BYTES&&PER<256);
  T* cur=nullptr;T* end=nullptr;Block* head=nullptr;Block* tail=nullptr;size_t nblocks=0;
  __attribute__((noinline,cold)) void grow(HugePool& pool){
-  Block* b=(Block*)pool.take(sizeof(Block));
-  b->next=nullptr;if(tail)tail->next=b;else head=b;
+  Block* b=(Block*)pool.take_page(BYTES);
+  b->next=nullptr;b->prev=tail;if(tail)tail->next=b;else head=b;
   tail=b;++nblocks;cur=b->items;end=b->items+PER;
  }
  T* slot(HugePool& pool){if(cur==end)grow(pool);return cur++;} // the place for the next element
  size_t size()const{return nblocks?(nblocks-1)*PER+(size_t)(cur-tail->items):0;}
  size_t count(const Block* b)const{return b==tail?(size_t)(cur-b->items):PER;}
+ // 32-bit name of the element just returned by slot(), and the way back from it.
+ uint32_t mark(const T* p)const{return (uint32_t)(nblocks<<8)|(uint32_t)((((uintptr_t)p&(BYTES-1))-16)/sizeof(T));}
+ T* at_mark(uint32_t m)const{Block* b=tail;for(size_t k=nblocks-(m>>8);k;--k)b=b->prev;return &b->items[m&255];}
 };
 using EvList=Blocks<Ev,4096>;using ClickList=Blocks<Click,4096>;
 struct alignas(64) ThreadState{
@@ -1607,9 +1617,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  vector<Survivors> surv(T);
  // One region per thread should hold its share of the survivors plus its dedup tables; a thread that
  // does more than its share continues in smaller regions.
- const size_t slotCap=2*max(maxEvBucket,maxClBucket)+2;
+ // Measuring switches for the dedup stage.
+ static const bool simdProbe=!getenv("SS_NOSIMDPROBE"); // first probe of eight slots at once
+ static const size_t slotPct=[]{const char* v=getenv("SS_SLOTPCT");const long x=v?atol(v):200;return (size_t)(x<110?110:x>800?800:x);}(); // table slots per 100 records
+ static const size_t pfe=[]{const char* v=getenv("SS_PFE");const long x=v?atol(v):128;return (size_t)(x<0?0:x>4096?4096:x);}(); // write prefetch this many bytes ahead of each survivor list's tail (0: only the line being written)
+ const size_t slotCap=max(maxEvBucket,maxClBucket)*slotPct/100+2+4; // +4: the four-slot probe may read past the last slot
  for(int t=0;t<T;++t){surv[t].ev.resize(UPn);surv[t].cl.resize(UPn);tls[t].uev.clear();tls[t].ucl.clear();
-  surv[t].pool.first=(size_t)((parsedEvents*sizeof(Ev)+parsedClicks*sizeof(Click))/(uint64_t)T*9/8)+slotCap*sizeof(uint32_t)+maxEvBucket*sizeof(Ev*)+(size_t(2)<<20);
+  surv[t].pool.first=(size_t)((parsedEvents*sizeof(Ev)+parsedClicks*sizeof(Click))/(uint64_t)T*9/8)+slotCap*sizeof(uint32_t)+maxEvBucket*sizeof(uint32_t)+(size_t(2)<<20);
   surv[t].pool.next=max<size_t>(size_t(8)<<20,surv[t].pool.first/4);}
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
@@ -1620,7 +1634,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();HugePool& pool=surv[tid].pool;
   // Slot = tag<<ib | (record number+1), 0 = empty; ib bits are enough for the bucket's record count.
   // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
-  Scratch<uint32_t> slotBuf;Scratch<Ev*> emitBuf;vector<size_t> off(T+1);
+  Scratch<uint32_t> slotBuf,emitBuf;vector<size_t> off(T+1);
   slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);emitBuf.reserve(maxEvBucket);
   auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
   // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
@@ -1631,10 +1645,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=bucket_size(tls[t].eb,p);}off[T]=n;
    if(!n)continue;
    if(n>=0x7fffffffu){fprintf(stderr,"ERROR event ID bucket too large\n");_exit(1);}
-   const size_t cap=2*n+2;
-   uint32_t* const S=slotBuf.get(cap);memset(S,0,cap*sizeof(uint32_t));
-   Ev** const emitted=emitBuf.get(n); // where record g's event went (only read for valid winners)
+   const size_t cap=n*slotPct/100+2;
+   uint32_t* const S=slotBuf.get(cap+4);memset(S,0,cap*sizeof(uint32_t));memset(S+cap,0xff,4*sizeof(uint32_t)); // the pad is never empty
+   uint32_t* const emitted=emitBuf.get(n); // where record g's event went: its list mark (only read for valid winners)
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
+   const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
    size_t dups=0,dead=0;
    for(int t=0;t<T;++t){
     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
@@ -1644,7 +1659,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
      const uint32_t tg=((((uint32_t)r->hx|(hl<<16))&tagKeep)<<ib);
      size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
-     for(uint32_t e;(e=S[j])!=0;){
+     // First look at four slots at once: which are empty, and which carry this record's tag? Almost
+     // always the first empty one comes before any such tag, and the record goes there without a
+     // data-dependent loop. Everything else (and a run into the never-empty pad) goes slot by slot.
+     unsigned mz=0,mt=1;
+     if(simdProbe){
+      const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
+      mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
+      mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
+     }
+     const unsigned any=mz|mt; // quick if the lowest slot that is empty or carries the tag is an empty one
+     if(__builtin_expect(((any&(0u-any))&mz)!=0,1))j+=(unsigned)__builtin_ctz(mz);
+     else for(uint32_t e;(e=S[j])!=0;){
       if((e^tg)<=imask){ // same tag: compare the IDs themselves
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const PRec& o=tls[ot].eb[p][og-off[ot]];
@@ -1654,7 +1680,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
         const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi;
         if(notEarlier)goto next_event;
-        if(o.k){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
+        if(o.k){uint32_t ou=o.user;if(ou&LOCAL_USER)ou=trans[ot][ou&~LOCAL_USER];
+         Ev* const gone=myEv[ou>>pshift].at_mark(emitted[og]);gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
        ++stEvFalse; // same tag, other ID
@@ -1666,8 +1693,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       const uint64_t rk=r->k;
       if(rk){
        uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
-       Ev* const out=myEv[u>>pshift].slot(pool);
-       emitted[g1-1]=out;
+       EvList& L=myEv[u>>pshift];Ev* const out=L.slot(pool);
+       emitted[g1-1]=L.mark(out);
+       __builtin_prefetch((const char*)out+pfe,1,3); // every time: testing for a new cache line would be an unpredictable branch
        out->k=rk-PR_KBIAS; // otherwise already in its final form
        const uint64_t w=(uint64_t)u|((uint64_t)r->cat<<32);memcpy((void*)&out->person,&w,8);
       }
@@ -1688,16 +1716,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=bucket_size(tls[t].cb,p);}off[T]=n;
    if(!n)continue;
    if(n>=0x7fffffffu){fprintf(stderr,"ERROR click ID bucket too large\n");_exit(1);}
-   const size_t cap=2*n+2;
-   uint32_t* const S=slotBuf.get(cap);memset(S,0,cap*sizeof(uint32_t));
+   const size_t cap=n*slotPct/100+2;
+   uint32_t* const S=slotBuf.get(cap+4);memset(S,0,cap*sizeof(uint32_t));memset(S+cap,0xff,4*sizeof(uint32_t));
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
+   const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
    for(int t=0;t<T;++t){
     const size_t m=bucket_size(tls[t].cb,p);if(!m)continue;
     const CRec* r=tls[t].cb[p].data();const CRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
     for(;r!=rend;++r,++g1){
      const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
      size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
-     for(uint32_t e;(e=S[j])!=0;){
+     unsigned mz=0,mt=1; // four slots at once, as for events
+     if(simdProbe){
+      const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
+      mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
+      mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
+     }
+     const unsigned any=mz|mt; // quick if the lowest slot that is empty or carries the tag is an empty one
+     if(__builtin_expect(((any&(0u-any))&mz)!=0,1))j+=(unsigned)__builtin_ctz(mz);
+     else for(uint32_t e;(e=S[j])!=0;){
       if((e^tg)<=imask){
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const CRec& o=tls[ot].cb[p][og-off[ot]];
@@ -1710,6 +1747,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
       Click* const out=myCl[u>>pshift].slot(pool);
+      __builtin_prefetch((const char*)out+pfe,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
      }
      next_click:;
@@ -1768,6 +1806,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const int countType=narrow?PQ_INT32:PQ_INT64;
  const vector<PqCol> userCols={{"user_id",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},{"sessions",countType,false,CONV_NONE},
   {"events",countType,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"top_category",PQ_BYTES,true,CONV_UTF8}};
+ static const size_t pfa=[]{const char* v=getenv("SS_PFA");const long x=v?atol(v):0;return (size_t)(x<0?0:x>4096?4096:x);}(); // measuring switch: write prefetch this many bytes ahead in the two event counting passes (0 = off)
  uint64_t num_sessions=0;
  // Input files nobody reads any more are unmapped by the worker threads, a few large pieces each,
  // instead of leaving every page of them to process exit, which tears mappings down on one thread.
@@ -1848,6 +1887,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Ev* A=bufA.get(nE);Ev* B=bufB.get(nE);
    for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
     for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
+     if(pfa)for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));Ev* const d=A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+     else
      #pragma GCC unroll 4
      for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));_mm_storeu_si128((__m128i*)(A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++),e);}}}
    for(size_t q=1;q<tpass.size();++q){
@@ -1859,6 +1900,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     swap(A,B);
    }
    {uint32_t* const pq=pp+1;
+    if(pfa)for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));Ev* const d=B+pq[A[i].person-base]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+    else
     #pragma GCC unroll 4
     for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+pq[A[i].person-base]++),e);}}
    const Ev* const E=B;
