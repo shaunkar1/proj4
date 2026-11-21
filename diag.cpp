@@ -141,7 +141,7 @@ static void put_bytes(string& o,string_view s){put_le32(o,(uint32_t)s.size());o.
 template<class V> static string_view raw(const V& v){return string_view((const char*)v.data(),v.size()*sizeof(v[0]));}
 
 static uint64_t gKe=0,gKu=0,gKc=0;static bool gKeys=false; // the generator's ID keys, read from the pipeline's STATS line
-struct RunResult{string label;double wall=0,user=0,sys=0;long minflt=0,majflt=0,maxrssMB=0,nvcsw=0,nivcsw=0;int rc=0;map<string,double> t;uint64_t pc[4]={0,0,0,0};int perfErr=0;};
+struct RunResult{string dth,csw;string label;double wall=0,user=0,sys=0;long minflt=0,majflt=0,maxrssMB=0,nvcsw=0,nivcsw=0;int rc=0;map<string,double> t;uint64_t pc[4]={0,0,0,0};int perfErr=0;};
 static vector<RunResult> results;
 static int perf_open(pid_t pid,uint32_t type,uint64_t config){
  perf_event_attr a;memset(&a,0,sizeof a);a.size=sizeof a;a.type=type;a.config=config;a.inherit=1;a.exclude_kernel=0;a.exclude_hv=1;a.disabled=0;
@@ -174,6 +174,8 @@ static void run_child(const string& bin,vector<pair<string,string>> env,RunResul
   if(line.rfind("SYS ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["s"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1);}
   if(line.rfind("FLT ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["f"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1)/1e6;}
   if(line.rfind("SMAPS FilePmdMapped:",0)==0)r.t["pmd"]=atof(line.c_str()+20)/1e6;
+  if(line.rfind("STATS dense threads:",0)==0)r.dth=line.substr(20);
+  if(line.rfind("CSW DENSE ",0)==0)r.csw=line.substr(10);
   if(line.rfind("STATS dense keys ",0)==0){unsigned long long a=0,b=0,c=0;if(sscanf(line.c_str(),"STATS dense keys %llu %llu %llu",&a,&b,&c)==3&&(a|b|c)){gKe=a;gKu=b;gKc=c;gKeys=true;}}}
  r.rc=WIFEXITED(st)?WEXITSTATUS(st):-1;
 }
@@ -392,13 +394,15 @@ int main(){
  add("warm",1,{N8});
  #define V3 {"SS_EV8","3"}
  #define ST {"SS_STATS","1"}
- for(int r=0;r<4;++r){
-  add("B",1,{N8});add("v3",1,{N8,V3});add("O",1,{N8});add("Bs",1,{N8,ST});add("Os",1,{N8,ST});
-  add("pB",1,{N8,{"SS_DENSE_DUMP","-"}});add("pN",1,{N8,{"SS_DENSE_DUMP","-"}},"core-n");add("pK",1,{N8,{"SS_DENSE_DUMP","-"}},"core-k");
+ #define PO {"SS_DENSE_DUMP","-"}
+ for(int r=0;r<3;++r){
+  add("B",1,{N8});add("v3",1,{N8,V3});add("O",1,{N8});add("Os",1,{N8,ST});add("Oe",1,{N8,{"SS_OUTOPEN","early"}});add("Ow",1,{N8,{"SS_OUTWRITE","end"}});
+  add("pB",1,{N8,PO});add("pN",1,{N8,PO},"core-n");add("pK",1,{N8,PO},"core-k");
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hv3",1,{N8,V3},"",true);add("HO",1,{N8},"",true);add("HBs",1,{N8,ST},"",true);add("HOs",1,{N8,ST},"",true);add("HpB",1,{N8,{"SS_DENSE_DUMP","-"}},"",true);add("HpN",1,{N8,{"SS_DENSE_DUMP","-"}},"core-n",true);add("HpK",1,{N8,{"SS_DENSE_DUMP","-"}},"core-k",true);}
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hv3",1,{N8,V3},"",true);add("HO",1,{N8},"",true);add("HOs",1,{N8,ST},"",true);add("HOe",1,{N8,{"SS_OUTOPEN","early"}},"",true);
+  add("HpB",1,{N8,PO},"",true);add("HpN",1,{N8,PO},"core-n",true);add("HpK",1,{N8,PO},"core-k",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
@@ -449,11 +453,16 @@ int main(){
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=eqText+" | wPRYXAW/us/exit: "+fmt("v4","B","wPRYXAWusE")+fmt("v3","v3","wPRYXAWusE")+fmt("v4 to /output","O","wPRYXAWusE");
-  a+="| stats w/sysP,R,X,A/cpuP,R,X,A: "+fmt("v4","Bs","wyhzgpqxa")+fmt("v4 to /output","Os","wyhzgpqxa");
-  c+="60x wPRYXAW/us/exit: "+fmt("v4","HB","wPRYXAWusE")+fmt("v3","Hv3","wPRYXAWusE")+fmt("v4 to /output","HO","wPRYXAWusE");
-  c+="| stats w/sysP,R,X,A/cpuP,R,X,A: "+fmt("v4","HBs","wyhzgpqxa")+fmt("v4 to /output","HOs","wyhzgpqxa");
-  c+="| parse-only P/us: "+fmt("base","pB","Pus")+fmt("nolock","pN","Pus")+fmt("nocommit","pK","Pus")+fmt("60x base","HpB","Pus")+fmt("60x nolock","HpN","Pus")+fmt("60x nocommit","HpK","Pus");
+  auto squeeze=[](string x){for(auto pr:{make_pair("serial_pre","sp"),make_pair("first_start","fs"),make_pair("last_end","le"),make_pair("loop_wall","lw"),make_pair("loop_cpu","lc"),make_pair("write_wall","ww"),make_pair("write_max","wm"),make_pair("write_cpu","wc"),make_pair("write_calls","wn"),make_pair("open_wall","ow"),make_pair("grow_wall","gw"),make_pair("grow_calls","gn"),make_pair("tail_wall","tw"),make_pair("end_wall","ew"),make_pair("serial_end","se"),make_pair("thread_cpu","tc"),make_pair("noloop","nl")}){size_t p;while((p=x.find(pr.first))!=string::npos)x.replace(p,strlen(pr.first),pr.second);}
+   string y;bool skip=false;size_t i=0;while(i<x.size()){size_t e=x.find(' ',i);if(e==string::npos)e=x.size();const string tok=x.substr(i,e-i);i=e+1;if(tok.empty())continue;
+    const bool name=isalpha((unsigned char)tok[0]);if(name)skip=(tok=="n"||tok=="nl"||tok=="se"||tok=="ew"||tok=="wc"||tok=="gn"||tok=="tc"||tok=="le");if(!skip){if(!y.empty())y+=' ';y+=tok;}}
+   return y;};
+  a+=eqText+" | wPRYXAW/us/exit: "+fmt("v4","B","wPRYXAWusE")+fmt("v3","v3","wPRXus")+fmt("v4->/output","O","wPRYXAWusE")+fmt("outopen-early","Oe","wXAW")+fmt("outwrite-end","Ow","wXAW");
+  a+="| parse-only P/us: "+fmt("base","pB","Pus")+fmt("nolock","pN","Pus")+fmt("nocommit","pK","Pus")+fmt("60x base","HpB","Pus")+fmt("60x nolock","HpN","Pus")+fmt("60x nocommit","HpK","Pus");
+  c+="60x wPRYXAW/us/exit: "+fmt("v4","HB","wPRYXAWusE")+fmt("v3","Hv3","wPRX")+fmt("v4->/output","HO","wPRYXAWusE")+fmt("outopen-early","HOe","wXAW");
+  {const RunResult* r=get("Os#0");if(r)c+="| DENSE threads 20M->/output:"+squeeze(r->dth)+" csw "+r->csw+" "+fmt("w/sysX/cpuX","Os","wzx");}
+  {const RunResult* r=get("HOs#0");if(r)c+="| 60x:"+squeeze(r->dth)+" csw "+r->csw+" "+fmt("w/sysX/cpuX","HOs","wzx");}
+  c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)

@@ -386,6 +386,12 @@ static string hexstr(string_view s){static constexpr char h[]="0123456789ABCDEF"
 // Switches for measuring on the target machine; all default to the fast setting.
 // Measured on the scoring machine: huge pages help, bulk pre-faulting and the side-thread unmap do not.
 static bool optHuge=true,optPrefault=false,optAsyncFree=false;
+// SS_STATS: per-thread clocks of the reader stages (see the "STATS dense threads" line). optThrStats is set once, before any thread works.
+static bool optThrStats=false;
+static thread_local double tlGrowWall=0;static thread_local uint32_t tlGrowCalls=0;
+static inline double now_s(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;}
+static inline double thr_cpu_s(){timespec t;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;}
+struct alignas(128) ThrStat{double in=0,cIn=0,first=-1,cFirst=0,last=0,cLast=0,out=0,cOut=0,wWall=0,wMax=0,wCpu=0,oWall=0,gWall=0,endWall=0;uint32_t wCalls=0,gCalls=0;};
 // A fresh anonymous mapping of at least `bytes`: zero-filled, touched lazily, 2 MB aligned and (unless
 // SS_NOHUGE) advised for huge pages, so first touches cost one fault per 2 MB. The whole mapping
 // (for munmap) is reported through rawBase/rawLen when asked for.
@@ -408,7 +414,9 @@ struct HugePool{
  __attribute__((noinline,cold)) void grow(size_t bytes){
   const size_t huge=size_t(2)<<20;
   const size_t want=(max(bytes,cur?next:first)+huge-1)&~(huge-1);
+  const double t0=optThrStats?now_s():0;
   cur=(char*)map_huge(want);lim=cur+want;
+  if(optThrStats){tlGrowWall+=now_s()-t0;++tlGrowCalls;}
  }
  void* take(size_t bytes){
   bytes=(bytes+63)&~size_t(63);
@@ -948,18 +956,39 @@ struct Thrift{
  void open_elem(){stack.push_back(last);last=0;}
  void close(){o.push_back(0);last=stack.back();stack.pop_back();}
 };
+// Output switches for measuring (both off by default; the files' bytes are the same either way):
+//  SS_OUTOPEN=early  both output folders, every thread's user_daily part file and the campaign_daily file are
+//                    created (and their first four bytes written) by a helper thread while the input is parsed;
+//                    a worker takes its open file at its first row group. Files of threads that
+//                    never write a row are removed again after the last stage.
+//  SS_OUTWRITE=end   a file's row groups are kept in memory (one copy) and written by one writev when the file
+//                    is closed, instead of one writev per row group in the middle of the index loop.
+static bool optOutEarly=false,optOutEnd=false;
 struct PqFile{
  struct Chunk{int64_t offset,size,nvalues;};
  struct Group{int64_t rows,bytes;vector<Chunk> cols;};
  int fd=-1;int64_t pos=0,rows=0;vector<PqCol> cols;vector<Group> groups;string buf;
+ bool defer=false;vector<string> held; // SS_OUTWRITE=end: everything not yet written
  bool is_open()const{return fd>=0;}
+ void writev_all(vector<struct iovec>& iov){
+  size_t k=0;
+  while(k<iov.size()){
+   ssize_t w=::writev(fd,iov.data()+k,(int)min<size_t>(iov.size()-k,64));
+   if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}
+   size_t left=(size_t)w;
+   while(k<iov.size()&&left>=iov[k].iov_len){left-=iov[k].iov_len;++k;}
+   if(left){iov[k].iov_base=(char*)iov[k].iov_base+left;iov[k].iov_len-=left;}
+  }
+ }
+ void adopt(int f,vector<PqCol> c){cols=std::move(c);fd=f;defer=optOutEnd;pos=4;} // f: a fresh file open for writing that holds "PAR1" already
  void write_all(const char* p,size_t n){
+  if(defer){held.emplace_back(p,n);return;}
   while(n){ssize_t w=::write(fd,p,n);if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}p+=w;n-=(size_t)w;}
  }
  void open(const fs::path& path,vector<PqCol> c){
   cols=std::move(c);fd=::open(path.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
   if(fd<0)throw runtime_error("Cannot create "+path.string());
-  write_all("PAR1",4);pos=4;
+  defer=optOutEnd;write_all("PAR1",4);pos=4;
  }
  // bodies[i] is the finished page body of column i: optional definition levels, then PLAIN values.
  // The bodies are written from where they are (writev); only the small page headers are built here.
@@ -982,14 +1011,8 @@ struct PqFile{
    iov.push_back({(void*)(buf.data()+hoff[i]),hoff[i+1]-hoff[i]});
    if(!bodies[i].empty())iov.push_back({(void*)bodies[i].data(),bodies[i].size()});
   }
-  size_t k=0;
-  while(k<iov.size()){
-   ssize_t w=::writev(fd,iov.data()+k,(int)min<size_t>(iov.size()-k,64));
-   if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}
-   size_t left=(size_t)w;
-   while(k<iov.size()&&left>=iov[k].iov_len){left-=iov[k].iov_len;++k;}
-   if(left){iov[k].iov_base=(char*)iov[k].iov_base+left;iov[k].iov_len-=left;}
-  }
+  if(defer){size_t tot=0;for(const auto& v:iov)tot+=v.iov_len;string keep;keep.reserve(tot);for(const auto& v:iov)keep.append((const char*)v.iov_base,v.iov_len);held.push_back(std::move(keep));}
+  else writev_all(iov);
   pos=at;rows+=nrows;groups.push_back(std::move(g));
  }
  void close(){
@@ -1024,6 +1047,8 @@ struct PqFile{
   buf.push_back(0);
   put_le32(buf,(uint32_t)buf.size());buf.append("PAR1",4);
   write_all(buf.data(),buf.size());
+  if(defer){defer=false;vector<struct iovec> iov;iov.reserve(held.size());for(const string& h:held)if(!h.empty())iov.push_back({(void*)h.data(),h.size()});
+   writev_all(iov);held.clear();held.shrink_to_fit();}
   if(::close(fd)!=0)throw runtime_error("Parquet close failed");
   fd=-1;
  }
@@ -4000,18 +4025,22 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  double __cpu0=__cpu_now();
  // ... and by a SYS line (system CPU of the whole process in that stage, seconds) and a FLT line (minor page faults).
  // SYS/FLT EXITPREP at the very end cover what runs after the last mark.
- auto __ru_now=[](double& sys,long& flt){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;};
- double __sys0=0;long __flt0=0;if(__cpuLines)__ru_now(__sys0,__flt0);
- auto __sysflt=[&](const char* label){double s;long f;__ru_now(s,f);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\n";__sys0=s;__flt0=f;};
+ // ... and a CSW line: context switches of the whole process in the stage, voluntary (a thread went to sleep: futex,
+ // lock or I/O wait) and involuntary (a thread was taken off its processor).
+ auto __ru_now=[](double& sys,long& flt,long& vol,long& invol){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;vol=r.ru_nvcsw;invol=r.ru_nivcsw;};
+ double __sys0=0;long __flt0=0,__vol0=0,__inv0=0;if(__cpuLines)__ru_now(__sys0,__flt0,__vol0,__inv0);
+ auto __sysflt=[&](const char* label){double s;long f,v,iv;__ru_now(s,f,v,iv);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\nCSW "<<label<<" "<<v-__vol0<<" "<<iv-__inv0<<"\n";__sys0=s;__flt0=f;__vol0=v;__inv0=iv;};
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
  if(const char* v=getenv("SS_FILEALIGN")){const string_view w(v);optFileAlign=w=="2m"?1:w=="2m+huge"?2:0;}
+ if(const char* v=getenv("SS_OUTOPEN"))optOutEarly=string_view(v)=="early";
+ if(const char* v=getenv("SS_OUTWRITE"))optOutEnd=string_view(v)=="end";
  if(const char* v=getenv("SS_FILEADVISE")){const string_view w(v);optFileAdvise=w=="random"?1:w=="seq"?2:0;}
  if(const char* v=getenv("SS_POPULATE")){const string_view w(v);optPopulate=w=="ahead"?1:w=="all"?2:w.substr(0,2)=="bg"?3:0;
   if(optPopulate==3&&w.size()>2){const int n=atoi(v+2);if(n>=1&&n<=64)optPopulateBg=n;}}
  if(__cpuLines)cerr<<"STATS kernel switches: SS_FILEALIGN="<<(optFileAlign==2?"2m+huge":optFileAlign?"2m":"off")<<" SS_POPULATE="<<(optPopulate==1?"ahead":optPopulate==2?"all":optPopulate==3?"bg"+to_string(optPopulateBg):string("off"))
-  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
+  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" SS_OUTOPEN="<<(optOutEarly?"early":"off")<<" SS_OUTWRITE="<<(optOutEnd?"end":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
@@ -4046,6 +4075,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(size_t c=0;c<chunks.size();++c)populate_chunk(c);
  }
  __mark("MAP");
+ struct EarlyOut{vector<int> fd;int campFd=-1;bool dirs=false;atomic<bool> done{false};};
+ shared_ptr<EarlyOut> earlyOut;
+ if(optOutEarly){earlyOut=make_shared<EarlyOut>();earlyOut->fd.assign((size_t)T,-1);
+  thread([eo=earlyOut,dir=output/"user_daily",cdir=output/"campaign_daily",T]{
+   std::error_code ec,ec2;fs::create_directories(dir,ec);fs::create_directories(cdir,ec2);eo->dirs=!ec&&!ec2;
+   {int f=::open((cdir/"part-00000.parquet").c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);if(f>=0&&::write(f,"PAR1",4)!=4){::close(f);f=-1;}eo->campFd=f;}
+   for(int t=0;t<T;++t){char name[32];snprintf(name,sizeof name,"part-%05d.parquet",t);int f=::open((dir/name).c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
+    if(f>=0&&::write(f,"PAR1",4)!=4){::close(f);f=-1;} // the file's first four bytes go out here too; on any failure the worker creates the file itself
+    eo->fd[(size_t)t]=f;}
+   eo->done.store(true,memory_order_release);}).detach();}
  if(optPopulate==3)for(int i=0;i<optPopulateBg;++i)thread([&chunks,populate_chunk]{ // chunks outlives the threads' work: they stop before PARSE ends and the process leaves through _exit
   for(;;){if(populateStop.load(memory_order_relaxed))break;const size_t c=populateNext.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;populate_chunk(c);}}).detach();
  // ---- Dense IDs: find the generator's keys from the first lines of one event file and one click file. ----
@@ -5148,9 +5187,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   __mark("DENSE1");
  }
  const size_t idxEnd=slots&&denseUsers?(size_t)denseMaxIdx.load()+1:0;
+ optThrStats=stats;
+ const double thrS0=stats?now_s():0; // start of the DENSE stage's serial lead-in
+ double thrR0=0,thrA0=0,thrSingle=0; // parallel region start; AGGREGATE start; serial part at the end of DENSE
+ vector<ThrStat> dstat(stats?T:0),astat(stats?T:0);
+ // One line per stage, all times in ms. min/max/sum are over the threads.
+ const auto thr_line=[&](const char* name,const vector<ThrStat>& v,double t0,double serialPre,double serialEnd){
+  double fMin=1e9,fMax=0,lMin=1e9,lMax=0,wMin=1e9,wMax=0,wSum=0,cLoop=0,wr=0,wrMax=0,wrCpu=0,op=0,gr=0,tMin=1e9,tMax=0,cAll=0,en=0;unsigned wc=0,gc=0,idle=0;
+  for(const ThrStat& x:v){
+   if(x.first<0){++idle;cAll+=x.cOut-x.cIn;wr+=x.wWall;wrCpu+=x.wCpu;wc+=x.wCalls;op+=x.oWall;gr+=x.gWall;gc+=x.gCalls;en+=x.endWall;continue;}
+   const double f=x.first-t0,l=x.last-t0,w=x.last-x.first,tl=x.out-x.last;
+   fMin=min(fMin,f);fMax=max(fMax,f);lMin=min(lMin,l);lMax=max(lMax,l);wMin=min(wMin,w);wMax=max(wMax,w);wSum+=w;cLoop+=x.cLast-x.cFirst;
+   wr+=x.wWall;wrMax=max(wrMax,x.wMax);wrCpu+=x.wCpu;wc+=x.wCalls;op+=x.oWall;gr+=x.gWall;gc+=x.gCalls;tMin=min(tMin,tl);tMax=max(tMax,tl);cAll+=x.cOut-x.cIn;en+=x.endWall;
+  }
+  if(idle==v.size())fMin=lMin=wMin=tMin=0;
+  char b[640];snprintf(b,sizeof b,"STATS %s threads: n %zu noloop %u serial_pre %.2f first_start %.2f %.2f last_end %.2f %.2f loop_wall %.2f %.2f %.2f loop_cpu %.2f write_wall %.2f write_max %.2f write_cpu %.2f write_calls %u open_wall %.2f grow_wall %.2f grow_calls %u tail_wall %.2f %.2f end_wall %.2f serial_end %.2f thread_cpu %.2f\n",
+   name,v.size(),idle,serialPre*1e3,fMin*1e3,fMax*1e3,lMin*1e3,lMax*1e3,wMin*1e3,wMax*1e3,wSum*1e3,cLoop*1e3,wr*1e3,wrMax*1e3,wrCpu*1e3,wc,op*1e3,gr*1e3,gc,tMin*1e3,tMax*1e3,en*1e3,serialEnd*1e3,cAll*1e3);
+  cerr<<b;};
  uint64_t deferLoE=UINT64_MAX,deferHiE=0,deferLoC=UINT64_MAX,deferHiC=0; // counter ranges holding the rows of deferred indexes
  // ---- Per person bucket: order, sessionize, attribute. Each thread writes its own Parquet file. ----
- fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");
+ if(earlyOut)while(!earlyOut->done.load(memory_order_acquire))this_thread::yield(); // SS_OUTOPEN=early: long done in practice
+ if(!(earlyOut&&earlyOut->dirs)){fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");}
  const bool debugCsv=getenv("SS_DEBUG_CSV")!=nullptr; // unit tests read these hex rows from SCRATCH_DIR
  const size_t ncamp=campaigns.size();
  const int64_t firstday=divfloor(window_start,DAY);
@@ -5216,9 +5273,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(evBase&&evEnd)slot_pieces(evBase,(size_t)denseEvEnd.load()<<evShift);
   if(denseCl&&clEnd)slot_pieces((const char*)denseCl,(size_t)denseClEnd.load()*sizeof(CSlot));
  }
+ if(stats)thrR0=now_s();
  #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9])
  {
   const int tid=omp_get_thread_num();
+  ThrStat thrNone;ThrStat* cur=stats?&dstat[tid]:&thrNone; // the stage this thread is in
+  double grow0=tlGrowWall;uint32_t growN0=tlGrowCalls;
+  if(stats){cur->in=now_s();cur->cIn=thr_cpu_s();}
+  const auto thr_chunk_in=[&]{if(__builtin_expect(stats,0)&&cur->first<0){cur->first=cur->last=now_s();cur->cFirst=cur->cLast=thr_cpu_s();}};
+  const auto thr_chunk_out=[&]{if(__builtin_expect(stats,0)){cur->last=now_s();cur->cLast=thr_cpu_s();}};
+  const auto thr_stage_out=[&]{cur->out=now_s();cur->cOut=thr_cpu_s();cur->gWall=tlGrowWall-grow0;cur->gCalls=tlGrowCalls-growN0;grow0=tlGrowWall;growN0=tlGrowCalls;};
   #pragma omp for schedule(static,1) nowait
   for(size_t i=0;i<unmapFirst.size();++i)munmap(unmapFirst[i].first,unmapFirst[i].second);
   // Per-thread campaign totals, laid out [day][campaign].
@@ -5229,7 +5293,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp+1);size_t nact=0; // active: one free place after a full list (see the fast lane's large click sets)
   vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
   PqFile file;
-  auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
+  auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);
+   const int efd=earlyOut&&(size_t)tid<earlyOut->fd.size()?earlyOut->fd[(size_t)tid]:-1; // each worker touches only its own entry
+   if(efd>=0){earlyOut->fd[(size_t)tid]=-1;file.adopt(efd,userCols);}
+   else file.open(output/"user_daily"/name,userCols);};
   // Row buffers. A person adds at most ndays rows and the buffers are flushed between persons,
   // so the fixed-width columns never need a capacity check.
   static constexpr size_t FLUSH=50000;
@@ -5249,11 +5316,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    catbody.clear();
    string head;put_varint(head,(groups<<1)|1);
    put_le32(catbody,(uint32_t)(head.size()+groups));catbody+=head;catbody.append((const char*)catbits,groups);catbody+=catv;
+   const double w0=stats?now_s():0,c0=stats?thr_cpu_s():0;
    if(!file.is_open())open_file();
+   const double w1=stats?now_s():0;
    file.row_group((int64_t)n,{string_view(uidp,uidLen),string_view((const char*)dayp,n*4),
     narrow?string_view((const char*)sess32p,n*4):string_view((const char*)sessp,n*8),
     narrow?string_view((const char*)evs32p,n*4):string_view((const char*)evsp,n*8),
     string_view((const char*)revp,n*8),catbody});
+   if(stats){const double w2=now_s();cur->oWall+=w1-w0;cur->wWall+=w2-w1;cur->wMax=max(cur->wMax,w2-w1);cur->wCpu+=thr_cpu_s()-c0;++cur->wCalls;}
    memset(catbits,0,groups);catv.clear();uidLen=0;nrows=0;
   };
   Scratch<Ev> bufA,bufB;Scratch<Click> bufC,bufD;
@@ -5396,6 +5466,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
    for(size_t i0=0;i0<idxEnd;i0+=ICH){
     const size_t i1=min(idxEnd,i0+ICH);
+    thr_chunk_in();
     for(size_t ix=i0;ix<i1;++ix){
      DInfo& f=info[ix];
      const uint32_t ec=f.ec.load(memory_order_relaxed),cc=f.cc.load(memory_order_relaxed);
@@ -5638,6 +5709,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        if(sl.present&&d<8){hand_click(myCl,pool,txt,sl.key,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),(uint32_t)c);++rdHandCl;}}
      }
     }
+    thr_chunk_out();
    }
    // ---- DENSE stage, part 3: the rows of the deferred indexes, in one sweep. ----
    #pragma omp for schedule(dynamic,1) nowait
@@ -5654,18 +5726,26 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      if(sl.present&&(u&DENSE_USER)){const uint32_t d=u&~DENSE_USER;
       if(info[d>>dn::ALIAS_BITS].state.load(memory_order_relaxed)==DSTATE_DEFER){hand_click(myCl,pool,txt,sl.key,dBase+(d^((comp[d>>3].load(memory_order_relaxed)>>(3*(d&7)))&7)),(uint32_t)c);++rdHandCl;}}}
    }
+   if(stats){ // every thread closes its DENSE record before one of them prints the line
+    thr_stage_out();
+    #pragma omp barrier
+   }
    // The general lists are complete now: size the buffers of the rest of this stage by them.
    #pragma omp single
    {
+    const double thrSg0=stats?now_s():0;
     if(slots){
      maxEvPerson=0;maxClPerson=0;
      for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
       maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
      size_pools();
+     if(stats){thrSingle=now_s()-thrSg0;thr_line("dense",dstat,thrR0,thrR0-thrS0,thrSingle);}
      __mark("DENSE");
     }
+    if(stats)thrA0=now_s();
    }
   }
+  if(stats){cur=&astat[tid];cur->in=now_s();cur->cIn=thr_cpu_s();} // from here on: the AGGREGATE stage
   bufA.reserve(maxEvPerson);bufB.reserve(maxEvPerson);bufC.reserve(maxClPerson);bufD.reserve(maxClPerson);
   if(cellPass)cellBuf.reserve(maxEvPerson+2);
   Cell* const cells=cellBuf.p;
@@ -5674,6 +5754,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t nE=0,nC=0;
    for(int t=0;t<T;++t){nE+=surv[t].ev[up].size();nC+=surv[t].cl[up].size();}
    if(!nE)continue;
+   thr_chunk_in();thr_chunk_out();
    const uint32_t base=up<nA?(uint32_t)(up<<shA):denseBase+(uint32_t)((up-nA)<<shB),W=up<nA?WA:WB;
    if(SMALL_BUCKET&&nE<=max<size_t>(SMALL_BUCKET,W/2)){
     // Few rows for the bucket's width: sort them by person and time and go person by person, so the
@@ -5883,14 +5964,20 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     nact=0;
     if(nrows>=FLUSH)flush_rows();
    }
+   thr_chunk_out();
   }
+  const double thrE0=stats?now_s():0;
   // Every row is in the output buffers now (names are copied there): nothing points into an input file.
   #pragma omp for schedule(static,1) nowait
   for(size_t i=0;i<unmapLast.size();++i)munmap(unmapLast[i].first,unmapLast[i].second);
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
   if(file.is_open())file.close();
+  if(stats){thr_stage_out();cur->endWall=cur->out-thrE0;}
  }
+ if(stats)thr_line("aggregate",astat,thrA0?thrA0:thrR0,0,0);
+ if(earlyOut)for(size_t t=0;t<earlyOut->fd.size();++t)if(earlyOut->fd[t]>=0){ // a file no worker wrote to: it must not stay behind empty
+  ::close(earlyOut->fd[t]);earlyOut->fd[t]=-1;char name[32];snprintf(name,sizeof name,"part-%05d.parquet",(int)t);::unlink((output/"user_daily"/name).c_str());}
  vector<Totals> campTotals(ncamp*(size_t)ndays);
  for(const Totals* tt:threadTotals)if(tt)for(size_t i=0;i<ncells;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
  for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=0;i<ncells;++i)campTotals[i].assists+=ta[i];
@@ -5910,8 +5997,10 @@ __mark("AGGREGATE");
    if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
   }
   PqFile f;
-  f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
-   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});
+  const vector<PqCol> campCols={{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
+   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}};
+  if(earlyOut&&earlyOut->campFd>=0){f.adopt(earlyOut->campFd,campCols);earlyOut->campFd=-1;}
+  else f.open(output/"campaign_daily"/"part-00000.parquet",campCols);
   if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
   f.close();
   if(debugCsv){
