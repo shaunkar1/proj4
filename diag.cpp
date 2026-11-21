@@ -387,11 +387,11 @@ int main(){
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
  for(int r=0;r<3;++r){
-  add("B",1,{N8});add("r8",1,{N8,{"SS_DENSE_AHEAD","8"}});add("m",1,{N8},"core-m");add("b",1,{N8},"core-b");
+  add("B",1,{N8});add("r8",1,{N8,{"SS_DENSE_AHEAD","8"}});add("m",1,{N8},"core-m");add("b",1,{N8},"core-b");add("c",1,{N8},"core-c");
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hr8",1,{N8,{"SS_DENSE_AHEAD","8"}},"",true);add("Hm",1,{N8},"core-m",true);add("Hb",1,{N8},"core-b",true);}
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hr8",1,{N8,{"SS_DENSE_AHEAD","8"}},"",true);add("Hm",1,{N8},"core-m",true);add("Hb",1,{N8},"core-b",true);add("Hc",1,{N8},"core-c",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
@@ -438,8 +438,8 @@ int main(){
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=eqText+" | "+fmt("c46 wPYXus","B","wPYXus")+fmt("c46 ring8 wPYXus","r8","wPYXus")+fmt("main wPYXus","m","wPYXus")+fmt("c47 wPYXAus","b","wPYXAus");
-  a+="| 60x "+fmt("c46 wPYXus","HB","wPYXus")+fmt("ring8 wPYX","Hr8","wPYX")+fmt("main wPYX","Hm","wPYX")+fmt("c47 wPYXA","Hb","wPYXA");
+  a+=eqText+" | "+fmt("c46 wPYXus","B","wPYXus")+fmt("c46 ring8 wPYXus","r8","wPYXus")+fmt("main wPYXus","m","wPYXus")+fmt("c47 wPYXAus","b","wPYXAus")+fmt("c48 wPYXAus","c","wPYXAus");
+  a+="| 60x "+fmt("c46 wPYXus","HB","wPYXus")+fmt("ring8 wPYX","Hr8","wPYX")+fmt("main wPYX","Hm","wPYX")+fmt("c47 wPYXA","Hb","wPYXA")+fmt("c48 wPYXA","Hc","wPYXA");
   c+=benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
