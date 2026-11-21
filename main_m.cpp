@@ -1174,7 +1174,7 @@ static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32
 //           decoded and write it at the end of the line, or `ahead` dense rows later (SS_DENSE_AHEAD, 1-16).
 //   bucket  the row is appended to a per-thread bucket by counter range (counter >> shE / shC); a later pass
 //           fills the slot arrays bucket by bucket, so the random writes stay inside a small range.
-struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false;unsigned ahead=8,shE=14,shC=14;};
+struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false,batch=false,ev8=false;unsigned ahead=8,shE=14,shC=14;};
 // A dense event line in bucket form, valid or not. k as in PRec (0 = not a valid event), ingest = exact
 // ingest_ts in ms, lo = the low shE bits of the counter: counter = (bucket index << shE) | lo.
 struct DRec{uint64_t k;int64_t ingest;uint32_t user;uint16_t cat;uint16_t lo;};
@@ -1712,6 +1712,132 @@ TARGET static void NAME(ESlot* const ev,const size_t from,const size_t to,KeyTab
 }
 SS_RESOLVE_RAW(resolve_raw_v3,SS_V3,parse36_v3)
 SS_RESOLVE_RAW(resolve_raw_plain,,dn::parse36)
+// ---- Raw users read where they lie (the folded form: no pass that rewrites the slots). ----
+// What a raw text stands for without asking the ID table: its DENSE_USER code, or the raw word itself
+// (DENSE_USER_RAW | length) if the text is not a dense user's. Exactly the test of SS_RESOLVE_RAW.
+SS_V3 [[gnu::noinline]] static uint32_t raw_dense_code_v3(uint64_t raw,uint32_t len){
+ uint64_t y;uint32_t code=0;
+ return parse36_v3((const char*)&raw,len,y)&&dense_user_code(dn::index_of(y,dense.ku),code)?code:(DENSE_USER_RAW|len);
+}
+[[gnu::noinline]] static uint32_t raw_dense_code_plain(uint64_t raw,uint32_t len){
+ uint64_t y;uint32_t code=0;
+ return dn::parse36((const char*)&raw,len,y)&&dense_user_code(dn::index_of(y,dense.ku),code)?code:(DENSE_USER_RAW|len);
+}
+// A user word that is a DENSE_USER code (top bits 01; a raw word has 11, a LOCAL number 10, a table number 00).
+static inline __attribute__((always_inline)) bool is_dense_code(uint32_t u){return (u>>30)==1u;}
+// The first 16 bytes of an event slot: all a reader of resolved slots needs (see ev_at in run()).
+struct ESmall{uint64_t k;uint32_t user;uint16_t cat;uint16_t thread;};
+static_assert(sizeof(ESmall)==16&&offsetof(ESmall,user)==offsetof(ESlot,user)&&offsetof(ESmall,cat)==offsetof(ESlot,cat)&&offsetof(ESmall,thread)==offsetof(ESlot,thread)&&offsetof(ESlot,k)==0);
+// One thread's reader of slot users when the slots are left as the parser wrote them. code() gives the
+// user word of a slot holding a valid event: unchanged if the line resolved it (DENSE_USER code, table
+// number, LOCAL number of the slot's thread); for a raw text its DENSE_USER code, or the raw word if the
+// text is not a dense user's - unless this thread has already asked the ID table for it (set_table),
+// then that answer (a table number, or a LOCAL number of THIS thread). A user's rows are neighbours but
+// change between the user's aliases (texts) from row to row, so the answers are kept in a small table
+// indexed by a hash of the text; a row costs one probe of it. (Slots resolved on their line have no
+// text and share entry 0; they are rare where it matters.)
+struct RawCtx{
+ static constexpr unsigned BITS=8;
+ struct Entry{uint64_t raw;uint32_t user,code;};
+ uint32_t dmax=0; // largest DENSE_USER code decoded here
+ bool v3=false;
+ Entry memo[1u<<BITS];
+ RawCtx(){for(Entry& m:memo){m.raw=0;m.user=0xFFFFFFFFu;m.code=0;}} // no slot has that user word
+ static inline __attribute__((always_inline)) size_t at(uint64_t raw){return (size_t)((raw*0x9E3779B97F4A7C15ULL)>>(64-BITS));}
+ [[gnu::noinline]] uint32_t slow(Entry& m,uint32_t u,uint64_t sp){
+  uint32_t code=u;
+  if((u&DENSE_USER_RAW)==DENSE_USER_RAW){
+   const uint32_t len=u&15u;
+   code=v3?raw_dense_code_v3(sp,len):raw_dense_code_plain(sp,len);
+   if(is_dense_code(code))dmax=max(dmax,code);
+  }
+  m.raw=sp;m.user=u;m.code=code;return code;
+ }
+ // sl must be the head of a 32-byte ESlot (the text is in its spare word).
+ inline __attribute__((always_inline)) uint32_t code(const ESmall& sl){
+  const uint32_t u=sl.user;const uint64_t sp=((const ESlot*)(const void*)&sl)->spare;
+  Entry& m=memo[at(sp)];
+  if(__builtin_expect((m.raw!=sp)|(m.user!=u),0))return slow(m,u,sp);
+  return m.code;
+ }
+ void set_table(uint64_t sp,uint32_t len,uint32_t code){Entry& m=memo[at(sp)];m.raw=sp;m.user=DENSE_USER_RAW|len;m.code=code;}
+};
+// Where one thread puts the session lists of the runs it reads (blocks of its pool) and a run's purchases.
+struct SessArena{uint64_t* cur=nullptr;uint64_t* end=nullptr;vector<uint64_t> pur;};
+// The event sweep of the counters [lo,hi) of an event slot array (stride 1 << evShift bytes, layout ESmall
+// at the head of each slot). A run is a stretch of valid slots of one user index, not broken by a valid
+// slot of anybody else; it belongs to the piece it starts in and may run past `hi` (cross), up to evEnd,
+// so a piece first steps over the run that reaches into it. While a run is read its sessions are made as
+// well: every row either continues the current session or starts one (more than GAP after the row
+// before), written without a branch on that - each row writes "a session starts here" into the next free
+// entry, and the entry only stays if the row really starts one. The run's counts, alias mask and session
+// list go to the index's DInfo.
+//   code_of(slot)     the user word of a valid slot (see RawCtx::code; plain `user` when slots are resolved)
+//   run_start(code)   called with the first row's DENSE_USER code of every run
+//   other(slot,code)  a valid slot of this piece whose user is not a dense user
+// Returns the number of rows in the runs of this piece.
+template<class CODE,class START,class OTHER>
+static inline __attribute__((always_inline)) uint64_t sweep_event_runs(const char* const evBase,const unsigned evShift,const size_t lo,const size_t hi,const size_t evEnd,const bool cross,
+  DInfo* const info,HugePool& pool,SessArena& ar,CODE&& code_of,START&& run_start,OTHER&& other){
+ const auto ev_at=[evBase,evShift](size_t c)->const ESmall&{return *(const ESmall*)(const void*)(evBase+(c<<evShift));};
+ uint64_t rows=0;
+ size_t c=lo;
+ if(cross&&lo>0){
+  size_t p=lo;uint32_t code0=0;bool reaches=false;
+  while(p>0){--p;const ESmall& sl=ev_at(p);if(sl.k>=PR_KBIAS){const uint32_t u=code_of(sl);if(is_dense_code(u)){code0=u&~7u;reaches=true;}break;}}
+  if(reaches)for(;c<hi;++c){const ESmall& sl=ev_at(c);if(sl.k>=PR_KBIAS&&(code_of(sl)&~7u)!=code0)break;}
+ }
+ const size_t stop=cross?evEnd:hi; // how far a run may go
+ while(c<hi){
+  const ESmall& sl=ev_at(c);const uint64_t k0=sl.k;
+  if(k0<PR_KBIAS){++c;continue;} // empty, or present but not valid
+  const uint32_t u=code_of(sl);
+  if(!is_dense_code(u)){other(sl,u);++c;continue;}
+  run_start(u);
+  const uint32_t code=u&~7u;const size_t first=c;size_t lastSlot=c;
+  // Room: one entry per slot looked at, at most, plus the end entry.
+  if((size_t)(ar.end-ar.cur)<hi-c+2){const size_t want=max<size_t>(hi-c+2,size_t(1)<<19);ar.cur=(uint64_t*)pool.take(want*8);ar.end=ar.cur+want;}
+  uint64_t* blk=ar.cur;size_t cap=(size_t)(ar.end-blk);
+  size_t n=0,ns=0;uint64_t last=0-(uint64_t)(GAP+1),disorder=0;uint32_t mask=0;ar.pur.clear();
+  size_t j=c;
+  const size_t stride=size_t(1)<<evShift;
+  for(;;){
+   const size_t lim=min(stop,c+cap-2);
+   const char* p=(const char*)&ev_at(j);const char* const pe=(const char*)&ev_at(lim);const char* lastp=p;
+   for(;p<pe;p+=stride){
+    const ESmall& r=*(const ESmall*)(const void*)p;const uint64_t k=r.k;
+    if(k<PR_KBIAS)continue;
+    const uint32_t al=code_of(r)^code; // the alias if the row is this index's
+    if(al>7)break;
+    mask|=1u<<al;
+    const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
+    disorder|=step; // its top bit: a row before its predecessor
+    blk[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
+    if(__builtin_expect((k&EV_PURCHASE)!=0,0))ar.pur.push_back(((uint64_t)(ns-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
+    ++n;lastp=p;
+   }
+   j=(size_t)(p-(const char*)&ev_at(0))>>evShift;
+   if(n)lastSlot=(size_t)(lastp-(const char*)&ev_at(0))>>evShift;
+   if(p<pe)goto run_done; // a valid slot of somebody else
+   if(j>=stop)break;
+   {const size_t cap2=cap*2;uint64_t* const nb=(uint64_t*)pool.take(cap2*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=cap2;ar.end=nb+cap2;} // a long run past the piece: a bigger block
+  }
+  run_done:;
+  {const size_t np=ar.pur.size(),need=ns+1+np+1;
+   if(cap<need){uint64_t* const nb=(uint64_t*)pool.take(need*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=need;ar.end=nb+need;}
+   blk[ns]=n;if(np)memcpy(blk+ns+1,ar.pur.data(),np*8);blk[ns+1+np]=~0ull;
+   ar.cur=blk+need;}
+  DInfo& f=info[(code&~DENSE_USER)>>dn::ALIAS_BITS];
+  dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)lastSlot+1);f.ec.fetch_add((uint32_t)n,memory_order_relaxed);
+  uint64_t* none=nullptr;
+  if(f.sess.compare_exchange_strong(none,blk,memory_order_relaxed)){
+   f.ns.store((uint32_t)ns|(((disorder>>63)||n>=(size_t(1)<<24))?0x80000000u:0u),memory_order_relaxed);f.amask.store((uint8_t)mask,memory_order_relaxed);}
+  else f.multi.store(1,memory_order_relaxed); // the index has another run
+  rows+=n;
+  c=j;
+ }
+ return rows;
+}
 // The event loop of one chunk for one mask builder.
 #define SS_EVENT_LOOP(NAME,TARGET,MASKS) \
 template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
@@ -1796,6 +1922,571 @@ SS_EVENT_LOOP_2P(events_avx2_2p,SS_V3,win_masks_avx2,nl_mask_avx2)
 SS_EVENT_LOOP_2P(events_avx512z_2p,SS_V5,win_masks_avx512z,nl_mask_avx512z)
 SS_EVENT_LOOP_2P(events_avx512y_2p,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 #undef SS_IX_FILL
+// ---- Batch event loop (SS_LINES=batch; layout and contract in /home/claude/vert/BATCH.md) ----
+// Stage 1 cuts a line as event_line_v3 does and, if its shapes fit, only writes the operands of the row into
+// a batch of eight; stage 2 works out counter, ingest_ts, validity and k for the whole batch (the place for
+// the vertical kernels; ev_stage2_scalar is the reference, built from the functions of the line code);
+// stage 3 asks for the slots of the batch just decoded and then finishes the batch before it. A line whose
+// shapes do not fit, and a row the stage-2 code refuses, goes through event_line_v3 when its batch is finished.
+struct alignas(64) EvBatch{uint64_t idw[8],idn[8],ig0[8],ig1[8],ig2[8],ts0[8],ts1[8],ts2[8],tsn[8],kw[8],kn[8],fl[8];};
+struct alignas(64) EvBatchOut{uint64_t ve[8],ingest[8],k[8],kind[8];uint8_t ok,idok;}; // idok: ve is the counter of a dense ID (also when ok is clear)
+// What the loop keeps per row besides the operands.
+struct EvRows{const char* line[8];const char* nl[8];const char* s5[8];const char* s6[8];uint64_t uw[8];uint32_t l5[8],l6[8],un[8],pre[8];unsigned n;uint8_t slow;};
+SS_V3 static void ev_stage2_scalar(const EvBatch& in,const unsigned n,EvBatchOut& out,const EvLoop& lp){
+ unsigned ok=0,idok=0;
+ for(unsigned i=0;i<n;++i){
+  out.ve[i]=0;out.ingest[i]=0;out.k[i]=0;out.kind[i]=0;
+  uint64_t y,ve=0;bool good=true;
+  if(parse36_v3((const char*)&in.idw[i],(unsigned)in.idn[i],y)&&(ve=dn::index_of(y,lp.ke))<lp.limE){idok|=1u<<i;out.ve[i]=ve;}else good=false;
+  char ig[32]={0},ts[32]={0};
+  memcpy(ig,&in.ig0[i],8);memcpy(ig+8,&in.ig1[i],8);memcpy(ig+12,&in.ig2[i],8);
+  int64_t tod,day=0,ingest=0,tsv=0;
+  if(ig[19]=='Z'&&(tod=tod_v3(ig))>=0&&date3(ig,lp.memo,day))ingest=day+tod;else good=false;
+  if(in.tsn[i]==20){
+   memcpy(ts,&in.ts0[i],8);memcpy(ts+8,&in.ts1[i],8);memcpy(ts+12,&in.ts2[i],8);
+   int64_t tod2;
+   if(ts[19]=='Z'&&memcmp(ts,ig,10)==0&&(tod2=tod_v3(ts))>=0)tsv=day+tod2;else good=false;
+  }else{ // 13 digits
+   memcpy(ts,&in.ts0[i],8);memcpy(ts+5,&in.ts1[i],8);
+   if(!epoch13_v3(ts,tsv))good=false;
+  }
+  if(!good)continue;
+  char kb[16]={0};memcpy(kb,&in.kw[i],8);
+  const unsigned kind=in.kn[i]<=8?event_kind(string_view(kb,(size_t)in.kn[i])):0;
+  const uint64_t tsrel=(uint64_t)tsv-(uint64_t)lp.wstart;
+  const bool valid=kind&&(in.fl[i]&1)&&(in.fl[i]&2)&&tsrel<lp.wlen&&ingest-tsv<=DAY;
+  out.ingest[i]=(uint64_t)ingest;out.kind[i]=kind;out.k[i]=valid?(tsrel+1)<<EV_TS:0;ok|=1u<<i;
+ }
+ out.ok=(uint8_t)ok;out.idok=(uint8_t)idok;
+}
+// Stage 1 for the line at p (b, w1, w2, nl as for event_line_v3<true,...>): row r of the batch, or a slow row.
+// Returns false if the line is dropped outright (no event_id).
+// Eight bytes as they stand (a plain load; memcpy into an indexed array would become a checked library call).
+static inline __attribute__((always_inline)) uint64_t ld8(const char* p){uint64_t w;__builtin_memcpy(&w,p,8);return w;}
+SS_V3I bool ev_stage1_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const char* const nl,EvBatch& bt,EvRows& rw,const unsigned r,const EvLoop& lp){
+ rw.line[r]=p;rw.nl[r]=nl;
+ const uint64_t c=w1.c,qa=w1.q;
+ const uint64_t cA=_blsr_u64(c),cB=_blsr_u64(cA),cR=_blsr_u64(cB);
+ const uint64_t m1=_blsmsk_u64(cB);
+ const uint64_t q1=qa&m1,st1=((c^cB)<<1)|1,en1=c^cR;
+ uint64_t sq1,op1;const uint64_t err1=quote_errors_v3(q1,st1,en1,sq1,op1);
+ const uint64_t e2=_tzcnt_u64(cB);
+ const uint64_t L=(uint64_t)(nl-b),nbit=1ull<<(L&63),keep=nbit-1;
+ const uint64_t d=w2.c&keep,qb=w2.q&keep;
+ const uint64_t st2=(d<<1)|1,en2=d|nbit;
+ uint64_t sq2,op2;const uint64_t err2=quote_errors_v3(qb,st2,en2,sq2,op2);
+ bool fast=(err1|err2|(uint64_t)(_mm_popcnt_u64(d)^3)|((e2|L)>>6))==0;
+ if(__builtin_expect(fast,1)){
+  uint64_t B1=st1+sq1,E1=en1-(op1>>1),B2=st2+sq2,E2=en2-(op2>>1);
+  const unsigned z0=(unsigned)(q1&1);
+  const char* const s0=p+z0;const unsigned l0=(unsigned)_tzcnt_u64(E1)-z0;
+  if(l0==0)return false; // no event_id: dropped
+  const unsigned z3=(unsigned)(qb&1);
+  const char* const s3=b+z3;const unsigned l3=(unsigned)_tzcnt_u64(E2)-z3;
+  B1=_blsr_u64(B1);E1=_blsr_u64(E1);
+  const unsigned b1=(unsigned)_tzcnt_u64(B1),l1=(unsigned)_tzcnt_u64(E1)-b1;
+  B1=_blsr_u64(B1);E1=_blsr_u64(E1);
+  const unsigned b2=(unsigned)_tzcnt_u64(B1),l2=(unsigned)_tzcnt_u64(E1)-b2;
+  B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+  const unsigned b4=(unsigned)_tzcnt_u64(B2),l4=(unsigned)_tzcnt_u64(E2)-b4;
+  B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+  const unsigned b5=(unsigned)_tzcnt_u64(B2),l5=(unsigned)_tzcnt_u64(E2)-b5;
+  B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+  const unsigned b6=(unsigned)_tzcnt_u64(B2),l6=(unsigned)_tzcnt_u64(E2)-b6;
+  const char* const s1=p+b1;const char* const s2=p+b2;
+  // the shapes of the fast path: 'e' + 1-8 bytes, ingest_ts 20 long, ts 20 or 13 long, user empty or 'u' + 0-8 bytes
+  fast=(s0[0]=='e')&(l0-2u<8u)&(l3==20)&((l2==20)|(l2==13))&((l1==0)|((s1[0]=='u')&(l1<=9u)));
+  if(__builtin_expect(fast,1)){
+      bt.idw[r]=ld8(s0+1);bt.idn[r]=l0-1;
+   bt.ig0[r]=ld8(s3);bt.ig1[r]=ld8(s3+8);bt.ig2[r]=ld8(s3+12);
+   bt.ts0[r]=ld8(s2);bt.ts1[r]=ld8(s2+(l2==20?8:5));bt.ts2[r]=ld8(s2+12);bt.tsn[r]=l2;
+   bt.kw[r]=ld8(b+b4);bt.kn[r]=l4;
+   bt.fl[r]=(uint64_t)(l1!=0)|((uint64_t)(l5!=0)<<1);
+   rw.un[r]=l1?l1-1:0;rw.uw[r]=_bzhi_u64(ld8(s1+1),8*rw.un[r]);
+   rw.s5[r]=b+b5;rw.l5[r]=l5;rw.s6[r]=b+b6;rw.l6[r]=l6;
+   return true;
+  }
+ }
+ // not for the batch: the line code takes it when the batch is finished; its slot is asked for now
+ rw.slow|=(uint8_t)(1u<<r);rw.pre[r]=event_pre_v3(p,lp);
+ bt.idw[r]=0;bt.idn[r]=0;bt.ig0[r]=0;bt.ig1[r]=0;bt.ig2[r]=0;bt.ts0[r]=0;bt.ts1[r]=0;bt.ts2[r]=0;bt.tsn[r]=20;bt.kw[r]=0;bt.kn[r]=0;bt.fl[r]=0;
+ return true;
+}
+// Stage 3 for one batch: every row in line order.
+#define SS_BATCH_FINISH(X,MASKS) {const EvRows& R_=rw[X];const EvBatchOut& O_=bo[X]; \
+  for(unsigned i_=0;i_<R_.n;++i_){ \
+   if(__builtin_expect(((R_.slow>>i_)&1)|(~(O_.ok>>i_)&1),0)){ \
+    const char* const q_=R_.line[i_];const WinMasks w1_=MASKS(q_);const char* const bb_=event_window2(q_,w1_.c); \
+    const uint32_t pre_=((R_.slow>>i_)&1)?R_.pre[i_]:(((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:NOPRE); \
+    event_line_v3<true,true>(q_,bb_,w1_,MASKS(bb_),R_.nl[i_],pre_,lp,pend,pp,dmax,send,ring,rpos,general);continue;} \
+   uint64_t k_=O_.k[i_];unsigned cat_=0; \
+   if(k_&&O_.kind[i_]==3){int32_t price_=0; \
+    if(price_value(string_view(R_.s6[i_],R_.l6[i_]),price_)){const uint32_t ci_=products.find(string_view(R_.s5[i_],R_.l5[i_]));cat_=ci_==KeyTable::NONE?0:(unsigned)(uint16_t)ci_;k_|=EV_PURCHASE|(uint64_t)(uint32_t)price_;} \
+    else k_=0;} \
+   const uint64_t ve_=O_.ve[i_];send=max(send,(uint32_t)ve_+1); \
+   eslot_commit(lp.ev[ve_],k_?k_:ESLOT_INVALID,(k_?(uint64_t)(DENSE_USER_RAW|R_.un[i_]):0)|((uint64_t)cat_<<32)|lp.tid48,(int64_t)O_.ingest[i_],k_?R_.uw[i_]:0);} }
+// Stage 2 and the slot requests for the batch just filled, then stage 3 for the one before.
+#define SS_BATCH_TURN(MASKS) {EvRows& R_=rw[cur];for(unsigned i_=R_.n;i_<8;++i_){R_.slow|=(uint8_t)(1u<<i_);bt[cur].idn[i_]=0;bt[cur].tsn[i_]=20;} \
+  ev_stage2_scalar(bt[cur],R_.n,bo[cur],lp); \
+  for(unsigned i_=0;i_<R_.n;++i_)if((bo[cur].idok>>i_)&~(R_.slow>>i_)&1)__builtin_prefetch(&lp.ev[bo[cur].ve[i_]],1,3); \
+  SS_BATCH_FINISH(cur^1,MASKS) cur^=1;rw[cur].n=0;rw[cur].slow=0;}
+#define SS_EVENT_LOOP_BATCH(NAME,TARGET,MASKS,NLMASK) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const char* const end=base+len; \
+ const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;ERing* const ring=nullptr;unsigned rpos=0; \
+ EvBatch bt[2];EvBatchOut bo[2];EvRows rw[2];int cur=0;rw[0].n=0;rw[0].slow=0;rw[1].n=0;rw[1].slow=0; \
+ const char* starts[IX_BLOCK+64];const char* scan=p; \
+ while(p<lim){ \
+  size_t n=0; \
+  for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
+  for(size_t i=0;i<n&&p<lim;++i){ \
+   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c); \
+   if(ev_stage1_v3(p,b,w1,MASKS(b),starts[i]-1,bt[cur],rw[cur],rw[cur].n,lp)&&++rw[cur].n==8)SS_BATCH_TURN(MASKS) \
+   p=starts[i];} \
+  if(scan>=end&&p<lim){p=line_general<7>(p,end,general);break;} /* the last line has no newline */ \
+ } \
+ SS_BATCH_TURN(MASKS) SS_BATCH_FINISH(cur^1,MASKS) \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send); \
+}
+SS_EVENT_LOOP_BATCH(events_avx2_bt,SS_V3,win_masks_avx2,nl_mask_avx2)
+SS_EVENT_LOOP_BATCH(events_avx512z_bt,SS_V5,win_masks_avx512z,nl_mask_avx512z)
+SS_EVENT_LOOP_BATCH(events_avx512y_bt,SS_V5,win_masks_avx512y,nl_mask_avx512y)
+// ---- ev8 event loop (SS_LINES=ev8) ----
+// The lines are taken eight at a time straight from the line index: a kernel works out everything about the
+// eight rows from the line text (vert::ev8_v5, AVX-512, eight 64-bit lanes; vert::ev8_ref is its scalar twin
+// with the same decisions, used by the avx2 loop), the slots of the group are asked for, and then the group
+// before it is finished in line order, so every slot has had at least eight lines of time. A row the kernel
+// does not decide (ok bit clear) goes through event_line_v3 unchanged when its group is finished. The
+// kernel's answers for an ok row are exactly what event_line_v3<true,true> would hand to eslot_commit for
+// that line, a purchase's category excepted (see pur); the contract is the comment of Ev8Out below and the
+// head of /home/claude/vert/vert.h.
+// ---- ev8: eight event lines per call (vertical AVX-512). Generated from /home/claude/vert/vert.h by mkpaste.py; contract in
+// ---- vert.h / BATCH.md. Tested as this exact text by vert_line_test -DVERT_PASTE. Do not edit here: change vert.h and regenerate.
+namespace vert{
+#define VERT_T5 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512cd,avx2,bmi,bmi2,lzcnt,popcnt")))
+static constexpr uint64_t MASK40=(1ull<<40)-1;
+static constexpr uint64_t M1=0x9E3779B97F4Bull&MASK40,M2=0xD6E8FEB86659ull&MASK40;
+static constexpr uint64_t inv40(uint64_t a){uint64_t x=a;for(int i=0;i<6;++i)x*=2-a*x;return x&MASK40;}
+static constexpr uint64_t I1=inv40(M1),I2=inv40(M2);
+static_assert(((M1*I1)&MASK40)==1&&((M2*I2)&MASK40)==1);
+static inline uint64_t index_of_ref(uint64_t y,uint64_t key){uint64_t m=(y*I2)&MASK40;m=m^(m>>17)^(m>>34);return ((m^key)*I1)&MASK40;}
+static inline unsigned id8_ref(const uint64_t* w,const uint64_t* n,uint64_t key,uint64_t limit,uint64_t* ctr){
+ unsigned acc=0;
+ for(int i=0;i<8;++i){
+  ctr[i]=0;
+  const uint64_t len=n[i];
+  if(len-1u>7u)continue;
+  unsigned char s[8];memcpy(s,&w[i],8);
+  if(s[0]=='0'&&len>1)continue;
+  uint64_t v=0;bool ok=true;
+  for(uint64_t j=0;j<len;++j){unsigned d=s[j]-(unsigned)'0';if(d>9){d=s[j]-(unsigned)'a';if(d>25){ok=false;break;}d+=10;}v=v*36+d;}
+  if(!ok||v>MASK40)continue;
+  const uint64_t c=index_of_ref(v,key);
+  if(c<limit){ctr[i]=c;acc|=1u<<i;}
+ }
+ return acc;
+}
+VERT_T5 static inline __m512i id8k_v5(__m512i W,__m512i N,uint64_t key,uint64_t limit,__mmask8& okOut){
+ const __m512i n8=_mm512_slli_epi64(N,3);
+ const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(W,_mm512_sub_epi64(_mm512_set1_epi64(64),n8)),_mm512_srlv_epi64(_mm512_set1_epi8(0x30),n8));
+ const __m512i t=_mm512_sub_epi8(x,_mm512_set1_epi8('0')),u=_mm512_sub_epi8(x,_mm512_set1_epi8('a'));
+ const __m512i bad=_mm512_min_epu8(_mm512_subs_epu8(t,_mm512_set1_epi8(9)),_mm512_subs_epu8(u,_mm512_set1_epi8(25)));
+ const __m512i d=_mm512_min_epu8(t,_mm512_add_epi8(x,_mm512_set1_epi8((char)(10-'a'))));
+ const __m512i p2=_mm512_maddubs_epi16(d,_mm512_set1_epi16(0x0124));
+ const __m512i p4=_mm512_madd_epi16(p2,_mm512_set1_epi32(0x00010510));
+ const __m512i val=_mm512_add_epi64(_mm512_mul_epu32(p4,_mm512_set1_epi64(1679616)),_mm512_srli_epi64(p4,32));
+ // MIN36[n] picked by the low three bits of n (n == 8 -> entry 0); n == 0 and n > 8 are refused by the length test
+ const __m512i min36=_mm512_permutexvar_epi64(N,_mm512_setr_epi64(78364164096LL,0,36,1296,46656,1679616,60466176,2176782336LL));
+ __mmask8 ok=_mm512_testn_epi64_mask(bad,bad);
+ ok&=_mm512_cmple_epu64_mask(_mm512_sub_epi64(N,_mm512_set1_epi64(1)),_mm512_set1_epi64(7));
+ ok&=_mm512_cmpge_epu64_mask(val,min36);
+ ok&=_mm512_cmple_epu64_mask(val,_mm512_set1_epi64((long long)MASK40));
+ const __m512i mask=_mm512_set1_epi64((long long)MASK40);
+ __m512i m=_mm512_and_si512(_mm512_mullo_epi64(val,_mm512_set1_epi64((long long)I2)),mask);
+ m=_mm512_ternarylogic_epi64(m,_mm512_srli_epi64(m,17),_mm512_srli_epi64(m,34),0x96);
+ m=_mm512_xor_si512(m,_mm512_set1_epi64((long long)key));
+ const __m512i c=_mm512_and_si512(_mm512_mullo_epi64(m,_mm512_set1_epi64((long long)I1)),mask);
+ ok&=_mm512_cmplt_epu64_mask(c,_mm512_set1_epi64((long long)limit));
+ okOut=ok;return c;
+}
+struct DateEnt{uint64_t k;uint32_t cc;uint32_t pad;int64_t ms;};
+static_assert(sizeof(DateEnt)==24);
+static constexpr int64_t DAYMS=86400000LL;
+static constexpr unsigned EV_TS_SHIFT=25; // main.cpp EV_TS
+struct EvConst{uint64_t ke,limE;int64_t wstart;uint64_t wlen;const DateEnt* memo;uint64_t tid48=0;}; // tid48 (= lp.tid48) is used by ev8 only
+static inline unsigned date_slot(uint64_t w0,uint64_t w1){ // w0 = date bytes 0..7, w1 = bytes 8..15
+ return (unsigned)(((w0>>34)&0x40)|((w0>>46)&0x3C)|(w1&0x0F03));
+}
+static inline unsigned char byte_of(uint64_t w,unsigned i){return (unsigned char)(w>>(8*i));}
+static inline bool tod_ref(uint64_t w1,uint64_t w2,uint64_t& ms){
+ if(byte_of(w1,2)!='T'||byte_of(w2,1)!=':'||byte_of(w2,4)!=':')return false;
+ const unsigned ht=byte_of(w1,3)-(unsigned)'0',hu=byte_of(w2,0)-(unsigned)'0',mt=byte_of(w2,2)-(unsigned)'0',mu=byte_of(w2,3)-(unsigned)'0',st=byte_of(w2,5)-(unsigned)'0',su=byte_of(w2,6)-(unsigned)'0';
+ if(ht>2||hu>9||mt>5||mu>9||st>5||su>9)return false;
+ const uint64_t v=(uint64_t)(((ht*10+hu)*60+mt*10+mu)*60+st*10+su)*1000;
+ if(v>=86400000ULL)return false;
+ ms=v;return true;
+}
+static inline bool day_ref(uint64_t w0,uint64_t w1,const DateEnt* memo,uint64_t& dayms){
+ const DateEnt& x=memo[date_slot(w0,w1)];
+ if(x.k==((w0>>16)|(w1<<48))&&x.cc==(uint32_t)(w0&0xFFFF)){dayms=(uint64_t)x.ms;return true;}
+ return false;
+}
+static inline bool epoch_ref(uint64_t w0,uint64_t w1,uint64_t& ms){
+ uint64_t hi=0,lo=0;
+ for(unsigned i=0;i<8;++i){const unsigned d=byte_of(w0,i)-(unsigned)'0';if(d>9)return false;hi=hi*10+d;}
+ for(unsigned i=0;i<8;++i){const unsigned d=byte_of(w1,i)-(unsigned)'0';if(d>9)return false;if(i>=3)lo=lo*10+d;}
+ ms=hi*100000+lo;return true;
+}
+static inline bool off_ref(uint64_t w2,uint64_t w3,int64_t& delta){
+ const unsigned char sg=byte_of(w2,7);
+ if((sg!='+'&&sg!='-')||byte_of(w3,5)!=':')return false;
+ const unsigned o1=byte_of(w3,3)-(unsigned)'0',o2=byte_of(w3,4)-(unsigned)'0',o3=byte_of(w3,6)-(unsigned)'0',o4=byte_of(w3,7)-(unsigned)'0';
+ if(o1>9||o2>9||o3>9||o4>9)return false;
+ const unsigned oh=o1*10+o2,om=o3*10+o4;
+ if(oh>23||om>59)return false; // (ts_v3 says "not a timestamp" here; the kernels simply refuse the row)
+ const int64_t off=(int64_t)(oh*60+om)*60000LL;
+ delta=sg=='-'?off:-off;return true;
+}
+static inline unsigned kind_ref(uint64_t w,uint64_t n){
+ if(n==4)return (uint32_t)w==0x77656976u?1u:((uint32_t)w==0x74726163u?2u:0u);
+ if(n==8)return w==0x6573616863727570ULL?3u:0u;
+ return 0;
+}
+#define VERT_C5(x) _mm512_set1_epi64((long long)(x))
+#define VERT_LD5(p) _mm512_loadu_si512((const void*)(p))
+VERT_T5 static inline __m512i tod8k_v5(__m512i a,__m512i b,__mmask8& ok){
+ const __m512i va=_mm512_sub_epi8(a,VERT_C5(0x0000000030540000ULL)),la=VERT_C5(0xFFFFFFFF0200FFFFULL);
+ const __m512i vb=_mm512_sub_epi8(b,VERT_C5(0x0030303A30303A30ULL)),lb=VERT_C5(0xFF09050009050009ULL);
+ const __m512i pa=_mm512_madd_epi16(_mm512_maddubs_epi16(va,VERT_C5(0x0000000064000000ULL)),VERT_C5(0x0000000001680000ULL));
+ const __m512i pb=_mm512_madd_epi16(_mm512_maddubs_epi16(vb,VERT_C5(0x00010A00010A0001ULL)),VERT_C5(0x00010001003C0E10ULL));
+ const __m512i s=_mm512_add_epi32(pa,pb);
+ const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(s,_mm512_srli_epi64(s,32)),VERT_C5(1000));
+ ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(va,la),la)&_mm512_cmpeq_epi64_mask(_mm512_max_epu8(vb,lb),lb)&_mm512_cmplt_epu64_mask(ms,VERT_C5(86400000));
+ return ms;
+}
+VERT_T5 static inline __m512i epoch8k_v5(__m512i w0,__m512i w1,__mmask8& ok){
+ const __m512i z=_mm512_set1_epi8('0'),nine=_mm512_set1_epi8(9);
+ const __m512i v0=_mm512_sub_epi8(w0,z),v1=_mm512_sub_epi8(w1,z);
+ ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v0,nine),nine)&_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v1,nine),nine);
+ const __m512i p0=_mm512_madd_epi16(_mm512_maddubs_epi16(v0,VERT_C5(0x010A010A010A010AULL)),VERT_C5(0x0001006400010064ULL));
+ const __m512i p1=_mm512_madd_epi16(_mm512_maddubs_epi16(v1,VERT_C5(0x010A010A01000000ULL)),VERT_C5(0x0001006400010000ULL));
+ const __m512i tenk=VERT_C5(10000);
+ const __m512i hi=_mm512_add_epi64(_mm512_mul_epu32(p0,tenk),_mm512_srli_epi64(p0,32));
+ const __m512i lo=_mm512_add_epi64(_mm512_mul_epu32(p1,tenk),_mm512_srli_epi64(p1,32));
+ return _mm512_add_epi64(_mm512_mul_epu32(hi,VERT_C5(100000)),lo);
+}
+VERT_T5 static inline __m512i off8k_v5(__m512i w3,__mmask8& ok){
+ const __m512i v=_mm512_sub_epi8(w3,VERT_C5(0x30303A3030000000ULL)),l=VERT_C5(0x0905000902FFFFFFULL);
+ const __m512i p=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_C5(0x010A00010A000000ULL)),VERT_C5(0x0001003C003C0000ULL));
+ const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(p,_mm512_srli_epi64(p,32)),VERT_C5(60000));
+ ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,l),l)&_mm512_cmplt_epu64_mask(ms,VERT_C5(86400000));
+ return ms;
+}
+VERT_T5 static inline __m512i day8k_v5(__m512i w0,__m512i w1,const DateEnt* memo,__mmask8& hit){
+ const __m512i slot=_mm512_ternarylogic_epi64(_mm512_and_si512(_mm512_srli_epi64(w0,34),VERT_C5(0x40)),_mm512_and_si512(_mm512_srli_epi64(w0,46),VERT_C5(0x3C)),_mm512_and_si512(w1,VERT_C5(0x0F03)),0xFE);
+ const __m512i i3=_mm512_add_epi64(slot,_mm512_slli_epi64(slot,1));
+ const long long* base=(const long long*)memo;
+ const __m512i gk=_mm512_i64gather_epi64(i3,base,8),gc=_mm512_i64gather_epi64(i3,base+1,8),gm=_mm512_i64gather_epi64(i3,base+2,8);
+ const __m512i k=_mm512_or_si512(_mm512_srli_epi64(w0,16),_mm512_slli_epi64(w1,48));
+ hit=_mm512_cmpeq_epi64_mask(gk,k)&_mm512_cmpeq_epi64_mask(_mm512_and_si512(gc,VERT_C5(0xFFFFFFFFULL)),_mm512_and_si512(w0,VERT_C5(0xFFFF)));
+ return gm;
+}
+VERT_T5 static inline __m512i kind8k_v5(__m512i w,__m512i n,__mmask8& nz){
+ const __m512i lo=_mm512_and_si512(w,VERT_C5(0xFFFFFFFFULL));
+ const __mmask8 is4=_mm512_cmpeq_epi64_mask(n,VERT_C5(4));
+ const __mmask8 view=_mm512_mask_cmpeq_epi64_mask(is4,lo,VERT_C5(0x77656976ULL)),cart=_mm512_mask_cmpeq_epi64_mask(is4,lo,VERT_C5(0x74726163ULL));
+ const __mmask8 pur=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(n,VERT_C5(8)),w,VERT_C5(0x6573616863727570ULL));
+ nz=view|cart|pur;
+ __m512i kind=_mm512_maskz_mov_epi64(view,VERT_C5(1));
+ kind=_mm512_mask_mov_epi64(kind,cart,VERT_C5(2));
+ return _mm512_mask_mov_epi64(kind,pur,VERT_C5(3));
+}
+static constexpr uint64_t ESLOT_INVALID_K=2,EV_PURCHASE_BIT=1ull<<24,RAW_USER=0xC0000000u,PRICE_MAX=10000000; // main.cpp: ESLOT_INVALID, EV_PURCHASE, DENSE_USER_RAW, price_value's limit
+struct alignas(64) Ev8Out{
+ uint64_t ve[8];      // idok rows: event counter (== event_pre_v3)
+ uint64_t so[8];      // idok rows: ve << 5 (byte offset of the 32-byte ESlot)
+ uint64_t kk[8];      // ok rows: the slot's k: ESLOT_INVALID (2) if not a valid event, else (ts - window_start + 1) << 25,
+                      //          for a purchase with EV_PURCHASE | price already in it (final)
+ uint64_t ingest[8];  // ok rows: ingest_ts, ms
+ uint64_t uct[8];     // ok rows: valid ? (DENSE_USER_RAW | n) | tid48 : tid48   (n = bytes after 'u', 0..8); the caller ORs cat << 32 for pur rows
+ uint64_t uw[8];      // ok rows: valid ? the n bytes after 'u', zero-padded : 0
+ const char* s5[8];const char* s6[8];uint64_t l5[8],l6[8]; // ok rows: product_id / price_cents content (quotes stripped); needed for pur rows (s5,l5)
+ uint8_t ok;          // bit i: row i is on event_line_v3's fast path and all of the above is exact
+ uint8_t idok;        // bit i: ve[i] is exactly event_pre_v3's counter of the line (ok implies idok)
+ uint8_t pur;         // bit i: ok row that is a valid purchase (price already checked and in kk): the caller looks the category up
+};
+static inline uint64_t ld8_ref(const char* p){uint64_t w;memcpy(&w,p,8);return w;}
+static inline void masks_ref(const char* p,uint64_t& c,uint64_t& q){c=0;q=0;for(int i=0;i<64;++i){c|=(uint64_t)(p[i]==',')<<i;q|=(uint64_t)(p[i]=='"')<<i;}}
+static inline unsigned tz_ref(uint64_t x){return x?(unsigned)__builtin_ctzll(x):64u;}
+static inline uint64_t blsr_ref(uint64_t x){return x&(x-1);}
+static inline void ev8_ref(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
+ unsigned okm=0,idm=0,pum=0;
+ for(int i=0;i<8;++i){
+  o.ve[i]=o.so[i]=o.kk[i]=o.ingest[i]=o.uct[i]=o.uw[i]=o.l5[i]=o.l6[i]=0;o.s5[i]=o.s6[i]=ls[i];
+  const char* const p=ls[i];const char* const nl=nx[i]-1;
+  uint64_t cm,qa;masks_ref(p,cm,qa);
+  // the counter as event_pre_v3 sees it: text before the first comma of the first 16 bytes, one quote pair stripped
+  {const unsigned cp=tz_ref(cm)<16?tz_ref(cm):16;const unsigned z=(unsigned)(qa&1);
+   const uint64_t n=(uint64_t)cp-2*z-1,w=ld8_ref(p+z+1);uint64_t ctr[8];const uint64_t ws[8]={w,w,w,w,w,w,w,w},ns[8]={n,n,n,n,n,n,n,n};
+   if(p[z]=='e'&&(id8_ref(ws,ns,c.ke,c.limE,ctr)&1)){o.ve[i]=ctr[0];o.so[i]=ctr[0]<<5;idm|=1u<<i;}}
+  // structure, as event_line_v3 (DREC form: the newline is known)
+  const uint64_t cA=blsr_ref(cm),cB=blsr_ref(cA),cR=blsr_ref(cB);
+  const uint64_t m1=cB^(cB-1);
+  const uint64_t q1=qa&m1,st1=((cm^cB)<<1)|1,en1=cm^cR;
+  const uint64_t sq1=q1&st1,op1=(sq1+~en1)&en1,err1=op1^((q1&~st1)<<1);
+  const uint64_t e2=tz_ref(cB);
+  const char* const b=p+e2+1;
+  uint64_t c2,q2;masks_ref(b,c2,q2);
+  const uint64_t L=(uint64_t)(nl-b),nbit=1ull<<(L&63),keep=nbit-1;
+  const uint64_t d=c2&keep,qb=q2&keep;
+  const uint64_t st2=(d<<1)|1,en2=d|nbit;
+  const uint64_t sq2=qb&st2,op2=(sq2+~en2)&en2,err2=op2^((qb&~st2)<<1);
+  if((err1|err2|(uint64_t)(__builtin_popcountll(d)^3)|((e2|L)>>6))!=0)continue;
+  uint64_t B1=st1+sq1,E1=en1-(op1>>1),B2=st2+sq2,E2=en2-(op2>>1);
+  const unsigned z0=(unsigned)(q1&1);
+  const unsigned l0=tz_ref(E1)-z0;
+  if(l0==0)continue;
+  const unsigned z3=(unsigned)(qb&1);
+  const char* const s3=b+z3;const unsigned l3=tz_ref(E2)-z3;
+  B1=blsr_ref(B1);E1=blsr_ref(E1);
+  const unsigned b1=tz_ref(B1),l1=tz_ref(E1)-b1;
+  B1=blsr_ref(B1);E1=blsr_ref(E1);
+  const unsigned b2=tz_ref(B1),l2=tz_ref(E1)-b2;
+  B2=blsr_ref(B2);E2=blsr_ref(E2);
+  const unsigned b4=tz_ref(B2),l4=tz_ref(E2)-b4;
+  B2=blsr_ref(B2);E2=blsr_ref(E2);
+  const unsigned b5=tz_ref(B2),l5=tz_ref(E2)-b5;
+  B2=blsr_ref(B2);E2=blsr_ref(E2);
+  const unsigned b6=tz_ref(B2),l6=tz_ref(E2)-b6;
+  const char* const s1=p+b1;const char* const s2=p+b2;
+  o.s5[i]=b+b5;o.l5[i]=l5;o.s6[i]=b+b6;o.l6[i]=l6;
+  const unsigned kind=kind_ref(ld8_ref(b+b4),l4);
+  if(!(idm>>i&1))continue;                                   // (then l0 is 2..9 and the ID is the line's first field)
+  if(!(l1==0||(s1[0]=='u'&&l1<=9)))continue;                 // user: empty, or 'u' + 0..8 bytes
+  const uint64_t un=l1?l1-1:0,uw=!l1?0:(un==8?ld8_ref(s1+1):(ld8_ref(s1+1)&((1ull<<(8*un))-1)));
+  if(l3!=20)continue;
+  const uint64_t ig0=ld8_ref(s3),ig1=ld8_ref(s3+8),ig2=ld8_ref(s3+12);
+  uint64_t todi,dayi;
+  if(!tod_ref(ig1,ig2,todi)||byte_of(ig2,7)!='Z'||!day_ref(ig0,ig1,c.memo,dayi))continue;
+  const int64_t ingest=(int64_t)(dayi+todi);
+  o.ingest[i]=(uint64_t)ingest;
+  int64_t ts;
+  if(l2==13){uint64_t v;if(!epoch_ref(ld8_ref(s2),ld8_ref(s2+5),v))continue;ts=(int64_t)v;}
+  else if(l2==20||l2==25){
+   const uint64_t t0=ld8_ref(s2),t1=ld8_ref(s2+8),t2=ld8_ref(s2+12);
+   uint64_t tods,days;
+   if(!tod_ref(t1,t2,tods)||!day_ref(t0,t1,c.memo,days))continue;
+   ts=(int64_t)(days+tods);
+   if(l2==20){if(byte_of(t2,7)!='Z')continue;}
+   else{int64_t delta;if(!off_ref(t2,ld8_ref(s2+17),delta))continue;ts+=delta;}
+  }else continue;
+  const uint64_t tsrel=(uint64_t)ts-(uint64_t)c.wstart;
+  uint64_t k=0;
+  if(kind!=0&&l1!=0&&l5!=0&&tsrel<c.wlen&&ingest-ts<=DAYMS)k=(tsrel+1)<<EV_TS_SHIFT;
+  if(k&&kind==3){ // price_value: digits only, 1..10000000 (longer than 8 bytes: left to the row code)
+   if(l6>8)continue;
+   uint64_t price=0;bool dig=l6!=0;
+   for(unsigned j=0;j<l6;++j){const unsigned dd=(unsigned char)b[b6+j]-(unsigned)'0';if(dd>9)dig=false;price=price*10+dd;}
+   if(dig&&price>=1&&price<=PRICE_MAX){k|=EV_PURCHASE_BIT|price;pum|=1u<<i;}else k=0;
+  }
+  okm|=1u<<i;
+  o.kk[i]=k?k:ESLOT_INVALID_K;o.uct[i]=(k?(RAW_USER|un):0)|c.tid48;o.uw[i]=k?uw:0;
+ }
+ o.ok=(uint8_t)okm;o.idok=(uint8_t)idm;o.pur=(uint8_t)pum;
+}
+VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
+ // ---- horizontal: the two 64-byte windows of every line -> comma and quote masks ----
+ alignas(64) uint64_t aC1[8],aQ1[8],aC2[8],aQ2[8],aB[8];
+ {const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"');
+  for(int i=0;i<8;++i){
+   const char* const p=ls[i];
+   const __m512i x=_mm512_loadu_si512((const void*)p);
+   const uint64_t cm=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));
+   aC1[i]=cm;aQ1[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq));
+   const char* const b=p+_tzcnt_u64(_blsr_u64(_blsr_u64(cm)))+1; // one past the third comma (p+65 if there is none)
+   const __m512i y=_mm512_loadu_si512((const void*)b);
+   aC2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc));aQ2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));aB[i]=(uint64_t)b;
+  }}
+ // ---- vertical ----
+ const __m512i one=VERT_C5(1),ones=VERT_C5(-1),c63=VERT_C5(63),c64=VERT_C5(64);
+ #define VERT_TZ5(x,xm) _mm512_sub_epi64(c63,_mm512_lzcnt_epi64(_mm512_xor_si512(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
+ const __m512i P=VERT_LD5(ls),NL=_mm512_add_epi64(VERT_LD5(nx),ones),Bv=_mm512_load_si512((const void*)aB);
+ const __m512i C1=_mm512_load_si512((const void*)aC1),Q1=_mm512_load_si512((const void*)aQ1),C2=_mm512_load_si512((const void*)aC2),Q2=_mm512_load_si512((const void*)aQ2);
+ // window 1: the first three commas, quote rules up to the third
+ const __m512i t0=_mm512_add_epi64(C1,ones),c0=VERT_TZ5(C1,t0),cA=_mm512_and_si512(C1,t0);
+ const __m512i t1=_mm512_add_epi64(cA,ones),c1=VERT_TZ5(cA,t1),cB=_mm512_and_si512(cA,t1);
+ const __m512i t2=_mm512_add_epi64(cB,ones),m1=_mm512_xor_si512(cB,t2),cR=_mm512_and_si512(cB,t2);
+ const __m512i c2=_mm512_add_epi64(_mm512_sub_epi64(Bv,P),ones); // tzcnt(cB), 64 if there is no third comma
+ const __m512i q1=_mm512_and_si512(Q1,m1),st1=_mm512_or_si512(_mm512_slli_epi64(_mm512_xor_si512(C1,cB),1),one),en1=_mm512_xor_si512(C1,cR);
+ const __m512i sq1=_mm512_and_si512(q1,st1),op1=_mm512_and_si512(_mm512_add_epi64(_mm512_sub_epi64(sq1,en1),ones),en1);
+ const __m512i err1=_mm512_xor_si512(op1,_mm512_slli_epi64(_mm512_andnot_si512(st1,q1),1));
+ // window 2: the bytes before the newline, three commas, quote rules
+ const __m512i L=_mm512_sub_epi64(NL,Bv),nbit=_mm512_sllv_epi64(one,_mm512_and_si512(L,c63)),keep=_mm512_add_epi64(nbit,ones);
+ const __m512i d=_mm512_and_si512(C2,keep),qb=_mm512_and_si512(Q2,keep);
+ const __m512i st2=_mm512_or_si512(_mm512_slli_epi64(d,1),one),en2=_mm512_or_si512(d,nbit);
+ const __m512i sq2=_mm512_and_si512(qb,st2),op2=_mm512_and_si512(_mm512_add_epi64(_mm512_sub_epi64(sq2,en2),ones),en2);
+ const __m512i err2=_mm512_xor_si512(op2,_mm512_slli_epi64(_mm512_andnot_si512(st2,qb),1));
+ const __m512i u0=_mm512_add_epi64(d,ones),d0=VERT_TZ5(d,u0),dA=_mm512_and_si512(d,u0);
+ const __m512i u1=_mm512_add_epi64(dA,ones),d1=VERT_TZ5(dA,u1),dB=_mm512_and_si512(dA,u1);
+ const __m512i u2=_mm512_add_epi64(dB,ones),d2=VERT_TZ5(dB,u2),dR=_mm512_and_si512(dB,u2);
+ const __m512i err=_mm512_or_si512(err1,err2);
+ __mmask8 ok=_mm512_testn_epi64_mask(err,err)&_mm512_testn_epi64_mask(dR,dR)&_mm512_test_epi64_mask(dB,dB); // no quote error, exactly three commas
+ ok&=_mm512_cmplt_epu64_mask(c2,c64)&_mm512_cmplt_epu64_mask(L,c64);                                           // third comma and newline inside their windows
+ // fields: a quoted field starts one later and is two shorter
+ const __m512i z0=_mm512_and_si512(Q1,one);
+ const __m512i a1=_mm512_add_epi64(c0,one),z1=_mm512_and_si512(_mm512_srlv_epi64(q1,a1),one),o1=_mm512_add_epi64(a1,z1),l1=_mm512_sub_epi64(_mm512_sub_epi64(c1,o1),z1);
+ const __m512i a2=_mm512_add_epi64(c1,one),z2=_mm512_and_si512(_mm512_srlv_epi64(q1,a2),one),o2=_mm512_add_epi64(a2,z2),l2=_mm512_sub_epi64(_mm512_sub_epi64(c2,o2),z2);
+ const __m512i z3=_mm512_and_si512(qb,one),l3=_mm512_sub_epi64(d0,_mm512_add_epi64(z3,z3));
+ const __m512i a4=_mm512_add_epi64(d0,one),z4=_mm512_and_si512(_mm512_srlv_epi64(qb,a4),one),o4=_mm512_add_epi64(a4,z4),l4=_mm512_sub_epi64(_mm512_sub_epi64(d1,o4),z4);
+ const __m512i a5=_mm512_add_epi64(d1,one),z5=_mm512_and_si512(_mm512_srlv_epi64(qb,a5),one),o5=_mm512_add_epi64(a5,z5),l5=_mm512_sub_epi64(_mm512_sub_epi64(d2,o5),z5);
+ const __m512i a6=_mm512_add_epi64(d2,one),z6=_mm512_and_si512(_mm512_srlv_epi64(qb,a6),one),o6=_mm512_add_epi64(a6,z6),l6=_mm512_sub_epi64(_mm512_sub_epi64(L,o6),z6);
+ #define VERT_G5(a) _mm512_i64gather_epi64(a,(const void*)0,1)
+ // event_id exactly as event_pre_v3: first comma of the first 16 bytes, one quote pair stripped
+ const __m512i idn=_mm512_sub_epi64(_mm512_sub_epi64(_mm512_min_epu64(c0,VERT_C5(16)),_mm512_add_epi64(z0,z0)),one);
+ const __m512i S0=_mm512_add_epi64(P,z0);
+ const __m512i W0=VERT_G5(S0),IDW=VERT_G5(_mm512_add_epi64(S0,one));
+ __mmask8 idok;const __m512i ve=id8k_v5(IDW,idn,c.ke,c.limE,idok);
+ const __m512i lowbyte=VERT_C5(0xFF);
+ idok&=_mm512_cmpeq_epi64_mask(_mm512_and_si512(W0,lowbyte),VERT_C5('e'));
+ // user: empty, or 'u' + 0..8 bytes kept as text
+ const __m512i S1=_mm512_add_epi64(P,o1);
+ const __m512i U0=VERT_G5(S1),UW=VERT_G5(_mm512_add_epi64(S1,one));
+ const __mmask8 hasu=_mm512_test_epi64_mask(l1,l1);
+ ok&=(__mmask8)(~hasu|(_mm512_cmpeq_epi64_mask(_mm512_and_si512(U0,lowbyte),VERT_C5('u'))&_mm512_cmple_epu64_mask(l1,VERT_C5(9))));
+ const __m512i un=_mm512_maskz_sub_epi64(hasu,l1,one);
+ const __m512i uw=_mm512_and_si512(UW,_mm512_srlv_epi64(ones,_mm512_sub_epi64(c64,_mm512_slli_epi64(un,3)))); // un == 0: shift by 64 gives 0
+ // ingest_ts: 20 bytes, Z form
+ const __m512i S3=_mm512_add_epi64(Bv,z3);
+ const __m512i ig0=VERT_G5(S3),ig1=VERT_G5(_mm512_add_epi64(S3,VERT_C5(8))),ig2=VERT_G5(_mm512_add_epi64(S3,VERT_C5(12)));
+ __mmask8 oki,hiti,oks,hits,okoff,okep,knz;
+ const __m512i todi=tod8k_v5(ig1,ig2,oki);
+ const __m512i dayi=day8k_v5(ig0,ig1,c.memo,hiti);
+ const __m512i ingest=_mm512_add_epi64(dayi,todi);
+ ok&=oki&hiti&_mm512_cmpeq_epi64_mask(_mm512_srli_epi64(ig2,56),VERT_C5('Z'))&_mm512_cmpeq_epi64_mask(l3,VERT_C5(20));
+ // ts: 20 (Z), 13 (digits), 25 (offset)
+ const __mmask8 is20=_mm512_cmpeq_epi64_mask(l2,VERT_C5(20)),is25=_mm512_cmpeq_epi64_mask(l2,VERT_C5(25)),is13=_mm512_cmpeq_epi64_mask(l2,VERT_C5(13));
+ const __m512i S2=_mm512_add_epi64(P,o2);
+ const __m512i ts0=VERT_G5(S2),ts1=VERT_G5(_mm512_add_epi64(S2,_mm512_mask_mov_epi64(VERT_C5(8),is13,VERT_C5(5))));
+ const __m512i ts2=VERT_G5(_mm512_add_epi64(S2,VERT_C5(12))),ts3=VERT_G5(_mm512_add_epi64(S2,VERT_C5(17)));
+ const __m512i tods=tod8k_v5(ts1,ts2,oks);
+ const __m512i days=day8k_v5(ts0,ts1,c.memo,hits);
+ const __m512i off=off8k_v5(ts3,okoff);
+ const __m512i ep=epoch8k_v5(ts0,ts1,okep);
+ const __m512i b19=_mm512_srli_epi64(ts2,56);
+ const __mmask8 isZ=_mm512_cmpeq_epi64_mask(b19,VERT_C5('Z')),isP=_mm512_cmpeq_epi64_mask(b19,VERT_C5('+')),isM=_mm512_cmpeq_epi64_mask(b19,VERT_C5('-'));
+ __m512i ts=_mm512_add_epi64(days,tods);
+ ts=_mm512_mask_sub_epi64(ts,(__mmask8)(is25&isP),ts,off);
+ ts=_mm512_mask_add_epi64(ts,(__mmask8)(is25&isM),ts,off);
+ ts=_mm512_mask_mov_epi64(ts,is13,ep);
+ ok&=(__mmask8)((is13&okep)|(oks&hits&((is20&isZ)|(is25&okoff&(isP|isM)))));
+ // kind, validity, k
+ const __m512i kind=kind8k_v5(VERT_G5(_mm512_add_epi64(Bv,o4)),l4,knz);
+ const __m512i tsrel=_mm512_sub_epi64(ts,VERT_C5(c.wstart));
+ __mmask8 valid=knz&hasu&_mm512_test_epi64_mask(l5,l5)&_mm512_cmplt_epu64_mask(tsrel,VERT_C5(c.wlen));
+ valid&=_mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest,ts),VERT_C5(DAYMS));
+ __m512i k=_mm512_slli_epi64(_mm512_add_epi64(tsrel,one),EV_TS_SHIFT);
+ // purchases: the price as price_value takes it, for fields of up to 8 bytes (right-aligned over '0' like the ID digits)
+ const __m512i S6=_mm512_add_epi64(Bv,o6);
+ const __mmask8 pv=valid&_mm512_cmpeq_epi64_mask(kind,VERT_C5(3));
+ __mmask8 pur=pv;
+ {const __m512i n8=_mm512_slli_epi64(l6,3);
+  const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(VERT_G5(S6),_mm512_sub_epi64(c64,n8)),_mm512_srlv_epi64(_mm512_set1_epi8(0x30),n8));
+  const __m512i v=_mm512_sub_epi8(x,_mm512_set1_epi8('0')),nine=_mm512_set1_epi8(9);
+  const __m512i p4=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_C5(0x010A010A010A010AULL)),VERT_C5(0x0001006400010064ULL));
+  const __m512i price=_mm512_add_epi64(_mm512_mul_epu32(p4,VERT_C5(10000)),_mm512_srli_epi64(p4,32));
+  pur&=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,nine),nine)&_mm512_cmple_epu64_mask(_mm512_sub_epi64(price,one),VERT_C5(PRICE_MAX-1)); // digits, 1..10000000 (an empty field gives 0)
+  ok&=(__mmask8)~(pv&_mm512_cmplt_epu64_mask(VERT_C5(8),l6));                                                                     // a longer price field: the row code decides
+  k=_mm512_mask_or_epi64(k,pur,k,_mm512_or_si512(price,VERT_C5(EV_PURCHASE_BIT)));
+ }
+ valid&=(__mmask8)(~pv|pur); // a purchase with a bad price is not a valid event
+ const __m512i tid=VERT_C5(c.tid48);
+ _mm512_store_si512((void*)o.ve,ve);_mm512_store_si512((void*)o.so,_mm512_slli_epi64(ve,5));
+ _mm512_store_si512((void*)o.kk,_mm512_mask_mov_epi64(VERT_C5(ESLOT_INVALID_K),valid,k));
+ _mm512_store_si512((void*)o.ingest,ingest);
+ _mm512_store_si512((void*)o.uct,_mm512_mask_or_epi64(tid,valid,tid,_mm512_or_si512(un,VERT_C5(RAW_USER))));
+ _mm512_store_si512((void*)o.uw,_mm512_maskz_mov_epi64(valid,uw));
+ _mm512_store_si512((void*)o.s5,_mm512_add_epi64(Bv,o5));_mm512_store_si512((void*)o.l5,l5);
+ _mm512_store_si512((void*)o.s6,S6);_mm512_store_si512((void*)o.l6,l6);
+ ok&=idok;
+ o.idok=(uint8_t)idok;o.ok=(uint8_t)ok;o.pur=(uint8_t)(pur&ok);
+ #undef VERT_G5
+ #undef VERT_TZ5
+}
+#undef VERT_C5
+#undef VERT_LD5
+} // namespace vert
+static_assert(sizeof(vert::DateEnt)==sizeof(DateMemo3)&&offsetof(vert::DateEnt,k)==offsetof(DateMemo3,k)&&offsetof(vert::DateEnt,cc)==offsetof(DateMemo3,cc)&&offsetof(vert::DateEnt,ms)==offsetof(DateMemo3,ms));
+static_assert(vert::ESLOT_INVALID_K==ESLOT_INVALID&&vert::EV_PURCHASE_BIT==EV_PURCHASE&&vert::RAW_USER==DENSE_USER_RAW&&sizeof(ESlot)==32);
+static_assert(vert::MASK40==dn::MASK&&vert::I1==dn::I1&&vert::I2==dn::I2&&vert::EV_TS_SHIFT==EV_TS&&vert::DAYMS==DAY);
+// The scalar kernel as a call of its own (the avx2 loop; also what callgrind and the sanitizer runs see).
+[[gnu::noinline]] static void ev8_ref_call(const char* const* ls,const char* const* nx,const vert::EvConst& c,vert::Ev8Out& o){vert::ev8_ref(ls,nx,c,o);}
+// Finishing the first N rows of a group in line order. Purchases first get their category (reads only).
+// A group whose eight rows are all ok takes the short way: no row test, and the highest counter of the group
+// goes into vmx (the low halves of four 64-bit lanes; fastAny says that vmx holds anything).
+#define SS_EV8_SLOT(O_,i_) (*(ESlot*)((char*)lp.ev+O_.so[i_]))
+#define SS_EV8_COMMIT(O_,i_) eslot_commit(SS_EV8_SLOT(O_,i_),O_.kk[i_],O_.uct[i_],(int64_t)O_.ingest[i_],O_.uw[i_]);
+#define SS_EV8_FINISH(O,LS,NX,N,MASKS) {vert::Ev8Out& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
+  const unsigned ok_=O_.ok&((1u<<n_)-1); \
+  for(unsigned m_=O_.pur&ok_;m_;m_&=m_-1){const unsigned i_=(unsigned)__builtin_ctz(m_); \
+   const uint32_t ci_=products.find(string_view(O_.s5[i_],(size_t)O_.l5[i_]));O_.uct[i_]|=(uint64_t)(ci_==KeyTable::NONE?0u:(unsigned)(uint16_t)ci_)<<32;} \
+  if(__builtin_expect(ok_==0xFFu,1)){ \
+   vmx=_mm256_max_epu32(vmx,_mm256_max_epu32(_mm256_load_si256((const __m256i*)&O_.ve[0]),_mm256_load_si256((const __m256i*)&O_.ve[4])));fastAny=true; \
+   SS_EV8_COMMIT(O_,0) SS_EV8_COMMIT(O_,1) SS_EV8_COMMIT(O_,2) SS_EV8_COMMIT(O_,3) SS_EV8_COMMIT(O_,4) SS_EV8_COMMIT(O_,5) SS_EV8_COMMIT(O_,6) SS_EV8_COMMIT(O_,7) \
+  }else for(unsigned i_=0;i_<n_;++i_){ \
+   if((ok_>>i_)&1){send=max(send,(uint32_t)O_.ve[i_]+1);SS_EV8_COMMIT(O_,i_)} \
+   else{const char* const q_=L_[i_];const uint32_t pre_=((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:event_pre_v3(q_,lp); \
+    const WinMasks w1_=MASKS(q_);const char* const bb_=event_window2(q_,w1_.c); \
+    event_line_v3<true,true>(q_,bb_,w1_,MASKS(bb_),X_[i_]-1,pre_,lp,pend,pp,dmax,send,ring,rpos,general);}} }
+// The line index of this loop. ls[pos..m]: the starts of the lines not yet in a group; ls[pos..m-1] have their
+// newline (ls[i+1]-1), the line at ls[m] not yet (the index has not got that far, or the file ends without
+// one). The group that is waiting to be finished keeps its eight starts right before ls[pos].
+static constexpr size_t EV8_BLOCK=4096; // bytes indexed at a time
+#define SS_EV8_PF(O_,i_) __builtin_prefetch(&SS_EV8_SLOT(O_,i_),1,3);
+#define SS_EVENT_LOOP_EV8(NAME,TARGET,MASKS,NLMASK,KERNEL) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const char* const end=base+len; \
+ const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;ERing* const ring=nullptr;unsigned rpos=0; /* no pending batch, no ring here */ \
+ const char* ls[EV8_BLOCK+64+32];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
+ const vert::EvConst ec{lp.ke,lp.limE,lp.wstart,lp.wlen,(const vert::DateEnt*)lp.memo,lp.tid48}; \
+ vert::Ev8Out out[2];const char* tls[8];const char* tnx[8];const char* const* gl[2]={ls,ls};const char* const* gx[2]={ls,ls};unsigned gn[2]={0,0};int cur=0;bool more=true; \
+ __m256i vmx=_mm256_setzero_si256();bool fastAny=false; \
+ while(more||gn[cur^1]){ \
+  unsigned n=0; \
+  if(more){ \
+   if(pos+8>m){ /* fewer than eight whole lines known: what is still needed moves to the front and the index goes on */ \
+    const size_t s_=pos-(gn[cur^1]?8:0); \
+    if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_;gl[cur^1]=ls;gx[cur^1]=ls+1;} \
+    while(m-pos<8&&scan<end&&ls[m]<lim){ \
+     const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
+     do{uint64_t x_=NLMASK(scan);while(x_){ls[++m]=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);}scan+=64;}while(scan<stop);} \
+   } \
+   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[cur]=ls+pos;gx[cur]=ls+pos+1;} \
+   else{ /* the last lines of the chunk: a short group, filled up with copies of its last line (results not used) */ \
+    more=false; \
+    while(pos+n<m&&ls[pos+n]<lim)++n; \
+    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}gl[cur]=tls;gx[cur]=tnx;} \
+   } \
+   pos+=n; \
+   if(n){ \
+    vert::Ev8Out& o_=out[cur]; \
+    KERNEL(gl[cur],gx[cur],ec,o_); \
+    if(__builtin_expect((n==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
+    else for(unsigned x_=o_.idok&((1u<<n)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
+   } \
+  } \
+  gn[cur]=n; \
+  if(gn[cur^1])SS_EV8_FINISH(out[cur^1],gl[cur^1],gx[cur^1],gn[cur^1],MASKS) \
+  cur^=1; \
+ } \
+ if(pos==m&&ls[m]<lim)line_general<7>(ls[m],end,general); /* the last line has no newline */ \
+ if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send); \
+}
+SS_EVENT_LOOP_EV8(events_avx2_e8,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_ref_call)
+SS_EVENT_LOOP_EV8(events_avx512z_e8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::ev8_v5)
+SS_EVENT_LOOP_EV8(events_avx512y_e8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert::ev8_v5)
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
@@ -2053,7 +2744,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Event lines with raw users use the two-phase loop (SS_EVENT_LOOP_2P) unless SS_DENSE_AHEAD is given: then the
  // loop with the ring of that length (0 = write at the end of the line) runs, for comparison.
  dparse.twoPhase=dparse.raw&&!getenv("SS_DENSE_AHEAD");
- cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<"\n";
+ // SS_LINES=batch: the batch event loop (SS_EVENT_LOOP_BATCH), for comparison while it is being built.
+ dparse.batch=dparse.twoPhase&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="batch";
+ // SS_LINES=ev8: the event loop that hands eight lines at a time to a kernel (SS_EVENT_LOOP_EV8). Where the CPU
+ // has the AVX-512 kernel it is also the default (decided at the parse stage, see ev8Auto); SS_LINES=2p keeps the
+ // two-phase loop there.
+ dparse.ev8=dparse.twoPhase&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="ev8";
+ cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<" batch "<<dparse.batch<<" ev8 "<<dparse.ev8<<"\n";
  // First pass over the link files.
  // Without dense users it only counts lines (the table and the union-find arrays are sized by them).
  // With dense users it is the only pass that reads the files: a "simple" line - two dense user IDs
@@ -2298,6 +2995,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // without it they fall back to avx2. The default is avx2.
  const bool hasV3=__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("popcnt")&&__builtin_cpu_supports("lzcnt");
  const bool hasV5=hasV3&&__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512vl");
+ const bool hasE8=hasV5&&__builtin_cpu_supports("avx512dq")&&__builtin_cpu_supports("avx512cd"); // what vert::ev8_v5 needs beyond the AVX-512 loops
  enum{ISA_SSE2,ISA_AVX2,ISA_AVX512Z,ISA_AVX512Y};
  int isaUse=hasV3?ISA_AVX2:ISA_SSE2;
  if(const char* isa=getenv("SS_ISA")){const string_view w(isa);
@@ -2307,8 +3005,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // The vector loops locate line starts ahead of cutting the lines (see SS_EVENT_LOOP_IX): measured 5% faster
  // in the parse stage on the scoring machine. SS_LINES=plain switches back to the loop without the index.
  const bool lineIndex=isaUse!=ISA_SSE2&&!(getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="plain");
+ // The event loop with the AVX-512 kernel (vert::ev8_v5) is the default for dense-record event files on a CPU that
+ // has it: measured on the scoring machine at less than half the time per row of the two-phase loop. With no
+ // SS_ISA the event files then use the avx512z masks (the kernel uses 512-bit registers anyway) while the click
+ // files stay on the avx2 loop; with SS_ISA=avx512z|avx512y everything follows that choice. Any SS_LINES value
+ // switches the default off (SS_LINES=ev8 asks for the loop explicitly, also on avx2 with the scalar kernel).
+ const bool ev8Auto=hasE8&&dparse.twoPhase&&!getenv("SS_LINES")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
-  <<"\n";
+  <<(ev8Auto?" events: ev8 kernel":"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -2435,11 +3139,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const Chunk& ck=chunks[c];
    // Dense records (DREC loops) exist with the line index only; SS_LINES=plain then applies to the other kind of file.
    const bool drec=ck.click?dparse.clicks:dparse.events;
+   const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
+   if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){events_avx512z_e8(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);continue;} // the default on an AVX-512 CPU
    #define SS_RUN_LOOPS(ISA) \
     if(ck.click){if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else clicks_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);} \
-    else{if(drec&&dparse.twoPhase)events_##ISA##_2p(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+    else{if(drec&&ev8Use)events_##ISA##_e8(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+     else if(drec&&dparse.batch)events_##ISA##_bt(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+     else if(drec&&dparse.twoPhase)events_##ISA##_2p(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(drec)events_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(lineIndex)events_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else events_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);}
@@ -2456,20 +3164,67 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   dense_note_end(denseEvEnd,tl.evEnd);dense_note_end(denseClEnd,tl.clEnd);
   tl.slotWaits=eslotWaits;
  }
- // ---- Raw users in the event slots become what the line loop would have written (see DENSE_USER_RAW). ----
- // The ID table still takes new IDs here; a thread's part of the slots is one contiguous range.
+ __mark("PARSE");
+ // ---- Raw users in the event slots (see DENSE_USER_RAW). The ID table still takes new IDs here. ----
+ // Folded form (default): the event sweep of the DENSE stage runs here and reads the raw texts as it
+ // goes; no slot is rewritten, so the slot array is read-only from here on and every later reader of
+ // event slot users goes through RawCtx::code (rawSlots). Rows that are not a dense user's get their
+ // table or LOCAL number here and wait in a per-thread list (k, user, cat, thread - the slot is not
+ // needed again) until the person buckets exist. Only the piece that owns such a row asks the table.
+ // SS_RESOLVE_RAW=pass: the separate pass that rewrites every raw slot, and the sweep after DEDUP, as
+ // before (also when the slots are dumped for the parse checks, which expect resolved slots, and when
+ // the index table cannot be mapped at its full size).
+ // Event slots per piece of the sweep. SS_TEST_ECH: tests make the pieces tiny, so that runs cross piece ends all the time.
+ static const size_t ECH=[]{const char* v=getenv("SS_TEST_ECH");const long long x=v?atoll(v):0;return x>0?(size_t)x:size_t(1)<<15;}();
+ uint64_t rdSlotEv=0; // SS_STATS: valid event slots seen by the sweep
+ vector<vector<ESmall>> sideRows(T); // folded form: the rows of table and LOCAL users, by sweeping thread
+ vector<HugePool> sessPools(T);     // folded form: the session lists of each thread's runs
+ bool rawSlots=false;
  if(dparse.raw&&denseEv){
   const size_t evEnd=denseEvEnd.load();
-  #pragma omp parallel num_threads(T)
-  {
-   const size_t t=(size_t)omp_get_thread_num();ThreadState& tl=tls[t];uint32_t dmax=0;
-   const size_t from=evEnd*t/(size_t)T,to=evEnd*(t+1)/(size_t)T;
-   if(hasV3)resolve_raw_v3(denseEv,from,to,tab,tl,dmax);else resolve_raw_plain(denseEv,from,to,tab,tl,dmax);
-   if(dmax)dense_note_index((dmax&~DENSE_USER)>>dn::ALIAS_BITS);
+  {const char* v=getenv("SS_RESOLVE_RAW");rawSlots=!dumpDir&&!(v&&string_view(v)=="pass");}
+  if(rawSlots){ // the index table by the index limit: the highest index is only known after this pass
+   try{denseInfo=(DInfo*)map_huge(((size_t)dense.limI+2)*sizeof(DInfo));}catch(const bad_alloc&){rawSlots=false;}
+  }
+  if(rawSlots){
+   for(int t=0;t<T;++t){sessPools[t].first=(((evEnd/4+4096)*8/(size_t)T)+(size_t(8)<<20));sessPools[t].next=max<size_t>(size_t(8)<<20,sessPools[t].first/4);}
+   #pragma omp parallel num_threads(T) reduction(+:rdSlotEv)
+   {
+    const size_t t=(size_t)omp_get_thread_num();ThreadState& tl=tls[t];
+    RawCtx rc;rc.v3=hasV3;SessArena arena;vector<ESmall>& side=sideRows[t];HugePool& pool=sessPools[t];
+    const uint16_t tid=(uint16_t)tl.tid;
+    uint64_t inRuns=0;
+    #pragma omp for schedule(dynamic,1) nowait
+    for(size_t lo=0;lo<evEnd;lo+=ECH)
+     inRuns+=sweep_event_runs((const char*)denseEv,5,lo,min(evEnd,lo+ECH),evEnd,true,denseInfo,pool,arena,
+      [&rc](const ESmall& sl){return rc.code(sl);},
+      [](uint32_t){},
+      [&](const ESmall& sl,uint32_t u){
+       uint16_t th=sl.thread;
+       if((sl.user&DENSE_USER_RAW)==DENSE_USER_RAW){ // a raw text that is not a dense user's: a number of this thread's making
+        th=tid;
+        if((u&DENSE_USER_RAW)==DENSE_USER_RAW){const uint32_t len=u&15u;const uint64_t raw=((const ESlot*)(const void*)&sl)->spare;
+         u=raw_user_table(raw,len,tab,tl);rc.set_table(raw,len,u);}
+       }
+       side.push_back(ESmall{sl.k,u,sl.cat,th});
+      });
+    rdSlotEv+=inRuns;
+    if(rc.dmax)dense_note_index((rc.dmax&~DENSE_USER)>>dn::ALIAS_BITS);
+   }
+  }
+  else{
+   // A thread's part of the slots is one contiguous range.
+   #pragma omp parallel num_threads(T)
+   {
+    const size_t t=(size_t)omp_get_thread_num();ThreadState& tl=tls[t];uint32_t dmax=0;
+    const size_t from=evEnd*t/(size_t)T,to=evEnd*(t+1)/(size_t)T;
+    if(hasV3)resolve_raw_v3(denseEv,from,to,tab,tl,dmax);else resolve_raw_plain(denseEv,from,to,tab,tl,dmax);
+    if(dmax)dense_note_index((dmax&~DENSE_USER)>>dn::ALIAS_BITS);
+   }
   }
  }
  const uint32_t totalIds=tab.end_parallel();
- __mark("PARSE");
+ __mark("RESOLVE");
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
   cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
@@ -2618,8 +3373,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // The reader only needs the first 16 bytes of an event slot (k, user, cat, thread). When the slots are
  // filled here from buckets, the array holds just those (ESmall) and the winners' ingest times live in a
  // scratch array while a bucket is filled; ev_at() reads either layout.
- struct ESmall{uint64_t k;uint32_t user;uint16_t cat;uint16_t thread;};
- static_assert(sizeof(ESmall)==16&&offsetof(ESmall,user)==offsetof(ESlot,user)&&offsetof(ESmall,cat)==offsetof(ESlot,cat)&&offsetof(ESmall,thread)==offsetof(ESlot,thread)&&offsetof(ESlot,k)==0);
  const char* const evBase=nEvBuckets?(const char*)map_huge((size_t)(dense.limE+1)*sizeof(ESmall)):(const char*)denseEv;
  const unsigned evShift=nEvBuckets?4:5;
  const auto ev_at=[evBase,evShift](size_t c)->const ESmall&{return *(const ESmall*)(const void*)(evBase+(c<<evShift));};
@@ -2628,7 +3381,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const auto db_size=[&](int t,size_t b)->size_t{return b<tls[t].db.size()?tls[t].db[b].size():0;};
  const auto dcb_size=[&](int t,size_t b)->size_t{return b<tls[t].dcb.size()?tls[t].dcb[b].size():0;};
  const bool slotMode=evBase||denseCl;
- if(slotMode)denseInfo=(DInfo*)map_huge(((size_t)denseMaxIdx.load()+2)*sizeof(DInfo));
+ if(slotMode&&!denseInfo)denseInfo=(DInfo*)map_huge(((size_t)denseMaxIdx.load()+2)*sizeof(DInfo));
  uint64_t parsedEvents=0,parsedClicks=0;
  size_t maxEvBucket=0,maxClBucket=0; // most parsed lines in one ID bucket (all threads together)
  for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
@@ -2645,7 +3398,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // of the event slots estimates it (a wrong guess costs time, nothing else).
  unsigned shA=0,shB=0;
  {uint64_t estA=parsedEvents;
-  if(denseEv){const size_t end=denseEvEnd.load(),step=max<size_t>(1,end/1024);size_t taken=0,tableRows=0;
+  if(rawSlots)for(int t=0;t<T;++t)estA+=sideRows[t].size(); // the rows the event slots add to the first stretch: known exactly
+  else if(denseEv){const size_t end=denseEvEnd.load(),step=max<size_t>(1,end/1024);size_t taken=0,tableRows=0;
    for(size_t c=step/2;c<end;c+=step){++taken;const ESlot& sl=denseEv[c];if(sl.k.load(memory_order_relaxed)>=PR_KBIAS&&!(sl.user&DENSE_USER))++tableRows;}
    if(taken)estA+=(uint64_t)end*tableRows/taken;}
   if(nEvBuckets){ // rows still in buckets: the first record of every few buckets stands for its bucket
@@ -2845,12 +3599,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Rows of all other users go to the general person lists right here.
  const size_t evEnd=nEvBuckets?(size_t)dense.limE:evBase?denseEvEnd.load():0,clEnd=nClBuckets?(size_t)dense.limC:denseCl?denseClEnd.load():0;
  const bool slots=evEnd||clEnd;
- static constexpr size_t ECH=size_t(1)<<15,CCH=size_t(1)<<16,ICH=512; // slots / user indexes per piece of work
+ static constexpr size_t CCH=size_t(1)<<16,ICH=512; // slots / user indexes per piece of work (ECH: above)
  // Test switches: every n-th user index is treated as if its rows were spread out (it takes the
  // sweep of part 3) / as if it could not take the fast lane (its rows are handed over in part 2).
  static const uint32_t noTightN=[]{const char* v=getenv("SS_TEST_NOTIGHT");return v?(uint32_t)max(1,atoi(v)):0u;}();
  static const uint32_t noFastN=[]{const char* v=getenv("SS_TEST_NOFAST");return v?(uint32_t)max(1,atoi(v)):0u;}();
- uint64_t rdSlotEv=0,rdSlotCl=0,rdHandEv=0,rdHandCl=0,rdFastIdx=0,rdFastEv=0,rdFastCl=0,rdDeferIdx=0; // SS_STATS
+ uint64_t rdSlotCl=0,rdHandEv=0,rdHandCl=0,rdFastIdx=0,rdFastEv=0,rdFastCl=0,rdDeferIdx=0; // SS_STATS
  // Who is handed over, in events (SS_STATS): rows of users that came through the ID table - of a linked
  // person, of an unlinked dense-looking ID with alias 8 or more, of an unlinked ID of a complex index, of
  // any other text - or through the fallback; then dense users whose index has rows in the general lane,
@@ -2879,71 +3633,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();HugePool& pool=surv[tid].pool;
    DInfo* const info=denseInfo;IdText txt;
    const auto bad_user=[]{fprintf(stderr,"ERROR dense user index above the reported maximum\n");_exit(1);};
-   // The sweep of one stretch of counters (events, then clicks).
-   // Session lists go to pieces of this thread's pool, one block per run.
-   uint64_t* acur=nullptr;uint64_t* aend=nullptr;vector<uint64_t> purTmp;
-   // The event sweep of [lo,hi). A run is a stretch of valid slots of one user index, not broken by a
-   // valid slot of anybody else; it belongs to the piece it starts in and may run past `hi` (cross),
-   // so a piece first steps over the run that reaches into it. While a run is read its sessions are
-   // made as well: every row either continues the current session or starts one (more than GAP after
-   // the row before), written without a branch on that - each row writes "a session starts here" into
-   // the next free entry, and the entry only stays if the row really starts one.
+   // The sweep of one stretch of counters (events, then clicks). Session lists go to pieces of this
+   // thread's pool, one block per run (sweep_event_runs). With rawSlots the event sweep has run already
+   // (see RESOLVE) and only the rows it set aside are handed over here.
+   SessArena arena;
    const auto sweep_events=[&](size_t lo,size_t hi,bool cross){
-    size_t c=lo;
-    if(cross&&lo>0){
-     size_t p=lo;uint32_t code0=0;bool reaches=false;
-     while(p>0){--p;const ESmall& sl=ev_at(p);if(sl.k>=PR_KBIAS){if(sl.user&DENSE_USER){code0=sl.user&~7u;reaches=true;}break;}}
-     if(reaches)for(;c<hi;++c){const ESmall& sl=ev_at(c);if(sl.k>=PR_KBIAS&&(sl.user&~7u)!=code0)break;}
-    }
-    const size_t stop=cross?evEnd:hi; // how far a run may go
-    while(c<hi){
-     const ESmall& sl=ev_at(c);const uint64_t k0=sl.k;
-     if(k0<PR_KBIAS){++c;continue;} // empty, or present but not valid
-     const uint32_t u=sl.user;
-     if(!(u&DENSE_USER)){hand_event(myEv,pool,k0,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++rdHandEv;++rdSlotEv;++c;if(stats)++rdWhy[why_table(u)];continue;}
-     if(__builtin_expect(u>denseTop,0))bad_user();
-     const uint32_t code=u&~7u;const size_t first=c;size_t lastSlot=c;
-     // Room: one entry per slot looked at, at most, plus the end entry.
-     if((size_t)(aend-acur)<hi-c+2){const size_t want=max<size_t>(hi-c+2,size_t(1)<<19);acur=(uint64_t*)pool.take(want*8);aend=acur+want;}
-     uint64_t* blk=acur;size_t cap=(size_t)(aend-blk);
-     size_t n=0,ns=0;uint64_t last=0-(uint64_t)(GAP+1),disorder=0;uint32_t mask=0;purTmp.clear();
-     size_t j=c;
-     const size_t stride=size_t(1)<<evShift;
-     for(;;){
-      const size_t lim=min(stop,c+cap-2);
-      const char* p=(const char*)&ev_at(j);const char* const pe=(const char*)&ev_at(lim);const char* lastp=p;
-      for(;p<pe;p+=stride){
-       const ESmall& r=*(const ESmall*)(const void*)p;const uint64_t k=r.k;
-       if(k<PR_KBIAS)continue;
-       const uint32_t al=r.user^code; // the alias if the row is this index's
-       if(al>7)break;
-       mask|=1u<<al;
-       const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
-       disorder|=step; // its top bit: a row before its predecessor
-       blk[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
-       if(__builtin_expect((k&EV_PURCHASE)!=0,0))purTmp.push_back(((uint64_t)(ns-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
-       ++n;lastp=p;
-      }
-      j=(size_t)(p-(const char*)&ev_at(0))>>evShift;
-      if(n)lastSlot=(size_t)(lastp-(const char*)&ev_at(0))>>evShift;
-      if(p<pe)goto run_done; // a valid slot of somebody else
-      if(j>=stop)break;
-      {const size_t cap2=cap*2;uint64_t* const nb=(uint64_t*)pool.take(cap2*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=cap2;aend=nb+cap2;} // a long run past the piece: a bigger block
-     }
-     run_done:;
-     {const size_t np=purTmp.size(),need=ns+1+np+1;
-      if(cap<need){uint64_t* const nb=(uint64_t*)pool.take(need*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=need;aend=nb+need;}
-      blk[ns]=n;if(np)memcpy(blk+ns+1,purTmp.data(),np*8);blk[ns+1+np]=~0ull;
-      acur=blk+need;}
-     DInfo& f=info[(code&~DENSE_USER)>>dn::ALIAS_BITS];
-     dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)lastSlot+1);f.ec.fetch_add((uint32_t)n,memory_order_relaxed);
-     uint64_t* none=nullptr;
-     if(f.sess.compare_exchange_strong(none,blk,memory_order_relaxed)){
-      f.ns.store((uint32_t)ns|(((disorder>>63)||n>=(size_t(1)<<24))?0x80000000u:0u),memory_order_relaxed);f.amask.store((uint8_t)mask,memory_order_relaxed);}
-     else f.multi.store(1,memory_order_relaxed); // the index has another run
-     rdSlotEv+=n;
-     c=j;
-    }
+    uint64_t others=0;
+    const uint64_t inRuns=sweep_event_runs(evBase,evShift,lo,hi,evEnd,cross,info,pool,arena,
+     [](const ESmall& sl){return sl.user;},
+     [&](uint32_t u){if(__builtin_expect(u>denseTop,0))bad_user();},
+     [&](const ESmall& sl,uint32_t u){
+      if(__builtin_expect((u&DENSE_USER_RAW)==DENSE_USER_RAW,0))bad_user(); // a raw user here: the slots were not resolved
+      hand_event(myEv,pool,sl.k,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++others;if(stats)++rdWhy[why_table(u)];});
+    rdHandEv+=others;rdSlotEv+=inRuns+others;
    };
    const auto sweep_clicks=[&](size_t lo,size_t hi){
     for(size_t c=lo;c<hi;){
@@ -3008,8 +3710,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     }
    }
    else{
-    #pragma omp for schedule(dynamic,1) nowait
-    for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH),true);
+    if(rawSlots){
+     #pragma omp for schedule(dynamic,1) nowait
+     for(int t=0;t<T;++t){
+      for(const ESmall& r:sideRows[t]){const uint32_t u=r.user;
+       hand_event(myEv,pool,r.k,(u&LOCAL_USER)?trans[r.thread][u&~LOCAL_USER]:u,r.cat);if(stats)++rdWhy[why_table(u)];}
+      rdHandEv+=sideRows[t].size();rdSlotEv+=sideRows[t].size();
+     }
+    }
+    else{
+     #pragma omp for schedule(dynamic,1) nowait
+     for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH),true);
+    }
     #pragma omp for schedule(dynamic,1)
     for(size_t lo=0;lo<clEnd;lo+=CCH)sweep_clicks(lo,min(clEnd,lo+CCH));
    }
@@ -3078,6 +3790,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   group_pieces(eventFiles,(size_t)T,eventsFree?unmapFirst:unmapLast);
   group_pieces(clickFiles,(size_t)T,unmapLast); // click IDs still break ties while sessions are attributed
   group_pieces(linkFiles,1,unmapLast);
+  // The slot arrays are not read after the DENSE stage; the part of them that was written is handed
+  // back by the workers too (in pieces of whole huge pages) instead of at process exit.
+  const auto slot_pieces=[&](const char* base,size_t bytes){
+   const size_t huge=size_t(2)<<20,len=(bytes+huge-1)&~(huge-1),per=max(huge,(len/(size_t)T+huge-1)&~(huge-1));
+   for(size_t at=0;at<len;at+=per)unmapLast.push_back({(char*)base+at,min(per,len-at)});};
+  if(evBase&&evEnd)slot_pieces(evBase,(size_t)denseEvEnd.load()<<evShift);
+  if(denseCl&&clEnd)slot_pieces((const char*)denseCl,(size_t)denseClEnd.load()*sizeof(CSlot));
  }
  #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9])
  {
@@ -3158,6 +3877,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     o+=best==0?string("NULL"):hexstr(catnames[top]);o+='\n';
    }
   };
+  // The rows of one person in one go (the fast lane; its names are always of the fixed kind).
+  struct RowOut{uint64_t rev,best;int day;uint32_t sess,evs;uint16_t top;};
+  auto put_rows=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&catv,&dbg,&catnames,dayp,revp,sess32p,evs32p,sessp,evsp,catbits,narrow,debugCsv,firstday,tid]
+   (const NameRef& nm,const RowOut* R,size_t k){
+   const size_t room=k*((size_t)nm.L+4)+64;
+   if(uidCap-uidLen<room)grow_uid(room);
+   size_t r=nrows;char* o=uidp+uidLen;
+   for(size_t i=0;i<k;++i,++r){const RowOut& x=R[i];
+    memcpy(o,&nm.L,4);memcpy(o+4,nm.p,16);o+=4+nm.L;
+    dayp[r]=(int32_t)(firstday+x.day);revp[r]=(int64_t)x.rev;
+    if(narrow){sess32p[r]=(int32_t)x.sess;evs32p[r]=(int32_t)x.evs;}else{sessp[r]=(int64_t)x.sess;evsp[r]=(int64_t)x.evs;}
+    if(__builtin_expect(x.best!=0,0)){catbits[r>>3]|=(uint8_t)(1u<<(r&7));put_bytes(catv,catnames[x.top]);}
+    if(debugCsv){string& t=dbg[tid];
+     t+=hexstr(string_view(nm.p,nm.L));t+=',';t+=to_string(firstday+x.day);t+=',';t+=to_string(x.sess);t+=',';t+=to_string(x.evs);t+=',';t+=to_string(x.rev);t+=',';
+     t+=x.best==0?string("NULL"):hexstr(catnames[x.top]);t+='\n';
+    }
+   }
+   uidLen=(size_t)(o-uidp);nrows=r;
+  };
   // All rows and campaign totals of one person. E[0..ne): the person's events in time order (ne > 0; the
   // order of events with the same time does not matter). cb..ce: the person's clicks in click_before order.
   // The rules are those of the cell loop below: a session starts at the first event and after every gap
@@ -3215,6 +3953,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   {
    EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();
    DInfo* const info=denseInfo;IdText txt;
+   // The user word of an event slot holding a valid event (with rawSlots the slots are as the parser left them).
+   RawCtx rawCtx;rawCtx.v3=hasV3;
+   const auto ucode=[&rawCtx,rawSlots](const ESmall& sl)->uint32_t{return rawSlots?rawCtx.code(sl):sl.user;};
    // A click of the fast lane: time and campaign as in Click, and its counter, which stands for its ID.
    struct FClick{uint64_t key;uint32_t user;uint32_t ctr;};
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
@@ -3226,6 +3967,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
    const bool smallClicksOk=(uint64_t)(window_end-window_start)<0x7fffffffull&&!getenv("SS_TEST_NOSMALLCLICKS");
    uint32_t* const fr=freq.data();uint32_t* const pos=positions.data();uint16_t* const act=active.data();
+   vector<RowOut> rowsOut((size_t)ndays+2);
    const atomic<uint32_t>* const comp=denseComp;const uint32_t dBase=denseBase;
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
    for(size_t i0=0;i0<idxEnd;i0+=ICH){
@@ -3252,39 +3994,38 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      int why=5; // why the index is handed over, if it is
      if(noFastN&&ix%noFastN==0){if(fast)why=7;fast=false;}
      size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;
-     uint64_t* sTs=nullptr;uint32_t* sOrd=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0;
+     const uint64_t* SL=nullptr;uint64_t* mySL=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0; // SL: session entries "start << 24 | rows before", then the row count
      // The sweep's session list, if the index is one run of rows in time order.
      const uint64_t* const sweepList=f.multi.load(memory_order_relaxed)?nullptr:f.sess.load(memory_order_relaxed);
      const uint32_t sweepNs=f.ns.load(memory_order_relaxed);
      const bool listed=ec&&sweepList&&!(sweepNs>>31);
+     if(fast&&ec>=(1u<<24)){fast=false;why=5;} // too many rows for a session entry: the general lane takes the index
      if(fast){
       uint32_t mask=0;
-      sTs=sessTs.get((size_t)ec+2);sOrd=sessOrd.get((size_t)ec+2);
-      if(listed){
-       ns=sweepNs;n=ec;mask=f.amask.load(memory_order_relaxed);
-       for(size_t i=0;i<=ns;++i){const uint64_t e=sweepList[i];sTs[i]=e>>24;sOrd[i]=(uint32_t)(e&0xFFFFFFu);}
-       pur=sweepList+ns+1;
-      }
+      if(listed){ns=sweepNs;n=ec;mask=f.amask.load(memory_order_relaxed);SL=sweepList;pur=sweepList+ns+1;}
+      else{mySL=sessTs.get((size_t)ec+2);SL=mySL;}
       // Otherwise (several runs, or a row out of order) walk the index's stretch of event slots here
       // the way the sweep does, skipping other people's slots; `disorder` says whether a row was out of order.
       uint64_t* const myPur=listed?nullptr:purBuf.get((size_t)ec+2);size_t np=0;
       uint64_t last=0-(uint64_t)(GAP+1); // the first row starts a session
       if(!listed)for(size_t c=ef;c<el;++c){
-       const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t u=sl.user;
-       if(!((uint32_t)(k>=PR_KBIAS)&(uint32_t)((u^code)<8)))continue;
+       const ESmall& sl=ev_at(c);const uint64_t k=sl.k;
+       if(k<PR_KBIAS)continue;
+       const uint32_t u=ucode(sl);
+       if((u^code)>=8)continue;
        mask|=1u<<(u&7);
        const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
        disorder|=step>>63;
-       sTs[ns]=ts;sOrd[ns]=(uint32_t)n;ns+=step>(uint64_t)GAP;last=ts;
+       mySL[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
        if(__builtin_expect((k&EV_PURCHASE)!=0,0))myPur[np++]=((uint64_t)(ns-1)<<40)|((uint64_t)sl.cat<<24)|(k&EV_PRICE);
        ++n;
       }
-      if(!listed){myPur[np]=~0ull;pur=myPur;}
+      if(!listed){mySL[ns]=n;myPur[np]=~0ull;pur=myPur;}
       C=fastC.get((size_t)cc+1);
       for(size_t c=cf;c<cl;++c){
        const CSlot& sl=denseCl[c];const uint32_t u=sl.user;
-       C[m].key=sl.key;C[m].user=u;C[m].ctr=(uint32_t)c;
        const uint32_t ok=(uint32_t)(sl.present!=0)&(uint32_t)((u^code)<8);
+       _mm_storeu_si128((__m128i*)(void*)(C+m),_mm_loadu_si128((const __m128i*)(const void*)&sl));C[m].ctr=(uint32_t)c; // key and user as they are
        mask|=ok<<(u&7);m+=ok;
       }
       if(__builtin_expect(n!=ec||m!=cc,0)){fprintf(stderr,"ERROR dense slots changed under the reader\n");_exit(1);}
@@ -3298,18 +4039,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        // Not in time order: copy the rows out, sort them, and make the session list from the copy.
        E=fastE.get((size_t)ec+1);size_t q=0;
        for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);
-        if(sl.k>=PR_KBIAS&&(sl.user^code)<8){E[q].k=sl.k-PR_KBIAS;E[q].person=person;E[q].cat=sl.cat;E[q].pad=0;++q;}}
+        if(sl.k>=PR_KBIAS&&(ucode(sl)^code)<8){E[q].k=sl.k-PR_KBIAS;E[q].person=person;E[q].cat=sl.cat;E[q].pad=0;++q;}}
        ev_time_sort(E,E+n);
        uint64_t* const sortedPur=purBuf.get((size_t)ec+2);size_t np=0;
+       if(!mySL){mySL=sessTs.get((size_t)ec+2);}
+       SL=mySL;
        ns=0;uint64_t last=0-(uint64_t)(GAP+1);
        for(size_t i=0;i<n;++i){
         const uint64_t k=E[i].k,ts=k>>EV_TS,step=ts-last;
-        sTs[ns]=ts;sOrd[ns]=(uint32_t)i;ns+=step>(uint64_t)GAP;last=ts;
+        mySL[ns]=(ts<<24)|i;ns+=step>(uint64_t)GAP;last=ts;
         if(k&EV_PURCHASE)sortedPur[np++]=((uint64_t)(ns-1)<<40)|((uint64_t)E[i].cat<<24)|(k&EV_PRICE);
        }
-       sortedPur[np]=~0ull;pur=sortedPur;
+       mySL[ns]=n;sortedPur[np]=~0ull;pur=sortedPur;
       }
-      sOrd[ns]=(uint32_t)n;
       // The person's clicks. A small set (most are) is put in order once and kept as plain arrays: a
       // session then finds the clicks of its seven days with one vector compare, the credited campaign
       // is that of the last one, and the assists are counted in one byte per click (bumped only for the
@@ -3368,19 +4110,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       char tmp[16];const NameRef nm=person_name(person,tmp);
       const FClick *add=C,*expire=C,*const ce=C+m;size_t na=0;
       int currentday=-1;uint64_t dsess=0,drev=0;uint32_t rowStart=0;size_t pi=0;
+      RowOut* const R=rowsOut.data();size_t nr=0;
+      const auto close_row=[&](uint32_t evs){ // the finished row with its top category; written out after the person's last session
+       RowOut& o=R[nr++];o.day=currentday;o.sess=(uint32_t)dsess;o.evs=evs;o.rev=drev;o.best=0;o.top=0;
+       if(__builtin_expect(!touched.empty(),0)){
+        uint16_t top=0;uint64_t best=0;
+        for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
+        touched.clear();o.best=best;o.top=top;
+       }};
       const auto count_assists=[&](int day){ // the row's byte counters into the totals
        if(!(cntLo|cntHi))return;
        uint64_t* const arow=assists+(size_t)day*ncamp;
        for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));
        cntLo=0;cntHi=0;};
       for(size_t sn=0;sn<ns;++sn){
-       const uint64_t ts=sTs[sn];const int d=(int)((ts+dayOff)/(uint64_t)DAY);
+       const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);const int d=(int)((ts+dayOff)/(uint64_t)DAY);
        if(d!=currentday){
         if(currentday>=0){
          if(mode==SMALL)count_assists(currentday);
-         put_row(nm,currentday,dsess,sOrd[sn]-rowStart,drev);dsess=0;drev=0;
+         close_row(ord-rowStart);dsess=0;drev=0;
         }
-        currentday=d;rowStart=sOrd[sn];
+        currentday=d;rowStart=ord;
        }
        ++dsess;
        uint16_t credited=organic;
@@ -3415,15 +4165,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
       }
       if(mode==SMALL)count_assists(currentday);
-      put_row(nm,currentday,dsess,(uint32_t)n-rowStart,drev);
+      close_row((uint32_t)n-rowStart);
+      put_rows(nm,R,nr);
       for(size_t q=0;q<na;++q)fr[act[q]]=0;
       num_sessions+=ns;
       if(nrows>=FLUSH)flush_rows();
       ++rdFastIdx;rdFastEv+=n;rdFastCl+=m;
      }
      else{
-      for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t d=sl.user^code;
-       if(k>=PR_KBIAS&&d<8){hand_event(myEv,pool,k,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),sl.cat);++rdHandEv;++rdWhy[why];}}
+      for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;if(k<PR_KBIAS)continue;const uint32_t d=ucode(sl)^code;
+       if(d<8){hand_event(myEv,pool,k,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),sl.cat);++rdHandEv;++rdWhy[why];}}
       for(size_t c=cf;c<cl;++c){const CSlot& sl=denseCl[c];const uint32_t d=sl.user^code;
        if(sl.present&&d<8){hand_click(myCl,pool,txt,sl.key,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),(uint32_t)c);++rdHandCl;}}
      }
@@ -3433,8 +4184,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    #pragma omp for schedule(dynamic,1) nowait
    for(size_t lo=min<uint64_t>(deferLoE,deferHiE);lo<deferHiE;lo+=ECH){
     const size_t hi=min<size_t>(deferHiE,lo+ECH);
-    for(size_t c=lo;c<hi;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t u=sl.user;
-     if(k>=PR_KBIAS&&(u&DENSE_USER)){const uint32_t d=u&~DENSE_USER;
+    for(size_t c=lo;c<hi;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;if(k<PR_KBIAS)continue;const uint32_t u=ucode(sl);
+     if(is_dense_code(u)){const uint32_t d=u&~DENSE_USER;
       if(info[d>>dn::ALIAS_BITS].state.load(memory_order_relaxed)==DSTATE_DEFER){hand_event(myEv,pool,k,dBase+(d^((comp[d>>3].load(memory_order_relaxed)>>(3*(d&7)))&7)),sl.cat);++rdHandEv;++rdWhy[8];}}}
    }
    #pragma omp for schedule(dynamic,1)

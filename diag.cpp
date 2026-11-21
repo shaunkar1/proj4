@@ -387,11 +387,11 @@ int main(){
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
  for(int r=0;r<3;++r){
-  add("B",1,{N8});add("tp",1,{N8,{"SS_LINES","2p"}});add("rp",1,{N8,{"SS_RESOLVE_RAW","pass"}});add("m",1,{N8},"core-m");add("b",1,{N8},"core-b");add("c",1,{N8},"core-c");
+  add("B",1,{N8});add("tp",1,{N8,{"SS_LINES","2p"}});add("rp",1,{N8,{"SS_RESOLVE_RAW","pass"}});add("m",1,{N8},"core-m");add("x",1,{N8},"core-b");add("xc",1,{N8,{"SS_CLICKS","ix"}},"core-b");
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hm",1,{N8},"core-m",true);add("Hb",1,{N8},"core-b",true);add("Hc",1,{N8},"core-c",true);}
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hm",1,{N8},"core-m",true);add("Hx",1,{N8},"core-b",true);add("Hxc",1,{N8,{"SS_CLICKS","ix"}},"core-b",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
@@ -404,9 +404,9 @@ int main(){
    close(fd);unlink(pth.c_str());return true;};
   uint64_t ur[3]={0,0,0},us_[3]={0,0,0},cr[3]={0,0,0},cs[3]={0,0,0};bool ok[3]={false,false,false};
   for(int i=0;i<3;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
-   pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,i==2?"core-c":"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+   pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,i==2?"core-b":"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c49 dense %s (u%llu c%llu), c51 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0],
+  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c52 dense %s (u%llu c%llu), c53 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0],
    same(2)?"SAME":"DIFF",(unsigned long long)ur[2],(unsigned long long)cr[2]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
@@ -438,8 +438,8 @@ int main(){
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=eqText+" | wPRYXAus: "+fmt("c49","B","wPRYXAus")+fmt("c49-2p","tp","wPRYXAus")+fmt("c49-pass","rp","wPRYX")+fmt("c47","m","wPRYX")+fmt("c50","b","wPRYXAus")+fmt("c51","c","wPRYXAus");
-  a+="| 60x wPRYXA: "+fmt("c49","HB","wPRYXA")+fmt("c47","Hm","wPRYXA")+fmt("c50","Hb","wPRYXA")+fmt("c51","Hc","wPRYXA");
+  a+=eqText+" | wPRYXAus: "+fmt("c52","B","wPRYXAus")+fmt("c52-2p","tp","wPRYX")+fmt("c52-pass","rp","wPRYX")+fmt("c49","m","wPRYXAus")+fmt("c53","x","wPRYXAus")+fmt("c53-oldclicks","xc","wPRYX");
+  a+="| 60x wPRYXA: "+fmt("c52","HB","wPRYXA")+fmt("c49","Hm","wPRYXA")+fmt("c53","Hx","wPRYXA")+fmt("c53-oldclicks","Hxc","wPRYX");
   c+=benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
