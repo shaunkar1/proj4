@@ -10,7 +10,10 @@ for seed in "$@"; do
  env $FZ_NEWENV NCPU=1 DATA_DIR=$D OUTPUT_DIR=$A $NEW 2>$W/fzl_a.log; ra=$?
  env $FZ_NEWENV NCPU=3 DATA_DIR=$D OUTPUT_DIR=$B $NEW 2>$W/fzl_b.log; rb=$?
  NCPU=1 DATA_DIR=$D OUTPUT_DIR=$C $BASE 2>$W/fzl_c.log; rc=$?
- if [ $rc != 0 ]; then echo "seed $seed exit $ra/$rb/$rc $( [ $ra = $rc ] && [ $rb = $rc ] && echo SAME-FAILURE || echo EXIT-DIFFERS ) $(grep -h ERROR $W/fzl_a.log $W/fzl_c.log | tr '\n' ' ')"; continue; fi
+ # Output folders are removed as soon as they have been compared; a failing seed keeps its three.
+ if [ $rc != 0 ]; then echo "seed $seed exit $ra/$rb/$rc $( [ $ra = $rc ] && [ $rb = $rc ] && echo SAME-FAILURE || echo EXIT-DIFFERS ) $(grep -h ERROR $W/fzl_a.log $W/fzl_c.log | tr '\n' ' ')"
+  [ $ra = $rc ] && [ $rb = $rc ] && rm -r "$A" "$B" "$C"; continue; fi
  x=$(python3 $CMP $A $C 2>&1 | tail -1); y=$(python3 $CMP $B $C 2>&1 | tail -1)
  echo "seed $seed exit $ra/$rb/$rc new1-vs-base $x | new3-vs-base $y | $(grep -h 'linked IDs' $W/fzl_a.log $W/fzl_c.log | tr '\n' ' ')"
+ [ "$x" = MATCH ] && [ "$y" = MATCH ] && rm -r "$A" "$B" "$C"
 done

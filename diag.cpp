@@ -386,18 +386,22 @@ int main(){
  add("warm",1,{N8});
  auto ring=[&](const char* name,const char* ahead,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","slot"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD",ahead}},"",hs);};
  auto bkt=[&](const char* name,const char* sh,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","bucket"},{"SS_DENSE_DUMP","-"},{"SS_DSHIFT",sh},{"SS_CSHIFT",sh}},"",hs);};
+ auto full=[&](const char* name,vector<pair<string,string>> env,bool hs){env.insert(env.begin(),N8);add(name,1,env,"",hs);};
  for(int r=0;r<2;++r){
   add("B",1,{N8});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("nod",1,{N8,{"SS_NODENSE","1"}});
-  ring("r0","0",false);ring("r1","1",false);ring("r2","2",false);ring("r4","4",false);ring("r8","8",false);ring("r16","16",false);
-  bkt("k12","12",false);bkt("k14","14",false);bkt("k16","16",false);
-  add("pu",1,{N8,{"SS_DENSE_RECORDS","0"},{"SS_DENSE_DUMP","-"}},""); // parse only, dense users, general buckets
+  full("bk14",{{"SS_DENSE_RECORDS","bucket"}},false);full("bk12",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","12"},{"SS_CSHIFT","12"}},false);
+  full("bk13",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","13"},{"SS_CSHIFT","13"}},false);full("bk16",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","16"},{"SS_CSHIFT","16"}},false);
+  full("sl2",{{"SS_DENSE_AHEAD","2"}},false);full("sl4",{{"SS_DENSE_AHEAD","4"}},false);full("sl8",{{"SS_DENSE_AHEAD","8"}},false);full("sl16",{{"SS_DENSE_AHEAD","16"}},false);
  }
- add("B",1,{N8});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("nod",1,{N8,{"SS_NODENSE","1"}});
+ full("bk14",{{"SS_DENSE_RECORDS","bucket"}},false);add("nod",1,{N8,{"SS_NODENSE","1"}});
+ full("bk14z",{{"SS_DENSE_RECORDS","bucket"},{"SS_ISA","avx512z"}},false);
+ add("bk14n4",1,{{"NCPU","4"},{"SS_DENSE_RECORDS","bucket"}});add("bk14n1",1,{{"NCPU","1"},{"SS_DENSE_RECORDS","bucket"}});
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hrec0",1,{N8,{"SS_DENSE_RECORDS","0"}},"",true);add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);
-  ring("Hr0","0",true);ring("Hr4","4",true);ring("Hr16","16",true);bkt("Hk14","14",true);bkt("Hk16","16",true);
-  add("Hpu",1,{N8,{"SS_DENSE_RECORDS","0"},{"SS_DENSE_DUMP","-"}},"",true);}
+ for(int r=0;r<2;++r){add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);
+  full("Hbk14",{{"SS_DENSE_RECORDS","bucket"}},true);full("Hbk16",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","16"},{"SS_CSHIFT","16"}},true);
+  full("Hbk15",{{"SS_DENSE_RECORDS","bucket"},{"SS_DSHIFT","15"},{"SS_CSHIFT","15"}},true);
+  full("Hsl8",{{"SS_DENSE_AHEAD","8"}},true);add("HB",1,{N8},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -420,17 +424,18 @@ int main(){
     double v;const string k=key;
     if(k=="w")v=r.wall;else if(k=="u")v=r.user;else if(k=="s")v=r.sys;else if(k=="f")v=r.minflt/1e3;else if(k=="r")v=r.maxrssMB/1e3;
     else if(k=="L"){v=0;for(auto& kv:r.t)if(kv.first.rfind("LINK",0)==0||kv.first=="FLATTEN")v+=kv.second;}
-    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="K"?"KEYS":k=="W"?"WRITE":key);v=it==r.t.end()?0:it->second;}
+    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="Y"?"DENSE1":k=="K"?"KEYS":k=="W"?"WRITE":key);v=it==r.t.end()?0:it->second;}
     if(best<0||v<best)best=v;}
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=fmt("slots B w/PARSE/DEDUP/DENSE/AGG/links/user/sys","B","wPDXALus")+fmt("| users+general-buckets wPDXALus","rec0","wPDXALus")+fmt("| nodense wPDALus","nod","wPDALus");
-  a+="| PARSE only: "+fmt("dense users, general buckets","pu","P")+"slots by AHEAD: ";for(const char* g:{"r0","r1","r2","r4","r8","r16"})a+=fmt(g+1,g,"P");
-  a+="counter buckets by shift: ";for(const char* g:{"k12","k14","k16"})a+=fmt(g+1,g,"P");
-  c+="60x: "+fmt("slots wPDXALus","HB","wPDXALus")+fmt("| users+buckets wPDXALus","Hrec0","wPDXALus")+fmt("| nodense wPDALus","Hnod","wPDALus");
-  c+="| PARSE only: "+fmt("users+general","Hpu","P")+fmt("slots AHEAD 0","Hr0","P")+fmt("4","Hr4","P")+fmt("16","Hr16","P")+fmt("counter buckets shift 14","Hk14","P")+fmt("16","Hk16","P");
-  {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
+  a+=fmt("nodense w/PARSE/DEDUP/AGG/links/user/sys","nod","wPDALus")+fmt("| slot AHEAD0 w/P/D/DENSE1/DENSE/A/L/u/s","B","wPDYXALus")+fmt("| users+general wPDAL","rec0","wPDAL");
+  a+="| bucket wPDYXALus by shift: ";for(const char* g:{"bk12","bk13","bk14","bk16"})a+=fmt(g+2,g,"wPDYXALus");
+  a+="| slot wPYX by AHEAD: ";for(const char* g:{"sl2","sl4","sl8","sl16"})a+=fmt(g+2,g,"wPYX");
+  a+=fmt("| bucket14 avx512z wPYX","bk14z","wPYX")+fmt("n4 wPYXA","bk14n4","wPYXA")+fmt("n1 wPYXAus","bk14n1","wPYXAus");
+  c+="60x: "+fmt("nodense wPDALus","Hnod","wPDALus")+fmt("| slot0 wPDYXALus","HB","wPDYXALus")+fmt("slot8 wPYX","Hsl8","wPYX");
+  c+="| bucket wPDYXALusfr by shift: ";for(const char* g:{"Hbk14","Hbk15","Hbk16"})c+=fmt(g+3,g,"wPDYXALusfr");
+  {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,5,"bk14#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
   {string all;for(auto& r:results){auto g=[&](const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};char one[96];

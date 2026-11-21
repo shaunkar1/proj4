@@ -2465,7 +2465,23 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
   return u;
  };
- const bool slotMode=denseEv||denseCl;
+ // Dense rows may arrive in per-thread buckets by counter range instead of in the slots (tls[t].db /
+ // dcb, bucket = counter >> shift): then the DENSE1 stage below fills the slots from them.
+ const bool bucketMode=dparse.bucket;
+ const size_t nEvBuckets=bucketMode&&dparse.events?(size_t)(dense.limE>>dparse.shE)+1:0,nClBuckets=bucketMode&&dparse.clicks?(size_t)(dense.limC>>dparse.shC)+1:0;
+ // The reader only needs the first 16 bytes of an event slot (k, user, cat, thread). When the slots are
+ // filled here from buckets, the array holds just those (ESmall) and the winners' ingest times live in a
+ // scratch array while a bucket is filled; ev_at() reads either layout.
+ struct ESmall{uint64_t k;uint32_t user;uint16_t cat;uint16_t thread;};
+ static_assert(sizeof(ESmall)==16&&offsetof(ESmall,user)==offsetof(ESlot,user)&&offsetof(ESmall,cat)==offsetof(ESlot,cat)&&offsetof(ESmall,thread)==offsetof(ESlot,thread)&&offsetof(ESlot,k)==0);
+ const char* const evBase=nEvBuckets?(const char*)map_huge((size_t)(dense.limE+1)*sizeof(ESmall)):(const char*)denseEv;
+ const unsigned evShift=nEvBuckets?4:5;
+ const auto ev_at=[evBase,evShift](size_t c)->const ESmall&{return *(const ESmall*)(const void*)(evBase+(c<<evShift));};
+ if(nClBuckets&&!denseCl)denseCl=(CSlot*)map_huge((size_t)(dense.limC+1)*sizeof(CSlot));
+ const unsigned bshE=dparse.shE,bshC=dparse.shC;
+ const auto db_size=[&](int t,size_t b)->size_t{return b<tls[t].db.size()?tls[t].db[b].size():0;};
+ const auto dcb_size=[&](int t,size_t b)->size_t{return b<tls[t].dcb.size()?tls[t].dcb[b].size():0;};
+ const bool slotMode=evBase||denseCl;
  if(slotMode)denseInfo=(DInfo*)map_huge(((size_t)denseMaxIdx.load()+2)*sizeof(DInfo));
  uint64_t parsedEvents=0,parsedClicks=0;
  size_t maxEvBucket=0,maxClBucket=0; // most parsed lines in one ID bucket (all threads together)
@@ -2486,6 +2502,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(denseEv){const size_t end=denseEvEnd.load(),step=max<size_t>(1,end/1024);size_t taken=0,tableRows=0;
    for(size_t c=step/2;c<end;c+=step){++taken;const ESlot& sl=denseEv[c];if(sl.k.load(memory_order_relaxed)>=PR_KBIAS&&!(sl.user&DENSE_USER))++tableRows;}
    if(taken)estA+=(uint64_t)end*tableRows/taken;}
+  if(nEvBuckets){ // rows still in buckets: the first record of every few buckets stands for its bucket
+   const size_t step=max<size_t>(1,nEvBuckets*(size_t)T/2048);uint64_t all=0,tableRows=0,total=0;
+   for(int t=0;t<T;++t)for(size_t b=0;b<tls[t].db.size();++b){const Bucket<DRec>& B=tls[t].db[b];const size_t n=B.size();total+=n;
+    if(n&&(b+(size_t)t)%step==0){all+=n;if(!(B[0].user&DENSE_USER))tableRows+=n;}}
+   if(all)estA+=total*tableRows/all;}
   const uint64_t want=max<uint64_t>(1,estA/perBucket);while(shA<16&&((uint64_t)denseBase>>shA)>want)++shA;
   while(shB<16&&((npersons-denseBase)>>shB)>256)++shB;}
  if(const char* v=getenv("SS_TEST_PSHIFT")){int s=atoi(v);if(s>=0&&s<=16)shA=shB=(unsigned)s;} // tests force odd bucket widths
@@ -2676,7 +2697,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Rows of dense users are only counted: per user index the first and last counter, how many, and
  // which aliases (a user's rows sit next to each other, so the index's entry is updated once per run).
  // Rows of all other users go to the general person lists right here.
- const size_t evEnd=denseEv?denseEvEnd.load():0,clEnd=denseCl?denseClEnd.load():0;
+ const size_t evEnd=nEvBuckets?(size_t)dense.limE:evBase?denseEvEnd.load():0,clEnd=nClBuckets?(size_t)dense.limC:denseCl?denseClEnd.load():0;
  const bool slots=evEnd||clEnd;
  static constexpr size_t ECH=size_t(1)<<15,CCH=size_t(1)<<16,ICH=512; // slots / user indexes per piece of work
  // Test switches: every n-th user index is treated as if its rows were spread out (it takes the
@@ -2689,6 +2710,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // any other text - or through the fallback; then dense users whose index has rows in the general lane,
  // whose index holds several persons, whose index the test switch kept out, and whose rows are spread out.
  uint64_t rdWhy[9]={0,0,0,0,0,0,0,0,0};
+ uint64_t fillEndE=0,fillEndC=0;
  // The general lane orders clicks of one moment by their ID text; a click from a slot gets its text made here.
  struct IdText{char* cur=nullptr;char* end=nullptr;
   const char* make(HugePool& pool,char letter,uint64_t value,uint32_t& len){
@@ -2711,11 +2733,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();HugePool& pool=surv[tid].pool;
    DInfo* const info=denseInfo;IdText txt;
    const auto bad_user=[]{fprintf(stderr,"ERROR dense user index above the reported maximum\n");_exit(1);};
-   #pragma omp for schedule(dynamic,1) nowait
-   for(size_t lo=0;lo<evEnd;lo+=ECH){
-    const size_t hi=min(evEnd,lo+ECH);
+   // The sweep of one stretch of counters (events, then clicks).
+   const auto sweep_events=[&](size_t lo,size_t hi){
     for(size_t c=lo;c<hi;){
-     const ESlot& sl=denseEv[c];const uint64_t k=sl.k.load(memory_order_relaxed);
+     const ESmall& sl=ev_at(c);const uint64_t k=sl.k;
      if(k<PR_KBIAS){++c;continue;} // empty, or present but not valid
      const uint32_t u=sl.user;
      if(!(u&DENSE_USER)){hand_event(myEv,pool,k,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++rdHandEv;++rdSlotEv;++c;if(stats)++rdWhy[why_table(u)];continue;}
@@ -2723,18 +2744,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      // A run of this user index: up to the next valid slot of anybody else.
      const uint32_t code=u&~7u;const size_t first=c;size_t last=c;uint32_t cnt=1;
      for(++c;c<hi;++c){
-      if(denseEv[c].k.load(memory_order_relaxed)<PR_KBIAS)continue;
-      if((denseEv[c].user&~7u)!=code)break;
+      if(ev_at(c).k<PR_KBIAS)continue;
+      if((ev_at(c).user&~7u)!=code)break;
       last=c;++cnt;
      }
      DInfo& f=info[(code&~DENSE_USER)>>dn::ALIAS_BITS];
      dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)last+1);f.ec.fetch_add(cnt,memory_order_relaxed);
      rdSlotEv+=cnt;
     }
-   }
-   #pragma omp for schedule(dynamic,1)
-   for(size_t lo=0;lo<clEnd;lo+=CCH){
-    const size_t hi=min(clEnd,lo+CCH);
+   };
+   const auto sweep_clicks=[&](size_t lo,size_t hi){
     for(size_t c=lo;c<hi;){
      const CSlot& sl=denseCl[c];
      if(!sl.present){++c;continue;}
@@ -2751,8 +2770,60 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      dense_note_first(f.cf,(uint32_t)first+1);dense_note_end(f.cl,(uint32_t)last+1);f.cc.fetch_add(cnt,memory_order_relaxed);
      rdSlotCl+=cnt;
     }
+   };
+   vector<int64_t> ingestScratch(bucketMode&&nEvBuckets?size_t(1)<<bshE:0);int64_t* const ingestOf=ingestScratch.data(); // ingest_ts of the winner in each slot of the bucket being filled (only read where the slot is taken)
+   if(bucketMode){
+    // DENSE1: bucket by bucket, the records of all threads go into the bucket's stretch of slots by
+    // direct index. One thread owns the stretch, so nothing is atomic here. The copy with the smallest
+    // ingest_ts stays (copies with equal ingest_ts are identical in defined data; the first one stays),
+    // and a winner that is not a valid event is stored as ESLOT_INVALID. Then the stretch is swept at
+    // once, while it is in the cache.
+    #pragma omp for schedule(dynamic,1) nowait reduction(max:fillEndE)
+    for(size_t b=0;b<nEvBuckets;++b){
+     const size_t lo=b<<bshE;size_t any=0;
+     for(int t=0;t<T;++t){const size_t n=db_size(t,b);if(!n)continue;
+      any+=n;
+      const DRec* r=tls[t].db[b].data();
+      for(const DRec* const re=r+n;r!=re;++r){
+       ESmall& sl=const_cast<ESmall&>(ev_at(lo|r->lo));
+       if(sl.k==0||r->ingest<ingestOf[r->lo]){
+        const uint64_t uct=eslot_uct(r->user,r->cat,(unsigned)t);
+        sl.k=r->k?r->k:ESLOT_INVALID;memcpy((char*)&sl+offsetof(ESmall,user),&uct,8);ingestOf[r->lo]=r->ingest;
+       }
+      }
+     }
+     if(!any)continue; // nothing was written to this stretch
+     const size_t hi=min(evEnd,lo+(size_t(1)<<bshE));
+     fillEndE=max<uint64_t>(fillEndE,hi);
+     sweep_events(lo,hi);
+    }
+    #pragma omp for schedule(dynamic,1) reduction(max:fillEndC)
+    for(size_t b=0;b<nClBuckets;++b){
+     const size_t lo=b<<bshC;size_t any=0;
+     for(int t=0;t<T;++t){const size_t n=dcb_size(t,b);if(!n)continue;
+      any+=n;
+      const DCRec* r=tls[t].dcb[b].data();
+      for(const DCRec* const re=r+n;r!=re;++r){
+       if(__builtin_expect((r->kc>>bshC)!=b||r->kc>=dense.limC,0)){fprintf(stderr,"ERROR dense click record in the wrong bucket\n");_exit(1);}
+       CSlot& sl=denseCl[r->kc];
+       if(!sl.present){sl.key=r->key;sl.user=r->user;sl.present=(uint32_t)t+1;} // copies of a click are identical
+      }
+     }
+     if(!any)continue;
+     const size_t hi=min(clEnd,lo+(size_t(1)<<bshC));
+     fillEndC=max<uint64_t>(fillEndC,hi);
+     sweep_clicks(lo,hi);
+    }
+   }
+   else{
+    #pragma omp for schedule(dynamic,1) nowait
+    for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH));
+    #pragma omp for schedule(dynamic,1)
+    for(size_t lo=0;lo<clEnd;lo+=CCH)sweep_clicks(lo,min(clEnd,lo+CCH));
    }
   }
+  if(bucketMode){dense_note_end(denseEvEnd,(uint32_t)fillEndE);dense_note_end(denseClEnd,(uint32_t)fillEndC);} // one past the last stretch written
+  __mark("DENSE1");
  }
  const size_t idxEnd=slots&&denseUsers?(size_t)denseMaxIdx.load()+1:0;
  uint64_t deferLoE=UINT64_MAX,deferHiE=0,deferLoC=UINT64_MAX,deferHiC=0; // counter ranges holding the rows of deferred indexes
@@ -2989,8 +3060,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       E=fastE.get((size_t)ec+1);
       const __m128i bias=_mm_set_epi64x(0,(long long)PR_KBIAS);
       for(size_t c=ef;c<el;++c){
-       const __m128i v=_mm_loadu_si128((const __m128i*)(const void*)(denseEv+c));
-       const uint64_t k=(uint64_t)_mm_cvtsi128_si64(v);const uint32_t u=denseEv[c].user;
+       const ESmall& sl=ev_at(c);
+       const __m128i v=_mm_loadu_si128((const __m128i*)(const void*)&sl);
+       const uint64_t k=(uint64_t)_mm_cvtsi128_si64(v);const uint32_t u=sl.user;
        _mm_storeu_si128((__m128i*)(void*)(E+n),_mm_sub_epi64(v,bias));
        const uint32_t ok=(uint32_t)(k>=PR_KBIAS)&(uint32_t)((u^code)<8);
        mask|=ok<<(u&7);n+=ok;
@@ -3024,7 +3096,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       ++rdFastIdx;rdFastEv+=n;rdFastCl+=m;
      }
      else{
-      for(size_t c=ef;c<el;++c){const ESlot& sl=denseEv[c];const uint64_t k=sl.k.load(memory_order_relaxed);const uint32_t d=sl.user^code;
+      for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t d=sl.user^code;
        if(k>=PR_KBIAS&&d<8){hand_event(myEv,pool,k,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),sl.cat);++rdHandEv;++rdWhy[why];}}
       for(size_t c=cf;c<cl;++c){const CSlot& sl=denseCl[c];const uint32_t d=sl.user^code;
        if(sl.present&&d<8){hand_click(myCl,pool,txt,sl.key,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),(uint32_t)c);++rdHandCl;}}
@@ -3035,7 +3107,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    #pragma omp for schedule(dynamic,1) nowait
    for(size_t lo=min<uint64_t>(deferLoE,deferHiE);lo<deferHiE;lo+=ECH){
     const size_t hi=min<size_t>(deferHiE,lo+ECH);
-    for(size_t c=lo;c<hi;++c){const ESlot& sl=denseEv[c];const uint64_t k=sl.k.load(memory_order_relaxed);const uint32_t u=sl.user;
+    for(size_t c=lo;c<hi;++c){const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t u=sl.user;
      if(k>=PR_KBIAS&&(u&DENSE_USER)){const uint32_t d=u&~DENSE_USER;
       if(info[d>>dn::ALIAS_BITS].state.load(memory_order_relaxed)==DSTATE_DEFER){hand_event(myEv,pool,k,dBase+(d^((comp[d>>3].load(memory_order_relaxed)>>(3*(d&7)))&7)),sl.cat);++rdHandEv;++rdWhy[8];}}}
    }
