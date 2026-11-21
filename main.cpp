@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <fcntl.h>
@@ -3391,8 +3392,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool __cpuLines=getenv("SS_STATS")!=nullptr;
  auto __cpu_now=[]{timespec t;clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;};
  double __cpu0=__cpu_now();
+ // ... and by a SYS line (system CPU of the whole process in that stage, seconds) and a FLT line (minor page faults).
+ // SYS/FLT EXITPREP at the very end cover what runs after the last mark.
+ auto __ru_now=[](double& sys,long& flt){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;};
+ double __sys0=0;long __flt0=0;if(__cpuLines)__ru_now(__sys0,__flt0);
+ auto __sysflt=[&](const char* label){double s;long f;__ru_now(s,f);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\n";__sys0=s;__flt0=f;};
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
-  if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;}};
+  if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
@@ -5288,6 +5294,7 @@ __mark("AGGREGATE");
 __mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
  // Every output file is written and closed. Leave at once: unwinding would only hand gigabytes of
  // mappings back piece by piece before the kernel drops them anyway.
+ if(__cpuLines)__sysflt("EXITPREP");
  cerr.flush();fflush(nullptr);
  _exit(0);
 }
