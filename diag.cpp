@@ -384,6 +384,7 @@ int main(){
   for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
   gReplicaSec=now()-t;
   fprintf(stderr,"DIAG replica: %d x %d copies, %.1f MB written in %.2fs (elapsed %.1fs)\n",PARTS,BIG,b/1e6,now()-t,now()-T0);}
+ double syncSec=0;{const double t=now();int fd=open(scratch.c_str(),O_RDONLY|O_DIRECTORY);if(fd>=0){syncfs(fd);close(fd);}syncSec=now()-t;fprintf(stderr,"DIAG syncfs of the scratch mount after the replica: %.2fs\n",syncSec);}
  const string B=big.string(),H=huge.string();
  auto timeleft=[&](double need){if(now()-T0+need>150){fprintf(stderr,"DIAG skipping the rest: out of time (%.1fs elapsed)\n",now()-T0);return false;}return true;};
  struct Var{string label;vector<pair<string,string>> env;const char* bin="";bool hugeSet=false;};
@@ -398,20 +399,21 @@ int main(){
  #define UB {"SS_UNMAP","bg"}
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  for(int r=0;r<5;++r){
-  add("B",1,{N8});add("c62",1,{N8},"core-b");add("c61",1,{N8},"core-c");
-  add("ub",1,{N8,UB});add("ubp",1,{N8,UB,{"SS_POOLPRE","1"}});add("l2",1,{N8,L2});add("l2w",1,{N8,L2,{"SS_PF","w"}});add("all",1,{N8,L2,UB});add("ln",1,{N8},"core-l");add("b4",1,{N8},"core-d");
-  if(r<3){add("Bs",1,{N8,ST});add("ubs",1,{N8,ST,UB});add("pB",1,{N8,PO},"core-b");add("pL",1,{N8,PO},"core-l");}
+  add("B",1,{N8});add("c62",1,{N8},"core-b");add("b4",1,{N8},"core-d");
+  add("sw",1,{N8,{"SS_WILLNEED","inline"}});add("sc",1,{N8,{"SS_CATALOG","inline"}});add("se",1,{N8,{"SS_CAMPWRITE","end"}});add("sp",1,{N8,{"SS_PATHSORT","path"}});add("ss",1,{N8,{"SS_SAMPLE","serial"}});
+  add("ub",1,{N8,UB});add("all",1,{N8,L2,UB});add("b4ub",1,{N8,UB},"core-d");
+  if(r<3){add("Bs",1,{N8,ST});add("b4s",1,{N8,ST},"core-d");}
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("H61",1,{N8},"core-c",true);add("Hub",1,{N8,UB},"",true);add("Hl2",1,{N8,L2},"",true);add("Hall",1,{N8,L2,UB},"",true);add("Hln",1,{N8},"core-l",true);add("Hb4",1,{N8},"core-d",true);
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("Hb4",1,{N8},"core-d",true);add("Hub",1,{N8,UB},"",true);add("Hall",1,{N8,L2,UB},"",true);add("Hb4ub",1,{N8,UB},"core-d",true);
   if(r<2)add("HBs",1,{N8,ST},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;
   if(v.label[0]=='O'||(v.label[0]=='H'&&v.label.size()>1&&v.label[1]=='O')){const string ro=string(outdir)+"/zz_tmp";pipeline(v.label,v.hugeSet?H:B,ro,v.env,v.bin);error_code ec;fs::remove_all(ro,ec);}
-  else pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
+  else{const string o=od();pipeline(v.label,v.hugeSet?H:B,o,v.env,v.bin);error_code ec;fs::remove_all(o,ec);}}
  // Floors: 8 threads over every byte of the 20M replica's event and click files (page cache is warm by now).
  string floorText;
  if(timeleft(10)){
@@ -440,7 +442,7 @@ int main(){
    close(fd);unlink(pth.c_str());return true;};
   uint64_t ur[3]={0,0,0},us_[3]={0,0,0},cr[3]={0,0,0},cs[3]={0,0,0};bool ok[3]={false,false,false};
   for(int i=0;i<2;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
-   pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+   {const string o=od();pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,o,env,"");error_code ec;fs::remove_all(o,ec);}ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
   char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c63 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
@@ -482,13 +484,15 @@ int main(){
     const string k=key;double x;if(k=="w")x=r.wall;else{auto it=r.t.find(k=="P"?"PARSE":k=="X"?"DENSE":k=="R"?"RESOLVE":k=="A"?"AGGREGATE":key);x=it==r.t.end()?0:it->second;}v.push_back(x);}
    if(v.empty())return -1;sort(v.begin(),v.end());return (long)(v[v.size()/2]*1e3+0.5);};
   auto mm=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wPRXA";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one))+"~"+to_string(med(grp,one));}return o+" ";};
-  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c63","B")+mm("c62","c62")+mm("c61","c61")+mm("c63-unmap-bg","ub")+mm("unmap-bg+poolpre","ubp")+mm("lead2","l2")+mm("lead2+pfw","l2w")+mm("lead2+unmap-bg","all")+mm("LANES(on c62)","ln")+mm("B4-indexpass(on c62+B3)","b4")+"| parse-only P/us: "+fmt("c62","pB","Pus")+fmt("lanes","pL","Pus");
-  a+="| c63 small stages MAP/KEYS/LINK+FLATTEN/DEDUP/DENSE1/WRITE/exit: "+fmt("","Bs","MKLDYWE")+"u/s "+fmt("c63","B","us")+fmt("c62","c62","us")+fmt("c61","c61","us");
-  {const RunResult* r=get("Bs#0");if(r)a+="| DENSE threads c63:"+squeeze(r->dth)+" csw "+r->csw+" ";}
-  {const RunResult* r=get("ubs#0");if(r)a+="| unmap-bg:"+squeeze(r->dth)+" csw "+r->csw+" ";}
-  c+="60M min~median w/P/R/X/A: "+mm("c63","HB")+mm("c62","H62")+mm("c61","H61")+mm("unmap-bg","Hub")+mm("lead2","Hl2")+mm("lead2+unmap-bg","Hall")+mm("LANES","Hln")+mm("B4","Hb4");
+  auto mk=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wMKP";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one));}return o+"~"+to_string(med(grp,"w"))+" ";};
+  {char t[64];snprintf(t,sizeof t," | syncfs after replica %.1fs",syncSec);eqText+=t;}
+  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c63","B")+mm("c62","c62")+mm("B4(c62+B3+B4)","b4")+mm("c63-unmap-bg","ub")+mm("c63-lead2+unmap-bg","all")+mm("B4-unmap-bg","b4ub");
+  a+="| c63 with one of S's changes switched back, min w/MAP/KEYS/PARSE~median w: "+mk("c63","B")+mk("c62","c62")+mk("willneed-inline","sw")+mk("catalog-inline","sc")+mk("campwrite-end","se")+mk("pathsort-old","sp")+mk("sample-serial","ss");
+  a+="| small stages MKLDYWE "+fmt("c63","Bs","MKLDYWE")+fmt("B4","b4s","MKLDYWE");
+  {const RunResult* r=get("Bs#0");if(r)a+="| DENSE threads c63:"+squeeze(r->dth)+" ";}
+  c+="60M min~median w/P/R/X/A: "+mm("c63","HB")+mm("c62","H62")+mm("B4","Hb4")+mm("c63-unmap-bg","Hub")+mm("c63-lead2+unmap-bg","Hall")+mm("B4-unmap-bg","Hb4ub");
   {const RunResult* r=get("HBs#0");if(r)c+="| DENSE threads c63 60M:"+squeeze(r->dth)+" ";}
-  c+="| "+floorText+"|| "+benchText;
+  c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
