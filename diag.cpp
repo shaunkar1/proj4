@@ -384,20 +384,20 @@ int main(){
  auto add=[&](const char* group,int reps,vector<pair<string,string>> env,const char* bin="",bool hs=false){for(int i=0;i<reps;++i)vars.push_back({string(group)+"#"+to_string(i),env,bin,hs});};
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
- auto ring=[&](const char* name,const char* ahead,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD",ahead}},"core-ring",hs);};
- auto bkt=[&](const char* name,const char* sh,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DSHIFT",sh},{"SS_CSHIFT",sh}},"core-bkt",hs);};
+ auto ring=[&](const char* name,const char* ahead,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","slot"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD",ahead}},"",hs);};
+ auto bkt=[&](const char* name,const char* sh,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","bucket"},{"SS_DENSE_DUMP","-"},{"SS_DSHIFT",sh},{"SS_CSHIFT",sh}},"",hs);};
  for(int r=0;r<2;++r){
   add("B",1,{N8});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("nod",1,{N8,{"SS_NODENSE","1"}});
   ring("r0","0",false);ring("r1","1",false);ring("r2","2",false);ring("r4","4",false);ring("r8","8",false);ring("r16","16",false);
   bkt("k12","12",false);bkt("k14","14",false);bkt("k16","16",false);
-  add("pu",1,{N8,{"SS_DENSE_RECORDS","0"},{"SS_DENSE_DUMP","-"}},"core-ring"); // parse only, dense users, general buckets
+  add("pu",1,{N8,{"SS_DENSE_RECORDS","0"},{"SS_DENSE_DUMP","-"}},""); // parse only, dense users, general buckets
  }
  add("B",1,{N8});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("nod",1,{N8,{"SS_NODENSE","1"}});
  // final-sized set
  add("Hwarm",1,{N8},"",true);
  for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hrec0",1,{N8,{"SS_DENSE_RECORDS","0"}},"",true);add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);
   ring("Hr0","0",true);ring("Hr4","4",true);ring("Hr16","16",true);bkt("Hk14","14",true);bkt("Hk16","16",true);
-  add("Hpu",1,{N8,{"SS_DENSE_RECORDS","0"},{"SS_DENSE_DUMP","-"}},"core-ring",true);}
+  add("Hpu",1,{N8,{"SS_DENSE_RECORDS","0"},{"SS_DENSE_DUMP","-"}},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----

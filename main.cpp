@@ -201,15 +201,6 @@ static Mapped map_file(const fs::path& path){
 // followed by at least one page of zeros (as in map_file). One mmap per file instead of two, and the
 // whole folder can be unmapped later in a few large pieces.
 struct FileGroup{char* base=nullptr;size_t len=0;vector<size_t> ends;}; // ends: offset just past each mapped file's slot
-// Measuring switch SS_INPUT for how the pages of the event/click/link files get into the page table
-// (default: on first touch, with the kernel's fault-around):
-//   populate  the whole file when it is mapped (MAP_POPULATE; serial, in the MAP stage)
-//   seq       as default plus MADV_SEQUENTIAL
-//   chunk     each 2 MB chunk in one call right before the thread parses it (MADV_POPULATE_READ, Linux 5.14+)
-static int optInput=0;
-#ifndef MADV_POPULATE_READ
-#define MADV_POPULATE_READ 22
-#endif
 static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
  vector<size_t> lens(paths.size(),0);size_t total=0;
  for(size_t i=0;i<paths.size();++i){
@@ -226,11 +217,10 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
   if(!lens[i])continue;
   int fd=open(paths[i].c_str(),O_RDONLY);
   if(fd<0)throw runtime_error("Cannot open "+paths[i].string());
-  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED|(optInput==1?MAP_POPULATE:0),fd,0);
+  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
   close(fd);
   if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
   if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
-  if(optInput==2)madvise(got,lens[i],MADV_SEQUENTIAL);
   out[i]={g.base+off,lens[i]};
   off+=((lens[i]+4095)&~size_t(4095))+4096;g.ends.push_back(off);
  }
@@ -802,11 +792,13 @@ template<class T,size_t BYTES> struct Blocks{
  T* at_mark(uint32_t m)const{Block* b=tail;for(size_t k=nblocks-(m>>8);k;--k)b=b->prev;return &b->items[m&255];}
 };
 using EvList=Blocks<Ev,4096>;using ClickList=Blocks<Click,4096>;
+struct DRec;struct DCRec; // dense rows in bucket form, defined with the dense route below
 struct alignas(64) ThreadState{
  SmallTable users; // IDs that did not fit in the shared table
  vector<pair<const char*,int64_t>> ingestSide; // (event id pointer, ingest ms) of records whose ingest code is INGEST_SIDE
  vector<Bucket<PRec>> eb;vector<Bucket<CRec>> cb; // parsed lines by event/click ID hash
  uint32_t tid=0; // index of this thread's state (a LOCAL_USER number only means something together with it)
+ vector<Bucket<DRec>> db;vector<Bucket<DCRec>> dcb; // dense rows in bucket form, by counter range (SS_DENSE_RECORDS=bucket)
  uint64_t slotWaits=0; // eslotWaits of this thread
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
@@ -1154,8 +1146,24 @@ static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32
 //   users   a dense user ID with alias 0-7 of a non-complex index becomes DENSE_USER | (index<<3 | alias)
 //   events  an event line with a dense event_id goes to its slot denseEv[counter] (eslot_commit)
 //   clicks  a valid click line with a dense click_id goes to its slot denseCl[counter]
-// (The vector loops ask for a slot's memory when the ID is decoded and write the slot at the end of the line.)
-struct DenseParse{bool users=false,events=false,clicks=false;};
+// Dense records come in two forms (SS_DENSE_RECORDS):
+//   slot    the parse stage writes the slot itself. The vector loops ask for the slot's memory when the ID is
+//           decoded and write it at the end of the line, or `ahead` dense rows later (SS_DENSE_AHEAD, 1-16).
+//   bucket  the row is appended to a per-thread bucket by counter range (counter >> shE / shC); a later pass
+//           fills the slot arrays bucket by bucket, so the random writes stay inside a small range.
+struct DenseParse{bool users=false,events=false,clicks=false,bucket=false;unsigned ahead=0,shE=14,shC=14;};
+// A dense event line in bucket form, valid or not. k as in PRec (0 = not a valid event), ingest = exact
+// ingest_ts in ms, lo = the low shE bits of the counter: counter = (bucket index << shE) | lo.
+struct DRec{uint64_t k;int64_t ingest;uint32_t user;uint16_t cat;uint16_t lo;};
+static_assert(sizeof(DRec)==24);
+// A valid click line in bucket form. kc = counter, key as in CRec.
+struct DCRec{uint64_t key;uint32_t kc;uint32_t user;};
+static_assert(sizeof(DCRec)==16);
+// A dense row waiting for its slot (slot form with ahead > 0). uct overlays nothing else: the user is final when
+// the row enters. A free place points at a scratch slot of the loop, so leaving the ring needs no test.
+static constexpr unsigned RING_MAX=16;
+struct ERing{uint64_t k;int64_t ingest;uint64_t uct;ESlot* slot;};
+struct CRing{uint64_t key;CSlot* slot;uint32_t user;uint32_t pad;};
 static DenseParse dparse;
 // The route of an ID depends on its text only. These are the definitions every path must agree with
 // (the vector loops use parse36_v3, which gives the same answer as dn::parse36).
@@ -1276,49 +1284,6 @@ SS_V3I bool ts_v3(const char* p,unsigned n,DateMemo3* memo,int64_t& out){
   }
  }
  return parse_ts(string_view(p,n),out);
-}
-// Two experiments for the branch predictor, off by default (compile with -DSS_TS_SELECT / -DSS_KIND_ARITH).
-// Simulated on dev (callgrind --branch-sim): SS_TS_SELECT removes 0.49 mispredicts per event line for 54
-// more instructions, SS_KIND_ARITH 0.14 for 8.5; on the development machine both measured equal or slower.
-// The same answer as ts_v3, organised for the branch predictor: which form a ts has (F1, epoch
-// milliseconds, F2) changes from line to line with no pattern, so the two common forms are both worked
-// out without a branch and one is selected; only what is neither (F2, other lengths, a date not in the
-// memo yet, bad text) takes a branch, to ts_v3, which decides everything.
-SS_V3I bool ts_v3b(const char* p,unsigned n,DateMemo3* memo,int64_t& out){
- // F1: time of day and memo lookup, valid or not
- const __m128i x=_mm_loadu_si128((const __m128i*)(p+3));
- const __m128i tmpl=_mm_setr_epi8(0,0,0,0,0,0,0,'T','0','0',':','0','0',':','0','0');
- const __m128i lim=_mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,0,2,9,0,5,9,0,5,9);
- const __m128i v=_mm_sub_epi8(x,tmpl);
- const unsigned shape=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(v,lim),lim));
- const __m128i sm=_mm_madd_epi16(_mm_maddubs_epi16(v,_mm_setr_epi8(0,0,0,0,0,0,0,0,10,1,0,10,1,0,10,1)),_mm_setr_epi16(0,0,0,0,3600,60,60,1));
- const uint64_t r=(uint64_t)_mm_extract_epi64(sm,1);
- const uint64_t tod=((uint64_t)(uint32_t)r+(r>>32))*1000u; // exact whenever shape is all ones (see tod_v3); otherwise unused
- uint64_t k;uint16_t cc;memcpy(&k,p+2,8);memcpy(&cc,p,2);
- const DateMemo3& e=memo[((k&0x0F03000F01000000ULL)*((1ULL<<4)|(1ULL<<22)|(1ULL<<34)))>>52];
- const uint64_t dayms=(uint64_t)e.ms; // read whether or not it is the right entry
- // all-ones if the text is a valid F1 stamp whose date the memo knows, else zero (plain arithmetic, so it stays branch-free)
- const uint64_t f1=0-(uint64_t)((unsigned)(n==20)&(unsigned)(p[19]=='Z')&(unsigned)(shape==0xFFFFu)&(unsigned)(tod<86400000ULL)&(unsigned)(e.k==k)&(unsigned)(e.cc==cc));
- // epoch milliseconds: thirteen digits
- const __m128i d=_mm_sub_epi8(_mm_loadu_si128((const __m128i*)p),_mm_set1_epi8('0'));
- const __m128i dlim=_mm_setr_epi8(9,9,9,9,9,9,9,9,9,9,9,9,9,-1,-1,-1);
- const unsigned digits=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(d,dlim),dlim));
- const __m128i a=_mm_maddubs_epi16(d,_mm_setr_epi8(10,1,10,1,10,1,10,1,10,1,10,1,1,0,0,0));
- const __m128i b=_mm_madd_epi16(a,_mm_setr_epi16(100,1,100,1,100,1,1,0));
- const __m128i c=_mm_packus_epi32(b,b);
- const uint64_t q=(uint64_t)_mm_cvtsi128_si64(_mm_madd_epi16(c,_mm_setr_epi16(10000,1,10,1,0,0,0,0)));
- const int64_t epoch=(int64_t)((q&0xFFFFFFFFULL)*100000ULL+(q>>32)); // exact whenever digits is all ones (see epoch13_v3)
- const uint64_t f3=0-(uint64_t)((unsigned)(n==13)&(unsigned)(digits==0xFFFFu));
- out=(int64_t)(((dayms+tod)&f1)|((uint64_t)epoch&~f1));
- if(__builtin_expect((f1|f3)!=0,1))return true;
- return ts_v3(p,n,memo,out);
-}
-// event_kind() with the view/cart choice as arithmetic: which of the two a line is has no pattern,
-// while "four letters" is almost always true and predicts well.
-static inline __attribute__((always_inline)) unsigned event_kind_b(const char* p,unsigned n){
- if(__builtin_expect(n==4,1)){uint32_t w;memcpy(&w,p,4);return (unsigned)(w==0x77656976u)+2u*(unsigned)(w==0x74726163u);}
- if(n==8){uint64_t w;memcpy(&w,p,8);return w==0x6573616863727570ULL?3u:0u;}
- return 0;
 }
 // hkey() of the n bytes at p, without the loop for the usual short IDs.
 // HKEY_START[n] is hkey's starting value for length n.
@@ -1510,17 +1475,17 @@ static inline bool chunk_lines(const char* base,size_t len,size_t from,size_t to
 }
 // What an event loop keeps across lines (never changes during a chunk).
 struct EvLoop{ThreadState& tl;KeyTable& tab;const KeyTable& products;size_t PE;const char* end;DateMemo3* memo;int64_t wstart;uint64_t wlen,ibase;Bucket<PRec>* buckets;KeyTable::Slot* slots;size_t tmask;
- bool dUsers;uint64_t ke,ku,limE;ESlot* ev;uint64_t tid48; // dense route (dparse); tid48 = thread index << 48 (eslot_uct)
+ bool dUsers;uint64_t ke,ku,limE;ESlot* ev;uint64_t tid48;bool bucket;unsigned ahead,shE;uint32_t loMask;Bucket<DRec>* db; // dense route (dparse); tid48 = thread index << 48 (eslot_uct)
  EvLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& products_,size_t PE_,const char* end_):tl(tl_),tab(tab_),products(products_),PE(PE_),end(end_),memo(date_memo3()),
   wstart(window_start),wlen((uint64_t)(window_end-window_start)),ibase((uint64_t)ingestBase),buckets(tl_.eb.data()),slots(tab_.slots),tmask(tab_.mask),
-  dUsers(dparse.users),ke(dense.ke),ku(dense.ku),limE(dense.limE),ev(denseEv),tid48((uint64_t)tl_.tid<<48){}
+  dUsers(dparse.users),ke(dense.ke),ku(dense.ku),limE(dense.limE),ev(denseEv),tid48((uint64_t)tl_.tid<<48),bucket(dparse.bucket),ahead(dparse.ahead),shE(dparse.shE),loMask((1u<<dparse.shE)-1),db(tl_.db.data()){}
 };
 // Start of window 2 of an event line: one past the third comma of window 1 (p+65 if there is none).
 SS_V3I const char* event_window2(const char* p,uint64_t c){return p+_tzcnt_u64(_blsr_u64(_blsr_u64(c)))+1;}
 // One event line at p, given the masks of its two windows (w1 at p, w2 at b=event_window2(p,w1.c)).
 // Does exactly what for_records<7> + the general event handler would do with the line; `general` is
 // that handler and gets the line if the short path passes it on. Returns the start of the next line.
-template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const EvLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,GEN&& general){
+template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const EvLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,ERing* const ring,unsigned& rpos,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& products=lp.products;const size_t PE=lp.PE;
  DateMemo3* const memo=lp.memo;const int64_t wstart=lp.wstart;const uint64_t wlen=lp.wlen,ibase=lp.ibase;
  Bucket<PRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
@@ -1573,24 +1538,17 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
    if(DREC){
     uint64_t ye,yu;unsigned me,mu;
     if(__builtin_expect(parse36x2_v3(s0+1,l0-1,s1+1,l1-1,ye,yu,me,mu),1)){
-     if(__builtin_expect(s0[0]=='e'&&parse36x2_ok(ye,me)&&(ve=dn::index_of(ye,lp.ke))<lp.limE,1)){dEv=true;__builtin_prefetch(&lp.ev[ve],1,3);}
+     if(__builtin_expect(s0[0]=='e'&&parse36x2_ok(ye,me)&&(ve=dn::index_of(ye,lp.ke))<lp.limE,1)){dEv=true;if(!lp.bucket)__builtin_prefetch(&lp.ev[ve],1,3);}
      uDense=s1[0]=='u'&&parse36x2_ok(yu,mu)&&dense_user_code(dn::index_of(yu,lp.ku),ucode);
     }else{ // a byte that is no digit in one of the two texts: each on its own
-     if(s0[0]=='e'&&parse36_v3(s0+1,l0-1,ye)&&(ve=dn::index_of(ye,lp.ke))<lp.limE){dEv=true;__builtin_prefetch(&lp.ev[ve],1,3);}
+     if(s0[0]=='e'&&parse36_v3(s0+1,l0-1,ye)&&(ve=dn::index_of(ye,lp.ke))<lp.limE){dEv=true;if(!lp.bucket)__builtin_prefetch(&lp.ev[ve],1,3);}
      uDense=s1[0]=='u'&&parse36_v3(s1+1,l1-1,yu)&&dense_user_code(dn::index_of(yu,lp.ku),ucode);
     }
    }
-#ifdef SS_KIND_ARITH
-   const unsigned kind=event_kind_b(b+b4,l4);
-#else
    const unsigned kind=event_kind(string_view(b+b4,l4));
-#endif
    uint64_t k=0;unsigned cat=0; // k stays 0 unless the line is a valid event
    if(kind&&l1!=0&&has5){
     int64_t ts;bool tsOk;
-#ifdef SS_TS_SELECT
-    tsOk=ts_v3b(s2,l2,memo,ts);
-#else
     {
      uint64_t a8,b8;uint16_t a2,b2_;
      // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
@@ -1599,7 +1557,6 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
       if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
      }else tsOk=ts_v3(s2,l2,memo,ts);
     }
-#endif
     // window_start <= ts < window_end as one unsigned compare (the window is far shorter than 2^63 ms)
     uint64_t tsrel;
     if(tsOk&&(tsrel=(uint64_t)ts-(uint64_t)wstart)<wlen&&ingest-ts<=DAY){
@@ -1628,8 +1585,21 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
      resolve_users(&pu,&pu+1,tab,tl);
     }
     if(__builtin_expect(dEv,1)){
-     send=max(send,(uint32_t)ve+1);
-     eslot_commit(lp.ev[ve],k?k:ESLOT_INVALID,(uint64_t)user|((uint64_t)cat<<32)|lp.tid48,ingest); // cat < 2^16
+     if(lp.bucket){ // bucket form: appended by counter range, like a PRec
+      Bucket<DRec>& vec=lp.db[ve>>lp.shE];
+      if(__builtin_expect(vec.full(),0))vec.reserve(max<size_t>(16,2*vec.capacity()));
+      DRec r;r.k=k;r.ingest=ingest;r.user=user;r.cat=(uint16_t)cat;r.lo=(uint16_t)((uint32_t)ve&lp.loMask);
+      vec.append(r);
+     }else{
+      send=max(send,(uint32_t)ve+1);
+      const uint64_t kk=k?k:ESLOT_INVALID,uct=(uint64_t)user|((uint64_t)cat<<32)|lp.tid48; // cat < 2^16
+      if(lp.ahead){ // the row waits; the row it replaces has had `ahead` rows of time for its slot's memory to arrive
+       ERing& e=ring[rpos];
+       eslot_commit(*e.slot,e.k,e.uct,e.ingest);
+       e.k=kk;e.ingest=ingest;e.uct=uct;e.slot=&lp.ev[ve];
+       rpos=rpos+1==lp.ahead?0:rpos+1;
+      }else eslot_commit(lp.ev[ve],kk,uct,ingest);
+     }
     }else{ // an event_id that is not dense: a bucket record, as in the other loops
      const uint64_t h=hkey_v3(s0,l0);
      Bucket<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
@@ -1665,9 +1635,11 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
 #define SS_EVENT_LOOP(NAME,TARGET,MASKS) \
 template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
- const EvLoop lp(tl,tab,products,PE,base+len);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* send: one past the highest counter written to a slot */ /* dmax: largest dense user code seen */ \
- while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,general);} \
+ const EvLoop lp(tl,tab,products,PE,base+len);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* send: one past the highest counter written to a slot */ \
+ ESlot scratch;scratch.k.store(0,memory_order_relaxed);ERing ring[RING_MAX];unsigned rpos=0;for(ERing& e:ring){e.k=ESLOT_INVALID;e.ingest=0;e.uct=0;e.slot=&scratch;} /* dmax: largest dense user code seen */ \
+ while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,ring,rpos,general);} \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
+ for(const ERing& e:ring)eslot_commit(*e.slot,e.k,e.uct,e.ingest); /* the rows still waiting (free places write the scratch slot) */ \
  tl.evEnd=max(tl.evEnd,send); \
 }
 // The same loop with a line index (SS_LINES=index): the newlines of the next IX_BLOCK bytes are located
@@ -1679,16 +1651,18 @@ static constexpr size_t IX_BLOCK=1024;
 template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
- const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* send: one past the highest counter written to a slot */ /* dmax: largest dense user code seen */ \
+ const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* send: one past the highest counter written to a slot */ \
+ ESlot scratch;scratch.k.store(0,memory_order_relaxed);ERing ring[RING_MAX];unsigned rpos=0;for(ERing& e:ring){e.k=ESLOT_INVALID;e.ingest=0;e.uct=0;e.slot=&scratch;} /* dmax: largest dense user code seen */ \
  const char* starts[IX_BLOCK+64];const char* scan=p; \
  while(p<lim){ \
   size_t n=0; \
   for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
-  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,general);p=starts[i];} \
+  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,ring,rpos,general);p=starts[i];} \
   if(scan>=end&&p<lim){ /* the last line has no newline */ \
-   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,general);break;} \
+   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,ring,rpos,general);break;} \
  } \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
+ for(const ERing& e:ring)eslot_commit(*e.slot,e.k,e.uct,e.ingest); /* the rows still waiting (free places write the scratch slot) */ \
  tl.evEnd=max(tl.evEnd,send); \
 }
 SS_EVENT_LOOP_IX(events_avx2_ix,SS_V3,win_masks_avx2,nl_mask_avx2)
@@ -1699,12 +1673,12 @@ SS_EVENT_LOOP(events_avx512z,SS_V5,win_masks_avx512z)
 SS_EVENT_LOOP(events_avx512y,SS_V5,win_masks_avx512y)
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
- bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid; // dense route (dparse)
+ bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
  ClLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& camps_,size_t PC_,const char* end_,int64_t clickStart_):tl(tl_),tab(tab_),camps(camps_),PC(PC_),end(end_),memo(date_memo3()),
   clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask),
-  dUsers(dparse.users),kc(dense.kc),ku(dense.ku),limC(dense.limC),cl(denseCl),tid(tl_.tid){}
+  dUsers(dparse.users),kc(dense.kc),ku(dense.ku),limC(dense.limC),cl(denseCl),tid(tl_.tid),bucket(dparse.bucket),ahead(dparse.ahead),shC(dparse.shC),dcb(tl_.dcb.data()){}
 };
-template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const p,const WinMasks w,const ClLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,GEN&& general){
+template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const p,const WinMasks w,const ClLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,CRing* const ring,unsigned& rpos,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& camps=lp.camps;const size_t PC=lp.PC;
  DateMemo3* const memo=lp.memo;const int64_t clickStart=lp.clickStart;const uint64_t wlen=lp.wlen;
  Bucket<CRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
@@ -1730,10 +1704,10 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    if(DREC){
     uint64_t yk,yu;unsigned mk,mu;
     if(__builtin_expect(parse36x2_v3(s0+1,l0-1,p+b1+1,l1-1,yk,yu,mk,mu),1)){
-     if(__builtin_expect(s0[0]=='k'&&parse36x2_ok(yk,mk)&&(kcn=dn::index_of(yk,lp.kc))<lp.limC,1)){dCl=true;__builtin_prefetch(&lp.cl[kcn],1,3);}
+     if(__builtin_expect(s0[0]=='k'&&parse36x2_ok(yk,mk)&&(kcn=dn::index_of(yk,lp.kc))<lp.limC,1)){dCl=true;if(!lp.bucket)__builtin_prefetch(&lp.cl[kcn],1,3);}
      uDense=p[b1]=='u'&&parse36x2_ok(yu,mu)&&dense_user_code(dn::index_of(yu,lp.ku),ucode);
     }else{
-     if(s0[0]=='k'&&parse36_v3(s0+1,l0-1,yk)&&(kcn=dn::index_of(yk,lp.kc))<lp.limC){dCl=true;__builtin_prefetch(&lp.cl[kcn],1,3);}
+     if(s0[0]=='k'&&parse36_v3(s0+1,l0-1,yk)&&(kcn=dn::index_of(yk,lp.kc))<lp.limC){dCl=true;if(!lp.bucket)__builtin_prefetch(&lp.cl[kcn],1,3);}
      uDense=p[b1]=='u'&&parse36_v3(p+b1+1,l1-1,yu)&&dense_user_code(dn::index_of(yu,lp.ku),ucode);
     }
    }
@@ -1744,11 +1718,7 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
    uint64_t trel;
-#ifdef SS_TS_SELECT
-   const bool tsOk=ts_v3b(p+b3,l3,memo,ts);
-#else
    const bool tsOk=ts_v3(p+b3,l3,memo,ts);
-#endif
    if(!tsOk||(trel=(uint64_t)ts-(uint64_t)clickStart)>=wlen)break; // clickStart <= ts < window_end
    uint64_t k0;uint32_t k1;
    const string_view camp(p+b2,l2);
@@ -1765,7 +1735,22 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
      pu.j=(uint32_t)(KeyTable::hash_packed(pu.k0,pu.k1)&tmask);pu.u=s1;pu.up=&user;
      resolve_users(&pu,&pu+1,tab,tl);
     }
-    if(__builtin_expect(dCl,1)){send=max(send,(uint32_t)kcn+1);cslot_commit(lp.cl[kcn],ckey,user,lp.tid);}
+    if(__builtin_expect(dCl,1)){
+     if(lp.bucket){
+      Bucket<DCRec>& vec=lp.dcb[kcn>>lp.shC];
+      if(__builtin_expect(vec.full(),0))vec.reserve(max<size_t>(16,2*vec.capacity()));
+      DCRec r;r.key=ckey;r.kc=(uint32_t)kcn;r.user=user;
+      vec.append(r);
+     }else{
+      send=max(send,(uint32_t)kcn+1);
+      if(lp.ahead){
+       CRing& e=ring[rpos];
+       cslot_commit(*e.slot,e.key,e.user,lp.tid);
+       e.key=ckey;e.slot=&lp.cl[kcn];e.user=user;
+       rpos=rpos+1==lp.ahead?0:rpos+1;
+      }else cslot_commit(lp.cl[kcn],ckey,user,lp.tid);
+     }
+    }
     else{
      CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=ckey;r.user=user;
      Bucket<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
@@ -1798,24 +1783,26 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
 #define SS_CLICK_LOOP(NAME,TARGET,MASKS) \
 template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
- const ClLoop lp(tl,tab,camps,PC,base+len,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* dmax: largest dense user code seen */ \
- while(p<lim)p=click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,general); \
+ const ClLoop lp(tl,tab,camps,PC,base+len,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CSlot scratch;CRing ring[RING_MAX];unsigned rpos=0;for(CRing& e:ring){e.key=0;e.slot=&scratch;e.user=0;} /* dmax: largest dense user code seen */ \
+ while(p<lim)p=click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,ring,rpos,general); \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
+ for(const CRing& e:ring)cslot_commit(*e.slot,e.key,e.user,lp.tid); \
  tl.clEnd=max(tl.clEnd,send); \
 }
 #define SS_CLICK_LOOP_IX(NAME,TARGET,MASKS,NLMASK) \
 template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
- const ClLoop lp(tl,tab,camps,PC,end,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* dmax: largest dense user code seen */ \
+ const ClLoop lp(tl,tab,camps,PC,end,clickStart);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CSlot scratch;CRing ring[RING_MAX];unsigned rpos=0;for(CRing& e:ring){e.key=0;e.slot=&scratch;e.user=0;} /* dmax: largest dense user code seen */ \
  const char* starts[IX_BLOCK+64];const char* scan=p; \
  while(p<lim){ \
   size_t n=0; \
   for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
-  for(size_t i=0;i<n&&p<lim;++i){click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,general);p=starts[i];} \
-  if(scan>=end&&p<lim){p=click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,general);break;} \
+  for(size_t i=0;i<n&&p<lim;++i){click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,ring,rpos,general);p=starts[i];} \
+  if(scan>=end&&p<lim){p=click_line_v3<DREC>(p,MASKS(p),lp,pend,pp,dmax,send,ring,rpos,general);break;} \
  } \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
+ for(const CRing& e:ring)cslot_commit(*e.slot,e.key,e.user,lp.tid); \
  tl.clEnd=max(tl.clEnd,send); \
 }
 SS_CLICK_LOOP_IX(clicks_avx2_ix,SS_V3,win_masks_avx2,nl_mask_avx2)
@@ -1833,7 +1820,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;}};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
- if(const char* v=getenv("SS_INPUT")){const string_view w(v);optInput=w=="populate"?1:w=="seq"?2:w=="chunk"?3:0;}
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
@@ -1864,9 +1850,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // ---- Dense IDs: find the generator's keys from the first lines of one event file and one click file. ----
  // (SS_NODENSE=1 turns the dense route off.)
  if(!getenv("SS_NODENSE")&&sampleLen){
-  const size_t look=min<size_t>(sampleLen,size_t(1)<<16);
-  const vector<uint64_t> es=dn::sample_ids(sampleBase,look,0,'e',24),us=dn::sample_ids(sampleBase,look,1,'u',24);
-  vector<uint64_t> cs;for(const Chunk& c:chunks)if(c.click&&c.from==0){cs=dn::sample_ids(c.base,min<size_t>(c.len,size_t(1)<<16),0,'k',24);if(cs.size()>=12)break;}
+  // 24 IDs per column: from the first lines of a small file, six each from four places of a larger one
+  // (so that a few odd lines at the head of a file do not decide for the whole file).
+  auto sample=[](const char* base,size_t len,int col,char letter){
+   if(len<=(size_t(1)<<16))return dn::sample_ids(base,len,col,letter,24);
+   vector<uint64_t> out;
+   for(size_t k=0;k<4;++k){const size_t off=len/4*k; // a place inside the file starts in the middle of a line: sample_ids skips to the next one
+    for(uint64_t y:dn::sample_ids(base+off,min<size_t>(len-off,size_t(1)<<14),col,letter,6))out.push_back(y);}
+   return out;
+  };
+  const vector<uint64_t> es=sample(sampleBase,sampleLen,0,'e'),us=sample(sampleBase,sampleLen,1,'u');
+  vector<uint64_t> cs;for(const Chunk& c:chunks)if(c.click&&c.from==0){cs=sample(c.base,c.len,0,'k');if(cs.size()>=12)break;}
   dn::Info d;
   d.limE=min<uint64_t>(estEvents+estEvents/8+4096,uint64_t(1)<<31);
   d.limC=min<uint64_t>(estClicks+estClicks/8+4096,uint64_t(1)<<31);
@@ -1886,11 +1880,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Parse-stage switches of the dense route:
  //   SS_DENSE_USERS=0    dense user IDs go through the ID table like all others, links included (default: they get
  //                       DENSE_USER codes straight from the text if the links stage allows it; see denseUsers)
- //   SS_DENSE_RECORDS=0  event / click lines with a dense ID go to the general buckets (default: straight into the slot
- //                       arrays denseEv / denseCl, which the DENSE stage reads; needs dense users)
+ //   SS_DENSE_RECORDS    what happens to event / click lines with a dense ID (needs dense users):
+ //                       slot (default)  the parse stage writes them straight into the slot arrays denseEv / denseCl
+ //                       bucket          per-thread buckets by counter range (DRec / DCRec); a later pass fills the slots
+ //                       0               the general buckets, as for every other ID
+ //   SS_DENSE_AHEAD=n    slot form: write a slot n dense rows after asking for its memory (0-16, default 0 = at the end of the line)
+ //   SS_DSHIFT, SS_CSHIFT  bucket form: log2 of the counters per event / click bucket (4-16 / 4-24, default 14)
  //   SS_DENSE_DUMP=dir   test only: writes every record of the parse stage as text and stops after the parse stage ("-": only stops)
  {const char* rec=getenv("SS_DENSE_RECORDS");const bool recOn=!(rec&&rec[0]=='0');
-  dparse.events=dense.events&&recOn;dparse.clicks=dense.clicks&&recOn;}
+  dparse.events=dense.events&&recOn;dparse.clicks=dense.clicks&&recOn;
+  dparse.bucket=rec&&string_view(rec)=="bucket";}
+ if(const char* v=getenv("SS_DENSE_AHEAD")){const int x=atoi(v);if(x>=0&&x<=(int)RING_MAX)dparse.ahead=(unsigned)x;}
+ if(const char* v=getenv("SS_DSHIFT")){const int x=atoi(v);if(x>=4&&x<=16)dparse.shE=(unsigned)x;}
+ if(const char* v=getenv("SS_CSHIFT")){const int x=atoi(v);if(x>=4&&x<=24)dparse.shC=(unsigned)x;}
  const char* const dumpDir=getenv("SS_DENSE_DUMP");
  const bool dumpText=dumpDir&&strcmp(dumpDir,"-"); // "-": write nothing, only stop after the parse stage (for measuring it)
  cerr<<"dense: events "<<dense.events<<" clicks "<<dense.clicks<<"\n";
@@ -1917,7 +1919,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(denseUsers)denseComp=(atomic<uint32_t>*)map_huge((dense.limI+1)*sizeof(uint32_t));
  dparse.users=denseUsers;
  if(!denseUsers)dparse.events=dparse.clicks=false; // the record loops decode both IDs of a line together
- cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<"\n";
+ if(!dparse.events&&!dparse.clicks)dparse.bucket=false;
+ cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<"\n";
  // First pass over the link files.
  // Without dense users it only counts lines (the table and the union-find arrays are sized by them).
  // With dense users it is the only pass that reads the files: a "simple" line - two dense user IDs
@@ -2172,12 +2175,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // in the parse stage on the scoring machine. SS_LINES=plain switches back to the loop without the index.
  const bool lineIndex=isaUse!=ISA_SSE2&&!(getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="plain");
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
-#ifdef SS_TS_SELECT
-  <<"+tsselect"
-#endif
-#ifdef SS_KIND_ARITH
-  <<"+kindarith"
-#endif
   <<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
@@ -2188,8 +2185,31 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  atomic<size_t> nextChunk{0};
  const int64_t clickStart=window_start-WEEK;
  // Dense slots: zero pages, touched by whoever writes a slot first.
- if(dparse.events)denseEv=(ESlot*)map_huge((size_t)(dense.limE+1)*sizeof(ESlot));
- if(dparse.clicks)denseCl=(CSlot*)map_huge((size_t)(dense.limC+1)*sizeof(CSlot));
+ if(dparse.events&&!dparse.bucket)denseEv=(ESlot*)map_huge((size_t)(dense.limE+1)*sizeof(ESlot));
+ if(dparse.clicks&&!dparse.bucket)denseCl=(CSlot*)map_huge((size_t)(dense.limC+1)*sizeof(CSlot));
+ // Bucket form: one bucket per 2^sh counters and thread.
+ const size_t DE=dparse.bucket&&dparse.events?(size_t)(dense.limE>>dparse.shE)+1:0,DC=dparse.bucket&&dparse.clicks?(size_t)(dense.limC>>dparse.shC)+1:0;
+ // How full they get: counters are 0 .. D-1 with D = number of distinct IDs, which is smaller than the number of
+ // lines (copies) and well below the limit. The generator shuffles the lines, so the largest counter in the first
+ // lines of a file gives D closely; lines per bucket = lines * 2^sh / D. A wrong guess only costs growth.
+ auto dense_span=[&](const char* base,size_t len,char letter,uint64_t key,uint64_t limit)->uint64_t{
+  if(!base)return limit;
+  uint64_t n=0,m=0;
+  for(uint64_t y:dn::sample_ids(base,min<size_t>(len,size_t(256)<<10),0,letter,SIZE_MAX)){const uint64_t c=dn::index_of(y,key);if(c<limit){++n;m=max(m,c);}}
+  return n<256?limit:min(limit,m+1+4*(m+1)/n);
+ };
+ const char* clickBase=nullptr;size_t clickLen=0;
+ for(const Chunk& c:chunks)if(c.click&&c.from==0&&c.len>clickLen){clickBase=c.base;clickLen=c.len;}
+ const uint64_t spanE=DE?max<uint64_t>(1,dense_span(sampleBase,sampleLen,'e',dense.ke,dense.limE)):1;
+ const uint64_t spanC=DC?max<uint64_t>(1,dense_span(clickBase,clickLen,'k',dense.kc,dense.limC)):1;
+ // Records per bucket and thread: the expected number, 3% for the line estimate, five standard deviations.
+ auto dense_reserve=[&](uint64_t lines,uint64_t span,unsigned sh)->size_t{
+  const double lam=(double)lines*(double)(uint64_t(1)<<sh)/((double)span*(double)T);
+  return (size_t)(lam*1.03+5.0*sqrt(lam))+16;
+ };
+ const size_t rdFull=DE?dense_reserve(estEvents,spanE,dparse.shE):0,rdcFull=DC?dense_reserve(estClicks,spanC,dparse.shC):0;
+ const size_t usedE=DE?min<size_t>(DE,(size_t)((spanE-1)>>dparse.shE)+1):0,usedC=DC?min<size_t>(DC,(size_t)((spanC-1)>>dparse.shC)+1):0;
+ if(getenv("SS_STATS")&&(DE||DC))cerr<<"STATS dense buckets events "<<DE<<" (span "<<spanE<<", "<<usedE<<" x "<<rdFull<<" records) clicks "<<DC<<" (span "<<spanC<<", "<<usedC<<" x "<<rdcFull<<" records)\n";
  if(T>65535)throw runtime_error("Too many threads"); // ESlot::thread
  #pragma omp parallel num_threads(T)
  {
@@ -2199,10 +2219,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   {// With the dense slots on, the hash buckets only get the few general rows: start them small (they grow).
    const size_t re=dparse.events?(size_t)(estEvents/((uint64_t)T*PE)/64)+16:(size_t)(estEvents/((uint64_t)T*PE)*9/8)+16;
    const size_t rc=dparse.clicks?(size_t)(estClicks/((uint64_t)T*PC)/64)+16:(size_t)(estClicks/((uint64_t)T*PC)*9/8)+16;
-   const size_t need=PE*(re*sizeof(PRec)+64)+PC*(rc*sizeof(CRec)+64);
+   // Dense buckets past the counters in use stay small.
+   const size_t need=PE*(re*sizeof(PRec)+64)+PC*(rc*sizeof(CRec)+64)
+    +usedE*(rdFull*sizeof(DRec)+64)+(DE-usedE)*(16*sizeof(DRec)+64)+usedC*(rdcFull*sizeof(DCRec)+64)+(DC-usedC)*(16*sizeof(DCRec)+64);
    tlArena.stage=0;tlArena.add_region(need+(size_t(4)<<20),need); // one pre-faulted block per thread for its buckets
    for(auto& v:tl.eb)v.reserve(re);
    for(auto& v:tl.cb)v.reserve(rc);
+   tl.db.resize(DE);tl.dcb.resize(DC);
+   for(size_t i=0;i<DE;++i)tl.db[i].reserve(i<usedE?rdFull:16);
+   for(size_t i=0;i<DC;++i)tl.dcb[i].reserve(i<usedC?rdcFull:16);
   }
   // SS_DENSE_DUMP: text forms for the test dump (IDs can hold any byte, so they are written in hex).
   auto dump_user=[&](uint32_t user)->string{ // what a record's user field stands for
@@ -2244,7 +2269,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    uint64_t ve=0;
    const bool dEv=dparse.events&&dense_counter(f[0].data(),f[0].size(),'e',dense.ke,dense.limE,ve);
    if(dumpText){tl.dumpRows+=string("E\t")+(dEv?"D":"P")+"\t"+hexstr(f[0])+"\t"+to_string(ingest)+"\t"+to_string(k)+"\t"+to_string(cat)+"\t"+(k?hexstr(f[1])+"\t"+dump_user(user):string("-\t-"))+"\n";}
-   if(dEv){tl.evEnd=max(tl.evEnd,(uint32_t)ve+1);eslot_commit(denseEv[ve],k?k:ESLOT_INVALID,eslot_uct(user,cat,tl.tid),ingest);return;}
+   if(dEv){
+    if(dparse.bucket){DRec r;r.k=k;r.ingest=ingest;r.user=user;r.cat=(uint16_t)cat;r.lo=(uint16_t)((uint32_t)ve&((1u<<dparse.shE)-1));tl.db[(size_t)(ve>>dparse.shE)].push_back(r);}
+    else{tl.evEnd=max(tl.evEnd,(uint32_t)ve+1);eslot_commit(denseEv[ve],k?k:ESLOT_INVALID,eslot_uct(user,cat,tl.tid),ingest);}
+    return;
+   }
    uint64_t code=testSide?INGEST_SIDE:ingest_code(ingest);
    if(code==INGEST_SIDE)tl.ingestSide.emplace_back(f[0].data(),ingest); // rare: keep the exact value on the side
    PRec r=make_prec(f[0].data(),h,code,k,cat);r.user=user;
@@ -2260,17 +2289,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    uint64_t kcn=0;
    const bool dCl=dparse.clicks&&dense_counter(f[0].data(),f[0].size(),'k',dense.kc,dense.limC,kcn);
    if(dumpText){tl.dumpRows+=string("C\t")+(dCl?"D":"P")+"\t"+hexstr(f[0])+"\t"+to_string(ckey)+"\t"+hexstr(f[1])+"\t"+dump_user(user)+"\n";}
-   if(dCl){tl.clEnd=max(tl.clEnd,(uint32_t)kcn+1);cslot_commit(denseCl[kcn],ckey,user,tl.tid);return;}
+   if(dCl){
+    if(dparse.bucket){DCRec r;r.key=ckey;r.kc=(uint32_t)kcn;r.user=user;tl.dcb[(size_t)(kcn>>dparse.shC)].push_back(r);}
+    else{tl.clEnd=max(tl.clEnd,(uint32_t)kcn+1);cslot_commit(denseCl[kcn],ckey,user,tl.tid);}
+    return;
+   }
    CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.key=ckey;r.user=user;
    tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
   };
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
-   if(optInput==3){ // files start on a page boundary, so chunk offsets are page offsets
-    const size_t a=ck.from&~size_t(4095),b=min(ck.to,ck.len);
-    if(b>a)madvise((void*)(ck.base+a),(b-a+4095)&~size_t(4095),MADV_POPULATE_READ); // only a hint: any failure is ignored
-   }
    // Dense records (DREC loops) exist with the line index only; SS_LINES=plain then applies to the other kind of file.
    const bool drec=ck.click?dparse.clicks:dparse.events;
    #define SS_RUN_LOOPS(ISA) \
@@ -2318,6 +2347,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     o<<"E\tP\t"<<hexstr(string_view(r.id,n))<<'\t'<<ing<<'\t'<<r.k<<'\t'<<r.cat<<'\t'<<(r.k?user_text(r.user):string("-"))<<'\n';}
    for(const auto& v:tls[t].cb)for(size_t i=0;i<v.size();++i){const CRec& r=v[i];
     o<<"C\tP\t"<<hexstr(string_view(r.id,r.idlen))<<'\t'<<r.key<<'\t'<<user_text(r.user)<<'\n';}
+   // bucket form: every dense row, with the ID text rebuilt from bucket index and record
+   for(size_t b=0;b<tls[t].db.size();++b)for(size_t i=0;i<tls[t].db[b].size();++i){const DRec& r=tls[t].db[b][i];char tx[9];
+    const size_t n=dn::text36('e',dn::value_of(((uint64_t)b<<dparse.shE)|r.lo,dense.ke),tx);
+    o<<"E\tB\t"<<hexstr(string_view(tx,n))<<'\t'<<r.ingest<<'\t'<<r.k<<'\t'<<(r.k?r.cat:0)<<'\t'<<(r.k?user_text(r.user):string("-"))<<'\n';}
+   for(size_t b=0;b<tls[t].dcb.size();++b)for(size_t i=0;i<tls[t].dcb[b].size();++i){const DCRec& r=tls[t].dcb[b][i];char tx[9];
+    const size_t n=dn::text36('k',dn::value_of(r.kc,dense.kc),tx);
+    if((r.kc>>dparse.shC)!=b)o<<"C\tWRONGBUCKET\t"<<hexstr(string_view(tx,n))<<'\n';
+    o<<"C\tB\t"<<hexstr(string_view(tx,n))<<'\t'<<r.key<<'\t'<<user_text(r.user)<<'\n';}
   }
   {
    ofstream o(fs::path(dumpDir)/"slots.txt",ios::binary);
