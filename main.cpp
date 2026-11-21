@@ -418,6 +418,7 @@ struct HugePool{
   cur=(char*)map_huge(want);lim=cur+want;
   if(optThrStats){tlGrowWall+=now_s()-t0;++tlGrowCalls;}
  }
+ void ensure(size_t bytes){if((size_t)(lim-cur)<bytes)grow(bytes);} // room for `bytes` without another mapping
  void* take(size_t bytes){
   bytes=(bytes+63)&~size_t(63);
   if((size_t)(lim-cur)<bytes)grow(bytes);
@@ -5760,6 +5761,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(evBase&&evEnd)slot_pieces(evBase,(size_t)denseEvEnd.load()<<evShift);
   if(denseCl&&clEnd)slot_pieces((const char*)denseCl,(size_t)denseClEnd.load()*sizeof(CSlot));
  }
+ // SS_UNMAP (measuring switch; default: the workers unmap, the event files before the index loop, the rest
+ // after the last loop):
+ //   bg       one helper thread unmaps both lists in 16 MB steps while the workers compute (the event files
+ //            from the start of this stage, the rest from the end of the last loop; what is left at the end
+ //            goes with the process). No worker waits in munmap, and a worker's mmap waits for one step at most.
+ //   bgfirst  the helper takes the event files only; the rest as today.
+ //   late     the workers unmap everything after the last loop, nothing before the index loop.
+ vector<pair<char*,size_t>> unmapLastBg;
+ {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=w=="bg"?1:w=="bgfirst"?2:w=="late"?3:0;
+  const auto unmap_bg=[](vector<pair<char*,size_t>> v){if(v.empty())return;
+   thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();};
+  // SS_POOLPRE=1 (measuring switch): every thread's pool gets its next region here, before any unmapping starts,
+  // so the workers' first takes of this stage need no mmap while other threads hold the mapping lock in munmap.
+  const bool poolPre=getenv("SS_POOLPRE")!=nullptr;
+  if(poolPre)for(int t=0;t<T;++t)surv[t].pool.ensure(size_t(8)<<20);
+  if(stats)cerr<<"STATS pools: SS_POOLPRE="<<poolPre<<"\n";
+  if(mode==3){unmapLast.insert(unmapLast.end(),unmapFirst.begin(),unmapFirst.end());unmapFirst.clear();}
+  if(mode==1||mode==2){unmap_bg(std::move(unmapFirst));unmapFirst.clear();}
+  if(mode==1)unmapLastBg.swap(unmapLast);
+  if(stats)cerr<<"STATS unmap: SS_UNMAP="<<(mode==1?"bg":mode==2?"bgfirst":mode==3?"late":"workers")<<" first "<<unmapFirst.size()<<" last "<<unmapLast.size()<<" helper-last "<<unmapLastBg.size()<<"\n";
+ }
  if(stats)thrR0=now_s();
  #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9])
  {
@@ -6462,6 +6484,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(file.is_open())file.close();
   if(stats){thr_stage_out();cur->endWall=cur->out-thrE0;}
  }
+ if(!unmapLastBg.empty())thread([v=std::move(unmapLastBg)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach(); // SS_UNMAP=bg
  if(stats)thr_line("aggregate",astat,thrA0?thrA0:thrR0,0,0);
  if(earlyOut)for(size_t t=0;t<earlyOut->fd.size();++t)if(earlyOut->fd[t]>=0){ // a file no worker wrote to: it must not stay behind empty
   ::close(earlyOut->fd[t]);earlyOut->fd[t]=-1;char name[32];snprintf(name,sizeof name,"part-%05d.parquet",(int)t);::unlink((output/"user_daily"/name).c_str());}
