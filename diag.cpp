@@ -169,9 +169,10 @@ static void run_child(const string& bin,vector<pair<string,string>> env,RunResul
   if(line.rfind("TIME ",0)==0){size_t sp=line.find(' ',5);if(sp!=string::npos)r.t[line.substr(5,sp-5)]+=atof(line.c_str()+sp+1);}}
  r.rc=WIFEXITED(st)?WEXITSTATUS(st):-1;
 }
-// Writes each CSV of `src` into `dst` `reps` times over (one output file per source file, header once),
-// with a replica letter put in front of the given ID fields so every copy has its own events and people.
-static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int idFields){
+// Writes each CSV of `src` into `dst` as `parts` files, each holding the header and `reps` tagged copies of the
+// data lines (a two-character replica tag goes in front of the given ID fields, so every copy has its own
+// events and people). Files of part 0 are named *-0.csv, so a smaller set can link to them.
+static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int parts,int idFields){
  fs::create_directories(dst);
  vector<fs::path> files;for(auto& f:fs::directory_iterator(src))if(f.path().extension()==".csv")files.push_back(f.path());
  sort(files.begin(),files.end());
@@ -179,27 +180,30 @@ static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int i
  par(8,[&](int){for(;;){size_t j=next.fetch_add(1);if(j>=files.size())break;
    string in;{ifstream f(files[j],ios::binary);in.assign(istreambuf_iterator<char>(f),{});}
    size_t hdr=in.find('\n');if(hdr==string::npos)hdr=in.size();else ++hdr;
-   char name[64];snprintf(name,sizeof name,"part-%05zu.csv",j);
-   FILE* f=fopen((dst/name).c_str(),"wb");if(!f)continue;
-   fwrite(in.data(),1,hdr,f);uint64_t wrote=hdr;
-   string out;out.reserve(in.size()+in.size()/8);
-   for(int rep=0;rep<reps;++rep){
-    out.clear();const char tag=(char)('A'+rep%26),tag2=(char)('a'+rep/26);
-    size_t p=hdr;
-    while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
-     size_t q=p;
-     for(int k=0;k<idFields&&q<=e;++k){ // tag the start of field k unless it is empty
-      size_t c=in.find(',',q);if(c==string::npos||c>e)c=e;
-      if(c>q){if(in[q]=='"'){out.push_back('"');if(c-q>2){out.push_back(tag);if(reps>26)out.push_back(tag2);}out.append(in,q+1,c-q-1);}else{out.push_back(tag);if(reps>26)out.push_back(tag2);out.append(in,q,c-q);}}
-      if(c<e)out.push_back(',');
-      q=c+1;
+   string out;out.reserve(in.size()+in.size()/6);
+   for(int part=0;part<parts;++part){
+    char name[64];snprintf(name,sizeof name,"part-%05zu-%d.csv",j,part);
+    FILE* f=fopen((dst/name).c_str(),"wb");if(!f)continue;
+    fwrite(in.data(),1,hdr,f);uint64_t wrote=hdr;
+    for(int r0=0;r0<reps;++r0){
+     const int rep=part*reps+r0;
+     out.clear();const char tag=(char)('A'+rep%26),tag2=(char)('a'+rep/26);
+     size_t p=hdr;
+     while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
+      size_t q=p;
+      for(int k=0;k<idFields&&q<=e;++k){ // tag the start of field k unless it is empty
+       size_t c=in.find(',',q);if(c==string::npos||c>e)c=e;
+       if(c>q){if(in[q]=='"'){out.push_back('"');if(c-q>2){out.push_back(tag);out.push_back(tag2);}out.append(in,q+1,c-q-1);}else{out.push_back(tag);out.push_back(tag2);out.append(in,q,c-q);}}
+       if(c<e)out.push_back(',');
+       q=c+1;
+      }
+      if(q<=e)out.append(in,q,e-q);
+      out.push_back('\n');p=e+1;
      }
-     if(q<=e)out.append(in,q,e-q);
-     out.push_back('\n');p=e+1;
+     fwrite(out.data(),1,out.size(),f);wrote+=out.size();
     }
-    fwrite(out.data(),1,out.size(),f);wrote+=out.size();
+    fclose(f);bytes+=wrote;
    }
-   fclose(f);bytes+=wrote;
  }});
  return bytes.load();
 }
@@ -267,38 +271,55 @@ int main(){
   fprintf(stderr,"DIAG RUN %s begin\n",label.c_str());RunResult r;r.label=label;run_child(bin,env,r);
   fprintf(stderr,"DIAG RUN %s end: wall %.3fs user %.3f sys %.3f minflt %ld rc=%d (total elapsed %.1fs)\n",label.c_str(),r.wall,r.user,r.sys,r.minflt,r.rc,now()-T0);results.push_back(r);};
  int runid=0;auto od=[&]{return scratch+"/dout"+to_string(runid++);};
- // ---- a practice-sized replica of the dev data: BIG copies, same number of files as the dev set ----
+ // ---- replicas of the dev data: `huge` = PARTS x BIG copies (final-sized with 3 x 20), `big` = links to its first part ----
  const int BIG=getenv("SS_DIAG_BIG")?atoi(getenv("SS_DIAG_BIG")):20;
- const fs::path big=fs::path(scratch)/"big";
+ const int PARTS=getenv("SS_DIAG_PARTS")?atoi(getenv("SS_DIAG_PARTS")):3;
+ const fs::path big=fs::path(scratch)/"big",huge=fs::path(scratch)/"huge";
  {double t=now();uint64_t b=0;
-  for(const char* sub:{"events","clicks","links"})b+=replicate(fs::path(data)/sub,big/sub,BIG,2);
-  for(const char* f:{"products.csv","campaigns.csv","manifest.json"})fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);
+  for(const char* sub:{"events","clicks","links"}){
+   b+=replicate(fs::path(data)/sub,huge/sub,BIG,PARTS,2);
+   fs::create_directories(big/sub);
+   for(auto& f:fs::directory_iterator(huge/sub)){const string n=f.path().filename().string();if(n.size()>6&&n.compare(n.size()-6,6,"-0.csv")==0)fs::create_symlink(f.path(),big/sub/n);}
+  }
+  for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
   gReplicaSec=now()-t;
-  fprintf(stderr,"DIAG replica: %d copies, %.1f MB written in %.2fs (elapsed %.1fs)\n",BIG,b/1e6,now()-t,now()-T0);}
- const string B=big.string();
+  fprintf(stderr,"DIAG replica: %d x %d copies, %.1f MB written in %.2fs (elapsed %.1fs)\n",PARTS,BIG,b/1e6,now()-t,now()-T0);}
+ const string B=big.string(),H=huge.string();
  auto timeleft=[&](double need){if(now()-T0+need>150){fprintf(stderr,"DIAG skipping the rest: out of time (%.1fs elapsed)\n",now()-T0);return false;}return true;};
- struct Var{const char* label;vector<pair<string,string>> env;const char* bin="";};
+ struct Var{const char* label;vector<pair<string,string>> env;const char* bin="";bool hugeSet=false;};
+ #define N8 {"NCPU","8"}
  const vector<Var> vars={
-  {"d1",{{"NCPU","8"}}},{"p1",{{"NCPU","8"}},"core-v31"},{"d2",{{"NCPU","8"}}},{"p2",{{"NCPU","8"}},"core-v31"},{"d3",{{"NCPU","8"}}},{"p3",{{"NCPU","8"}},"core-v31"},
-  {"abl1",{{"NCPU","8"},{"SS_ABL","1"}},"core-abl"},{"abl2",{{"NCPU","8"},{"SS_ABL","2"}},"core-abl"},{"abl6",{{"NCPU","8"},{"SS_ABL","6"}},"core-abl"},{"abl3",{{"NCPU","8"},{"SS_ABL","3"}},"core-abl"},
-  {"abl4",{{"NCPU","8"},{"SS_ABL","4"}},"core-abl"},{"abl5",{{"NCPU","8"},{"SS_ABL","5"}},"core-abl"},
-  {"abl1b",{{"NCPU","8"},{"SS_ABL","1"}},"core-abl"},{"abl2b",{{"NCPU","8"},{"SS_ABL","2"}},"core-abl"},{"abl6b",{{"NCPU","8"},{"SS_ABL","6"}},"core-abl"},{"abl3b",{{"NCPU","8"},{"SS_ABL","3"}},"core-abl"},
-  {"abl4b",{{"NCPU","8"},{"SS_ABL","4"}},"core-abl"},{"abl5b",{{"NCPU","8"},{"SS_ABL","5"}},"core-abl"},
-  {"avx512z",{{"NCPU","8"},{"SS_ISA","avx512z"}}},{"avx512y",{{"NCPU","8"},{"SS_ISA","avx512y"}}},
-  {"noearly",{{"NCPU","8"},{"SS_NOEARLYUNMAP","1"}}},{"nowill",{{"NCPU","8"},{"SS_NOWILLNEED","1"}}},
-  {"nohuge",{{"NCPU","8"},{"SS_NOHUGE","1"}}},{"prefault",{{"NCPU","8"},{"SS_PREFAULT","1"}}},
-  {"n4",{{"NCPU","4"}}},{"n1",{{"NCPU","1"}}},{"n2",{{"NCPU","2"}}},{"n6",{{"NCPU","6"}}},{"n12",{{"NCPU","12"}}},{"n16",{{"NCPU","16"}}},
+  {"d1",{N8}},{"p1",{N8},"core-v31"},{"d2",{N8}},{"p2",{N8},"core-v31"},{"d3",{N8}},{"p3",{N8},"core-v31"},
+  {"abl1",{N8,{"SS_ABL","1"}},"core-abl"},{"abl2",{N8,{"SS_ABL","2"}},"core-abl"},{"abl6",{N8,{"SS_ABL","6"}},"core-abl"},{"abl3",{N8,{"SS_ABL","3"}},"core-abl"},
+  {"abl4",{N8,{"SS_ABL","4"}},"core-abl"},{"abl5",{N8,{"SS_ABL","5"}},"core-abl"},
+  {"x0",{N8},"core-x"},
+  {"per16k",{N8,{"SS_PER","16384"}},"core-x"},{"per8k",{N8,{"SS_PER","8192"},{"SS_CAP","8192"}},"core-x"},{"per4k",{N8,{"SS_PER","4096"},{"SS_CAP","16384"}},"core-x"},{"per64k",{N8,{"SS_PER","65536"}},"core-x"},
+  {"uper4k",{N8,{"SS_UPER","4096"}},"core-x"},{"uper8k",{N8,{"SS_UPER","8192"}},"core-x"},{"uper32k",{N8,{"SS_UPER","32768"}},"core-x"},
+  {"pfw64",{N8,{"SS_PFW","64"}},"core-x"},{"pfw128",{N8,{"SS_PFW","128"}},"core-x"},{"pfw256",{N8,{"SS_PFW","256"}},"core-x"},
+  {"pfe128",{N8,{"SS_PFE","128"}},"core-x"},{"pfe256",{N8,{"SS_PFE","256"}},"core-x"},
+  {"combo",{N8,{"SS_PER","8192"},{"SS_CAP","8192"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x"},
+  {"avx512z",{N8,{"SS_ISA","avx512z"}}},{"avx512y",{N8,{"SS_ISA","avx512y"}}},
+  {"noearly",{N8,{"SS_NOEARLYUNMAP","1"}}},{"nowill",{N8,{"SS_NOWILLNEED","1"}}},
+  {"abl1b",{N8,{"SS_ABL","1"}},"core-abl"},{"abl2b",{N8,{"SS_ABL","2"}},"core-abl"},{"abl6b",{N8,{"SS_ABL","6"}},"core-abl"},{"abl3b",{N8,{"SS_ABL","3"}},"core-abl"},
+  {"abl4b",{N8,{"SS_ABL","4"}},"core-abl"},{"abl5b",{N8,{"SS_ABL","5"}},"core-abl"},
+  // final-sized set
+  {"Hd1",{N8},"",true},{"Hp1",{N8},"core-v31",true},{"Hd2",{N8},"",true},
+  {"Hper16k",{N8,{"SS_PER","16384"},{"SS_CAP","8192"}},"core-x",true},{"Hper8k",{N8,{"SS_PER","8192"},{"SS_CAP","16384"}},"core-x",true},
+  {"Huper8k",{N8,{"SS_UPER","8192"}},"core-x",true},{"Hpf",{N8,{"SS_PFW","128"},{"SS_PFE","128"}},"core-x",true},
+  {"Hcombo",{N8,{"SS_PER","8192"},{"SS_CAP","16384"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x",true},
+  {"Havx512z",{N8,{"SS_ISA","avx512z"}},"",true},{"Hnoearly",{N8,{"SS_NOEARLYUNMAP","1"}},"",true},{"Hd3",{N8},"",true},
+  // repeats and lower-priority runs on the practice-sized set
+  {"x0b",{N8},"core-x"},{"per8kb",{N8,{"SS_PER","8192"},{"SS_CAP","8192"}},"core-x"},{"pfw128b",{N8,{"SS_PFW","128"}},"core-x"},{"pfe128b",{N8,{"SS_PFE","128"}},"core-x"},
+  {"combob",{N8,{"SS_PER","8192"},{"SS_CAP","8192"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x"},
+  {"avx512z2",{N8,{"SS_ISA","avx512z"}}},{"avx512y2",{N8,{"SS_ISA","avx512y"}}},{"noearly2",{N8,{"SS_NOEARLYUNMAP","1"}}},
+  {"nohuge",{N8,{"SS_NOHUGE","1"}}},{"prefault",{N8,{"SS_PREFAULT","1"}}},
+  {"n4",{{"NCPU","4"}}},{"n1",{{"NCPU","1"}}},{"n2",{{"NCPU","2"}}},{"n6",{{"NCPU","6"}}},{"n16",{{"NCPU","16"}}},
   {"4abl1",{{"NCPU","4"},{"SS_ABL","1"}},"core-abl"},{"4abl2",{{"NCPU","4"},{"SS_ABL","2"}},"core-abl"},{"4abl3",{{"NCPU","4"},{"SS_ABL","3"}},"core-abl"},{"4abl4",{{"NCPU","4"},{"SS_ABL","4"}},"core-abl"},
   {"1abl1",{{"NCPU","1"},{"SS_ABL","1"}},"core-abl"},{"1abl2",{{"NCPU","1"},{"SS_ABL","2"}},"core-abl"},{"1abl3",{{"NCPU","1"},{"SS_ABL","3"}},"core-abl"},{"1abl4",{{"NCPU","1"},{"SS_ABL","4"}},"core-abl"},
-  {"avx512z2",{{"NCPU","8"},{"SS_ISA","avx512z"}}},{"avx512y2",{{"NCPU","8"},{"SS_ISA","avx512y"}}},{"noearly2",{{"NCPU","8"},{"SS_NOEARLYUNMAP","1"}}},
-  {"n4cores",{{"NCPU","4"},{"OMP_PLACES","cores"},{"OMP_PROC_BIND","spread"}}},
-  {"n8bind",{{"NCPU","8"},{"OMP_PLACES","threads"},{"OMP_PROC_BIND","close"}}},
-  {"n8active",{{"NCPU","8"},{"OMP_WAIT_POLICY","active"}}},
-  {"sse2",{{"NCPU","8"},{"SS_ISA","sse2"}}},
-  {"mallocthp",{{"NCPU","8"},{"GLIBC_TUNABLES","glibc.malloc.hugetlb=1"}}},
-  {"d4",{{"NCPU","8"}}},{"p4",{{"NCPU","8"}},"core-v31"},{"d5",{{"NCPU","8"}}},{"p5",{{"NCPU","8"}},"core-v31"}};
+  {"n8bind",{N8,{"OMP_PLACES","threads"},{"OMP_PROC_BIND","close"}}},{"n8active",{N8,{"OMP_WAIT_POLICY","active"}}},
+  {"d4",{N8}},{"p4",{N8},"core-v31"},{"d5",{N8}},{"p5",{N8},"core-v31"}};
  pipeline("dev",data,od(),{{"NCPU","8"}});
- for(const Var& v:vars){if(!timeleft(8))break;pipeline(v.label,B,od(),v.env,v.bin);}
+ for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
  pipeline("final /data -> /output",data,outdir,{{"NCPU","8"}});
  // Put the findings into extra campaign_daily rows: the dev check reports a few rows that differ, as JSON.
@@ -314,29 +335,33 @@ int main(){
   auto row=[&](const string& label,const string& text,int64_t a,int64_t b,int64_t c,int64_t d){
    char id[16];snprintf(id,sizeof id,"!%02d ",idx++);put_bytes(cid,string(id)+label);put_bytes(chan,text);days.push_back(20000+idx);
    c1.push_back(a);c2.push_back(b);c3.push_back(c);c4.push_back(d);};
-  // row 0: best default run in full, with hardware counters (instructions, cycles, cache misses, branch misses)
+  auto g1=[&](const RunResult& r,const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};
+  auto brief=[&](const char* l)->string{const RunResult* r=get(l);char one[96];if(!r){snprintf(one,sizeof one,"%s=- ",l);return one;}
+   snprintf(one,sizeof one,"%s=%.0f(%.0f/%.0f/%.0f) ",l,r->wall*1e3,g1(*r,"PARSE"),g1(*r,"DEDUP"),g1(*r,"AGGREGATE"));return one;};
+  // row 0: v32 against v31 on both sizes; best default run in full with hardware counters
   {const RunResult* d=bestd();RunResult z;if(!d)d=&z;char pc[160];snprintf(pc,sizeof pc," | perf err%d ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",d->perfErr,d->pc[0]/1e9,d->pc[1]/1e9,d->pc[2]/1e6,d->pc[3]/1e6);
-   string all;for(auto& r:results)if(r.label[0]=='d'||(r.label.size()==2&&r.label[0]=='p')){char one[32];snprintf(one,sizeof one,"%s=%.0f ",r.label.c_str(),r.wall*1e3);all+=one;}
-   {const RunResult* pb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='p'&&r.rc==0&&(!pb||r.wall<pb->wall))pb=&r;if(pb)all+="| best v31: "+stages(*pb);}
-   row("v32 d*, v31 p*: "+all,stages(*d)+pc,us(d->wall),us(d->user),us(d->sys),d->minflt);}
-  // row 1: thread counts
-  {string walls,detail;for(const char* l:{"n1","n2","n4","n6","n12","n16","n4cores","n8bind","n8active"}){const RunResult* r=get(l);char one[48];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);walls+=one;}
-   const RunResult* n1=get("n1");const RunResult* n4=get("n4");
-   detail="n1: "+(n1?stages(*n1):string("-"))+" || n4: "+(n4?stages(*n4):string("-"));
-   if(n1){char pc[120];snprintf(pc,sizeof pc," || n1 perf ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",n1->pc[0]/1e9,n1->pc[1]/1e9,n1->pc[2]/1e6,n1->pc[3]/1e6);detail+=pc;}
-   row("threads ms: "+walls,detail,n1?us(n1->wall):0,n4?us(n4->wall):0,n1?us(n1->user):0,n1?us(n1->sys):0);}
-  // row 2: variants
-  {string walls,detail;for(const char* l:{"avx512z","avx512z2","avx512y","avx512y2","noearly","noearly2","nowill","nohuge","prefault","mallocthp","sse2"}){const RunResult* r=get(l);char one[48];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);walls+=one;
-    if(r){auto g=[&](const char* k){auto it=r->t.find(k);return it==r->t.end()?0.0:it->second*1e3;};char d2[96];snprintf(d2,sizeof d2,"%s:P%.0f,D%.0f,A%.0f,s%.0f,f%ld ",l,g("PARSE"),g("DEDUP"),g("AGGREGATE"),r->sys*1e3,r->minflt);detail+=d2;}}
-   row("variants ms: "+walls,detail,0,0,0,0);}
-  // row 3: parser ablation (PARSE stage ms; the run stops after that stage)
-  {string a,detail;for(auto& r:results)if(r.label.find("abl")!=string::npos){auto it=r.t.find("PARSE");char one[64];snprintf(one,sizeof one,"%s=%.0f ",r.label.c_str(),it==r.t.end()?-1.0:it->second*1e3);a+=one;
+   string all;for(const char* l:{"d1","d2","d3","d4","d5","p1","p2","p3","p4","p5","Hd1","Hd2","Hd3","Hp1"}){const RunResult* r=get(l);char one[32];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);all+=one;}
+   string det=stages(*d)+pc;
+   {const RunResult* pb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='p'&&r.rc==0&&(!pb||r.wall<pb->wall))pb=&r;if(pb)det+=" || v31: "+stages(*pb);}
+   {const RunResult* h=get("Hd1");const RunResult* h2=get("Hd2");if(h2&&(!h||h2->wall<h->wall))h=h2;if(h)det+=" || 60x: "+stages(*h);}
+   row("v32 d*, v31 p*, H=60x: "+all,det,us(d->wall),us(d->user),us(d->sys),d->minflt);}
+  // row 1: tuning experiments, wall(parse/dedup/agg)
+  {string a,b2;for(const char* l:{"x0","x0b","per64k","per16k","per8k","per8kb","per4k","uper4k","uper8k","uper32k","pfw64","pfw128","pfw128b","pfw256","pfe128","pfe128b","pfe256","combo","combob"})a+=brief(l);
+   for(const char* l:{"Hd1","Hd2","Hd3","Hp1","Hper16k","Hper8k","Huper8k","Hpf","Hcombo","Havx512z","Hnoearly"})b2+=brief(l);
+   row("tuning 20x wall(P/D/A): "+a,"60x: "+b2,0,0,0,0);}
+  // row 2: parser ablation (PARSE stage ms; the run stops after that stage)
+  {string a,detail;for(auto& r:results)if(r.label.find("abl")!=string::npos){char one[64];snprintf(one,sizeof one,"%s=%.0f ",r.label.c_str(),g1(r,"PARSE"));a+=one;
     char d2[96];snprintf(d2,sizeof d2,"%s:u%.0f,s%.0f,f%ld,w%.0f ",r.label.c_str(),r.user*1e3,r.sys*1e3,r.minflt,r.wall*1e3);detail+=d2;}
-   row("ablation PARSE ms (1 scan,2 +fields,3 +push,4 +users,5 clicks only,6 +record into a small ring instead of buckets): "+a,detail,0,0,0,0);}
+   row("ablation PARSE ms (1 scan,2 +fields,6 +record to a ring,3 +bucket push,4 +users,5 clicks only): "+a,detail,0,0,0,0);}
+  // row 3: switches and thread counts
+  {string a,b2;for(const char* l:{"avx512z","avx512z2","avx512y","avx512y2","noearly","noearly2","nowill","nohuge","prefault"})a+=brief(l);
+   for(const char* l:{"n1","n2","n4","n6","n16","n8bind","n8active"})b2+=brief(l);
+   const RunResult* n1=get("n1");if(n1){char pc[160];snprintf(pc,sizeof pc," || n1: u%.0f s%.0f perf ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",n1->user*1e3,n1->sys*1e3,n1->pc[0]/1e9,n1->pc[1]/1e9,n1->pc[2]/1e6,n1->pc[3]/1e6);b2+=pc;}
+   row("switches: "+a,"threads: "+b2,0,0,0,0);}
   // row 4: every run, compact
-  {string all;for(auto& r:results){auto g=[&](const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};char one[96];
-    snprintf(one,sizeof one,"%s:%.0f/%.0f/%.0f/%.0f/%.0f/u%.0f/s%.0f ",r.label.c_str(),r.wall*1e3,g("PARSE"),g("DEDUP"),g("AGGREGATE"),r.wall*1e3-g("PARSE")-g("DEDUP")-g("AGGREGATE"),r.user*1e3,r.sys*1e3);all+=one;}
-   row("all runs: label:wall/parse/dedup/agg/rest/user/sys ms",all,0,0,0,0);}
+  {string all;for(auto& r:results){char one[96];
+    snprintf(one,sizeof one,"%s:%.0f/%.0f/%.0f/%.0f/L%.0f/u%.0f/s%.0f/f%ld ",r.label.c_str(),r.wall*1e3,g1(r,"PARSE"),g1(r,"DEDUP"),g1(r,"AGGREGATE"),g1(r,"LINKREAD")+g1(r,"FLATTEN"),r.user*1e3,r.sys*1e3,r.minflt);all+=one;}
+   row("all runs: label:wall/parse/dedup/agg/links/user/sys/faults",all,0,0,0,0);}
   // row 5: machine
   {char t[400];snprintf(t,sizeof t,"%s | kernel %s | thp %s | defrag %s | aff %d | fs %s | memset8 %.1fGB/s touch1 %.2fus/page touch8(1.5GB) %.0f/%.0f/%.0f/%.0f ms munmap %.0f/%.0f ms | spin1/4/8 %.0f/%.0f/%.0f ms | read %.1f/%.1f GB/s | replica %.1fs",
     gCpu.c_str(),gKernel.c_str(),gThp.c_str(),gDefrag.c_str(),gAff,gFs.c_str(),gMemsetGBs,gTouchUsPage,gTouch8[0]*1e3,gTouch8[1]*1e3,gTouch8[2]*1e3,gTouch8[3]*1e3,gMunmap[0]*1e3,gMunmap[1]*1e3,gSpin[0]*1e3,gSpin[1]*1e3,gSpin[2]*1e3,gReadGBs[0],gReadGBs[1],gReplicaSec);
