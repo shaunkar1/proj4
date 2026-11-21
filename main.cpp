@@ -1889,7 +1889,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  //   SS_DENSE_DUMP=dir   test only: writes every record of the parse stage as text and stops after the parse stage ("-": only stops)
  {const char* rec=getenv("SS_DENSE_RECORDS");const bool recOn=!(rec&&rec[0]=='0');
   dparse.events=dense.events&&recOn;dparse.clicks=dense.clicks&&recOn;
-  dparse.bucket=rec&&string_view(rec)=="bucket";}
+  dparse.bucket=!(rec&&string_view(rec)=="slot");} // bucket form unless SS_DENSE_RECORDS=slot
  if(const char* v=getenv("SS_DENSE_AHEAD")){const int x=atoi(v);if(x>=0&&x<=(int)RING_MAX)dparse.ahead=(unsigned)x;}
  if(const char* v=getenv("SS_DSHIFT")){const int x=atoi(v);if(x>=4&&x<=16)dparse.shE=(unsigned)x;}
  if(const char* v=getenv("SS_CSHIFT")){const int x=atoi(v);if(x>=4&&x<=24)dparse.shC=(unsigned)x;}
