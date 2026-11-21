@@ -2,6 +2,9 @@
 # usage: struct_run.sh SEED...  -- the two-stage loops (SS_LINES=struct) against the index loops on mutated dev data
 # (fuzz/gen.py): whole-pipeline outputs must match at 1 and 3 threads and on the AVX-512 mask builders.
 # Prints whether the dense records were in use for events (otherwise the two-stage loop did not run at all).
+# The data: a whole generated set (so the ID keys are found; the first 300 lines of each file stay clean for the
+# key samples), FZ_NOCDUP=1 (click copies that differ are undefined by the rules and make the slot route depend on
+# thread timing), FZ_UNIQ=1 and a new folder per seed (two changed lines must never share a made-up ID).
 W=/home/claude/wtA; CMP=/home/claude/bb/starter-pyspark/starter-pyspark/scripts/compare.py; D=$W/fz_data_st
 mkdir -p $W/fzo
 for seed in "$@"; do
