@@ -395,15 +395,17 @@ int main(){
  #define V3 {"SS_EV8","3"}
  #define ST {"SS_STATS","1"}
  #define PO {"SS_DENSE_DUMP","-"}
- for(int r=0;r<4;++r){
-  add("B",1,{N8});add("c60",1,{N8},"core-b");add("cl1",1,{N8,{"SS_CL8","1"}});add("ix",1,{N8,{"SS_CLICKS","ix"}});
-  add("pB",1,{N8,PO});add("p60",1,{N8,PO},"core-b");add("Bs",1,{N8,ST});
-  add("el2",1,{N8,{"SS_EVLEAD","2"}});add("cl2",1,{N8,{"SS_CLLEAD","2"}});add("pt1",1,{N8,{"SS_PF","t1"}});add("pfw",1,{N8,{"SS_PF","w"}});add("pfn",1,{N8,{"SS_PF","none"}});
-  add("S",1,{N8},"core-s");add("Ss",1,{N8,ST},"core-s");
+ #define UB {"SS_UNMAP","bg"}
+ #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
+ for(int r=0;r<5;++r){
+  add("B",1,{N8});add("c62",1,{N8},"core-b");add("c61",1,{N8},"core-c");
+  add("ub",1,{N8,UB});add("ubp",1,{N8,UB,{"SS_POOLPRE","1"}});add("l2",1,{N8,L2});add("l2w",1,{N8,L2,{"SS_PF","w"}});add("all",1,{N8,L2,UB});
+  if(r<3){add("mt4",1,{N8,{"SS_MAPTHREADS","4"}});add("Bs",1,{N8,ST});add("ubs",1,{N8,ST,UB});}
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H60",1,{N8},"core-b",true);add("Hcl1",1,{N8,{"SS_CL8","1"}},"",true);add("Hl2",1,{N8,{"SS_EVLEAD","2"},{"SS_CLLEAD","2"}},"",true);add("HS",1,{N8},"core-s",true);}
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("H61",1,{N8},"core-c",true);add("Hub",1,{N8,UB},"",true);add("Hl2",1,{N8,L2},"",true);add("Hall",1,{N8,L2,UB},"",true);
+  if(r<2)add("HBs",1,{N8,ST},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
@@ -440,7 +442,7 @@ int main(){
   for(int i=0;i<2;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
    pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c62 (click kernel v2) dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
+  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c63 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
   if(fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
@@ -475,13 +477,18 @@ int main(){
    string y;bool skip=false;size_t i=0;while(i<x.size()){size_t e=x.find(' ',i);if(e==string::npos)e=x.size();const string tok=x.substr(i,e-i);i=e+1;if(tok.empty())continue;
     const bool name=isalpha((unsigned char)tok[0]);if(name)skip=(tok=="n"||tok=="nl"||tok=="se"||tok=="ew"||tok=="wc"||tok=="gn"||tok=="tc"||tok=="le");if(!skip){if(!y.empty())y+=' ';y+=tok;}}
    return y;};
-  auto allw=[&](const string& name,const string& grp)->string{string o=name+"=";bool first=true;for(auto& r:results){if(r.rc!=0||r.label.compare(0,grp.size()+1,grp+"#")!=0)continue;if(!first)o+=",";first=false;o+=to_string((long)(r.wall*1e3+0.5));}return o+" ";};
-  a+=eqText+" | 20M wall of every run: "+allw("c62","B")+allw("c60","c60")+allw("c62-cl8v1","cl1")+allw("c62-oldclicks","ix");
-  a+="| min wPRYXAW/us: "+fmt("c62","B","wPRYXAWus")+fmt("c60","c60","wPRYXAWus")+fmt("cl8v1","cl1","wPRXus")+fmt("oldclicks","ix","wPRXus")+"| parse-only P/us: "+fmt("c62","pB","Pus")+fmt("c60","p60","Pus");
-  a+="| slot request variants wPX: "+fmt("evlead2","el2","wPX")+fmt("cllead2","cl2","wPX")+fmt("pf=t1","pt1","wPX")+fmt("pf=w","pfw","wPX")+fmt("pf=none","pfn","wPX")+"| willneed-in-background wP+MAP: "+fmt("","S","wPM")+allw("walls","S")+fmt("small stages MKLDYWE","Ss","MKLDYWE");
-  a+="| c62 small stages MAP/KEYS/LINK+FLATTEN/DEDUP/DENSE1/WRITE/exit: "+fmt("","Bs","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","Bs","pqxa")+"| "+floorText;
-  c+="60M wall of every run: "+allw("c62","HB")+allw("c60","H60")+allw("c62-cl8v1","Hcl1")+"| min wPRYXAW/us: "+fmt("c62","HB","wPRYXAWus")+fmt("c60","H60","wPRYXAWus")+fmt("cl8v1","Hcl1","wPRX")+fmt("lead2","Hl2","wPRX")+fmt("willneed-bg","HS","wPM")+allw("walls lead2","Hl2")+allw("walls willneed-bg","HS");
-  c+="|| "+benchText;
+  // median over the repeats of a group, for wall / PARSE / DENSE
+  auto med=[&](const string& grp,const char* key)->long{vector<double> v;for(auto& r:results){if(r.rc!=0||r.label.compare(0,grp.size()+1,grp+"#")!=0)continue;
+    const string k=key;double x;if(k=="w")x=r.wall;else{auto it=r.t.find(k=="P"?"PARSE":k=="X"?"DENSE":k=="R"?"RESOLVE":k=="A"?"AGGREGATE":key);x=it==r.t.end()?0:it->second;}v.push_back(x);}
+   if(v.empty())return -1;sort(v.begin(),v.end());return (long)(v[v.size()/2]*1e3+0.5);};
+  auto mm=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wPRXA";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one))+"~"+to_string(med(grp,one));}return o+" ";};
+  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c63","B")+mm("c62","c62")+mm("c61","c61")+mm("c63-unmap-bg","ub")+mm("unmap-bg+poolpre","ubp")+mm("lead2","l2")+mm("lead2+pfw","l2w")+mm("lead2+unmap-bg","all")+mm("mapthreads4","mt4");
+  a+="| c63 small stages MAP/KEYS/LINK+FLATTEN/DEDUP/DENSE1/WRITE/exit: "+fmt("","Bs","MKLDYWE")+"u/s "+fmt("c63","B","us")+fmt("c62","c62","us")+fmt("c61","c61","us");
+  {const RunResult* r=get("Bs#0");if(r)a+="| DENSE threads c63:"+squeeze(r->dth)+" csw "+r->csw+" ";}
+  {const RunResult* r=get("ubs#0");if(r)a+="| unmap-bg:"+squeeze(r->dth)+" csw "+r->csw+" ";}
+  c+="60M min~median w/P/R/X/A: "+mm("c63","HB")+mm("c62","H62")+mm("c61","H61")+mm("unmap-bg","Hub")+mm("lead2","Hl2")+mm("lead2+unmap-bg","Hall");
+  {const RunResult* r=get("HBs#0");if(r)c+="| DENSE threads c63 60M:"+squeeze(r->dth)+" ";}
+  c+="| "+floorText+"|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)

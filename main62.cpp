@@ -244,12 +244,7 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
  if(base==MAP_FAILED)throw runtime_error("Cannot reserve address space for the input files");
  if(optFileAlign)base=(void*)(((uintptr_t)base+HUGE2M-1)&~(uintptr_t)(HUGE2M-1)); // the unused edges stay reserved, without pages
  g.base=(char*)base;g.len=total;size_t off=0;
- // MADV_WILLNEED walks the page cache of the whole file (measured: ~15 us per 11 MB file with everything cached,
- // more than half of the MAP stage). By default a background thread per folder makes those calls, so read-ahead of
- // files that are not cached still starts at once while this thread goes on. SS_WILLNEED=inline: this thread makes
- // them, file by file, as before. SS_NOWILLNEED=1: no such calls at all.
- static const int willNeed=getenv("SS_NOWILLNEED")?0:(getenv("SS_WILLNEED")&&string_view(getenv("SS_WILLNEED"))=="inline")?1:2;
- vector<pair<void*,size_t>> later;
+ static const bool willNeed=!getenv("SS_NOWILLNEED"); // measuring switch
  for(size_t i=0;i<paths.size();++i){
   if(!lens[i])continue;
   int fd=open(paths[i].c_str(),O_RDONLY);
@@ -257,16 +252,12 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
   void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
   close(fd);
   if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
-  if(willNeed==1)madvise(got,lens[i],MADV_WILLNEED);
-  else if(willNeed==2)later.push_back({got,lens[i]});
+  if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
   if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
   if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
   out[i]={g.base+off,lens[i]};
   off+=slot_of(lens[i]);g.ends.push_back(off);
  }
- // Advice only: it cannot change what is read. (A call that came after its file was unmapped would fail or hint
- // at whatever is mapped there by then; the calls are done long before anything is unmapped.)
- if(!later.empty())thread([list=move(later)]{for(const auto& [p,n]:list)madvise(p,n,MADV_WILLNEED);}).detach();
  return out;
 }
 // Cuts a group into about `parts` pieces of similar size at file boundaries (for unmapping in parallel).
@@ -4504,7 +4495,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(const char* v=getenv("SS_POPULATE")){const string_view w(v);optPopulate=w=="ahead"?1:w=="all"?2:w.substr(0,2)=="bg"?3:0;
   if(optPopulate==3&&w.size()>2){const int n=atoi(v+2);if(n>=1&&n<=64)optPopulateBg=n;}}
  if(__cpuLines)cerr<<"STATS kernel switches: SS_FILEALIGN="<<(optFileAlign==2?"2m+huge":optFileAlign?"2m":"off")<<" SS_POPULATE="<<(optPopulate==1?"ahead":optPopulate==2?"all":optPopulate==3?"bg"+to_string(optPopulateBg):string("off"))
-  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<(getenv("SS_NOWILLNEED")?"off":(getenv("SS_WILLNEED")&&string_view(getenv("SS_WILLNEED"))=="inline")?"inline":"bg")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
+  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
