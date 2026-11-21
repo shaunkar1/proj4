@@ -14,6 +14,11 @@ for seed in "$@"; do
  SS_ISA=sse2 NCPU=1 DATA_DIR=$D OUTPUT_DIR=$B $W/core 2>$W/fz_b.log; rb=$?
  SS_ISA=sse2 NCPU=1 DATA_DIR=$D OUTPUT_DIR=$C $W/base/core_base 2>$W/fz_c.log; rc=$?
  NCPU=3 DATA_DIR=$D OUTPUT_DIR=$E $W/core 2>$W/fz_e.log; re=$?
+ # the same with the test switches: every ingest_ts on the side list (general handler), ID text compared on every probe
+ F=$(mktemp -d $W/fzo/f.XXXXXX); G=$(mktemp -d $W/fzo/g.XXXXXX)
+ SS_TEST_SIDE=1 SS_TEST_TAG0=1 SS_ISA=sse2 NCPU=1 DATA_DIR=$D OUTPUT_DIR=$F $W/core 2>$W/fz_f.log; rf=$?
+ SS_TEST_SIDE=1 SS_TEST_TAG0=1 NCPU=1 DATA_DIR=$D OUTPUT_DIR=$G $W/core 2>$W/fz_g.log; rg=$?
  x=$(python3 $CMP $A $B 2>&1 | tail -1); y=$(python3 $CMP $A $C 2>&1 | tail -1); z=$(python3 $CMP $A $E 2>&1 | tail -1)
- echo "seed $seed exit $ra/$rb/$rc/$re avx2-vs-sse2 $x | avx2-vs-base-sse2 $y | avx2 1thr-vs-3thr $z | $(grep -h -E 'dedup|surviving clicks' $W/fz_a.log | tr '\n' ' ')"
+ u=$(python3 $CMP $A $F 2>&1 | tail -1); v=$(python3 $CMP $A $G 2>&1 | tail -1)
+ echo "seed $seed exit $ra/$rb/$rc/$re/$rf/$rg avx2-vs-sse2 $x | avx2-vs-base-sse2 $y | avx2 1thr-vs-3thr $z | switches sse2 $u avx2 $v | $(grep -h -E 'dedup|surviving clicks' $W/fz_a.log | tr '\n' ' ')"
 done

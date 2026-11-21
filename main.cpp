@@ -550,10 +550,56 @@ template<class T> struct ArenaAlloc{
 };
 template<class T> using AVec=vector<T,ArenaAlloc<T>>;
 static void unmap_regions(vector<Region> regions){for(const Region& r:regions)munmap(r.base,r.len);}
-static constexpr uint8_t F_VALID=1,F_PURCHASE=2,F_DEAD=4;
 static constexpr uint32_t LOCAL_USER=0x80000000u;
-// One parsed event line, bucketed by event_id hash so duplicates meet in one bucket.
-struct PRec{const char* id;uint64_t h;int64_t ingest;int64_t ts;uint32_t idlen;uint32_t user;int32_t price;uint16_t cat;uint8_t flags;};
+// One parsed event line, 32 bytes (two per cache line), bucketed by event_id hash so duplicates meet in one bucket.
+//  id    start of the event_id text in the mapped input. Its length is not kept: the text ends at the
+//        first ',' or '"' (an ID holds neither, and field 0 is always followed by one of them).
+//  k     for a valid line Ev::k (see below) with PR_VALID set on top, else 0.
+//  user  the user/person number (filled in by resolve_users on the AVX2 path); may carry LOCAL_USER.
+//  cat   category number of a purchase, else 0.
+//  hx    hash bits 25-40 of the event_id.
+//  ih    ingest code << 25 | hash bits 0-24. The ingest code is ingest_ts in whole seconds counted from
+//        INGEST_BASE_S; INGEST_SIDE means "not representable": the true milliseconds are then in the
+//        thread's ingestSide list under this id pointer (only the general parser path can produce that).
+struct PRec{const char* id;uint64_t k;uint32_t user;uint16_t cat;uint16_t hx;uint64_t ih;};
+static_assert(sizeof(PRec)==32);
+static constexpr uint64_t PR_VALID=1ull<<63; // Ev::k never reaches bit 62
+static constexpr unsigned PR_HBITS=25;
+static constexpr uint64_t PR_HMASK=(1ull<<PR_HBITS)-1;
+// One day before 0000-01-01T00:00:00Z: every F1/F2 timestamp (years 0000-9999, offsets up to 23:59)
+// lies above it and less than 2^39-1 seconds past it.
+static constexpr int64_t INGEST_BASE_S=-62167219200LL-86400;
+static constexpr uint64_t INGEST_SIDE=(1ull<<39)-1;
+// Ingest code of a timestamp in milliseconds, INGEST_SIDE if it is not whole seconds or out of range.
+static inline uint64_t ingest_code(int64_t ms){
+ if(ms%1000!=0)return INGEST_SIDE;
+ const int64_t sec=ms/1000;
+ if(sec<INGEST_BASE_S)return INGEST_SIDE;
+ const uint64_t c=(uint64_t)(sec-INGEST_BASE_S);
+ return c<INGEST_SIDE?c:INGEST_SIDE;
+}
+// h = hkey(event_id); code = ingest code; k and cat as described above.
+static inline __attribute__((always_inline)) PRec make_prec(const char* id,uint64_t h,uint64_t code,uint64_t k,unsigned cat){
+ PRec r;r.id=id;r.k=k;r.user=0;r.cat=(uint16_t)cat;r.hx=(uint16_t)(h>>PR_HBITS);
+ r.ih=(code<<PR_HBITS)|(h&PR_HMASK);return r;
+}
+// True if the event IDs starting at a and b are the same text (each ends at its first ',' or '"').
+// Both point into mapped inputs, which may be read a little past the end of the text.
+static inline bool same_event_id(const char* a,const char* b){
+ const __m128i vc=_mm_set1_epi8(','),vq=_mm_set1_epi8('"');
+ for(;;a+=16,b+=16){
+  const __m128i x=_mm_loadu_si128((const __m128i*)a),y=_mm_loadu_si128((const __m128i*)b);
+  const unsigned ta=(unsigned)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(x,vc),_mm_cmpeq_epi8(x,vq)));
+  const unsigned tb=(unsigned)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(y,vc),_mm_cmpeq_epi8(y,vq)));
+  const unsigned ne=~(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x,y))&0xFFFFu;
+  if(ta|tb){
+   if(!ta||!tb)return false; // one ends in this block, the other goes on
+   const unsigned ea=(unsigned)__builtin_ctz(ta),eb=(unsigned)__builtin_ctz(tb);
+   return ea==eb&&(ne&((1u<<ea)-1))==0;
+  }
+  if(ne)return false;
+ }
+}
 // One valid click line, bucketed by click_id hash.
 struct CRec{const char* id;uint64_t h;int64_t ts;uint32_t idlen;uint32_t user;uint16_t campaign;uint8_t flags;};
 struct Chunk{const char* base;size_t len,from,to;bool click;};
@@ -562,7 +608,6 @@ struct Chunk{const char* base;size_t len,from,to;bool click;};
 struct Ev{uint64_t k;uint32_t person;uint16_t cat;uint16_t pad;};
 static constexpr uint64_t EV_PURCHASE=1ull<<24,EV_PRICE=EV_PURCHASE-1;
 static constexpr unsigned EV_TS=25;
-static_assert(((uint64_t)F_PURCHASE<<23)==EV_PURCHASE); // the flag bit is shifted straight into place
 // One surviving click, 24 bytes. key = (ts - (window_start - 7 days))<<16 | campaign.
 struct Click{uint64_t key;const char* id;uint32_t person;uint32_t idlen;};
 // Order of a person's clicks: by ts, and at equal ts the byte-wise larger ID first, so the last click
@@ -608,7 +653,7 @@ template<class T,size_t BYTES> struct Blocks{
  static constexpr size_t PER=(BYTES-16)/sizeof(T);
  struct Block{Block* next;size_t pad;T items[PER];};
  T* cur=nullptr;T* end=nullptr;Block* head=nullptr;Block* tail=nullptr;size_t nblocks=0;
- __attribute__((noinline,cold)) void grow(SlabPool& pool){
+ void grow(SlabPool& pool){
   Block* b=(Block*)pool.take(sizeof(Block));
   b->next=nullptr;if(tail)tail->next=b;else head=b;
   tail=b;++nblocks;cur=b->items;end=b->items+PER;
@@ -620,6 +665,7 @@ template<class T,size_t BYTES> struct Blocks{
 using EvList=Blocks<Ev,4096>;using ClickList=Blocks<Click,4096>;
 struct alignas(64) ThreadState{
  SmallTable users; // IDs that did not fit in the shared table
+ vector<pair<const char*,int64_t>> ingestSide; // (event id pointer, ingest ms) of records whose ingest code is INGEST_SIDE
  vector<AVec<PRec>> eb;vector<AVec<CRec>> cb; // parsed lines by event/click ID hash
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
 };
@@ -918,9 +964,9 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
    // B2 is its start mark, and no end mark of a later field can sit that low.
    const bool has5=(_blsi_u64(B2)&E2)==0;
    const char* const s1=p+b1;const char* const s2=p+b2;
-   PRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
+   const uint64_t h=hkey_v3(s0,l0);
    const unsigned kind=event_kind(string_view(b+b4,l4));
-   bool valid=false;
+   bool valid=false;uint64_t k=0;unsigned cat=0;
    if(kind&&l1!=0&&has5){
     int64_t ts;bool tsOk;
     uint64_t a8,b8;uint16_t a2,b2_;
@@ -930,7 +976,8 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
      if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
     }else tsOk=ts_v3(s2,l2,memo,ts);
     // window_start <= ts < window_end as one unsigned compare (the window is far shorter than 2^63 ms)
-    if(tsOk&&(uint64_t)ts-(uint64_t)wstart<wlen&&ingest-ts<=DAY){
+    uint64_t tsrel;
+    if(tsOk&&(tsrel=(uint64_t)ts-(uint64_t)wstart)<wlen&&ingest-ts<=DAY){
      int32_t price=0;const bool purchase=kind==3;
      if(purchase){
       const unsigned b5=(unsigned)_tzcnt_u64(B2),l5=(unsigned)_tzcnt_u64(E2)-b5;
@@ -938,12 +985,14 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
       const unsigned b6=(unsigned)_tzcnt_u64(B2),l6=(unsigned)_tzcnt_u64(E2)-b6;
       if(price_value(string_view(b+b6,l6),price)){
        const uint32_t ci=products.find(string_view(b+b5,l5));
-       r.cat=ci==KeyTable::NONE?0:(uint16_t)ci;r.flags=F_VALID|F_PURCHASE;r.ts=ts;r.price=price;valid=true;
+       cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;k=PR_VALID|(tsrel<<EV_TS)|EV_PURCHASE|(uint64_t)(uint32_t)price;valid=true;
       }
-     }else{r.flags=F_VALID;r.ts=ts;valid=true;}
+     }else{k=PR_VALID|(tsrel<<EV_TS);valid=true;}
     }
    }
-   AVec<PRec>& vec=buckets[(size_t)(((r.h>>40)*PE)>>24)];
+   // an F1 ingest_ts is whole seconds within years 0000-9999, so its code always fits
+   const PRec r=make_prec(s0,h,(uint64_t)(ingest-INGEST_BASE_S*1000)/1000u,k,cat);
+   AVec<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
    if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
    if(valid){
     uint64_t k0;uint32_t k1;
@@ -1224,6 +1273,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(const char* isa=getenv("SS_ISA"))if(string_view(isa)=="sse2")useV3=false;
  cerr<<"splitter: "<<(useV3?"avx2":"sse2")<<"\n";
  vector<ThreadState> tls(T);
+ // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
+ // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
+ // ID text on every occupied slot it probes instead of only on a tag match.
+ const bool testSide=getenv("SS_TEST_SIDE")!=nullptr;
+ const uint32_t tagKeep=getenv("SS_TEST_TAG0")?0u:~0u;
  atomic<size_t> nextChunk{0};
  const int64_t clickStart=window_start-WEEK;
  #pragma omp parallel num_threads(T)
@@ -1247,7 +1301,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    int64_t ingest=0,ingestDay=0,ms;const char* pi=f[3].data();
    const bool ingestF1=f[3].size()==20&&pi[19]=='Z'&&hms_ms(pi,ms)&&f1_date(pi,ingestDay);
    if(ingestF1)ingest=ingestDay+ms;else if(!parse_ts(f[3],ingest))return;
-   PRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
+   const uint64_t h=hkey(f[0]);uint64_t k=0;unsigned cat=0;uint32_t user=0;
    const unsigned kind=event_kind(f[4]);
    if(kind&&!f[1].empty()&&!f[5].empty()){
     int64_t ts;bool tsOk;const char* pt=f[2].data();
@@ -1258,12 +1312,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(tsOk&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY){
      int32_t price=0;const bool purchase=kind==3;
      if(!purchase||price_value(f[6],price)){
-      r.flags=F_VALID|(purchase?F_PURCHASE:0);r.ts=ts;r.price=price;r.user=user_of(f[1]);
-      if(purchase){const uint32_t c=products.find(f[5]);r.cat=c==KeyTable::NONE?0:(uint16_t)c;}
+      k=PR_VALID|((uint64_t)(ts-window_start)<<EV_TS)|(purchase?EV_PURCHASE:0)|(uint64_t)(uint32_t)price;user=user_of(f[1]);
+      if(purchase){const uint32_t c=products.find(f[5]);cat=c==KeyTable::NONE?0:(unsigned)(uint16_t)c;}
      }
     }
    }
-   tl.eb[(size_t)(((r.h>>40)*PE)>>24)].push_back(r);
+   uint64_t code=testSide?INGEST_SIDE:ingest_code(ingest);
+   if(code==INGEST_SIDE)tl.ingestSide.emplace_back(f[0].data(),ingest); // rare: keep the exact value on the side
+   PRec r=make_prec(f[0].data(),h,code,k,cat);r.user=user;
+   tl.eb[(size_t)(((h>>40)*PE)>>24)].push_back(r);
   };
   auto on_click=[&](const string_view* f){
    if(f[0].empty())return;
@@ -1306,6 +1363,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(person<totalIds)return personNames[person].view();
   return extraNames[person-totalIds];
  };
+ // Ingest values that did not fit a record (see PRec::ih), by event id pointer. Normally empty.
+ unordered_map<const char*,int64_t> sideIngest;
+ for(int t=0;t<T;++t)for(const auto& e:tls[t].ingestSide)sideIngest.emplace(e.first,e.second);
+ if(!sideIngest.empty())cerr<<"ingest values kept on the side: "<<sideIngest.size()<<"\n";
+ auto ingest_ms=[&](const PRec& r)->int64_t{
+  const uint64_t c=r.ih>>PR_HBITS;
+  return c==INGEST_SIDE?sideIngest.find(r.id)->second:((int64_t)c+INGEST_BASE_S)*1000;
+ };
  const uint32_t newCount=totalIds-nlinked;
  cerr<<"unlinked IDs: "<<newCount<<" (+"<<extraNames.size()<<" via fallback)\n";
  // ---- Person buckets: bucket = person >> pshift, so a bucket is a dense range of W person numbers
@@ -1345,22 +1410,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Ev** const emitted=emitBuf.get(n); // where record g's event went (only read for valid winners)
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
    size_t dups=0,dead=0;
-   const int64_t ws=window_start;
    for(int t=0;t<T;++t){
     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
     const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
     for(;r!=rend;++r,++g1){
-     const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
-     size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
+     // 41 hash bits per record: the low 25 pick the slot, the tag is the other 16 plus the lowest of the 25.
+     const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
+     const uint32_t tg=((((uint32_t)r->hx|(hl<<16))&tagKeep)<<ib);
+     size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
      for(uint32_t e;(e=S[j])!=0;){
       if((e^tg)<=imask){ // same tag: compare the IDs themselves
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const PRec& o=tls[ot].eb[p][og-off[ot]];
-       if(o.idlen==r->idlen&&memcmp(o.id,r->id,r->idlen)==0){
+       if(same_event_id(o.id,r->id)){
         // Keep the earliest ingested copy; copies with equal ingest_ts are identical.
         ++dups;
-        if(r->ingest>=o.ingest)goto next_event;
-        if(o.flags&F_VALID){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
+        const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
+        const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi; // codes order like the times
+        if(notEarlier)goto next_event;
+        if(o.k&PR_VALID){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
       }
@@ -1368,12 +1436,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      }
      S[j]=tg|g1;
      {
-      const unsigned fl=r->flags;
-      if(fl&F_VALID){
+      const uint64_t rk=r->k;
+      if(rk&PR_VALID){
        uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
        Ev* const out=myEv[u>>pshift].slot(pool);
        emitted[g1-1]=out;
-       out->k=((uint64_t)(r->ts-ws)<<EV_TS)|((uint64_t)(fl&F_PURCHASE)<<23)|(uint64_t)(uint32_t)r->price;
+       out->k=rk&~PR_VALID; // otherwise already in its final form
        const uint64_t w=(uint64_t)u|((uint64_t)r->cat<<32);memcpy((void*)&out->person,&w,8);
       }
      }
