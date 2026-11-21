@@ -1167,7 +1167,7 @@ static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32
 //           decoded and write it at the end of the line, or `ahead` dense rows later (SS_DENSE_AHEAD, 1-16).
 //   bucket  the row is appended to a per-thread bucket by counter range (counter >> shE / shC); a later pass
 //           fills the slot arrays bucket by bucket, so the random writes stay inside a small range.
-struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false;unsigned ahead=8,shE=14,shC=14;};
+struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false,batch=false;unsigned ahead=8,shE=14,shC=14;};
 // A dense event line in bucket form, valid or not. k as in PRec (0 = not a valid event), ingest = exact
 // ingest_ts in ms, lo = the low shE bits of the counter: counter = (bucket index << shE) | lo.
 struct DRec{uint64_t k;int64_t ingest;uint32_t user;uint16_t cat;uint16_t lo;};
@@ -1789,6 +1789,136 @@ SS_EVENT_LOOP_2P(events_avx2_2p,SS_V3,win_masks_avx2,nl_mask_avx2)
 SS_EVENT_LOOP_2P(events_avx512z_2p,SS_V5,win_masks_avx512z,nl_mask_avx512z)
 SS_EVENT_LOOP_2P(events_avx512y_2p,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 #undef SS_IX_FILL
+// ---- Batch event loop (SS_LINES=batch; layout and contract in /home/claude/vert/BATCH.md) ----
+// Stage 1 cuts a line as event_line_v3 does and, if its shapes fit, only writes the operands of the row into
+// a batch of eight; stage 2 works out counter, ingest_ts, validity and k for the whole batch (the place for
+// the vertical kernels; ev_stage2_scalar is the reference, built from the functions of the line code);
+// stage 3 asks for the slots of the batch just decoded and then finishes the batch before it. A line whose
+// shapes do not fit, and a row the stage-2 code refuses, goes through event_line_v3 when its batch is finished.
+struct alignas(64) EvBatch{uint64_t idw[8],idn[8],ig0[8],ig1[8],ig2[8],ts0[8],ts1[8],ts2[8],tsn[8],kw[8],kn[8],fl[8];};
+struct alignas(64) EvBatchOut{uint64_t ve[8],ingest[8],k[8],kind[8];uint8_t ok,idok;}; // idok: ve is the counter of a dense ID (also when ok is clear)
+// What the loop keeps per row besides the operands.
+struct EvRows{const char* line[8];const char* nl[8];const char* s5[8];const char* s6[8];uint64_t uw[8];uint32_t l5[8],l6[8],un[8],pre[8];unsigned n;uint8_t slow;};
+SS_V3 static void ev_stage2_scalar(const EvBatch& in,const unsigned n,EvBatchOut& out,const EvLoop& lp){
+ unsigned ok=0,idok=0;
+ for(unsigned i=0;i<n;++i){
+  out.ve[i]=0;out.ingest[i]=0;out.k[i]=0;out.kind[i]=0;
+  uint64_t y,ve=0;bool good=true;
+  if(parse36_v3((const char*)&in.idw[i],(unsigned)in.idn[i],y)&&(ve=dn::index_of(y,lp.ke))<lp.limE){idok|=1u<<i;out.ve[i]=ve;}else good=false;
+  char ig[32]={0},ts[32]={0};
+  memcpy(ig,&in.ig0[i],8);memcpy(ig+8,&in.ig1[i],8);memcpy(ig+12,&in.ig2[i],8);
+  int64_t tod,day=0,ingest=0,tsv=0;
+  if(ig[19]=='Z'&&(tod=tod_v3(ig))>=0&&date3(ig,lp.memo,day))ingest=day+tod;else good=false;
+  if(in.tsn[i]==20){
+   memcpy(ts,&in.ts0[i],8);memcpy(ts+8,&in.ts1[i],8);memcpy(ts+12,&in.ts2[i],8);
+   int64_t tod2;
+   if(ts[19]=='Z'&&memcmp(ts,ig,10)==0&&(tod2=tod_v3(ts))>=0)tsv=day+tod2;else good=false;
+  }else{ // 13 digits
+   memcpy(ts,&in.ts0[i],8);memcpy(ts+5,&in.ts1[i],8);
+   if(!epoch13_v3(ts,tsv))good=false;
+  }
+  if(!good)continue;
+  char kb[16]={0};memcpy(kb,&in.kw[i],8);
+  const unsigned kind=in.kn[i]<=8?event_kind(string_view(kb,(size_t)in.kn[i])):0;
+  const uint64_t tsrel=(uint64_t)tsv-(uint64_t)lp.wstart;
+  const bool valid=kind&&(in.fl[i]&1)&&(in.fl[i]&2)&&tsrel<lp.wlen&&ingest-tsv<=DAY;
+  out.ingest[i]=(uint64_t)ingest;out.kind[i]=kind;out.k[i]=valid?(tsrel+1)<<EV_TS:0;ok|=1u<<i;
+ }
+ out.ok=(uint8_t)ok;out.idok=(uint8_t)idok;
+}
+// Stage 1 for the line at p (b, w1, w2, nl as for event_line_v3<true,...>): row r of the batch, or a slow row.
+// Returns false if the line is dropped outright (no event_id).
+// Eight bytes as they stand (a plain load; memcpy into an indexed array would become a checked library call).
+static inline __attribute__((always_inline)) uint64_t ld8(const char* p){uint64_t w;__builtin_memcpy(&w,p,8);return w;}
+SS_V3I bool ev_stage1_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const char* const nl,EvBatch& bt,EvRows& rw,const unsigned r,const EvLoop& lp){
+ rw.line[r]=p;rw.nl[r]=nl;
+ const uint64_t c=w1.c,qa=w1.q;
+ const uint64_t cA=_blsr_u64(c),cB=_blsr_u64(cA),cR=_blsr_u64(cB);
+ const uint64_t m1=_blsmsk_u64(cB);
+ const uint64_t q1=qa&m1,st1=((c^cB)<<1)|1,en1=c^cR;
+ uint64_t sq1,op1;const uint64_t err1=quote_errors_v3(q1,st1,en1,sq1,op1);
+ const uint64_t e2=_tzcnt_u64(cB);
+ const uint64_t L=(uint64_t)(nl-b),nbit=1ull<<(L&63),keep=nbit-1;
+ const uint64_t d=w2.c&keep,qb=w2.q&keep;
+ const uint64_t st2=(d<<1)|1,en2=d|nbit;
+ uint64_t sq2,op2;const uint64_t err2=quote_errors_v3(qb,st2,en2,sq2,op2);
+ bool fast=(err1|err2|(uint64_t)(_mm_popcnt_u64(d)^3)|((e2|L)>>6))==0;
+ if(__builtin_expect(fast,1)){
+  uint64_t B1=st1+sq1,E1=en1-(op1>>1),B2=st2+sq2,E2=en2-(op2>>1);
+  const unsigned z0=(unsigned)(q1&1);
+  const char* const s0=p+z0;const unsigned l0=(unsigned)_tzcnt_u64(E1)-z0;
+  if(l0==0)return false; // no event_id: dropped
+  const unsigned z3=(unsigned)(qb&1);
+  const char* const s3=b+z3;const unsigned l3=(unsigned)_tzcnt_u64(E2)-z3;
+  B1=_blsr_u64(B1);E1=_blsr_u64(E1);
+  const unsigned b1=(unsigned)_tzcnt_u64(B1),l1=(unsigned)_tzcnt_u64(E1)-b1;
+  B1=_blsr_u64(B1);E1=_blsr_u64(E1);
+  const unsigned b2=(unsigned)_tzcnt_u64(B1),l2=(unsigned)_tzcnt_u64(E1)-b2;
+  B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+  const unsigned b4=(unsigned)_tzcnt_u64(B2),l4=(unsigned)_tzcnt_u64(E2)-b4;
+  B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+  const unsigned b5=(unsigned)_tzcnt_u64(B2),l5=(unsigned)_tzcnt_u64(E2)-b5;
+  B2=_blsr_u64(B2);E2=_blsr_u64(E2);
+  const unsigned b6=(unsigned)_tzcnt_u64(B2),l6=(unsigned)_tzcnt_u64(E2)-b6;
+  const char* const s1=p+b1;const char* const s2=p+b2;
+  // the shapes of the fast path: 'e' + 1-8 bytes, ingest_ts 20 long, ts 20 or 13 long, user empty or 'u' + 0-8 bytes
+  fast=(s0[0]=='e')&(l0-2u<8u)&(l3==20)&((l2==20)|(l2==13))&((l1==0)|((s1[0]=='u')&(l1<=9u)));
+  if(__builtin_expect(fast,1)){
+      bt.idw[r]=ld8(s0+1);bt.idn[r]=l0-1;
+   bt.ig0[r]=ld8(s3);bt.ig1[r]=ld8(s3+8);bt.ig2[r]=ld8(s3+12);
+   bt.ts0[r]=ld8(s2);bt.ts1[r]=ld8(s2+(l2==20?8:5));bt.ts2[r]=ld8(s2+12);bt.tsn[r]=l2;
+   bt.kw[r]=ld8(b+b4);bt.kn[r]=l4;
+   bt.fl[r]=(uint64_t)(l1!=0)|((uint64_t)(l5!=0)<<1);
+   rw.un[r]=l1?l1-1:0;rw.uw[r]=_bzhi_u64(ld8(s1+1),8*rw.un[r]);
+   rw.s5[r]=b+b5;rw.l5[r]=l5;rw.s6[r]=b+b6;rw.l6[r]=l6;
+   return true;
+  }
+ }
+ // not for the batch: the line code takes it when the batch is finished; its slot is asked for now
+ rw.slow|=(uint8_t)(1u<<r);rw.pre[r]=event_pre_v3(p,lp);
+ bt.idw[r]=0;bt.idn[r]=0;bt.ig0[r]=0;bt.ig1[r]=0;bt.ig2[r]=0;bt.ts0[r]=0;bt.ts1[r]=0;bt.ts2[r]=0;bt.tsn[r]=20;bt.kw[r]=0;bt.kn[r]=0;bt.fl[r]=0;
+ return true;
+}
+// Stage 3 for one batch: every row in line order.
+#define SS_BATCH_FINISH(X,MASKS) {const EvRows& R_=rw[X];const EvBatchOut& O_=bo[X]; \
+  for(unsigned i_=0;i_<R_.n;++i_){ \
+   if(__builtin_expect(((R_.slow>>i_)&1)|(~(O_.ok>>i_)&1),0)){ \
+    const char* const q_=R_.line[i_];const WinMasks w1_=MASKS(q_);const char* const bb_=event_window2(q_,w1_.c); \
+    const uint32_t pre_=((R_.slow>>i_)&1)?R_.pre[i_]:(((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:NOPRE); \
+    event_line_v3<true,true>(q_,bb_,w1_,MASKS(bb_),R_.nl[i_],pre_,lp,pend,pp,dmax,send,ring,rpos,general);continue;} \
+   uint64_t k_=O_.k[i_];unsigned cat_=0; \
+   if(k_&&O_.kind[i_]==3){int32_t price_=0; \
+    if(price_value(string_view(R_.s6[i_],R_.l6[i_]),price_)){const uint32_t ci_=products.find(string_view(R_.s5[i_],R_.l5[i_]));cat_=ci_==KeyTable::NONE?0:(unsigned)(uint16_t)ci_;k_|=EV_PURCHASE|(uint64_t)(uint32_t)price_;} \
+    else k_=0;} \
+   const uint64_t ve_=O_.ve[i_];send=max(send,(uint32_t)ve_+1); \
+   eslot_commit(lp.ev[ve_],k_?k_:ESLOT_INVALID,(k_?(uint64_t)(DENSE_USER_RAW|R_.un[i_]):0)|((uint64_t)cat_<<32)|lp.tid48,(int64_t)O_.ingest[i_],k_?R_.uw[i_]:0);} }
+// Stage 2 and the slot requests for the batch just filled, then stage 3 for the one before.
+#define SS_BATCH_TURN(MASKS) {EvRows& R_=rw[cur];for(unsigned i_=R_.n;i_<8;++i_){R_.slow|=(uint8_t)(1u<<i_);bt[cur].idn[i_]=0;bt[cur].tsn[i_]=20;} \
+  ev_stage2_scalar(bt[cur],R_.n,bo[cur],lp); \
+  for(unsigned i_=0;i_<R_.n;++i_)if((bo[cur].idok>>i_)&~(R_.slow>>i_)&1)__builtin_prefetch(&lp.ev[bo[cur].ve[i_]],1,3); \
+  SS_BATCH_FINISH(cur^1,MASKS) cur^=1;rw[cur].n=0;rw[cur].slow=0;}
+#define SS_EVENT_LOOP_BATCH(NAME,TARGET,MASKS,NLMASK) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const char* const end=base+len; \
+ const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;ERing* const ring=nullptr;unsigned rpos=0; \
+ EvBatch bt[2];EvBatchOut bo[2];EvRows rw[2];int cur=0;rw[0].n=0;rw[0].slow=0;rw[1].n=0;rw[1].slow=0; \
+ const char* starts[IX_BLOCK+64];const char* scan=p; \
+ while(p<lim){ \
+  size_t n=0; \
+  for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
+  for(size_t i=0;i<n&&p<lim;++i){ \
+   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c); \
+   if(ev_stage1_v3(p,b,w1,MASKS(b),starts[i]-1,bt[cur],rw[cur],rw[cur].n,lp)&&++rw[cur].n==8)SS_BATCH_TURN(MASKS) \
+   p=starts[i];} \
+  if(scan>=end&&p<lim){p=line_general<7>(p,end,general);break;} /* the last line has no newline */ \
+ } \
+ SS_BATCH_TURN(MASKS) SS_BATCH_FINISH(cur^1,MASKS) \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send); \
+}
+SS_EVENT_LOOP_BATCH(events_avx2_bt,SS_V3,win_masks_avx2,nl_mask_avx2)
+SS_EVENT_LOOP_BATCH(events_avx512z_bt,SS_V5,win_masks_avx512z,nl_mask_avx512z)
+SS_EVENT_LOOP_BATCH(events_avx512y_bt,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
@@ -2046,7 +2176,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Event lines with raw users use the two-phase loop (SS_EVENT_LOOP_2P) unless SS_DENSE_AHEAD is given: then the
  // loop with the ring of that length (0 = write at the end of the line) runs, for comparison.
  dparse.twoPhase=dparse.raw&&!getenv("SS_DENSE_AHEAD");
- cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<"\n";
+ // SS_LINES=batch: the batch event loop (SS_EVENT_LOOP_BATCH), for comparison while it is being built.
+ dparse.batch=dparse.twoPhase&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="batch";
+ cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<" batch "<<dparse.batch<<"\n";
  // First pass over the link files.
  // Without dense users it only counts lines (the table and the union-find arrays are sized by them).
  // With dense users it is the only pass that reads the files: a "simple" line - two dense user IDs
@@ -2432,7 +2564,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(ck.click){if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else clicks_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);} \
-    else{if(drec&&dparse.twoPhase)events_##ISA##_2p(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+    else{if(drec&&dparse.batch)events_##ISA##_bt(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+     else if(drec&&dparse.twoPhase)events_##ISA##_2p(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(drec)events_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(lineIndex)events_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else events_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);}
