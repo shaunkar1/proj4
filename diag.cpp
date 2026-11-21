@@ -170,6 +170,10 @@ static void run_child(const string& bin,vector<pair<string,string>> env,RunResul
  fwrite(out.data(),1,out.size(),stderr);
  size_t p=0;while(p<out.size()){size_t e=out.find('\n',p);if(e==string::npos)e=out.size();string line=out.substr(p,e-p);p=e+1;
   if(line.rfind("TIME ",0)==0){size_t sp=line.find(' ',5);if(sp!=string::npos)r.t[line.substr(5,sp-5)]+=atof(line.c_str()+sp+1);}
+  if(line.rfind("CPU ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["c"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1);}
+  if(line.rfind("SYS ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["s"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1);}
+  if(line.rfind("FLT ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["f"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1)/1e6;}
+  if(line.rfind("SMAPS FilePmdMapped:",0)==0)r.t["pmd"]=atof(line.c_str()+20)/1e6;
   if(line.rfind("STATS dense keys ",0)==0){unsigned long long a=0,b=0,c=0;if(sscanf(line.c_str(),"STATS dense keys %llu %llu %llu",&a,&b,&c)==3&&(a|b|c)){gKe=a;gKu=b;gKc=c;gKeys=true;}}}
  r.rc=WIFEXITED(st)?WEXITSTATUS(st):-1;
 }
@@ -386,12 +390,17 @@ int main(){
  auto add=[&](const char* group,int reps,vector<pair<string,string>> env,const char* bin="",bool hs=false){for(int i=0;i<reps;++i)vars.push_back({string(group)+"#"+to_string(i),env,bin,hs});};
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
+ #define FA {"SS_FILEALIGN","2m+huge"}
+ add("fs",1,{N8,FA,{"SS_SMAPS","1"},{"SS_STATS","1"}},"core-b");
  for(int r=0;r<3;++r){
-  add("B",1,{N8});add("tp",1,{N8,{"SS_LINES","2p"}});add("rp",1,{N8,{"SS_RESOLVE_RAW","pass"}});add("m",1,{N8},"core-m");add("x",1,{N8},"core-b");add("xc",1,{N8,{"SS_CLICKS","ix"}},"core-b");
+  add("B",1,{N8});add("m",1,{N8},"core-m");add("cas",1,{N8},"core-c");add("rp",1,{N8,{"SS_RESOLVE_RAW","pass"}});
+  add("S",1,{N8,{"SS_STATS","1"}},"core-b");add("fa",1,{N8,FA},"core-b");add("p4",1,{N8,{"SS_POPULATE","bg4"}},"core-b");add("p8",1,{N8,{"SS_POPULATE","bg8"}},"core-b");
+  add("pa",1,{N8,{"SS_POPULATE","all"},{"SS_STATS","1"}},"core-b");add("ph",1,{N8,{"SS_POPULATE","ahead"}},"core-b");add("fr",1,{N8,{"SS_FILEADVISE","random"}},"core-b");
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hm",1,{N8},"core-m",true);add("Hx",1,{N8},"core-b",true);add("Hxc",1,{N8,{"SS_CLICKS","ix"}},"core-b",true);}
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hm",1,{N8},"core-m",true);add("Hcas",1,{N8},"core-c",true);add("Hrp",1,{N8,{"SS_RESOLVE_RAW","pass"}},"",true);
+  add("HS",1,{N8,{"SS_STATS","1"}},"core-b",true);add("Hfa",1,{N8,FA},"core-b",true);add("Hp4",1,{N8,{"SS_POPULATE","bg4"}},"core-b",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
@@ -404,9 +413,9 @@ int main(){
    close(fd);unlink(pth.c_str());return true;};
   uint64_t ur[3]={0,0,0},us_[3]={0,0,0},cr[3]={0,0,0},cs[3]={0,0,0};bool ok[3]={false,false,false};
   for(int i=0;i<3;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
-   pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,i==2?"core-b":"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+   if(i==2){env.push_back({"SS_FILEALIGN","2m+huge"});env.push_back({"SS_POPULATE","bg4"});}pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,i==2?"core-b":"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c52 dense %s (u%llu c%llu), c53 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0],
+  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c57 dense %s (u%llu c%llu), c58+align+bg4 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0],
    same(2)?"SAME":"DIFF",(unsigned long long)ur[2],(unsigned long long)cr[2]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
@@ -433,14 +442,16 @@ int main(){
     double v;const string k=key;
     if(k=="w")v=r.wall;else if(k=="u")v=r.user;else if(k=="s")v=r.sys;else if(k=="f")v=r.minflt/1e3;else if(k=="r")v=r.maxrssMB/1e3;
     else if(k=="L"){v=0;for(auto& kv:r.t)if(kv.first.rfind("LINK",0)==0||kv.first=="FLATTEN")v+=kv.second;}
-    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="Y"?"DENSE1":k=="K"?"KEYS":k=="W"?"WRITE":k=="R"?"RESOLVE":key);v=it==r.t.end()?0:it->second;}
+    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="Y"?"DENSE1":k=="K"?"KEYS":k=="W"?"WRITE":k=="R"?"RESOLVE":k=="M"?"MAP":k=="p"?"cPARSE":k=="q"?"cRESOLVE":k=="x"?"cDENSE":k=="a"?"cAGGREGATE":k=="i"?"sMAP":k=="y"?"sPARSE":k=="h"?"sRESOLVE":k=="z"?"sDENSE":k=="g"?"sAGGREGATE":k=="j"?"fPARSE":k=="k"?"fMAP":k=="e"?"pmd":key);v=it==r.t.end()?0:it->second;}
     if(best<0||v<best)best=v;}
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=eqText+" | wPRYXAus: "+fmt("c52","B","wPRYXAus")+fmt("c52-2p","tp","wPRYX")+fmt("c52-pass","rp","wPRYX")+fmt("c49","m","wPRYXAus")+fmt("c53","x","wPRYXAus")+fmt("c53-oldclicks","xc","wPRYX");
-  a+="| 60x wPRYXA: "+fmt("c52","HB","wPRYXA")+fmt("c49","Hm","wPRYXA")+fmt("c53","Hx","wPRYXA")+fmt("c53-oldclicks","Hxc","wPRYX");
-  c+=benchText;
+  a+=eqText+" | wPRYXAus: "+fmt("c57","B","wPRYXAus")+fmt("c53","m","wPRYXAus")+fmt("cas","cas","wPus")+fmt("pass","rp","wPRYX");
+  a+="| 60x wPRYXAus: "+fmt("c57","HB","wPRYXAus")+fmt("c53","Hm","wPRYXA")+fmt("cas","Hcas","wP")+fmt("pass","Hrp","wPRYX");
+  c+="c58: "+fmt("stats w/us/sysMAP,PARSE,RESOLVE,DENSE,AGG/fltkMAP,PARSE/cpuP,R,X","S","wusiyhzgkjpqx")+fmt("| align+huge wPus","fa","wPus")+fmt("align smaps: pmdMB,fltkPARSE,sysPARSE","fs","ejy")
+   +fmt("| bg4 wMPus","p4","wMPus")+fmt("bg8 wMPus","p8","wMPus")+fmt("all wMPus sysMAP,PARSE","pa","wMPusiy")+fmt("ahead wPus","ph","wPus")+fmt("random wPus","fr","wPus");
+  c+="| 60x "+fmt("stats w/us/sysMAP,PARSE,RESOLVE,DENSE,AGG","HS","wusiyhzg")+fmt("align wPus","Hfa","wPus")+fmt("bg4 wPus","Hp4","wPus");
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)

@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <fcntl.h>
@@ -202,16 +203,46 @@ static Mapped map_file(const fs::path& path){
 // followed by at least one page of zeros (as in map_file). One mmap per file instead of two, and the
 // whole folder can be unmapped later in a few large pieces.
 struct FileGroup{char* base=nullptr;size_t len=0;vector<size_t> ends;}; // ends: offset just past each mapped file's slot
+// ---- Switches for the kernel's share of the run (system time). All are off by default and none can change
+// the output: they only change where the input's pages sit in the address space and when they are mapped.
+// The active ones are listed in the "STATS kernel switches" line (SS_STATS=1).
+//  SS_FILEALIGN=2m      every input file starts at a 2 MB boundary of the reservation (default: 4 KB). File
+//                       offsets and addresses are then congruent modulo 2 MB, which the kernel requires before it
+//                       maps a 2 MB folio of the page cache with one PMD entry (one fault and one rmap step per
+//                       2 MB instead of 32 faults and 512 page-table entries). Costs address space only.
+//                       SS_FILEALIGN=2m+huge also advises MADV_HUGEPAGE on the file mappings.
+//  SS_POPULATE=ahead    each parser thread asks for its next 2 MB chunk with one madvise(MADV_POPULATE_READ)
+//                       before it parses it (one system call instead of ~32 fault traps per chunk).
+//  SS_POPULATE=all      all threads populate the whole input right after it is mapped (inside the MAP stage).
+//  SS_POPULATE=bg[n]    n (default 2) extra threads populate the input in the background from the end of MAP on;
+//                       they stop when the parse stage ends.
+//  SS_FILEADVISE=random|seq  MADV_RANDOM / MADV_SEQUENTIAL on the file mappings (after MADV_WILLNEED). Either one
+//                       tells the kernel the mapping says nothing about page recency, so unmapping skips the
+//                       per-page folio_mark_accessed step; seq may also change read-ahead decisions.
+//  SS_SMAPS=1          measuring only: after PARSE, print Rss / Anonymous / AnonHugePages / FilePmdMapped of the
+//                       process (SMAPS lines) - FilePmdMapped > 0 means SS_FILEALIGN=2m took effect.
+//  Older ones: SS_NOWILLNEED=1 (no MADV_WILLNEED on the files), SS_NOEARLYUNMAP=1 (inputs and slot arrays stay
+//  mapped until exit), SS_NOHUGE=1 (no MADV_HUGEPAGE on anonymous memory), SS_PREFAULT=1 (MADV_POPULATE_WRITE on
+//  the arenas), SS_ASYNCFREE=1.
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+static int optFileAlign=0; // 0 = 4 KB, 1 = 2 MB, 2 = 2 MB + MADV_HUGEPAGE
+static int optFileAdvise=0; // 0 none, 1 MADV_RANDOM, 2 MADV_SEQUENTIAL
+static int optPopulate=0,optPopulateBg=2; // 0 off, 1 ahead, 2 all, 3 bg
 static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
+ const size_t HUGE2M=size_t(2)<<20;
+ const auto slot_of=[&](size_t len){const size_t s=((len+4095)&~size_t(4095))+4096;return optFileAlign?(s+HUGE2M-1)&~(HUGE2M-1):s;};
  vector<size_t> lens(paths.size(),0);size_t total=0;
  for(size_t i=0;i<paths.size();++i){
   struct stat st{};if(stat(paths[i].c_str(),&st)!=0)throw runtime_error("Cannot stat "+paths[i].string());
-  lens[i]=(size_t)st.st_size;if(lens[i])total+=((lens[i]+4095)&~size_t(4095))+4096;
+  lens[i]=(size_t)st.st_size;if(lens[i])total+=slot_of(lens[i]);
  }
  vector<Mapped> out(paths.size());
  if(!total)return out;
- void* base=mmap(nullptr,total,PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+ void* base=mmap(nullptr,total+(optFileAlign?HUGE2M:0),PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
  if(base==MAP_FAILED)throw runtime_error("Cannot reserve address space for the input files");
+ if(optFileAlign)base=(void*)(((uintptr_t)base+HUGE2M-1)&~(uintptr_t)(HUGE2M-1)); // the unused edges stay reserved, without pages
  g.base=(char*)base;g.len=total;size_t off=0;
  static const bool willNeed=!getenv("SS_NOWILLNEED"); // measuring switch
  for(size_t i=0;i<paths.size();++i){
@@ -222,8 +253,10 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
   close(fd);
   if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
   if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
+  if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
+  if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
   out[i]={g.base+off,lens[i]};
-  off+=((lens[i]+4095)&~size_t(4095))+4096;g.ends.push_back(off);
+  off+=slot_of(lens[i]);g.ends.push_back(off);
  }
  return out;
 }
@@ -804,6 +837,7 @@ struct alignas(64) ThreadState{
  uint64_t slotWaits=0; // eslotWaits of this thread
  uint64_t cl8Rows=0,cl8Slow=0; // cl8 click loop: lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
+ uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
  string dumpRows; // SS_DENSE_DUMP only
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
@@ -1039,6 +1073,73 @@ static inline size_t text36(char letter,uint64_t y,char* out){
 // Looks for the key under which sample 0 has a counter that is a multiple of `step` below `limit` and
 // all but at most one of the other samples have counters below `limit`. um[i] = unmix(value of sample i).
 // Candidates are tried in increasing counter order by all threads; the smallest hit wins.
+// keysearch_paste.h - AVX-512 form of the first round of dn::find_key (agent C2, 2026-11-21). Text to paste into main.cpp.
+//
+// INTEGRATION (for whoever merges it; names are those of /home/claude/wtB/main.cpp at db47b3e, branch agent-post)
+//  1. Paste this file's text inside `namespace dn`, right before `static bool find_key(` (it uses dn::MASK and dn::I1 and
+//     nothing else of the program; it needs <immintrin.h>, <cstdint>, <cstddef>).
+//  2. In find_key, before `#pragma omp parallel`, add:      const bool ks5=ks_has512();
+//  3. In the first-round branch `if(round==0&&limit<=MASK){`, before its line `const uint64_t D1=(u0^u1)<<24,...`, add:
+//         if(ks5){const uint64_t c=ks_block_v5(um,n,limit,inc,b,e);
+//          if(c!=UINT64_MAX){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}}
+//          continue;}
+//     Nothing else changes: the scalar loop below it stays for other CPUs, the second round and the limit > MASK case stay.
+//     (vert/ks_test.cpp builds exactly this patched find_key from the production text and compares it with the original.)
+//  Dispatch: ks_has512() = the CPU has avx512f and avx512dq (vpmullq); the scoring machine has both.
+//
+// CONTRACT  ks_block_v5(um, n, limit, inc, b, e) returns the smallest c in [b, e) that the first round accepts, or
+// UINT64_MAX if there is none - exactly what the scalar loop of the first round does with one block [b, e): c is accepted
+// iff sample 1 has a counter below limit under the key um[0] ^ ((c*inc) & MASK) and at most one of the samples 1..n-1 is
+// at or above limit. Requires limit <= MASK (the branch's own condition) and n >= 2. ks_block_scalar is the scalar loop
+// itself (same text as in find_key), for the test and as the definition.
+// The vector loop tests 32 candidates per turn (four vectors of eight: one xor and one 64-bit multiply each, with the
+// 40-bit numbers in the top 40 bits of the lanes as in the scalar code; then one unsigned compare of the lane-wise minimum
+// of the four products with the limit). When any lane passes, the passing candidates are checked against all samples one
+// by one in increasing c, so the first accepted c of the block is the scalar loop's. The last (e - b) mod 32 candidates
+// run through the scalar loop.
+#define DN_KS5 __attribute__((target("avx512f,avx512dq")))
+static inline bool ks_has512(){static const bool h=__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512dq");return h;}
+// the full rule for one candidate (A = its c*inc in the top 40 bits): at most one of the samples 1..n-1 off
+static inline __attribute__((always_inline)) bool ks_full(const uint64_t* um,size_t n,uint64_t limit,uint64_t A){
+ const uint64_t k=um[0]^(A>>24);
+ size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
+ return miss<2;
+}
+static inline uint64_t ks_block_scalar(const uint64_t* um,size_t n,uint64_t limit,uint64_t inc,uint64_t b,uint64_t e){
+ const uint64_t D1=(um[0]^um[1])<<24,INC=inc<<24,LIM=limit<<24;uint64_t A=((b*inc)&MASK)<<24;
+ for(uint64_t c=b;c<e;++c,A+=INC){
+  if(__builtin_expect(((D1^A)*I1)>=LIM,1))continue; // sample 1 off
+  if(ks_full(um,n,limit,A))return c;
+ }
+ return UINT64_MAX;
+}
+// the candidates of one turn that passed the one-sample test (bit j of m = candidate j, A = c*inc of candidate 0), in
+// increasing c: the first that passes the full rule, as an offset, or UINT64_MAX. Out of line: it keeps the loop small.
+__attribute__((noinline)) static uint64_t ks_hits(const uint64_t* um,size_t n,uint64_t limit,uint64_t A,uint64_t INC,uint32_t m){
+ for(;m;m&=m-1){const unsigned j=(unsigned)__builtin_ctz(m);if(ks_full(um,n,limit,A+(uint64_t)j*INC))return j;}
+ return UINT64_MAX;
+}
+DN_KS5 static uint64_t ks_block_v5(const uint64_t* um,size_t n,uint64_t limit,uint64_t inc,uint64_t b,uint64_t e){
+ const uint64_t D1=(um[0]^um[1])<<24,INC=inc<<24,LIM=limit<<24;uint64_t A=((b*inc)&MASK)<<24,c=b;
+ const __m512i vD=_mm512_set1_epi64((long long)D1),vI=_mm512_set1_epi64((long long)I1),vL=_mm512_set1_epi64((long long)LIM),v8=_mm512_set1_epi64((long long)(8*INC));
+ __m512i a0=_mm512_add_epi64(_mm512_set1_epi64((long long)A),_mm512_mullo_epi64(_mm512_set1_epi64((long long)INC),_mm512_setr_epi64(0,1,2,3,4,5,6,7))); // lane j: A + j*INC, wrapping as the scalar A does
+ for(;c+32<=e;c+=32,A+=32*INC){
+  const __m512i a1=_mm512_add_epi64(a0,v8),a2=_mm512_add_epi64(a1,v8),a3=_mm512_add_epi64(a2,v8);
+  const __m512i p0=_mm512_mullo_epi64(_mm512_xor_si512(vD,a0),vI),p1=_mm512_mullo_epi64(_mm512_xor_si512(vD,a1),vI);
+  const __m512i p2=_mm512_mullo_epi64(_mm512_xor_si512(vD,a2),vI),p3=_mm512_mullo_epi64(_mm512_xor_si512(vD,a3),vI);
+  a0=_mm512_add_epi64(a3,v8);
+  // one compare for the 32: the smallest of the four products per lane (the four masks are only made when one passes)
+  if(__builtin_expect(_mm512_cmplt_epu64_mask(_mm512_min_epu64(_mm512_min_epu64(p0,p1),_mm512_min_epu64(p2,p3)),vL)==0,1))continue; // sample 1 off in all 32
+  const uint32_t m0=_mm512_cmplt_epu64_mask(p0,vL),m1=_mm512_cmplt_epu64_mask(p1,vL),m2=_mm512_cmplt_epu64_mask(p2,vL),m3=_mm512_cmplt_epu64_mask(p3,vL);
+  const uint64_t hit=ks_hits(um,n,limit,A,INC,m0|(m1<<8)|(m2<<16)|(m3<<24));
+  if(hit!=UINT64_MAX)return c+hit;
+ }
+ for(;c<e;++c,A+=INC){ // the tail of the block, as the scalar loop
+  if(__builtin_expect(((D1^A)*I1)>=LIM,1))continue;
+  if(ks_full(um,n,limit,A))return c;
+ }
+ return UINT64_MAX;
+}
 static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,uint64_t& key,int T){
  if(n<6||limit<step)return false;
  const uint64_t cand=limit/step;
@@ -1050,6 +1151,7 @@ static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,ui
  // rule is a valid key; which one is found only matters for speed.
  for(int round=0;round<2;++round){
   atomic<uint64_t> best{UINT64_MAX};
+  const bool ks5=ks_has512();
   #pragma omp parallel num_threads(T)
   {
    const int t=omp_get_thread_num();
@@ -1060,6 +1162,9 @@ static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,ui
     if(round==0&&limit<=MASK){
      // The first round's test with the 40-bit numbers held in the top 40 bits of a word: adding and
      // multiplying then wrap as they should without masks ((x << 24) * I1 = ((x * I1) mod 2^40) << 24).
+     if(ks5){const uint64_t c=ks_block_v5(um,n,limit,inc,b,e);
+      if(c!=UINT64_MAX){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}}
+      continue;}
      const uint64_t D1=(u0^u1)<<24,INC=inc<<24,LIM=limit<<24;uint64_t A=a<<24;
      for(uint64_t c=b;c<e;++c,A+=INC){
       if(__builtin_expect(((D1^A)*I1)>=LIM,1))continue; // sample 1 off
@@ -1162,8 +1267,17 @@ static_assert(offsetof(ESlot,user)==8&&offsetof(ESlot,cat)==12&&offsetof(ESlot,t
 // this into another pass over the slots has to do exactly that, before tab.end_parallel() if table IDs can
 // still be new. Only slots with a valid event (k >= PR_KBIAS) carry a user at all.
 static constexpr uint32_t DENSE_USER_RAW=0xC0000000u;
+// -DSS_CAS_FIRST (measuring option, off by default): the lock is first tried on the assumption that the slot is
+// empty, without reading it; any other state falls into the same loop. Fewer instructions for a first copy, a
+// second locked instruction for every later copy.
 static inline __attribute__((always_inline)) void eslot_commit(ESlot& s,uint64_t kk,uint64_t uct,int64_t ingest,uint64_t spare=0){
+#ifdef SS_CAS_FIRST
+ uint64_t cur=0;
+ if(__builtin_expect(s.k.compare_exchange_strong(cur,ESLOT_BUSY,memory_order_acquire,memory_order_relaxed),1)){
+  memcpy((char*)&s+offsetof(ESlot,user),&uct,8);s.ingest=ingest;s.spare=spare;s.k.store(kk,memory_order_release);return;}
+#else
  uint64_t cur=s.k.load(memory_order_relaxed);
+#endif
  for(;;){
   if(__builtin_expect(cur==ESLOT_BUSY,0)){++eslotWaits;_mm_pause();cur=s.k.load(memory_order_relaxed);continue;}
   if(__builtin_expect(!s.k.compare_exchange_weak(cur,ESLOT_BUSY,memory_order_acquire,memory_order_relaxed),0)){++eslotWaits;continue;} // cur is reloaded
@@ -2112,6 +2226,15 @@ SS_EVENT_LOOP_BATCH(events_avx512y_bt,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 // kernel's answers for an ok row are exactly what event_line_v3<true,true> would hand to eslot_commit for
 // that line, a purchase's category excepted (see pur); the contract is the comment of Ev8Out below and the
 // head of /home/claude/vert/vert.h.
+// Option set of the pasted kernel. Bit 0: the event_id and the user's letter come from the first 16 bytes of
+// each line, which the scan keeps, instead of three gathers (a user letter beyond them leaves the row to the
+// line code). Bit 1: when every Z/offset-form ts of a group has its ingest_ts date text, the date lookup of
+// ingest_ts is reused instead of three more gathers. Same results for every set (the kernel's own tests ran
+// all four). Set 3 measured fastest on the scoring machine, where gathers are slow: 37.9 ns per row against
+// 43.8 for set 0. -DVERT_EV8_OPT=n overrides.
+#ifndef VERT_EV8_OPT
+#define VERT_EV8_OPT 3
+#endif
 // ---- ev8: eight event lines per call (vertical AVX-512). Generated from /home/claude/vert/vert.h by mkpaste.py; contract in
 // ---- vert.h / BATCH.md. Tested as this exact text by vert_line_test -DVERT_PASTE. Do not edit here: change vert.h and regenerate.
 namespace vert{
@@ -2594,8 +2717,8 @@ static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
 // goes into vmx (the low halves of four 64-bit lanes; fastAny says that vmx holds anything).
 #define SS_EV8_SLOT(O_,i_) (*(ESlot*)((char*)lp.ev+O_.so[i_]))
 #define SS_EV8_COMMIT(O_,i_) eslot_commit(SS_EV8_SLOT(O_,i_),O_.kk[i_],O_.uct[i_],(int64_t)O_.ingest[i_],O_.uw[i_]);
-#define SS_EV8_FINISH(O,LS,NX,N,MASKS) {vert::Ev8Out& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
-  const unsigned ok_=O_.ok&((1u<<n_)-1); \
+#define SS_EV8_FINISH(O,LS,NX,N,SLOW) {vert::Ev8Out& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
+  const unsigned ok_=O_.ok&((1u<<n_)-1);rows+=n_; \
   for(unsigned m_=O_.pur&ok_;m_;m_&=m_-1){const unsigned i_=(unsigned)__builtin_ctz(m_); \
    const uint32_t ci_=products.find(string_view(O_.s5[i_],(size_t)O_.l5[i_]));O_.uct[i_]|=(uint64_t)(ci_==KeyTable::NONE?0u:(unsigned)(uint16_t)ci_)<<32;} \
   if(__builtin_expect(ok_==0xFFu,1)){ \
@@ -2603,9 +2726,7 @@ static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
    SS_EV8_COMMIT(O_,0) SS_EV8_COMMIT(O_,1) SS_EV8_COMMIT(O_,2) SS_EV8_COMMIT(O_,3) SS_EV8_COMMIT(O_,4) SS_EV8_COMMIT(O_,5) SS_EV8_COMMIT(O_,6) SS_EV8_COMMIT(O_,7) \
   }else for(unsigned i_=0;i_<n_;++i_){ \
    if((ok_>>i_)&1){send=max(send,(uint32_t)O_.ve[i_]+1);SS_EV8_COMMIT(O_,i_)} \
-   else{const char* const q_=L_[i_];const uint32_t pre_=((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:event_pre_v3(q_,lp); \
-    const WinMasks w1_=MASKS(q_);const char* const bb_=event_window2(q_,w1_.c); \
-    event_line_v3<true,true>(q_,bb_,w1_,MASKS(bb_),X_[i_]-1,pre_,lp,pend,pp,dmax,send,ring,rpos,general);}} }
+   else SLOW(L_[i_],X_[i_]-1,((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:NOPRE,lp,dmax,send,general);} }
 // The line index of this loop. ls[pos..m]: the starts of the lines not yet in a group; ls[pos..m-1] have their
 // newline (ls[i+1]-1), the line at ls[m] not yet (the index has not got that far, or the file ends without
 // one). Three groups are under way at any time, each one step further than the next:
@@ -2617,50 +2738,63 @@ static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
 // always the scan of exactly its lines.
 static constexpr size_t EV8_BLOCK=4096; // bytes indexed at a time
 #define SS_EV8_PF(O_,i_) __builtin_prefetch(&SS_EV8_SLOT(O_,i_),1,3);
+// NAME_slow: a row the kernel did not decide goes through the line code, kept out of the loop so that the loop
+// stays small (`have` = the kernel's counter, or NOPRE = no claim: then the line's ID is decoded here).
 #define SS_EVENT_LOOP_EV8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC) \
+template<class GEN> TARGET [[gnu::noinline]] static void NAME##_slow(const char* const q,const char* const nl,const uint32_t have,const EvLoop& lp,uint32_t& dmax,uint32_t& send,GEN&& general){ \
+ PendUser pend[1]={};PendUser* pp=pend;unsigned rpos=0; /* no pending batch, no ring in the dense-record line code */ \
+ ++lp.tl.ev8Slow; \
+ const uint32_t pre=have!=NOPRE?have:event_pre_v3(q,lp); \
+ const WinMasks w1=MASKS(q);const char* const bb=event_window2(q,w1.c); \
+ event_line_v3<true,true>(q,bb,w1,MASKS(bb),nl,pre,lp,pend,pp,dmax,send,(ERing*)nullptr,rpos,general); \
+} \
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
- const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;ERing* const ring=nullptr;unsigned rpos=0; /* no pending batch, no ring here */ \
+ const EvLoop lp(tl,tab,products,PE,end);uint32_t dmax=0;uint32_t send=0; \
  const char* ls[EV8_BLOCK+64+64];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
  const vert::EvConst ec{lp.ke,lp.limE,lp.wstart,lp.wlen,(const vert::DateEnt*)lp.memo,lp.tid48}; \
  vert::Ev8Out out[2];vert::Ev8Scan sc[2];const char* tls[8];const char* tnx[8]; \
- const char* const* gl[3]={ls,ls,ls};const char* const* gx[3]={ls,ls,ls};unsigned gn[3]={0,0,0}; /* lines, next lines and number of rows of N, D, F */ \
- unsigned iN=0,iD=1,iF=2,sN=0,oD=0;bool more=true; /* sc[sN]: N's scan, sc[sN^1]: D's; out[oD]: D's results, out[oD^1]: F's */ \
- __m256i vmx=_mm256_setzero_si256();bool fastAny=false; \
- while(more||gn[iD]||gn[iF]){ \
+ const char* const* lN=ls;const char* const* xN=ls;const char* const* lD=ls;const char* const* xD=ls;const char* const* lF=ls;const char* const* xF=ls; /* lines and next lines of N, D, F */ \
+ unsigned nD=0,nF=0;vert::Ev8Scan* sN=&sc[0];vert::Ev8Scan* sD=&sc[1];vert::Ev8Out* oD=&out[0];vert::Ev8Out* oF=&out[1];bool more=true; /* rows of D and F; N's and D's scan; D's and F's results */ \
+ __m256i vmx=_mm256_setzero_si256();bool fastAny=false;uint64_t rows=0; \
+ while(more||nD||nF){ \
   unsigned n=0; \
   if(more){ \
    if(pos+8>m){ /* fewer than eight whole lines known: what is still needed moves to the front and the index goes on */ \
-    const size_t s_=pos-(gn[iD]?8:0)-(gn[iF]?8:0); \
+    const size_t s_=pos-(nD?8:0)-(nF?8:0); \
     if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_; \
-     if(gn[iD]){gl[iD]-=s_;gx[iD]-=s_;} if(gn[iF]){gl[iF]-=s_;gx[iF]-=s_;}} \
+     if(nD){lD-=s_;xD-=s_;} if(nF){lF-=s_;xF-=s_;}} \
     while(m-pos<8&&scan<end&&ls[m]<lim){ \
      const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
-     do{uint64_t x_=NLMASK(scan);while(x_){ls[++m]=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);}scan+=64;}while(scan<stop);} \
+     const char** w_=ls+m; /* the first newline of a window is stored without a branch (no newline: a value past the last entry, never read); a second one is rare */ \
+     do{uint64_t x_=NLMASK(scan);w_[1]=scan+_tzcnt_u64(x_)+1;w_+=(x_!=0);x_=_blsr_u64(x_); \
+      while(__builtin_expect(x_!=0,0)){*++w_=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);} \
+      scan+=64;}while(scan<stop); \
+     m=(size_t)(w_-ls);} \
    } \
-   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[iN]=ls+pos;gx[iN]=ls+pos+1;} \
+   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;lN=ls+pos;xN=ls+pos+1;} \
    else{ /* the last lines of the chunk: a short group, filled up with copies of its last line (results not used) */ \
     more=false; \
     while(pos+n<m&&ls[pos+n]<lim)++n; \
-    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}gl[iN]=tls;gx[iN]=tnx;} \
+    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}lN=tls;xN=tnx;} \
    } \
    pos+=n; \
-   if(n)SCAN(gl[iN],sc[sN]); \
+   if(n)SCAN(lN,*sN); \
   } \
-  gn[iN]=n; \
-  if(gn[iD]){ \
-   vert::Ev8Out& o_=out[oD];const unsigned nd_=gn[iD]; \
-   DEC(gl[iD],gx[iD],sc[sN^1],ec,o_); \
-   if(__builtin_expect((nd_==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
-   else for(unsigned x_=o_.idok&((1u<<nd_)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
+  if(nD){ \
+   vert::Ev8Out& o_=*oD; \
+   DEC(lD,xD,*sD,ec,o_); \
+   if(__builtin_expect((nD==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&((1u<<nD)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
   } \
-  if(gn[iF])SS_EV8_FINISH(out[oD^1],gl[iF],gx[iF],gn[iF],MASKS) \
-  {const unsigned t_=iF;iF=iD;iD=iN;iN=t_;sN^=1;oD^=1;} \
+  if(nF)SS_EV8_FINISH(*oF,lF,xF,nF,NAME##_slow) \
+  lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=n; /* D becomes F, N becomes D */ \
+  {vert::Ev8Scan* const t_=sN;sN=sD;sD=t_;vert::Ev8Out* const u_=oD;oD=oF;oF=u_;} \
  } \
  if(pos==m&&ls[m]<lim)line_general<7>(ls[m],end,general); /* the last line has no newline */ \
  if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
- tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send); \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send);tl.ev8Rows+=rows; \
 }
 SS_EVENT_LOOP_EV8(events_avx2_e8,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_scan_none,ev8_dec_ref)
 SS_EVENT_LOOP_EV8(events_avx512z_e8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::scan8_v5,vert::dec8_v5)
@@ -3299,9 +3433,20 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool __cpuLines=getenv("SS_STATS")!=nullptr;
  auto __cpu_now=[]{timespec t;clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;};
  double __cpu0=__cpu_now();
+ // ... and by a SYS line (system CPU of the whole process in that stage, seconds) and a FLT line (minor page faults).
+ // SYS/FLT EXITPREP at the very end cover what runs after the last mark.
+ auto __ru_now=[](double& sys,long& flt){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;};
+ double __sys0=0;long __flt0=0;if(__cpuLines)__ru_now(__sys0,__flt0);
+ auto __sysflt=[&](const char* label){double s;long f;__ru_now(s,f);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\n";__sys0=s;__flt0=f;};
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
-  if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;}};
+  if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
+ if(const char* v=getenv("SS_FILEALIGN")){const string_view w(v);optFileAlign=w=="2m"?1:w=="2m+huge"?2:0;}
+ if(const char* v=getenv("SS_FILEADVISE")){const string_view w(v);optFileAdvise=w=="random"?1:w=="seq"?2:0;}
+ if(const char* v=getenv("SS_POPULATE")){const string_view w(v);optPopulate=w=="ahead"?1:w=="all"?2:w.substr(0,2)=="bg"?3:0;
+  if(optPopulate==3&&w.size()>2){const int n=atoi(v+2);if(n>=1&&n<=64)optPopulateBg=n;}}
+ if(__cpuLines)cerr<<"STATS kernel switches: SS_FILEALIGN="<<(optFileAlign==2?"2m+huge":optFileAlign?"2m":"off")<<" SS_POPULATE="<<(optPopulate==1?"ahead":optPopulate==2?"all":optPopulate==3?"bg"+to_string(optPopulateBg):string("off"))
+  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
@@ -3328,7 +3473,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
+ // SS_POPULATE=all|bg: the input's pages are entered into the page tables by madvise calls, a chunk at a time.
+ const auto populate_chunk=[&chunks](size_t c){const Chunk& ck=chunks[c];if(ck.from<ck.len)madvise((void*)(ck.base+ck.from),min(ck.to,ck.len)-ck.from,MADV_POPULATE_READ);};
+ static atomic<size_t> populateNext{0};static atomic<bool> populateStop{false};
+ if(optPopulate==2){
+  #pragma omp parallel for num_threads(T) schedule(dynamic,1)
+  for(size_t c=0;c<chunks.size();++c)populate_chunk(c);
+ }
  __mark("MAP");
+ if(optPopulate==3)for(int i=0;i<optPopulateBg;++i)thread([&chunks,populate_chunk]{ // chunks outlives the threads' work: they stop before PARSE ends and the process leaves through _exit
+  for(;;){if(populateStop.load(memory_order_relaxed))break;const size_t c=populateNext.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;populate_chunk(c);}}).detach();
  // ---- Dense IDs: find the generator's keys from the first lines of one event file and one click file. ----
  // (SS_NODENSE=1 turns the dense route off.)
  if(!getenv("SS_NODENSE")&&sampleLen){
@@ -3399,6 +3553,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  {const char* v=getenv("SS_DENSE_USERS");
   const uint64_t idBound=2*(linkBytes/4+linkFileCount)+(uint64_t)T*KeyTable::ID_BLOCK+maxNew64;
   denseUsers=denseLinks&&idBound<DENSE_USER&&(dense.limI<<dn::ALIAS_BITS)<=DENSE_USER&&!(v&&v[0]=='0');}
+ // With dense users only the IDs that cannot take the dense route are new to the ID table (generated data
+ // has a few hundred of them at 20M events), so an eighth of the room is still several hundred times what is
+ // needed - and the table, whose slots are touched at random, is an eighth as large: its first touches
+ // (whole huge pages, zeroed) are most of the LINKREAD stage. More new IDs than that take the fallback
+ // path as before. SS_ROOMY_IDS=1 keeps the full room.
+ if(denseUsers&&!getenv("SS_TEST_MAXNEW")&&!getenv("SS_ROOMY_IDS"))maxNew64=maxNew64/8+4096;
  if(denseUsers)denseComp=(atomic<uint32_t>*)map_huge((dense.limI+1)*sizeof(uint32_t));
  dparse.users=denseUsers;
  if(!denseUsers)dparse.events=dparse.clicks=false; // the record loops decode both IDs of a line together
@@ -3810,6 +3970,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
+   if(__builtin_expect(optPopulate==1,0)&&ck.from<ck.len)madvise((void*)(ck.base+ck.from),min(ck.to,ck.len)-ck.from,MADV_POPULATE_READ); // SS_POPULATE=ahead
    // Dense records (DREC loops) exist with the line index only; SS_LINES=plain then applies to the other kind of file.
    const bool drec=ck.click?dparse.clicks:dparse.events;
    const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
@@ -3840,7 +4001,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   dense_note_end(denseEvEnd,tl.evEnd);dense_note_end(denseClEnd,tl.clEnd);
   tl.slotWaits=eslotWaits;
  }
+ populateStop.store(true,memory_order_relaxed);
  __mark("PARSE");
+ if(getenv("SS_SMAPS")){ // measuring switch: how the kernel mapped things by the end of the parse stage (file PMD maps, anonymous huge pages)
+  ifstream f("/proc/self/smaps_rollup");string l;
+  while(getline(f,l))if(l.rfind("Rss:",0)==0||l.rfind("AnonHugePages:",0)==0||l.rfind("FilePmdMapped:",0)==0||l.rfind("ShmemPmdMapped:",0)==0||l.rfind("Anonymous:",0)==0)cerr<<"SMAPS "<<l<<"\n";
+  __mark("SMAPS");
+ }
  // ---- Raw users in the event slots (see DENSE_USER_RAW). The ID table still takes new IDs here. ----
  // Folded form (default): the event sweep of the DENSE stage runs here and reads the raw texts as it
  // goes; no slot is rewritten, so the slot array is read-only from here on and every later reader of
@@ -3904,7 +4071,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
   cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";
   uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
-  if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";}
+  if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";
+  uint64_t er=0,es=0;for(int t=0;t<T;++t){er+=tls[t].ev8Rows;es+=tls[t].ev8Slow;}
+  if(er)cerr<<"STATS ev8 loop: rows "<<er<<" left to the line code "<<es<<"\n";}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
  if(dumpDir){
   // Test only (fuzz/dense_check.py): rows-T.txt = what the general handlers saw (raw texts, written above),
@@ -4638,7 +4807,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    RawCtx rawCtx;rawCtx.v3=hasV3;
    const auto ucode=[&rawCtx,rawSlots](const ESmall& sl)->uint32_t{return rawSlots?rawCtx.code(sl):sl.user;};
    // A click of the fast lane: time and campaign as in Click, and its counter, which stands for its ID.
-   struct FClick{uint64_t key;uint32_t user;uint32_t ctr;};
+   // (A click slot itself; in a gathered copy `present` holds the counter. When an index's clicks fill their
+   // stretch of counters without a gap - no empty slot, nobody else's click: as many clicks as slots - the
+   // slots are used where they lie, nothing is copied, and the counter of a click is its place in the stretch.)
+   using FClick=CSlot;
+   static const bool noDirectClicks=getenv("SS_TEST_NODIRECT")!=nullptr; // test switch: always gather
+   const bool wideWindow=(uint64_t)(window_end-clickStart)>>32!=0; // click times beyond 32 bits: the clicks themselves are sorted, in a copy
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
    // One index's sessions (start time; number of its rows before the session) and purchases
    // (session<<40 | category<<24 | price), written by the walk over its event slots.
@@ -4675,7 +4849,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      bool fast=!general;
      int why=5; // why the index is handed over, if it is
      if(noFastN&&ix%noFastN==0){if(fast)why=7;fast=false;}
-     size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;
+     size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;bool direct=false;
+     const auto ctr_of=[&C,&direct,cf](uint32_t i)->uint32_t{return direct?(uint32_t)cf+i:C[i].present;}; // the counter of click i of C (before C is put in order)
      const uint64_t* SL=nullptr;uint64_t* mySL=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0; // SL: session entries "start << 24 | rows before", then the row count
      // The sweep's session list, if the index is one run of rows in time order.
      const uint64_t* const sweepList=f.multi.load(memory_order_relaxed)?nullptr:f.sess.load(memory_order_relaxed);
@@ -4703,12 +4878,23 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        ++n;
       }
       if(!listed){mySL[ns]=n;myPur[np]=~0ull;pur=myPur;}
-      C=fastC.get((size_t)cc+1);
-      for(size_t c=cf;c<cl;++c){
-       const CSlot& sl=denseCl[c];const uint32_t u=sl.user;
-       const uint32_t ok=(uint32_t)(sl.present!=0)&(uint32_t)((u^code)<8);
-       _mm_storeu_si128((__m128i*)(void*)(C+m),_mm_loadu_si128((const __m128i*)(const void*)&sl));C[m].ctr=(uint32_t)c; // key and user as they are
-       mask|=ok<<(u&7);m+=ok;
+      direct=cc&&cl-cf==(size_t)cc&&cc<=4096u&&!wideWindow&&!noDirectClicks;
+      if(direct){ // every slot of [cf, cl) is a click of this index (the sweep counted cc of them in there)
+       C=denseCl+cf;m=cc;
+       static constexpr uint8_t BIT8[8]={1,2,4,8,16,32,64,128}; // (a table: a shift by a variable count costs more here)
+       uint32_t m0=0,m1=0;size_t i=0;
+       for(;i+2<=m;i+=2){m0|=BIT8[C[i].user&7];m1|=BIT8[C[i+1].user&7];}
+       if(i<m)m0|=BIT8[C[i].user&7];
+       mask|=m0|m1;
+      }
+      else{
+       C=fastC.get((size_t)cc+1);
+       for(size_t c=cf;c<cl;++c){
+        const CSlot& sl=denseCl[c];const uint32_t u=sl.user;
+        const uint32_t ok=(uint32_t)(sl.present!=0)&(uint32_t)((u^code)<8);
+        _mm_storeu_si128((__m128i*)(void*)(C+m),_mm_loadu_si128((const __m128i*)(const void*)&sl));C[m].present=(uint32_t)c; // key and user as they are
+        mask|=ok<<(u&7);m+=ok;
+       }
       }
       if(__builtin_expect(n!=ec||m!=cc,0)){fprintf(stderr,"ERROR dense slots changed under the reader\n");_exit(1);}
       // One person: every alias in use has the same smallest alias of its group.
@@ -4759,7 +4945,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         for(size_t i=0;i<m;++i){const unsigned r=rnk[i];keys[r+taken[r]++]=((C[i].key>>16)<<32)|i;}}
        // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
        for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
-        const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
+        const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)key),dense.kc));};
         const uint64_t key=keys[i];size_t j=i;
         while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
         keys[j]=key;
@@ -4784,15 +4970,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        uint64_t* const keys=clickKeys.get(m);
        const bool wide=(C[0].key>>16)>>32!=0||(uint64_t)(window_end-clickStart)>>32!=0; // times that do not fit 32 bits: sort the clicks themselves
        if(wide||m>4096){
+        if(direct){FClick* const G=fastC.get(m+1);for(size_t i=0;i<m;++i){G[i]=C[i];G[i].present=(uint32_t)(cf+i);}C=G;direct=false;} // sorted in a copy that carries the counters
         const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
-         return ta!=tb?ta<tb:order36(dn::value_of(a.ctr,kc))>order36(dn::value_of(b.ctr,kc));};
+         return ta!=tb?ta<tb:order36(dn::value_of(a.present,kc))>order36(dn::value_of(b.present,kc));};
         sort(C,C+m,before);
        }
        else{
         for(size_t i=0;i<m;++i)keys[i]=((C[i].key>>16)<<32)|i;
         click_key_sort(keys,m,clickKeys2.get(m),sortCnt);
         for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
-         const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
+         const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)key),dense.kc));};
          const uint64_t key=keys[i];size_t j=i;
          while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
          keys[j]=key;
@@ -5170,6 +5357,7 @@ __mark("AGGREGATE");
 __mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
  // Every output file is written and closed. Leave at once: unwinding would only hand gigabytes of
  // mappings back piece by piece before the kernel drops them anyway.
+ if(__cpuLines)__sysflt("EXITPREP");
  cerr.flush();fflush(nullptr);
  _exit(0);
 }

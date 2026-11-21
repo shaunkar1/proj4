@@ -802,6 +802,7 @@ struct alignas(64) ThreadState{
  deque<array<char,16>> rawNames; // texts of raw users that ended up with a LOCAL_USER number (they need a place that stays)
  vector<Bucket<DRec>> db;vector<Bucket<DCRec>> dcb; // dense rows in bucket form, by counter range (SS_DENSE_RECORDS=bucket)
  uint64_t slotWaits=0; // eslotWaits of this thread
+ uint64_t cl8Rows=0,cl8Slow=0; // cl8 click loop: lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
  string dumpRows; // SS_DENSE_DUMP only
@@ -856,6 +857,8 @@ static inline uint64_t order36(uint64_t y){
  const unsigned n=1+(y>=36u)+(y>=1296u)+(y>=46656u)+(y>=1679616u)+(y>=60466176u)+(y>=2176782336ull)+(y>=78364164096ull);
  return y*POW36[8-n]*16+n;
 }
+// SPREAD3[m]: bit 3j is set where bit j of m is set (an alias mask laid over the 3-bit group fields of a denseComp word).
+static constexpr array<uint32_t,256> SPREAD3=[]{array<uint32_t,256> a{};for(unsigned m=0;m<256;++m){uint32_t v=0;for(unsigned j=0;j<8;++j)if((m>>j)&1)v|=1u<<(3*j);a[m]=v;}return a;}();
 // SPREAD8[m]: byte j is 1 where bit j of m is set (eight one-byte counters bumped by one add).
 static constexpr array<uint64_t,256> SPREAD8=[]{array<uint64_t,256> a{};for(unsigned m=0;m<256;++m){uint64_t v=0;for(unsigned j=0;j<8;++j)if((m>>j)&1)v|=1ull<<(8*j);a[m]=v;}return a;}();
 static inline size_t text36_fast(char letter,uint64_t y,char* out){
@@ -1038,24 +1041,46 @@ static inline size_t text36(char letter,uint64_t y,char* out){
 // Candidates are tried in increasing counter order by all threads; the smallest hit wins.
 static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,uint64_t& key,int T){
  if(n<6||limit<step)return false;
- const uint64_t cand=limit/step;atomic<uint64_t> best{UINT64_MAX};
+ const uint64_t cand=limit/step;
  const uint64_t inc=(M1*step)&MASK;
- #pragma omp parallel num_threads(T)
- {
-  const int t=omp_get_thread_num();
-  const uint64_t BL=1u<<16; // blocks are dealt round-robin so every thread stays near the low counters
-  for(uint64_t b=(uint64_t)t*BL;b<cand&&b<best.load(memory_order_relaxed);b+=(uint64_t)T*BL){
-   const uint64_t e=min(cand,b+BL);uint64_t a=(b*inc)&MASK;
-   for(uint64_t c=b;c<e;++c,a=(a+inc)&MASK){
-    const uint64_t k=um[0]^a;
-    if((((um[1]^k)*I1)&MASK)>=limit&&(((um[2]^k)*I1)&MASK)>=limit)continue; // two misses already
-    size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
-    if(miss<2){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}break;}
+ // The search costs one candidate per counter below sample 0's own, so the test per candidate is what
+ // counts. First round: sample 1 has to agree as well (one multiplication per candidate; a wrong key
+ // passes it once in limit / 2^40 tries). Only if that finds nothing - sample 1 is the odd one - the
+ // second round runs with the full rule (samples 1 and 2 both off: skip). Any key that passes the full
+ // rule is a valid key; which one is found only matters for speed.
+ for(int round=0;round<2;++round){
+  atomic<uint64_t> best{UINT64_MAX};
+  #pragma omp parallel num_threads(T)
+  {
+   const int t=omp_get_thread_num();
+   const uint64_t BL=1u<<16; // blocks are dealt round-robin so every thread stays near the low counters
+   const uint64_t u0=um[0],u1=um[1],u2=um[2];
+   for(uint64_t b=(uint64_t)t*BL;b<cand&&b<best.load(memory_order_relaxed);b+=(uint64_t)T*BL){
+    const uint64_t e=min(cand,b+BL);uint64_t a=(b*inc)&MASK;
+    if(round==0&&limit<=MASK){
+     // The first round's test with the 40-bit numbers held in the top 40 bits of a word: adding and
+     // multiplying then wrap as they should without masks ((x << 24) * I1 = ((x * I1) mod 2^40) << 24).
+     const uint64_t D1=(u0^u1)<<24,INC=inc<<24,LIM=limit<<24;uint64_t A=a<<24;
+     for(uint64_t c=b;c<e;++c,A+=INC){
+      if(__builtin_expect(((D1^A)*I1)>=LIM,1))continue; // sample 1 off
+      const uint64_t k=u0^(A>>24);
+      size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
+      if(miss<2){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}break;}
+     }
+     continue;
+    }
+    for(uint64_t c=b;c<e;++c,a=(a+inc)&MASK){
+     const uint64_t k=u0^a;
+     if((((u1^k)*I1)&MASK)>=limit&&(round==0||(((u2^k)*I1)&MASK)>=limit))continue; // sample 1 off (second round: and sample 2)
+     size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
+     if(miss<2){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}break;}
+    }
    }
   }
+  const uint64_t c=best.load();
+  if(c!=UINT64_MAX){key=um[0]^((c*inc)&MASK);return true;}
  }
- const uint64_t c=best.load();if(c==UINT64_MAX)return false;
- key=um[0]^((c*inc)&MASK);return true;
+ return false;
 }
 struct Info{
  bool events=false,clicks=false; // dense route usable for events / for clicks (each also needs the user key)
@@ -1174,7 +1199,7 @@ static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32
 //           decoded and write it at the end of the line, or `ahead` dense rows later (SS_DENSE_AHEAD, 1-16).
 //   bucket  the row is appended to a per-thread bucket by counter range (counter >> shE / shC); a later pass
 //           fills the slot arrays bucket by bucket, so the random writes stay inside a small range.
-struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false,batch=false,ev8=false;unsigned ahead=8,shE=14,shC=14;};
+struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false,batch=false,ev8=false,cl8=false;unsigned ahead=8,shE=14,shC=14;};
 // A dense event line in bucket form, valid or not. k as in PRec (0 = not a valid event), ingest = exact
 // ingest_ts in ms, lo = the low shE bits of the counter: counter = (bucket index << shE) | lo.
 struct DRec{uint64_t k;int64_t ingest;uint32_t user;uint16_t cat;uint16_t lo;};
@@ -1762,6 +1787,32 @@ struct RawCtx{
  }
  void set_table(uint64_t sp,uint32_t len,uint32_t code){Entry& m=memo[at(sp)];m.raw=sp;m.user=DENSE_USER_RAW|len;m.code=code;}
 };
+// Sorts m distinct keys "click time << 32 | position" (m > 1, times below 2^32). A person's clicks are
+// spread over the days before and inside the window, so one counting pass on the leading bits of the
+// time (two buckets per key or more) leaves most keys alone in their bucket and an insertion pass
+// finishes with few moves. If the times are bunched after all (a bucket with more than clickSortMax
+// keys), std::sort does it. tmp: room for m keys; cnt: room for CLICK_SORT_BUCKETS + 1 counters.
+static constexpr unsigned CLICK_SORT_BITS=13;static constexpr size_t CLICK_SORT_BUCKETS=size_t(1)<<CLICK_SORT_BITS;
+static const uint32_t clickSortMax=[]{const char* v=getenv("SS_TEST_SORTMAX");return v?(uint32_t)strtoul(v,nullptr,10):16u;}(); // tests: 0 = always std::sort, 1 = on any shared bucket
+[[gnu::noinline]] static void click_key_sort(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){
+ uint64_t mn=a[0],mx=a[0];
+ for(size_t i=1;i<m;++i){mn=min(mn,a[i]);mx=max(mx,a[i]);}
+ const uint64_t t0=mn>>32,range=(mx>>32)-t0;
+ const unsigned lb=min<unsigned>((unsigned)bit_width(m-1)+1,CLICK_SORT_BITS),rb=(unsigned)bit_width(range),sh=rb>lb?rb-lb:0;
+ const size_t B=(size_t)(range>>sh)+1; // buckets in use, at most 1 << lb
+ memset(cnt,0,(B+1)*sizeof(uint32_t));
+ uint32_t most=0;
+ for(size_t i=0;i<m;++i){const uint32_t c=++cnt[(((a[i]>>32)-t0)>>sh)+1];most=max(most,c);}
+ if(__builtin_expect(most>clickSortMax,0)){sort(a,a+m);return;}
+ for(size_t b=1;b<B;++b)cnt[b]+=cnt[b-1]; // cnt[b]: where bucket b starts
+ for(size_t i=0;i<m;++i){const uint64_t k=a[i];tmp[cnt[((k>>32)-t0)>>sh]++]=k;}
+ a[0]=tmp[0];
+ for(size_t i=1;i<m;++i){ // keys only move inside their bucket
+  const uint64_t k=tmp[i];size_t j=i;
+  while(j>0&&a[j-1]>k){a[j]=a[j-1];--j;}
+  a[j]=k;
+ }
+}
 // Where one thread puts the session lists of the runs it reads (blocks of its pool) and a run's purchases.
 struct SessArena{uint64_t* cur=nullptr;uint64_t* end=nullptr;vector<uint64_t> pur;};
 // The event sweep of the counters [lo,hi) of an event slot array (stride 1 << evShift bytes, layout ESmall
@@ -2054,7 +2105,7 @@ SS_EVENT_LOOP_BATCH(events_avx512z_bt,SS_V5,win_masks_avx512z,nl_mask_avx512z)
 SS_EVENT_LOOP_BATCH(events_avx512y_bt,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 // ---- ev8 event loop (SS_LINES=ev8) ----
 // The lines are taken eight at a time straight from the line index: a kernel works out everything about the
-// eight rows from the line text (vert::ev8_v5, AVX-512, eight 64-bit lanes; vert::ev8_ref is its scalar twin
+// eight rows from the line text (vert::scan8_v5 + dec8_v5, AVX-512, eight 64-bit lanes; vert::ev8_ref is the scalar twin
 // with the same decisions, used by the avx2 loop), the slots of the group are asked for, and then the group
 // before it is finished in line order, so every slot has had at least eight lines of time. A row the kernel
 // does not decide (ok bit clear) goes through event_line_v3 unchanged when its group is finished. The
@@ -2070,6 +2121,9 @@ static constexpr uint64_t M1=0x9E3779B97F4Bull&MASK40,M2=0xD6E8FEB86659ull&MASK4
 static constexpr uint64_t inv40(uint64_t a){uint64_t x=a;for(int i=0;i<6;++i)x*=2-a*x;return x&MASK40;}
 static constexpr uint64_t I1=inv40(M1),I2=inv40(M2);
 static_assert(((M1*I1)&MASK40)==1&&((M2*I2)&MASK40)==1);
+static constexpr int64_t DAYMS=86400000LL;
+static constexpr unsigned EV_TS_SHIFT=25; // main.cpp EV_TS
+static constexpr uint64_t ESLOT_INVALID_K=2,EV_PURCHASE_BIT=1ull<<24,RAW_USER=0xC0000000u,PRICE_MAX=10000000; // main.cpp: ESLOT_INVALID, EV_PURCHASE, DENSE_USER_RAW, price_value's limit
 static inline uint64_t index_of_ref(uint64_t y,uint64_t key){uint64_t m=(y*I2)&MASK40;m=m^(m>>17)^(m>>34);return ((m^key)*I1)&MASK40;}
 static inline unsigned id8_ref(const uint64_t* w,const uint64_t* n,uint64_t key,uint64_t limit,uint64_t* ctr){
  unsigned acc=0;
@@ -2087,33 +2141,107 @@ static inline unsigned id8_ref(const uint64_t* w,const uint64_t* n,uint64_t key,
  }
  return acc;
 }
+static const uint64_t VKT[]={
+ /* 0*/ (uint64_t)(64),
+ /* 1*/ (uint64_t)(uint8_t)(0x30)*0x0101010101010101ULL,
+ /* 2*/ (uint64_t)(uint8_t)('0')*0x0101010101010101ULL,
+ /* 3*/ (uint64_t)(uint8_t)('a')*0x0101010101010101ULL,
+ /* 4*/ (uint64_t)(uint8_t)(9)*0x0101010101010101ULL,
+ /* 5*/ (uint64_t)(uint8_t)(25)*0x0101010101010101ULL,
+ /* 6*/ (uint64_t)(uint8_t)((char)(10-'a'))*0x0101010101010101ULL,
+ /* 7*/ (uint64_t)(uint16_t)(0x0124)*0x0001000100010001ULL,
+ /* 8*/ (uint64_t)(uint32_t)(0x00010510)*0x0000000100000001ULL,
+ /* 9*/ (uint64_t)(1679616),
+ /*10*/ (uint64_t)(1),
+ /*11*/ (uint64_t)(7),
+ /*12*/ (uint64_t)(MASK40),
+ /*13*/ (uint64_t)(I2),
+ /*14*/ (uint64_t)(I1),
+ /*15*/ (uint64_t)(0x0000000030540000ULL),
+ /*16*/ (uint64_t)(0xFFFFFFFF0200FFFFULL),
+ /*17*/ (uint64_t)(0x0030303A30303A30ULL),
+ /*18*/ (uint64_t)(0xFF09050009050009ULL),
+ /*19*/ (uint64_t)(0x0000000064000000ULL),
+ /*20*/ (uint64_t)(0x0000000001680000ULL),
+ /*21*/ (uint64_t)(0x00010A00010A0001ULL),
+ /*22*/ (uint64_t)(0x00010001003C0E10ULL),
+ /*23*/ (uint64_t)(1000),
+ /*24*/ (uint64_t)(86400000),
+ /*25*/ (uint64_t)(0x010A010A010A010AULL),
+ /*26*/ (uint64_t)(0x0001006400010064ULL),
+ /*27*/ (uint64_t)(0x010A010A01000000ULL),
+ /*28*/ (uint64_t)(0x0001006400010000ULL),
+ /*29*/ (uint64_t)(10000),
+ /*30*/ (uint64_t)(100000),
+ /*31*/ (uint64_t)(0x30303A3030000000ULL),
+ /*32*/ (uint64_t)(0x0905000902FFFFFFULL),
+ /*33*/ (uint64_t)(0x010A00010A000000ULL),
+ /*34*/ (uint64_t)(0x0001003C003C0000ULL),
+ /*35*/ (uint64_t)(60000),
+ /*36*/ (uint64_t)(0x40),
+ /*37*/ (uint64_t)(0x3C),
+ /*38*/ (uint64_t)(0x0F03),
+ /*39*/ (uint64_t)(0xFFFFFFFFULL),
+ /*40*/ (uint64_t)(0xFFFF),
+ /*41*/ (uint64_t)(4),
+ /*42*/ (uint64_t)(0x77656976ULL),
+ /*43*/ (uint64_t)(0x74726163ULL),
+ /*44*/ (uint64_t)(8),
+ /*45*/ (uint64_t)(0x6573616863727570ULL),
+ /*46*/ (uint64_t)(2),
+ /*47*/ (uint64_t)(3),
+ /*48*/ (uint64_t)('Z'),
+ /*49*/ (uint64_t)('+'),
+ /*50*/ (uint64_t)('-'),
+ /*51*/ (uint64_t)(20),
+ /*52*/ (uint64_t)(25),
+ /*53*/ (uint64_t)(13),
+ /*54*/ (uint64_t)(DAYMS),
+ /*55*/ (uint64_t)(uint8_t)(',')*0x0101010101010101ULL,
+ /*56*/ (uint64_t)(uint8_t)('"')*0x0101010101010101ULL,
+ /*57*/ (uint64_t)(-1),
+ /*58*/ (uint64_t)(63),
+ /*59*/ (uint64_t)(16),
+ /*60*/ (uint64_t)(0xFF),
+ /*61*/ (uint64_t)('e'),
+ /*62*/ (uint64_t)('u'),
+ /*63*/ (uint64_t)(9),
+ /*64*/ (uint64_t)(12),
+ /*65*/ (uint64_t)(5),
+ /*66*/ (uint64_t)(17),
+ /*67*/ (uint64_t)(PRICE_MAX-1),
+ /*68*/ (uint64_t)(EV_PURCHASE_BIT),
+ /*69*/ (uint64_t)(ESLOT_INVALID_K),
+ /*70*/ (uint64_t)(RAW_USER),
+};
+static inline __attribute__((always_inline)) const uint64_t* vk_ptr(){const uint64_t* p=VKT;__asm__("":"+r"(p));return p;}
+#define VERT_K5(i) _mm512_set1_epi64((long long)VK[i])
 VERT_T5 static inline __m512i id8k_v5(__m512i W,__m512i N,uint64_t key,uint64_t limit,__mmask8& okOut){
+ const uint64_t* const VK=vk_ptr();
  const __m512i n8=_mm512_slli_epi64(N,3);
- const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(W,_mm512_sub_epi64(_mm512_set1_epi64(64),n8)),_mm512_srlv_epi64(_mm512_set1_epi8(0x30),n8));
- const __m512i t=_mm512_sub_epi8(x,_mm512_set1_epi8('0')),u=_mm512_sub_epi8(x,_mm512_set1_epi8('a'));
- const __m512i bad=_mm512_min_epu8(_mm512_subs_epu8(t,_mm512_set1_epi8(9)),_mm512_subs_epu8(u,_mm512_set1_epi8(25)));
- const __m512i d=_mm512_min_epu8(t,_mm512_add_epi8(x,_mm512_set1_epi8((char)(10-'a'))));
- const __m512i p2=_mm512_maddubs_epi16(d,_mm512_set1_epi16(0x0124));
- const __m512i p4=_mm512_madd_epi16(p2,_mm512_set1_epi32(0x00010510));
- const __m512i val=_mm512_add_epi64(_mm512_mul_epu32(p4,_mm512_set1_epi64(1679616)),_mm512_srli_epi64(p4,32));
+ const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(W,_mm512_sub_epi64(VERT_K5(0),n8)),_mm512_srlv_epi64(VERT_K5(1),n8));
+ const __m512i t=_mm512_sub_epi8(x,VERT_K5(2)),u=_mm512_sub_epi8(x,VERT_K5(3));
+ const __m512i bad=_mm512_min_epu8(_mm512_subs_epu8(t,VERT_K5(4)),_mm512_subs_epu8(u,VERT_K5(5)));
+ const __m512i d=_mm512_min_epu8(t,_mm512_add_epi8(x,VERT_K5(6)));
+ const __m512i p2=_mm512_maddubs_epi16(d,VERT_K5(7));
+ const __m512i p4=_mm512_madd_epi16(p2,VERT_K5(8));
+ const __m512i val=_mm512_add_epi64(_mm512_mul_epu32(p4,VERT_K5(9)),_mm512_srli_epi64(p4,32));
  // MIN36[n] picked by the low three bits of n (n == 8 -> entry 0); n == 0 and n > 8 are refused by the length test
  const __m512i min36=_mm512_permutexvar_epi64(N,_mm512_setr_epi64(78364164096LL,0,36,1296,46656,1679616,60466176,2176782336LL));
  __mmask8 ok=_mm512_testn_epi64_mask(bad,bad);
- ok&=_mm512_cmple_epu64_mask(_mm512_sub_epi64(N,_mm512_set1_epi64(1)),_mm512_set1_epi64(7));
- ok&=_mm512_cmpge_epu64_mask(val,min36);
- ok&=_mm512_cmple_epu64_mask(val,_mm512_set1_epi64((long long)MASK40));
- const __m512i mask=_mm512_set1_epi64((long long)MASK40);
- __m512i m=_mm512_and_si512(_mm512_mullo_epi64(val,_mm512_set1_epi64((long long)I2)),mask);
+ // (each test is a compare under the mask of the ones before: the mask never leaves the mask registers)
+ ok=_mm512_mask_cmple_epu64_mask(ok,_mm512_sub_epi64(N,VERT_K5(10)),VERT_K5(11));
+ ok=_mm512_mask_cmpge_epu64_mask(ok,val,min36);
+ ok=_mm512_mask_cmple_epu64_mask(ok,val,VERT_K5(12));
+ const __m512i mask=VERT_K5(12);
+ __m512i m=_mm512_and_si512(_mm512_mullo_epi64(val,VERT_K5(13)),mask);
  m=_mm512_ternarylogic_epi64(m,_mm512_srli_epi64(m,17),_mm512_srli_epi64(m,34),0x96);
  m=_mm512_xor_si512(m,_mm512_set1_epi64((long long)key));
- const __m512i c=_mm512_and_si512(_mm512_mullo_epi64(m,_mm512_set1_epi64((long long)I1)),mask);
- ok&=_mm512_cmplt_epu64_mask(c,_mm512_set1_epi64((long long)limit));
- okOut=ok;return c;
+ const __m512i c=_mm512_and_si512(_mm512_mullo_epi64(m,VERT_K5(14)),mask);
+ okOut=_mm512_mask_cmplt_epu64_mask(ok,c,_mm512_set1_epi64((long long)limit));return c;
 }
 struct DateEnt{uint64_t k;uint32_t cc;uint32_t pad;int64_t ms;};
 static_assert(sizeof(DateEnt)==24);
-static constexpr int64_t DAYMS=86400000LL;
-static constexpr unsigned EV_TS_SHIFT=25; // main.cpp EV_TS
 struct EvConst{uint64_t ke,limE;int64_t wstart;uint64_t wlen;const DateEnt* memo;uint64_t tid48=0;}; // tid48 (= lp.tid48) is used by ev8 only
 static inline unsigned date_slot(uint64_t w0,uint64_t w1){ // w0 = date bytes 0..7, w1 = bytes 8..15
  return (unsigned)(((w0>>34)&0x40)|((w0>>46)&0x3C)|(w1&0x0F03));
@@ -2156,53 +2284,57 @@ static inline unsigned kind_ref(uint64_t w,uint64_t n){
 #define VERT_C5(x) _mm512_set1_epi64((long long)(x))
 #define VERT_LD5(p) _mm512_loadu_si512((const void*)(p))
 VERT_T5 static inline __m512i tod8k_v5(__m512i a,__m512i b,__mmask8& ok){
- const __m512i va=_mm512_sub_epi8(a,VERT_C5(0x0000000030540000ULL)),la=VERT_C5(0xFFFFFFFF0200FFFFULL);
- const __m512i vb=_mm512_sub_epi8(b,VERT_C5(0x0030303A30303A30ULL)),lb=VERT_C5(0xFF09050009050009ULL);
- const __m512i pa=_mm512_madd_epi16(_mm512_maddubs_epi16(va,VERT_C5(0x0000000064000000ULL)),VERT_C5(0x0000000001680000ULL));
- const __m512i pb=_mm512_madd_epi16(_mm512_maddubs_epi16(vb,VERT_C5(0x00010A00010A0001ULL)),VERT_C5(0x00010001003C0E10ULL));
+ const uint64_t* const VK=vk_ptr();
+ const __m512i va=_mm512_sub_epi8(a,VERT_K5(15)),la=VERT_K5(16);
+ const __m512i vb=_mm512_sub_epi8(b,VERT_K5(17)),lb=VERT_K5(18);
+ const __m512i pa=_mm512_madd_epi16(_mm512_maddubs_epi16(va,VERT_K5(19)),VERT_K5(20));
+ const __m512i pb=_mm512_madd_epi16(_mm512_maddubs_epi16(vb,VERT_K5(21)),VERT_K5(22));
  const __m512i s=_mm512_add_epi32(pa,pb);
- const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(s,_mm512_srli_epi64(s,32)),VERT_C5(1000));
- ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(va,la),la)&_mm512_cmpeq_epi64_mask(_mm512_max_epu8(vb,lb),lb)&_mm512_cmplt_epu64_mask(ms,VERT_C5(86400000));
+ const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(s,_mm512_srli_epi64(s,32)),VERT_K5(23));
+ ok=_mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(va,la),la),_mm512_max_epu8(vb,lb),lb),ms,VERT_K5(24));
  return ms;
 }
 VERT_T5 static inline __m512i epoch8k_v5(__m512i w0,__m512i w1,__mmask8& ok){
- const __m512i z=_mm512_set1_epi8('0'),nine=_mm512_set1_epi8(9);
+ const uint64_t* const VK=vk_ptr();
+ const __m512i z=VERT_K5(2),nine=VERT_K5(4);
  const __m512i v0=_mm512_sub_epi8(w0,z),v1=_mm512_sub_epi8(w1,z);
- ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v0,nine),nine)&_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v1,nine),nine);
- const __m512i p0=_mm512_madd_epi16(_mm512_maddubs_epi16(v0,VERT_C5(0x010A010A010A010AULL)),VERT_C5(0x0001006400010064ULL));
- const __m512i p1=_mm512_madd_epi16(_mm512_maddubs_epi16(v1,VERT_C5(0x010A010A01000000ULL)),VERT_C5(0x0001006400010000ULL));
- const __m512i tenk=VERT_C5(10000);
+ ok=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v0,nine),nine),_mm512_max_epu8(v1,nine),nine);
+ const __m512i p0=_mm512_madd_epi16(_mm512_maddubs_epi16(v0,VERT_K5(25)),VERT_K5(26));
+ const __m512i p1=_mm512_madd_epi16(_mm512_maddubs_epi16(v1,VERT_K5(27)),VERT_K5(28));
+ const __m512i tenk=VERT_K5(29);
  const __m512i hi=_mm512_add_epi64(_mm512_mul_epu32(p0,tenk),_mm512_srli_epi64(p0,32));
  const __m512i lo=_mm512_add_epi64(_mm512_mul_epu32(p1,tenk),_mm512_srli_epi64(p1,32));
- return _mm512_add_epi64(_mm512_mul_epu32(hi,VERT_C5(100000)),lo);
+ return _mm512_add_epi64(_mm512_mul_epu32(hi,VERT_K5(30)),lo);
 }
 VERT_T5 static inline __m512i off8k_v5(__m512i w3,__mmask8& ok){
- const __m512i v=_mm512_sub_epi8(w3,VERT_C5(0x30303A3030000000ULL)),l=VERT_C5(0x0905000902FFFFFFULL);
- const __m512i p=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_C5(0x010A00010A000000ULL)),VERT_C5(0x0001003C003C0000ULL));
- const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(p,_mm512_srli_epi64(p,32)),VERT_C5(60000));
- ok=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,l),l)&_mm512_cmplt_epu64_mask(ms,VERT_C5(86400000));
+ const uint64_t* const VK=vk_ptr();
+ const __m512i v=_mm512_sub_epi8(w3,VERT_K5(31)),l=VERT_K5(32);
+ const __m512i p=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_K5(33)),VERT_K5(34));
+ const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(p,_mm512_srli_epi64(p,32)),VERT_K5(35));
+ ok=_mm512_mask_cmplt_epu64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,l),l),ms,VERT_K5(24));
  return ms;
 }
 VERT_T5 static inline __m512i day8k_v5(__m512i w0,__m512i w1,const DateEnt* memo,__mmask8& hit){
- const __m512i slot=_mm512_ternarylogic_epi64(_mm512_and_si512(_mm512_srli_epi64(w0,34),VERT_C5(0x40)),_mm512_and_si512(_mm512_srli_epi64(w0,46),VERT_C5(0x3C)),_mm512_and_si512(w1,VERT_C5(0x0F03)),0xFE);
+ const uint64_t* const VK=vk_ptr();
+ const __m512i slot=_mm512_ternarylogic_epi64(_mm512_and_si512(_mm512_srli_epi64(w0,34),VERT_K5(36)),_mm512_and_si512(_mm512_srli_epi64(w0,46),VERT_K5(37)),_mm512_and_si512(w1,VERT_K5(38)),0xFE);
  const __m512i i3=_mm512_add_epi64(slot,_mm512_slli_epi64(slot,1));
  const long long* base=(const long long*)memo;
  const __m512i gk=_mm512_i64gather_epi64(i3,base,8),gc=_mm512_i64gather_epi64(i3,base+1,8),gm=_mm512_i64gather_epi64(i3,base+2,8);
  const __m512i k=_mm512_or_si512(_mm512_srli_epi64(w0,16),_mm512_slli_epi64(w1,48));
- hit=_mm512_cmpeq_epi64_mask(gk,k)&_mm512_cmpeq_epi64_mask(_mm512_and_si512(gc,VERT_C5(0xFFFFFFFFULL)),_mm512_and_si512(w0,VERT_C5(0xFFFF)));
+ hit=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(gk,k),_mm512_and_si512(gc,VERT_K5(39)),_mm512_and_si512(w0,VERT_K5(40)));
  return gm;
 }
 VERT_T5 static inline __m512i kind8k_v5(__m512i w,__m512i n,__mmask8& nz){
- const __m512i lo=_mm512_and_si512(w,VERT_C5(0xFFFFFFFFULL));
- const __mmask8 is4=_mm512_cmpeq_epi64_mask(n,VERT_C5(4));
- const __mmask8 view=_mm512_mask_cmpeq_epi64_mask(is4,lo,VERT_C5(0x77656976ULL)),cart=_mm512_mask_cmpeq_epi64_mask(is4,lo,VERT_C5(0x74726163ULL));
- const __mmask8 pur=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(n,VERT_C5(8)),w,VERT_C5(0x6573616863727570ULL));
+ const uint64_t* const VK=vk_ptr();
+ const __m512i lo=_mm512_and_si512(w,VERT_K5(39));
+ const __mmask8 is4=_mm512_cmpeq_epi64_mask(n,VERT_K5(41));
+ const __mmask8 view=_mm512_mask_cmpeq_epi64_mask(is4,lo,VERT_K5(42)),cart=_mm512_mask_cmpeq_epi64_mask(is4,lo,VERT_K5(43));
+ const __mmask8 pur=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(n,VERT_K5(44)),w,VERT_K5(45));
  nz=view|cart|pur;
- __m512i kind=_mm512_maskz_mov_epi64(view,VERT_C5(1));
- kind=_mm512_mask_mov_epi64(kind,cart,VERT_C5(2));
- return _mm512_mask_mov_epi64(kind,pur,VERT_C5(3));
+ __m512i kind=_mm512_maskz_mov_epi64(view,VERT_K5(10));
+ kind=_mm512_mask_mov_epi64(kind,cart,VERT_K5(46));
+ return _mm512_mask_mov_epi64(kind,pur,VERT_K5(47));
 }
-static constexpr uint64_t ESLOT_INVALID_K=2,EV_PURCHASE_BIT=1ull<<24,RAW_USER=0xC0000000u,PRICE_MAX=10000000; // main.cpp: ESLOT_INVALID, EV_PURCHASE, DENSE_USER_RAW, price_value's limit
 struct alignas(64) Ev8Out{
  uint64_t ve[8];      // idok rows: event counter (== event_pre_v3)
  uint64_t so[8];      // idok rows: ve << 5 (byte offset of the 32-byte ESlot)
@@ -2295,21 +2427,29 @@ static inline void ev8_ref(const char* const* ls,const char* const* nx,const EvC
  }
  o.ok=(uint8_t)okm;o.idok=(uint8_t)idm;o.pur=(uint8_t)pum;
 }
-VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
- // ---- horizontal: the two 64-byte windows of every line -> comma and quote masks ----
- alignas(64) uint64_t aC1[8],aQ1[8],aC2[8],aQ2[8],aB[8];
- {const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"');
-  for(int i=0;i<8;++i){
-   const char* const p=ls[i];
-   const __m512i x=_mm512_loadu_si512((const void*)p);
-   const uint64_t cm=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));
-   aC1[i]=cm;aQ1[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq));
-   const char* const b=p+_tzcnt_u64(_blsr_u64(_blsr_u64(cm)))+1; // one past the third comma (p+65 if there is none)
-   const __m512i y=_mm512_loadu_si512((const void*)b);
-   aC2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc));aQ2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));aB[i]=(uint64_t)b;
-  }}
+struct alignas(64) Ev8Scan{uint64_t c1[8],q1[8],c2[8],q2[8],b[8],h[16];}; // h: the first 16 bytes of each line (OPT bit 0 only)
+#ifndef VERT_EV8_OPT
+#define VERT_EV8_OPT 0
+#endif
+template<unsigned OPT> VERT_T5 static inline void scan8t_v5(const char* const* ls,Ev8Scan& s){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i vc=VERT_K5(55),vq=VERT_K5(56);
+ for(int i=0;i<8;++i){
+  const char* const p=ls[i];
+  const __m512i x=_mm512_loadu_si512((const void*)p);
+  const uint64_t cm=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));
+  s.c1[i]=cm;s.q1[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq));
+  if(OPT&1)_mm_storeu_si128((__m128i*)&s.h[2*i],_mm512_castsi512_si128(x));
+  const char* const b=p+_tzcnt_u64(_blsr_u64(_blsr_u64(cm)))+1; // one past the third comma (p+65 if there is none)
+  const __m512i y=_mm512_loadu_si512((const void*)b);
+  s.c2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc));s.q2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));s.b[i]=(uint64_t)b;
+ }
+}
+template<unsigned OPT> VERT_T5 static inline void dec8t_v5(const char* const* ls,const char* const* nx,const Ev8Scan& s,const EvConst& c,Ev8Out& o){
+ const uint64_t* const VK=vk_ptr();
+ const uint64_t* const aC1=s.c1;const uint64_t* const aQ1=s.q1;const uint64_t* const aC2=s.c2;const uint64_t* const aQ2=s.q2;const uint64_t* const aB=s.b;
  // ---- vertical ----
- const __m512i one=VERT_C5(1),ones=VERT_C5(-1),c63=VERT_C5(63),c64=VERT_C5(64);
+ const __m512i one=VERT_K5(10),ones=VERT_K5(57),c63=VERT_K5(58),c64=VERT_K5(0);
  #define VERT_TZ5(x,xm) _mm512_sub_epi64(c63,_mm512_lzcnt_epi64(_mm512_xor_si512(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
  const __m512i P=VERT_LD5(ls),NL=_mm512_add_epi64(VERT_LD5(nx),ones),Bv=_mm512_load_si512((const void*)aB);
  const __m512i C1=_mm512_load_si512((const void*)aC1),Q1=_mm512_load_si512((const void*)aQ1),C2=_mm512_load_si512((const void*)aC2),Q2=_mm512_load_si512((const void*)aQ2);
@@ -2330,9 +2470,10 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
  const __m512i u0=_mm512_add_epi64(d,ones),d0=VERT_TZ5(d,u0),dA=_mm512_and_si512(d,u0);
  const __m512i u1=_mm512_add_epi64(dA,ones),d1=VERT_TZ5(dA,u1),dB=_mm512_and_si512(dA,u1);
  const __m512i u2=_mm512_add_epi64(dB,ones),d2=VERT_TZ5(dB,u2),dR=_mm512_and_si512(dB,u2);
- const __m512i err=_mm512_or_si512(err1,err2);
- __mmask8 ok=_mm512_testn_epi64_mask(err,err)&_mm512_testn_epi64_mask(dR,dR)&_mm512_test_epi64_mask(dB,dB); // no quote error, exactly three commas
- ok&=_mm512_cmplt_epu64_mask(c2,c64)&_mm512_cmplt_epu64_mask(L,c64);                                           // third comma and newline inside their windows
+ const __m512i err=_mm512_ternarylogic_epi64(err1,err2,dR,0xFE);            // a quote error, or a fourth comma before the newline
+ __mmask8 ok=_mm512_testn_epi64_mask(err,err);
+ ok=_mm512_mask_test_epi64_mask(ok,dB,dB);                                    // at least three commas
+ ok=_mm512_mask_cmplt_epu64_mask(ok,_mm512_or_si512(c2,L),c64);               // third comma and newline inside their windows ((e2|L)>>6 == 0)
  // fields: a quoted field starts one later and is two shorter
  const __m512i z0=_mm512_and_si512(Q1,one);
  const __m512i a1=_mm512_add_epi64(c0,one),z1=_mm512_and_si512(_mm512_srlv_epi64(q1,a1),one),o1=_mm512_add_epi64(a1,z1),l1=_mm512_sub_epi64(_mm512_sub_epi64(c1,o1),z1);
@@ -2343,84 +2484,111 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
  const __m512i a6=_mm512_add_epi64(d2,one),z6=_mm512_and_si512(_mm512_srlv_epi64(qb,a6),one),o6=_mm512_add_epi64(a6,z6),l6=_mm512_sub_epi64(_mm512_sub_epi64(L,o6),z6);
  #define VERT_G5(a) _mm512_i64gather_epi64(a,(const void*)0,1)
  // event_id exactly as event_pre_v3: first comma of the first 16 bytes, one quote pair stripped
- const __m512i idn=_mm512_sub_epi64(_mm512_sub_epi64(_mm512_min_epu64(c0,VERT_C5(16)),_mm512_add_epi64(z0,z0)),one);
+ const __m512i idn=_mm512_sub_epi64(_mm512_sub_epi64(_mm512_min_epu64(c0,VERT_K5(59)),_mm512_add_epi64(z0,z0)),one);
  const __m512i S0=_mm512_add_epi64(P,z0);
- const __m512i W0=VERT_G5(S0),IDW=VERT_G5(_mm512_add_epi64(S0,one));
- __mmask8 idok;const __m512i ve=id8k_v5(IDW,idn,c.ke,c.limE,idok);
- const __m512i lowbyte=VERT_C5(0xFF);
- idok&=_mm512_cmpeq_epi64_mask(_mm512_and_si512(W0,lowbyte),VERT_C5('e'));
- // user: empty, or 'u' + 0..8 bytes kept as text
+ const __m512i lowbyte=VERT_K5(60);
  const __m512i S1=_mm512_add_epi64(P,o1);
- const __m512i U0=VERT_G5(S1),UW=VERT_G5(_mm512_add_epi64(S1,one));
+ __m512i IDW,E0,U0;  // the ID's digits; words whose low byte is the ID's letter / the user's letter
+ __mmask8 ukn;       // rows whose user letter is known
+ if(OPT&1){
+  const __m512i H0=_mm512_load_si512((const void*)s.h),H1=_mm512_load_si512((const void*)(s.h+8));
+  const __m512i LO=_mm512_permutex2var_epi64(H0,_mm512_setr_epi64(0,2,4,6,8,10,12,14),H1),HI=_mm512_permutex2var_epi64(H0,_mm512_setr_epi64(1,3,5,7,9,11,13,15),H1); // bytes 0..7 / 8..15 of each line
+  const __m512i z8=_mm512_slli_epi64(z0,3),i8=_mm512_add_epi64(z8,VERT_K5(44));
+  E0=_mm512_srlv_epi64(LO,z8);
+  IDW=_mm512_or_si512(_mm512_srlv_epi64(LO,i8),_mm512_sllv_epi64(HI,_mm512_sub_epi64(c64,i8))); // line bytes z0+1 .. z0+8
+  // the user's letter is byte o1 of the line: in the saved bytes whenever the ID is a dense one (then o1 <= 13)
+  U0=_mm512_srlv_epi64(_mm512_mask_blend_epi64(_mm512_cmple_epu64_mask(VERT_K5(44),o1),LO,HI),_mm512_slli_epi64(_mm512_and_si512(o1,VERT_K5(11)),3));
+  ukn=_mm512_cmplt_epu64_mask(o1,VERT_K5(59));
+ }else{
+  E0=VERT_G5(S0);IDW=VERT_G5(_mm512_add_epi64(S0,one));U0=VERT_G5(S1);ukn=0xFF;
+ }
+ __mmask8 idok;const __m512i ve=id8k_v5(IDW,idn,c.ke,c.limE,idok);
+ idok=_mm512_mask_cmpeq_epi64_mask(idok,_mm512_and_si512(E0,lowbyte),VERT_K5(61));
+ // user: empty, or 'u' + 0..8 bytes kept as text
+ const __m512i UW=VERT_G5(_mm512_add_epi64(S1,one));
  const __mmask8 hasu=_mm512_test_epi64_mask(l1,l1);
- ok&=(__mmask8)(~hasu|(_mm512_cmpeq_epi64_mask(_mm512_and_si512(U0,lowbyte),VERT_C5('u'))&_mm512_cmple_epu64_mask(l1,VERT_C5(9))));
+ ok=_kand_mask8(ok,_kor_mask8(_knot_mask8(hasu),_mm512_mask_cmple_epu64_mask(_mm512_mask_cmpeq_epi64_mask(ukn,_mm512_and_si512(U0,lowbyte),VERT_K5(62)),l1,VERT_K5(63))));
  const __m512i un=_mm512_maskz_sub_epi64(hasu,l1,one);
  const __m512i uw=_mm512_and_si512(UW,_mm512_srlv_epi64(ones,_mm512_sub_epi64(c64,_mm512_slli_epi64(un,3)))); // un == 0: shift by 64 gives 0
  // ingest_ts: 20 bytes, Z form
  const __m512i S3=_mm512_add_epi64(Bv,z3);
- const __m512i ig0=VERT_G5(S3),ig1=VERT_G5(_mm512_add_epi64(S3,VERT_C5(8))),ig2=VERT_G5(_mm512_add_epi64(S3,VERT_C5(12)));
+ const __m512i ig0=VERT_G5(S3),ig1=VERT_G5(_mm512_add_epi64(S3,VERT_K5(44))),ig2=VERT_G5(_mm512_add_epi64(S3,VERT_K5(64)));
  __mmask8 oki,hiti,oks,hits,okoff,okep,knz;
  const __m512i todi=tod8k_v5(ig1,ig2,oki);
  const __m512i dayi=day8k_v5(ig0,ig1,c.memo,hiti);
  const __m512i ingest=_mm512_add_epi64(dayi,todi);
- ok&=oki&hiti&_mm512_cmpeq_epi64_mask(_mm512_srli_epi64(ig2,56),VERT_C5('Z'))&_mm512_cmpeq_epi64_mask(l3,VERT_C5(20));
+ ok=_mm512_mask_cmpeq_epi64_mask(_mm512_mask_cmpeq_epi64_mask(_kand_mask8(ok,_kand_mask8(oki,hiti)),_mm512_srli_epi64(ig2,56),VERT_K5(48)),l3,VERT_K5(51));
  // ts: 20 (Z), 13 (digits), 25 (offset)
- const __mmask8 is20=_mm512_cmpeq_epi64_mask(l2,VERT_C5(20)),is25=_mm512_cmpeq_epi64_mask(l2,VERT_C5(25)),is13=_mm512_cmpeq_epi64_mask(l2,VERT_C5(13));
+ const __mmask8 is20=_mm512_cmpeq_epi64_mask(l2,VERT_K5(51)),is25=_mm512_cmpeq_epi64_mask(l2,VERT_K5(52)),is13=_mm512_cmpeq_epi64_mask(l2,VERT_K5(53));
  const __m512i S2=_mm512_add_epi64(P,o2);
- const __m512i ts0=VERT_G5(S2),ts1=VERT_G5(_mm512_add_epi64(S2,_mm512_mask_mov_epi64(VERT_C5(8),is13,VERT_C5(5))));
- const __m512i ts2=VERT_G5(_mm512_add_epi64(S2,VERT_C5(12))),ts3=VERT_G5(_mm512_add_epi64(S2,VERT_C5(17)));
+ const __m512i ts0=VERT_G5(S2),ts1=VERT_G5(_mm512_add_epi64(S2,_mm512_mask_mov_epi64(VERT_K5(44),is13,VERT_K5(65))));
+ const __m512i ts2=VERT_G5(_mm512_add_epi64(S2,VERT_K5(64))),ts3=VERT_G5(_mm512_add_epi64(S2,VERT_K5(66)));
  const __m512i tods=tod8k_v5(ts1,ts2,oks);
- const __m512i days=day8k_v5(ts0,ts1,c.memo,hits);
+ __m512i days;
+ if(OPT&2){
+  const __m512i dd=_mm512_or_si512(_mm512_xor_si512(ts0,ig0),_mm512_and_si512(_mm512_xor_si512(ts1,ig1),VERT_K5(40)));
+  if(_mm512_mask_test_epi64_mask(_kor_mask8(is20,is25),dd,dd)==0){days=dayi;hits=hiti;} // every Z/offset-form ts has its ingest date: same text, same entry
+  else days=day8k_v5(ts0,ts1,c.memo,hits);
+ }else days=day8k_v5(ts0,ts1,c.memo,hits);
  const __m512i off=off8k_v5(ts3,okoff);
  const __m512i ep=epoch8k_v5(ts0,ts1,okep);
  const __m512i b19=_mm512_srli_epi64(ts2,56);
- const __mmask8 isZ=_mm512_cmpeq_epi64_mask(b19,VERT_C5('Z')),isP=_mm512_cmpeq_epi64_mask(b19,VERT_C5('+')),isM=_mm512_cmpeq_epi64_mask(b19,VERT_C5('-'));
+ const __mmask8 z20=_mm512_mask_cmpeq_epi64_mask(is20,b19,VERT_K5(48)),p25=_mm512_mask_cmpeq_epi64_mask(is25,b19,VERT_K5(49)),m25=_mm512_mask_cmpeq_epi64_mask(is25,b19,VERT_K5(50));
  __m512i ts=_mm512_add_epi64(days,tods);
- ts=_mm512_mask_sub_epi64(ts,(__mmask8)(is25&isP),ts,off);
- ts=_mm512_mask_add_epi64(ts,(__mmask8)(is25&isM),ts,off);
+ ts=_mm512_mask_sub_epi64(ts,p25,ts,off);
+ ts=_mm512_mask_add_epi64(ts,m25,ts,off);
  ts=_mm512_mask_mov_epi64(ts,is13,ep);
- ok&=(__mmask8)((is13&okep)|(oks&hits&((is20&isZ)|(is25&okoff&(isP|isM)))));
+ // ts decided: 13 digits, or (valid time and known date) and (Z form, or offset form with a valid offset)
+ ok=_kand_mask8(ok,_kor_mask8(_kand_mask8(is13,okep),_kand_mask8(_kand_mask8(oks,hits),_kor_mask8(z20,_kand_mask8(okoff,_kor_mask8(p25,m25))))));
  // kind, validity, k
  const __m512i kind=kind8k_v5(VERT_G5(_mm512_add_epi64(Bv,o4)),l4,knz);
  const __m512i tsrel=_mm512_sub_epi64(ts,VERT_C5(c.wstart));
- __mmask8 valid=knz&hasu&_mm512_test_epi64_mask(l5,l5)&_mm512_cmplt_epu64_mask(tsrel,VERT_C5(c.wlen));
- valid&=_mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest,ts),VERT_C5(DAYMS));
+ __mmask8 valid=_mm512_mask_cmplt_epu64_mask(_mm512_mask_test_epi64_mask(_kand_mask8(knz,hasu),l5,l5),tsrel,VERT_C5(c.wlen));
+ valid=_mm512_mask_cmple_epi64_mask(valid,_mm512_sub_epi64(ingest,ts),VERT_K5(54));
  __m512i k=_mm512_slli_epi64(_mm512_add_epi64(tsrel,one),EV_TS_SHIFT);
  // purchases: the price as price_value takes it, for fields of up to 8 bytes (right-aligned over '0' like the ID digits)
  const __m512i S6=_mm512_add_epi64(Bv,o6);
- const __mmask8 pv=valid&_mm512_cmpeq_epi64_mask(kind,VERT_C5(3));
- __mmask8 pur=pv;
+ const __mmask8 pv=_mm512_mask_cmpeq_epi64_mask(valid,kind,VERT_K5(47));
+ __mmask8 pur;
  {const __m512i n8=_mm512_slli_epi64(l6,3);
-  const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(VERT_G5(S6),_mm512_sub_epi64(c64,n8)),_mm512_srlv_epi64(_mm512_set1_epi8(0x30),n8));
-  const __m512i v=_mm512_sub_epi8(x,_mm512_set1_epi8('0')),nine=_mm512_set1_epi8(9);
-  const __m512i p4=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_C5(0x010A010A010A010AULL)),VERT_C5(0x0001006400010064ULL));
-  const __m512i price=_mm512_add_epi64(_mm512_mul_epu32(p4,VERT_C5(10000)),_mm512_srli_epi64(p4,32));
-  pur&=_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,nine),nine)&_mm512_cmple_epu64_mask(_mm512_sub_epi64(price,one),VERT_C5(PRICE_MAX-1)); // digits, 1..10000000 (an empty field gives 0)
-  ok&=(__mmask8)~(pv&_mm512_cmplt_epu64_mask(VERT_C5(8),l6));                                                                     // a longer price field: the row code decides
-  k=_mm512_mask_or_epi64(k,pur,k,_mm512_or_si512(price,VERT_C5(EV_PURCHASE_BIT)));
+  const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(VERT_G5(S6),_mm512_sub_epi64(c64,n8)),_mm512_srlv_epi64(VERT_K5(1),n8));
+  const __m512i v=_mm512_sub_epi8(x,VERT_K5(2)),nine=VERT_K5(4);
+  const __m512i p4=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_K5(25)),VERT_K5(26));
+  const __m512i price=_mm512_add_epi64(_mm512_mul_epu32(p4,VERT_K5(29)),_mm512_srli_epi64(p4,32));
+  pur=_mm512_mask_cmple_epu64_mask(_mm512_mask_cmpeq_epi64_mask(pv,_mm512_max_epu8(v,nine),nine),_mm512_sub_epi64(price,one),VERT_K5(67)); // digits, 1..10000000 (an empty field gives 0)
+  ok=_kandn_mask8(_mm512_mask_cmplt_epu64_mask(pv,VERT_K5(44),l6),ok);                                                             // a longer price field: the row code decides
+  k=_mm512_mask_or_epi64(k,pur,k,_mm512_or_si512(price,VERT_K5(68)));
  }
- valid&=(__mmask8)(~pv|pur); // a purchase with a bad price is not a valid event
+ valid=_kand_mask8(valid,_kor_mask8(_knot_mask8(pv),pur)); // a purchase with a bad price is not a valid event
  const __m512i tid=VERT_C5(c.tid48);
  _mm512_store_si512((void*)o.ve,ve);_mm512_store_si512((void*)o.so,_mm512_slli_epi64(ve,5));
- _mm512_store_si512((void*)o.kk,_mm512_mask_mov_epi64(VERT_C5(ESLOT_INVALID_K),valid,k));
+ _mm512_store_si512((void*)o.kk,_mm512_mask_mov_epi64(VERT_K5(69),valid,k));
  _mm512_store_si512((void*)o.ingest,ingest);
- _mm512_store_si512((void*)o.uct,_mm512_mask_or_epi64(tid,valid,tid,_mm512_or_si512(un,VERT_C5(RAW_USER))));
+ _mm512_store_si512((void*)o.uct,_mm512_mask_or_epi64(tid,valid,tid,_mm512_or_si512(un,VERT_K5(70))));
  _mm512_store_si512((void*)o.uw,_mm512_maskz_mov_epi64(valid,uw));
  _mm512_store_si512((void*)o.s5,_mm512_add_epi64(Bv,o5));_mm512_store_si512((void*)o.l5,l5);
  _mm512_store_si512((void*)o.s6,S6);_mm512_store_si512((void*)o.l6,l6);
- ok&=idok;
- o.idok=(uint8_t)idok;o.ok=(uint8_t)ok;o.pur=(uint8_t)(pur&ok);
+ ok=_kand_mask8(ok,idok);
+ o.idok=(uint8_t)idok;o.ok=(uint8_t)ok;o.pur=(uint8_t)_kand_mask8(pur,ok);
  #undef VERT_G5
  #undef VERT_TZ5
 }
+VERT_T5 static inline void scan8_v5(const char* const* ls,Ev8Scan& s){scan8t_v5<VERT_EV8_OPT>(ls,s);}
+VERT_T5 static inline void dec8_v5(const char* const* ls,const char* const* nx,const Ev8Scan& s,const EvConst& c,Ev8Out& o){dec8t_v5<VERT_EV8_OPT>(ls,nx,s,c,o);}
+VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,const EvConst& c,Ev8Out& o){
+ Ev8Scan s;scan8_v5(ls,s);dec8_v5(ls,nx,s,c,o);
+}
 #undef VERT_C5
 #undef VERT_LD5
+#undef VERT_K5
 } // namespace vert
 static_assert(sizeof(vert::DateEnt)==sizeof(DateMemo3)&&offsetof(vert::DateEnt,k)==offsetof(DateMemo3,k)&&offsetof(vert::DateEnt,cc)==offsetof(DateMemo3,cc)&&offsetof(vert::DateEnt,ms)==offsetof(DateMemo3,ms));
 static_assert(vert::ESLOT_INVALID_K==ESLOT_INVALID&&vert::EV_PURCHASE_BIT==EV_PURCHASE&&vert::RAW_USER==DENSE_USER_RAW&&sizeof(ESlot)==32);
 static_assert(vert::MASK40==dn::MASK&&vert::I1==dn::I1&&vert::I2==dn::I2&&vert::EV_TS_SHIFT==EV_TS&&vert::DAYMS==DAY);
-// The scalar kernel as a call of its own (the avx2 loop; also what callgrind and the sanitizer runs see).
-[[gnu::noinline]] static void ev8_ref_call(const char* const* ls,const char* const* nx,const vert::EvConst& c,vert::Ev8Out& o){vert::ev8_ref(ls,nx,c,o);}
+// The scalar kernel in the two-step shape of the vector one (nothing to scan), as a call of its own: the avx2
+// loop, a test stand-in only (also what callgrind and the sanitizer runs see).
+static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
+[[gnu::noinline]] static void ev8_dec_ref(const char* const* ls,const char* const* nx,const vert::Ev8Scan&,const vert::EvConst& c,vert::Ev8Out& o){vert::ev8_ref(ls,nx,c,o);}
 // Finishing the first N rows of a group in line order. Purchases first get their category (reads only).
 // A group whose eight rows are all ok takes the short way: no row test, and the highest counter of the group
 // goes into vmx (the low halves of four 64-bit lanes; fastAny says that vmx holds anything).
@@ -2440,53 +2608,63 @@ static_assert(vert::MASK40==dn::MASK&&vert::I1==dn::I1&&vert::I2==dn::I2&&vert::
     event_line_v3<true,true>(q_,bb_,w1_,MASKS(bb_),X_[i_]-1,pre_,lp,pend,pp,dmax,send,ring,rpos,general);}} }
 // The line index of this loop. ls[pos..m]: the starts of the lines not yet in a group; ls[pos..m-1] have their
 // newline (ls[i+1]-1), the line at ls[m] not yet (the index has not got that far, or the file ends without
-// one). The group that is waiting to be finished keeps its eight starts right before ls[pos].
+// one). Three groups are under way at any time, each one step further than the next:
+//   N  just formed from the index: SCAN (the window masks of its lines, kept in one of two Ev8Scan)
+//   D  formed a turn ago: DEC (everything else, from its own scan) and the requests for its slots
+//   F  decoded a turn ago: finished (SS_EV8_FINISH), so every slot has had eight lines and a kernel call of time
+// The masks a DEC loads were stored a whole turn earlier (a load right behind its eight stores would wait for
+// them). The groups that are under way keep their eight starts each right before ls[pos]; a group's scan is
+// always the scan of exactly its lines.
 static constexpr size_t EV8_BLOCK=4096; // bytes indexed at a time
 #define SS_EV8_PF(O_,i_) __builtin_prefetch(&SS_EV8_SLOT(O_,i_),1,3);
-#define SS_EVENT_LOOP_EV8(NAME,TARGET,MASKS,NLMASK,KERNEL) \
+#define SS_EVENT_LOOP_EV8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC) \
 template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
  const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;ERing* const ring=nullptr;unsigned rpos=0; /* no pending batch, no ring here */ \
- const char* ls[EV8_BLOCK+64+32];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
+ const char* ls[EV8_BLOCK+64+64];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
  const vert::EvConst ec{lp.ke,lp.limE,lp.wstart,lp.wlen,(const vert::DateEnt*)lp.memo,lp.tid48}; \
- vert::Ev8Out out[2];const char* tls[8];const char* tnx[8];const char* const* gl[2]={ls,ls};const char* const* gx[2]={ls,ls};unsigned gn[2]={0,0};int cur=0;bool more=true; \
+ vert::Ev8Out out[2];vert::Ev8Scan sc[2];const char* tls[8];const char* tnx[8]; \
+ const char* const* gl[3]={ls,ls,ls};const char* const* gx[3]={ls,ls,ls};unsigned gn[3]={0,0,0}; /* lines, next lines and number of rows of N, D, F */ \
+ unsigned iN=0,iD=1,iF=2,sN=0,oD=0;bool more=true; /* sc[sN]: N's scan, sc[sN^1]: D's; out[oD]: D's results, out[oD^1]: F's */ \
  __m256i vmx=_mm256_setzero_si256();bool fastAny=false; \
- while(more||gn[cur^1]){ \
+ while(more||gn[iD]||gn[iF]){ \
   unsigned n=0; \
   if(more){ \
    if(pos+8>m){ /* fewer than eight whole lines known: what is still needed moves to the front and the index goes on */ \
-    const size_t s_=pos-(gn[cur^1]?8:0); \
-    if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_;gl[cur^1]=ls;gx[cur^1]=ls+1;} \
+    const size_t s_=pos-(gn[iD]?8:0)-(gn[iF]?8:0); \
+    if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_; \
+     if(gn[iD]){gl[iD]-=s_;gx[iD]-=s_;} if(gn[iF]){gl[iF]-=s_;gx[iF]-=s_;}} \
     while(m-pos<8&&scan<end&&ls[m]<lim){ \
      const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
      do{uint64_t x_=NLMASK(scan);while(x_){ls[++m]=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);}scan+=64;}while(scan<stop);} \
    } \
-   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[cur]=ls+pos;gx[cur]=ls+pos+1;} \
+   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[iN]=ls+pos;gx[iN]=ls+pos+1;} \
    else{ /* the last lines of the chunk: a short group, filled up with copies of its last line (results not used) */ \
     more=false; \
     while(pos+n<m&&ls[pos+n]<lim)++n; \
-    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}gl[cur]=tls;gx[cur]=tnx;} \
+    if(n){for(unsigned i_=0;i_<8;++i_){const unsigned j_=i_<n?i_:n-1;tls[i_]=ls[pos+j_];tnx[i_]=ls[pos+j_+1];}gl[iN]=tls;gx[iN]=tnx;} \
    } \
    pos+=n; \
-   if(n){ \
-    vert::Ev8Out& o_=out[cur]; \
-    KERNEL(gl[cur],gx[cur],ec,o_); \
-    if(__builtin_expect((n==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
-    else for(unsigned x_=o_.idok&((1u<<n)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
-   } \
+   if(n)SCAN(gl[iN],sc[sN]); \
   } \
-  gn[cur]=n; \
-  if(gn[cur^1])SS_EV8_FINISH(out[cur^1],gl[cur^1],gx[cur^1],gn[cur^1],MASKS) \
-  cur^=1; \
+  gn[iN]=n; \
+  if(gn[iD]){ \
+   vert::Ev8Out& o_=out[oD];const unsigned nd_=gn[iD]; \
+   DEC(gl[iD],gx[iD],sc[sN^1],ec,o_); \
+   if(__builtin_expect((nd_==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&((1u<<nd_)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
+  } \
+  if(gn[iF])SS_EV8_FINISH(out[oD^1],gl[iF],gx[iF],gn[iF],MASKS) \
+  {const unsigned t_=iF;iF=iD;iD=iN;iN=t_;sN^=1;oD^=1;} \
  } \
  if(pos==m&&ls[m]<lim)line_general<7>(ls[m],end,general); /* the last line has no newline */ \
  if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
  tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send); \
 }
-SS_EVENT_LOOP_EV8(events_avx2_e8,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_ref_call)
-SS_EVENT_LOOP_EV8(events_avx512z_e8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::ev8_v5)
-SS_EVENT_LOOP_EV8(events_avx512y_e8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert::ev8_v5)
+SS_EVENT_LOOP_EV8(events_avx2_e8,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_scan_none,ev8_dec_ref)
+SS_EVENT_LOOP_EV8(events_avx512z_e8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::scan8_v5,vert::dec8_v5)
+SS_EVENT_LOOP_EV8(events_avx512y_e8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert::scan8_v5,vert::dec8_v5)
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
@@ -2628,6 +2806,493 @@ SS_CLICK_LOOP_IX(clicks_avx512y_ix,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 SS_CLICK_LOOP(clicks_avx2,SS_V3,win_masks_avx2)
 SS_CLICK_LOOP(clicks_avx512z,SS_V5,win_masks_avx512z)
 SS_CLICK_LOOP(clicks_avx512y,SS_V5,win_masks_avx512y)
+// ---- cl8 click loop (SS_CLICKS=cl8) ----
+// The click analogue of the ev8 event loop: eight click lines at a time straight from the line index go to a kernel
+// (vcl::cscan8_v5 + cdec8_v5, AVX-512; vcl::cl8_ref is the scalar twin with the same decisions, used by the avx2 loop
+// as a test stand-in only). An ok row is what click_line_v3<true> would do up to its campaign lookup; the loop does the
+// lookup and the commit. A drop row is a line the row code drops without a trace. Every other row goes through
+// click_line_v3<true> unchanged, at its place in line order. Contract: /home/claude/vert/BATCH.md ("cl8") and the
+// head of vert_cl.h. Slot form only (not the bucket form); the ring is not used (the distance from decode to
+// finish is the prefetch lead: at least eight lines).
+// ---- cl8: eight click lines per call (vertical AVX-512). Generated from /home/claude/vert/vert.h + vert_cl.h by mkpaste_cl.py;
+// ---- contract at the top of vert_cl.h and in BATCH.md ("cl8: interface + integration"). Tested as this exact text by
+// ---- vert_cl_test -DVERT_CL_PASTE. Do not edit here: change vert_cl.h and regenerate. Needs <immintrin.h> <cstdint> <cstring> <cstddef>.
+namespace vcl{
+#ifndef VERT_T5
+#define VERT_T5 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512cd,avx2,bmi,bmi2,lzcnt,popcnt")))
+#endif
+static constexpr uint64_t MASK40=(1ull<<40)-1;
+static constexpr uint64_t M1=0x9E3779B97F4Bull&MASK40,M2=0xD6E8FEB86659ull&MASK40;
+static constexpr uint64_t inv40(uint64_t a){uint64_t x=a;for(int i=0;i<6;++i)x*=2-a*x;return x&MASK40;}
+static constexpr uint64_t I1=inv40(M1),I2=inv40(M2);
+static_assert(((M1*I1)&MASK40)==1&&((M2*I2)&MASK40)==1);
+static constexpr int64_t DAYMS=86400000LL;
+static constexpr uint64_t ESLOT_INVALID_K=2,EV_PURCHASE_BIT=1ull<<24,RAW_USER=0xC0000000u,PRICE_MAX=10000000; // main.cpp: ESLOT_INVALID, EV_PURCHASE, DENSE_USER_RAW, price_value's limit
+static inline uint64_t index_of_ref(uint64_t y,uint64_t key){uint64_t m=(y*I2)&MASK40;m=m^(m>>17)^(m>>34);return ((m^key)*I1)&MASK40;}
+static inline unsigned id8_ref(const uint64_t* w,const uint64_t* n,uint64_t key,uint64_t limit,uint64_t* ctr){
+ unsigned acc=0;
+ for(int i=0;i<8;++i){
+  ctr[i]=0;
+  const uint64_t len=n[i];
+  if(len-1u>7u)continue;
+  unsigned char s[8];memcpy(s,&w[i],8);
+  if(s[0]=='0'&&len>1)continue;
+  uint64_t v=0;bool ok=true;
+  for(uint64_t j=0;j<len;++j){unsigned d=s[j]-(unsigned)'0';if(d>9){d=s[j]-(unsigned)'a';if(d>25){ok=false;break;}d+=10;}v=v*36+d;}
+  if(!ok||v>MASK40)continue;
+  const uint64_t c=index_of_ref(v,key);
+  if(c<limit){ctr[i]=c;acc|=1u<<i;}
+ }
+ return acc;
+}
+static const uint64_t VKT[]={
+ /* 0*/ (uint64_t)(64),
+ /* 1*/ (uint64_t)(uint8_t)(0x30)*0x0101010101010101ULL,
+ /* 2*/ (uint64_t)(uint8_t)('0')*0x0101010101010101ULL,
+ /* 3*/ (uint64_t)(uint8_t)('a')*0x0101010101010101ULL,
+ /* 4*/ (uint64_t)(uint8_t)(9)*0x0101010101010101ULL,
+ /* 5*/ (uint64_t)(uint8_t)(25)*0x0101010101010101ULL,
+ /* 6*/ (uint64_t)(uint8_t)((char)(10-'a'))*0x0101010101010101ULL,
+ /* 7*/ (uint64_t)(uint16_t)(0x0124)*0x0001000100010001ULL,
+ /* 8*/ (uint64_t)(uint32_t)(0x00010510)*0x0000000100000001ULL,
+ /* 9*/ (uint64_t)(1679616),
+ /*10*/ (uint64_t)(1),
+ /*11*/ (uint64_t)(7),
+ /*12*/ (uint64_t)(MASK40),
+ /*13*/ (uint64_t)(I2),
+ /*14*/ (uint64_t)(I1),
+ /*15*/ (uint64_t)(0x0000000030540000ULL),
+ /*16*/ (uint64_t)(0xFFFFFFFF0200FFFFULL),
+ /*17*/ (uint64_t)(0x0030303A30303A30ULL),
+ /*18*/ (uint64_t)(0xFF09050009050009ULL),
+ /*19*/ (uint64_t)(0x0000000064000000ULL),
+ /*20*/ (uint64_t)(0x0000000001680000ULL),
+ /*21*/ (uint64_t)(0x00010A00010A0001ULL),
+ /*22*/ (uint64_t)(0x00010001003C0E10ULL),
+ /*23*/ (uint64_t)(1000),
+ /*24*/ (uint64_t)(86400000),
+ /*25*/ (uint64_t)(0x010A010A010A010AULL),
+ /*26*/ (uint64_t)(0x0001006400010064ULL),
+ /*27*/ (uint64_t)(0x010A010A01000000ULL),
+ /*28*/ (uint64_t)(0x0001006400010000ULL),
+ /*29*/ (uint64_t)(10000),
+ /*30*/ (uint64_t)(100000),
+ /*31*/ (uint64_t)(0x30303A3030000000ULL),
+ /*32*/ (uint64_t)(0x0905000902FFFFFFULL),
+ /*33*/ (uint64_t)(0x010A00010A000000ULL),
+ /*34*/ (uint64_t)(0x0001003C003C0000ULL),
+ /*35*/ (uint64_t)(60000),
+ /*36*/ (uint64_t)(0x40),
+ /*37*/ (uint64_t)(0x3C),
+ /*38*/ (uint64_t)(0x0F03),
+ /*39*/ (uint64_t)(0xFFFFFFFFULL),
+ /*40*/ (uint64_t)(0xFFFF),
+ /*41*/ (uint64_t)(4),
+ /*42*/ (uint64_t)(0x77656976ULL),
+ /*43*/ (uint64_t)(0x74726163ULL),
+ /*44*/ (uint64_t)(8),
+ /*45*/ (uint64_t)(0x6573616863727570ULL),
+ /*46*/ (uint64_t)(2),
+ /*47*/ (uint64_t)(3),
+ /*48*/ (uint64_t)('Z'),
+ /*49*/ (uint64_t)('+'),
+ /*50*/ (uint64_t)('-'),
+ /*51*/ (uint64_t)(20),
+ /*52*/ (uint64_t)(25),
+ /*53*/ (uint64_t)(13),
+ /*54*/ (uint64_t)(DAYMS),
+ /*55*/ (uint64_t)(uint8_t)(',')*0x0101010101010101ULL,
+ /*56*/ (uint64_t)(uint8_t)('"')*0x0101010101010101ULL,
+ /*57*/ (uint64_t)(-1),
+ /*58*/ (uint64_t)(63),
+ /*59*/ (uint64_t)(16),
+ /*60*/ (uint64_t)(0xFF),
+ /*61*/ (uint64_t)('e'),
+ /*62*/ (uint64_t)('u'),
+ /*63*/ (uint64_t)(9),
+ /*64*/ (uint64_t)(12),
+ /*65*/ (uint64_t)(5),
+ /*66*/ (uint64_t)(17),
+ /*67*/ (uint64_t)(PRICE_MAX-1),
+ /*68*/ (uint64_t)(EV_PURCHASE_BIT),
+ /*69*/ (uint64_t)(ESLOT_INVALID_K),
+ /*70*/ (uint64_t)(RAW_USER),
+};
+static inline __attribute__((always_inline)) const uint64_t* vk_ptr(){const uint64_t* p=VKT;__asm__("":"+r"(p));return p;}
+#define VERT_K5(i) _mm512_set1_epi64((long long)VK[i])
+struct DateEnt{uint64_t k;uint32_t cc;uint32_t pad;int64_t ms;};
+static_assert(sizeof(DateEnt)==24);
+static inline unsigned date_slot(uint64_t w0,uint64_t w1){ // w0 = date bytes 0..7, w1 = bytes 8..15
+ return (unsigned)(((w0>>34)&0x40)|((w0>>46)&0x3C)|(w1&0x0F03));
+}
+static inline unsigned char byte_of(uint64_t w,unsigned i){return (unsigned char)(w>>(8*i));}
+static inline bool tod_ref(uint64_t w1,uint64_t w2,uint64_t& ms){
+ if(byte_of(w1,2)!='T'||byte_of(w2,1)!=':'||byte_of(w2,4)!=':')return false;
+ const unsigned ht=byte_of(w1,3)-(unsigned)'0',hu=byte_of(w2,0)-(unsigned)'0',mt=byte_of(w2,2)-(unsigned)'0',mu=byte_of(w2,3)-(unsigned)'0',st=byte_of(w2,5)-(unsigned)'0',su=byte_of(w2,6)-(unsigned)'0';
+ if(ht>2||hu>9||mt>5||mu>9||st>5||su>9)return false;
+ const uint64_t v=(uint64_t)(((ht*10+hu)*60+mt*10+mu)*60+st*10+su)*1000;
+ if(v>=86400000ULL)return false;
+ ms=v;return true;
+}
+static inline bool day_ref(uint64_t w0,uint64_t w1,const DateEnt* memo,uint64_t& dayms){
+ const DateEnt& x=memo[date_slot(w0,w1)];
+ if(x.k==((w0>>16)|(w1<<48))&&x.cc==(uint32_t)(w0&0xFFFF)){dayms=(uint64_t)x.ms;return true;}
+ return false;
+}
+static inline bool epoch_ref(uint64_t w0,uint64_t w1,uint64_t& ms){
+ uint64_t hi=0,lo=0;
+ for(unsigned i=0;i<8;++i){const unsigned d=byte_of(w0,i)-(unsigned)'0';if(d>9)return false;hi=hi*10+d;}
+ for(unsigned i=0;i<8;++i){const unsigned d=byte_of(w1,i)-(unsigned)'0';if(d>9)return false;if(i>=3)lo=lo*10+d;}
+ ms=hi*100000+lo;return true;
+}
+static inline bool off_ref(uint64_t w2,uint64_t w3,int64_t& delta){
+ const unsigned char sg=byte_of(w2,7);
+ if((sg!='+'&&sg!='-')||byte_of(w3,5)!=':')return false;
+ const unsigned o1=byte_of(w3,3)-(unsigned)'0',o2=byte_of(w3,4)-(unsigned)'0',o3=byte_of(w3,6)-(unsigned)'0',o4=byte_of(w3,7)-(unsigned)'0';
+ if(o1>9||o2>9||o3>9||o4>9)return false;
+ const unsigned oh=o1*10+o2,om=o3*10+o4;
+ if(oh>23||om>59)return false; // (ts_v3 says "not a timestamp" here; the kernels simply refuse the row)
+ const int64_t off=(int64_t)(oh*60+om)*60000LL;
+ delta=sg=='-'?off:-off;return true;
+}
+#define VERT_C5(x) _mm512_set1_epi64((long long)(x))
+#define VERT_LD5(p) _mm512_loadu_si512((const void*)(p))
+VERT_T5 static inline __m512i tod8k_v5(__m512i a,__m512i b,__mmask8& ok){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i va=_mm512_sub_epi8(a,VERT_K5(15)),la=VERT_K5(16);
+ const __m512i vb=_mm512_sub_epi8(b,VERT_K5(17)),lb=VERT_K5(18);
+ const __m512i pa=_mm512_madd_epi16(_mm512_maddubs_epi16(va,VERT_K5(19)),VERT_K5(20));
+ const __m512i pb=_mm512_madd_epi16(_mm512_maddubs_epi16(vb,VERT_K5(21)),VERT_K5(22));
+ const __m512i s=_mm512_add_epi32(pa,pb);
+ const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(s,_mm512_srli_epi64(s,32)),VERT_K5(23));
+ ok=_mm512_mask_cmplt_epu64_mask(_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(va,la),la),_mm512_max_epu8(vb,lb),lb),ms,VERT_K5(24));
+ return ms;
+}
+VERT_T5 static inline __m512i epoch8k_v5(__m512i w0,__m512i w1,__mmask8& ok){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i z=VERT_K5(2),nine=VERT_K5(4);
+ const __m512i v0=_mm512_sub_epi8(w0,z),v1=_mm512_sub_epi8(w1,z);
+ ok=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v0,nine),nine),_mm512_max_epu8(v1,nine),nine);
+ const __m512i p0=_mm512_madd_epi16(_mm512_maddubs_epi16(v0,VERT_K5(25)),VERT_K5(26));
+ const __m512i p1=_mm512_madd_epi16(_mm512_maddubs_epi16(v1,VERT_K5(27)),VERT_K5(28));
+ const __m512i tenk=VERT_K5(29);
+ const __m512i hi=_mm512_add_epi64(_mm512_mul_epu32(p0,tenk),_mm512_srli_epi64(p0,32));
+ const __m512i lo=_mm512_add_epi64(_mm512_mul_epu32(p1,tenk),_mm512_srli_epi64(p1,32));
+ return _mm512_add_epi64(_mm512_mul_epu32(hi,VERT_K5(30)),lo);
+}
+VERT_T5 static inline __m512i off8k_v5(__m512i w3,__mmask8& ok){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i v=_mm512_sub_epi8(w3,VERT_K5(31)),l=VERT_K5(32);
+ const __m512i p=_mm512_madd_epi16(_mm512_maddubs_epi16(v,VERT_K5(33)),VERT_K5(34));
+ const __m512i ms=_mm512_mul_epu32(_mm512_add_epi32(p,_mm512_srli_epi64(p,32)),VERT_K5(35));
+ ok=_mm512_mask_cmplt_epu64_mask(_mm512_cmpeq_epi64_mask(_mm512_max_epu8(v,l),l),ms,VERT_K5(24));
+ return ms;
+}
+static inline uint64_t ld8_ref(const char* p){uint64_t w;memcpy(&w,p,8);return w;}
+static inline void masks_ref(const char* p,uint64_t& c,uint64_t& q){c=0;q=0;for(int i=0;i<64;++i){c|=(uint64_t)(p[i]==',')<<i;q|=(uint64_t)(p[i]=='"')<<i;}}
+static inline unsigned tz_ref(uint64_t x){return x?(unsigned)__builtin_ctzll(x):64u;}
+static inline uint64_t blsr_ref(uint64_t x){return x&(x-1);}
+static constexpr unsigned CL_GEN_ALIAS_BITS=9,CL_ALIAS_BITS=3; // main.cpp: dn::GEN_ALIAS_BITS, dn::ALIAS_BITS
+static constexpr uint64_t DENSE_USER_BIT=0x40000000u;          // main.cpp: DENSE_USER
+static constexpr unsigned CSLOT_SHIFT=4;                       // main.cpp: sizeof(CSlot) == 16
+struct ClConst{uint64_t kc,limC,ku,limI;const uint64_t* cplx;int64_t clickStart;uint64_t wlen;const DateEnt* memo;};
+struct alignas(64) Cl8Scan{uint64_t c[8],q[8];};
+struct alignas(64) Cl8Out{
+ uint64_t kcn[8];     // idok rows: click counter
+ uint64_t so[8];      // idok rows: kcn << 4 (byte offset of the CSlot)
+ uint64_t ckh[8];     // ok rows: (ts - clickStart) << 16; the caller ORs (uint16_t)campaign index
+ uint64_t user[8];    // ok rows: DENSE_USER | index << 3 | alias
+ const char* sc[8];uint64_t lc[8]; // ok rows: campaign_id content (quotes stripped)
+ uint32_t umax,kend;  // over the ok rows: largest user, largest (uint32_t)kcn + 1 (0 if there is no ok row)
+ uint8_t ok;          // bit i: the caller looks the campaign up and commits (see the contract)
+ uint8_t drop;        // bit i: click_line_v3 drops the line without doing anything; never together with ok
+ uint8_t idok;        // bit i: kcn[i] is the counter of a dense click_id on a line click_line_v3 decodes (ok implies idok)
+};
+// one row of K1 through id8_ref (the reference is allowed to be slow)
+static inline bool id1_ref(uint64_t w,uint64_t n,uint64_t key,uint64_t limit,uint64_t& ctr){
+ uint64_t out[8];const uint64_t ws[8]={w,w,w,w,w,w,w,w},ns[8]={n,n,n,n,n,n,n,n};
+ if(!(id8_ref(ws,ns,key,limit,out)&1))return false;
+ ctr=out[0];return true;
+}
+static inline void cl8_ref(const char* const* ls,const char* const* nx,const ClConst& c,Cl8Out& o){
+ unsigned okm=0,idm=0,drm=0;uint32_t umax=0,kend=0;
+ for(int i=0;i<8;++i){
+  o.kcn[i]=o.so[i]=o.ckh[i]=o.user[i]=o.lc[i]=0;o.sc[i]=ls[i];
+  const char* const p=ls[i];const char* const nl=nx[i]-1;
+  uint64_t cm,qa;masks_ref(p,cm,qa);
+  // structure, as click_line_v3 (DREC form: the newline is known)
+  const uint64_t L=(uint64_t)(nl-p),nbit=1ull<<(L&63),keep=nbit-1;
+  const uint64_t d=cm&keep,q=qa&keep;
+  const uint64_t st=(d<<1)|1,en=d|nbit;
+  const uint64_t sq=q&st,op=(sq+~en)&en,err=op^((q&~st)<<1);
+  if((err|(uint64_t)(__builtin_popcountll(d)^3)|(L>>6))!=0)continue;      // not well-formed: the row code passes it on
+  uint64_t B=st+sq,E=en-(op>>1);
+  const unsigned z0=(unsigned)(q&1);
+  const char* const s0=p+z0;const unsigned l0=tz_ref(E)-z0;
+  B=blsr_ref(B);E=blsr_ref(E);
+  const unsigned b1=tz_ref(B),l1=tz_ref(E)-b1;
+  B=blsr_ref(B);E=blsr_ref(E);
+  const unsigned b2=tz_ref(B),l2=tz_ref(E)-b2;
+  B=blsr_ref(B);E=blsr_ref(E);
+  const unsigned b3=tz_ref(B),l3=tz_ref(E)-b3;
+  o.sc[i]=p+b2;o.lc[i]=l2;
+  if(l0==0||l1==0){drm|=1u<<i;continue;}                                   // dropped before anything is decoded
+  uint64_t kcn=0,uc=0;bool dCl=false,uD=false;uint32_t code=0;
+  if(s0[0]=='k'&&id1_ref(ld8_ref(s0+1),(uint64_t)l0-1,c.kc,c.limC,kcn)){dCl=true;o.kcn[i]=kcn;o.so[i]=kcn<<CSLOT_SHIFT;idm|=1u<<i;}
+  if(p[b1]=='u'&&id1_ref(ld8_ref(p+b1+1),(uint64_t)l1-1,c.ku,MASK40+1,uc)){ // dense_user_code
+   const uint64_t idx=uc>>CL_GEN_ALIAS_BITS,alias=uc&((1u<<CL_GEN_ALIAS_BITS)-1);
+   if(alias<(1u<<CL_ALIAS_BITS)&&idx<c.limI&&!((c.cplx[idx>>6]>>(idx&63))&1)){uD=true;code=(uint32_t)DENSE_USER_BIT|(uint32_t)((idx<<CL_ALIAS_BITS)|alias);}
+  }
+  // ts: the three fast forms of ts_v3; anything else is left to the row code
+  const char* const s3=p+b3;
+  int64_t ts;
+  if(l3==13){uint64_t v;if(!epoch_ref(ld8_ref(s3),ld8_ref(s3+5),v))continue;ts=(int64_t)v;}
+  else if(l3==20||l3==25){
+   const uint64_t t0=ld8_ref(s3),t1=ld8_ref(s3+8),t2=ld8_ref(s3+12);
+   uint64_t tods,days;
+   if(!tod_ref(t1,t2,tods)||!day_ref(t0,t1,c.memo,days))continue;
+   ts=(int64_t)(days+tods);
+   if(l3==20){if(byte_of(t2,7)!='Z')continue;}
+   else{int64_t delta;if(!off_ref(t2,ld8_ref(s3+17),delta))continue;ts+=delta;}
+  }else continue;
+  const uint64_t trel=(uint64_t)ts-(uint64_t)c.clickStart;
+  if(trel>=c.wlen){drm|=1u<<i;continue;}                                   // outside the click window: dropped
+  if(!dCl||!uD)continue;                                                   // bucket record / ID table: the row code's business
+  okm|=1u<<i;o.ckh[i]=trel<<16;o.user[i]=code;
+  if(code>umax)umax=code;
+  if((uint32_t)kcn+1>kend)kend=(uint32_t)kcn+1;
+ }
+ o.ok=(uint8_t)okm;o.drop=(uint8_t)drm;o.idok=(uint8_t)idm;o.umax=umax;o.kend=kend;
+}
+// constants of the click kernel that the ev8 table (VKT) does not have; read through an opaque pointer for the same reason
+static const uint64_t VKC[]={
+ /*0*/ (uint64_t)('k'),
+ /*1*/ (uint64_t)(((1u<<CL_GEN_ALIAS_BITS)-1)&~((1u<<CL_ALIAS_BITS)-1)), // alias bits that must be zero (alias < 8)
+ /*2*/ (uint64_t)((1u<<CL_ALIAS_BITS)-1),
+ /*3*/ (uint64_t)(0xFFFFFFFFu),
+ /*4*/ (uint64_t)(DENSE_USER_BIT),
+ /*5*/ (uint64_t)(0xFF),
+};
+static inline __attribute__((always_inline)) const uint64_t* vkc_ptr(){const uint64_t* p=VKC;__asm__("":"+r"(p));return p;}
+// K1 as id8k_v5 of vert.h (same arithmetic, same answer), without its separate length test, which the other tests imply:
+//   n == 0            x is eight '0' bytes, val = 0 < MIN36[8] = 36^7 (the entry picked by n & 7 == 0)   -> refused by val >= min36
+//   n >= 9 (any size) both shift counts are 64 or more, x = 0, and a zero byte is not a base-36 digit      -> refused by bad != 0
+VERT_T5 static inline __m512i cid8k_v5(__m512i W,__m512i N,uint64_t key,uint64_t limit,__mmask8& okOut){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i n8=_mm512_slli_epi64(N,3);
+ const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(W,_mm512_sub_epi64(VERT_K5(0),n8)),_mm512_srlv_epi64(VERT_K5(1),n8));
+ const __m512i t=_mm512_sub_epi8(x,VERT_K5(2)),u=_mm512_sub_epi8(x,VERT_K5(3));
+ const __m512i bad=_mm512_min_epu8(_mm512_subs_epu8(t,VERT_K5(4)),_mm512_subs_epu8(u,VERT_K5(5)));
+ const __m512i d=_mm512_min_epu8(t,_mm512_add_epi8(x,VERT_K5(6)));
+ const __m512i p2=_mm512_maddubs_epi16(d,VERT_K5(7));
+ const __m512i p4=_mm512_madd_epi16(p2,VERT_K5(8));
+ const __m512i val=_mm512_add_epi64(_mm512_mul_epu32(p4,VERT_K5(9)),_mm512_srli_epi64(p4,32));
+ const __m512i min36=_mm512_permutexvar_epi64(N,_mm512_setr_epi64(78364164096LL,0,36,1296,46656,1679616,60466176,2176782336LL)); // MIN36[n] by the low three bits of n
+ __mmask8 ok=_mm512_testn_epi64_mask(bad,bad);
+ ok=_mm512_mask_cmpge_epu64_mask(ok,val,min36);
+ ok=_mm512_mask_cmple_epu64_mask(ok,val,VERT_K5(12));
+ const __m512i mask=VERT_K5(12);
+ __m512i m=_mm512_and_si512(_mm512_mullo_epi64(val,VERT_K5(13)),mask);
+ m=_mm512_ternarylogic_epi64(m,_mm512_srli_epi64(m,17),_mm512_srli_epi64(m,34),0x96);
+ m=_mm512_xor_si512(m,_mm512_set1_epi64((long long)key));
+ const __m512i c=_mm512_and_si512(_mm512_mullo_epi64(m,VERT_K5(14)),mask);
+ okOut=_mm512_mask_cmplt_epu64_mask(ok,c,_mm512_set1_epi64((long long)limit));return c;
+}
+VERT_T5 static inline void cscan8_v5(const char* const* ls,Cl8Scan& s){
+ const uint64_t* const VK=vk_ptr();
+ const __m512i vc=VERT_K5(55),vq=VERT_K5(56);
+ for(int i=0;i<8;++i){
+  const __m512i x=_mm512_loadu_si512((const void*)ls[i]);
+  s.c[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));s.q[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq));
+ }
+}
+// OPT (compile-time, identical results; the bench measures both):
+//   bit 0  every gather gets zero as its pass-through operand. A gather merges into its destination register, so without
+//          this it waits for whatever wrote that register last (an earlier gather, as a rule) although its mask is full.
+//          Costs twelve register moves that take no execution port.
+#ifndef VERT_CL8_OPT
+#define VERT_CL8_OPT 1
+#endif
+template<unsigned OPT> VERT_T5 static inline void cdec8t_v5(const char* const* ls,const char* const* nx,const Cl8Scan& s,const ClConst& c,Cl8Out& o){
+ const uint64_t* const VK=vk_ptr();const uint64_t* const VC=vkc_ptr();
+ const __m512i one=VERT_K5(10),ones=VERT_K5(57),c63=VERT_K5(58),c64=VERT_K5(0);
+ #define VERT_TZ5(x,xm) _mm512_sub_epi64(c63,_mm512_lzcnt_epi64(_mm512_xor_si512(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
+ // (OPT bit 0: the mask is all ones, but the compiler must not know - with a known full mask it drops the zero operand -
+ // so it is read from the constant table, whose address the compiler cannot see through)
+ const __mmask8 ALL=(OPT&1)?(__mmask8)VC[5]:(__mmask8)0xFF;
+ #define VERT_GX5(i,b,sc) ((OPT&1)?_mm512_mask_i64gather_epi64(_mm512_setzero_si512(),ALL,i,b,sc):_mm512_i64gather_epi64(i,b,sc))
+ #define VERT_G5(a) VERT_GX5(a,(const void*)0,1)
+ #define VERT_KC5(i) _mm512_set1_epi64((long long)VC[i])
+ const __m512i P=VERT_LD5(ls),NL=_mm512_add_epi64(VERT_LD5(nx),ones);
+ const __m512i Cm=_mm512_load_si512((const void*)s.c),Qm=_mm512_load_si512((const void*)s.q);
+ // structure: the bytes before the newline, three commas, quote rules (click_line_v3's test, lane-wise)
+ const __m512i L=_mm512_sub_epi64(NL,P),nbit=_mm512_sllv_epi64(one,L),keep=_mm512_add_epi64(nbit,ones); // (a line of 64+ bytes gives nbit = 0: it fails the length test below whatever the masks are)
+ const __m512i d=_mm512_and_si512(Cm,keep),qb=_mm512_and_si512(Qm,keep);
+ const __m512i st=_mm512_or_si512(_mm512_slli_epi64(d,1),one),en=_mm512_or_si512(d,nbit);
+ const __m512i sq=_mm512_and_si512(qb,st),op=_mm512_and_si512(_mm512_add_epi64(_mm512_sub_epi64(sq,en),ones),en);
+ const __m512i err=_mm512_xor_si512(op,_mm512_slli_epi64(_mm512_andnot_si512(st,qb),1));
+ const __m512i u0=_mm512_add_epi64(d,ones),d0=VERT_TZ5(d,u0),dA=_mm512_and_si512(d,u0);
+ const __m512i u1=_mm512_add_epi64(dA,ones),d1=VERT_TZ5(dA,u1),dB=_mm512_and_si512(dA,u1);
+ const __m512i u2=_mm512_add_epi64(dB,ones),d2=VERT_TZ5(dB,u2),dR=_mm512_and_si512(dB,u2);
+ const __m512i errAll=_mm512_or_si512(err,dR);                                  // a quote error, or a fourth comma before the newline
+ // fields: a quoted field starts one later and is two shorter
+ const __m512i z0=_mm512_and_si512(qb,one),l0=_mm512_sub_epi64(d0,_mm512_add_epi64(z0,z0));
+ const __m512i a1=_mm512_add_epi64(d0,one),z1=_mm512_and_si512(_mm512_srlv_epi64(qb,a1),one),o1=_mm512_add_epi64(a1,z1),l1=_mm512_sub_epi64(_mm512_sub_epi64(d1,o1),z1);
+ const __m512i a2=_mm512_add_epi64(d1,one),z2=_mm512_and_si512(_mm512_srlv_epi64(qb,a2),one),o2=_mm512_add_epi64(a2,z2),l2=_mm512_sub_epi64(_mm512_sub_epi64(d2,o2),z2);
+ const __m512i a3=_mm512_add_epi64(d2,one),z3=_mm512_and_si512(_mm512_srlv_epi64(qb,a3),one),o3=_mm512_add_epi64(a3,z3),l3=_mm512_sub_epi64(_mm512_sub_epi64(L,o3),z3);
+ // (the masks are combined as early as they can be: there are eight mask registers and every gather needs one)
+ __mmask8 sok=_mm512_testn_epi64_mask(errAll,errAll);
+ sok=_mm512_mask_test_epi64_mask(sok,dB,dB);                                    // at least three commas
+ sok=_mm512_mask_cmplt_epu64_mask(sok,L,c64);                                   // newline inside the window (L >> 6 == 0)
+ const __mmask8 nz=_mm512_mask_test_epi64_mask(_mm512_mask_test_epi64_mask(sok,l0,l0),l1,l1); // well-formed, click_id and user_id not empty
+ const __mmask8 dropE=_kandn_mask8(nz,sok);                                     // well-formed with an empty ID
+ const __m512i lowbyte=VERT_K5(60);
+ // click_id: 'k' + K1 with kc, counter < limC
+ const __m512i S0=_mm512_add_epi64(P,z0);
+ __mmask8 idok;const __m512i kcn=cid8k_v5(VERT_G5(_mm512_add_epi64(S0,one)),_mm512_sub_epi64(l0,one),c.kc,c.limC,idok);
+ idok=_kand_mask8(nz,_mm512_mask_cmpeq_epi64_mask(idok,_mm512_and_si512(VERT_G5(S0),lowbyte),VERT_KC5(0)));
+ // user_id: 'u' + K1 with ku, then dense_user_code: alias < 8, index < limI, not complex
+ const __m512i S1=_mm512_add_epi64(P,o1);
+ const uint64_t limU=(c.limI<(1ull<<(40-CL_GEN_ALIAS_BITS))?c.limI:(1ull<<(40-CL_GEN_ALIAS_BITS)))<<CL_GEN_ALIAS_BITS; // index < limI  <=>  counter < limI << 9 (a counter is below 2^40)
+ __mmask8 uok;const __m512i uc=cid8k_v5(VERT_G5(_mm512_add_epi64(S1,one)),_mm512_sub_epi64(l1,one),c.ku,limU,uok);
+ uok=_mm512_mask_cmpeq_epi64_mask(uok,_mm512_and_si512(VERT_G5(S1),lowbyte),VERT_K5(62));
+ uok=_mm512_mask_testn_epi64_mask(uok,uc,VERT_KC5(1));
+ const __m512i cw=_mm512_mask_i64gather_epi64(_mm512_setzero_si512(),uok,_mm512_srli_epi64(uc,CL_GEN_ALIAS_BITS+6),(const void*)c.cplx,8); // only rows whose index is below limI are read
+ uok=_mm512_mask_testn_epi64_mask(uok,cw,_mm512_rolv_epi64(one,_mm512_srli_epi64(uc,CL_GEN_ALIAS_BITS)));                               // bit (index & 63) of the word
+ const __mmask8 okIU=_kand_mask8(idok,uok);
+ __m512i user=_mm512_ternarylogic_epi64(VERT_KC5(2),uc,_mm512_srli_epi64(uc,CL_GEN_ALIAS_BITS-CL_ALIAS_BITS),0xCA);                      // index << 3 | alias (alias < 8)
+ user=_mm512_ternarylogic_epi64(user,VERT_KC5(3),VERT_KC5(4),0xEA);                                                                      // DENSE_USER | (uint32_t)...
+ // ts: 20 (Z), 13 (digits), 25 (offset), as in ev8
+ const __mmask8 is13=_mm512_cmpeq_epi64_mask(l3,VERT_K5(53));
+ const __m512i S3=_mm512_add_epi64(P,o3);
+ const __m512i ts0=VERT_G5(S3),ts1=VERT_G5(_mm512_add_epi64(S3,_mm512_mask_mov_epi64(VERT_K5(44),is13,VERT_K5(65))));
+ const __m512i ts2=VERT_G5(_mm512_add_epi64(S3,VERT_K5(64))),ts3=VERT_G5(_mm512_add_epi64(S3,VERT_K5(66)));
+ __mmask8 oks,hits,okoff,okep;
+ // the date through the memo (day8k_v5 of vert.h, with this function's gathers)
+ __m512i days;
+ {const __m512i slot=_mm512_ternarylogic_epi64(_mm512_and_si512(_mm512_srli_epi64(ts0,34),VERT_K5(36)),_mm512_and_si512(_mm512_srli_epi64(ts0,46),VERT_K5(37)),_mm512_and_si512(ts1,VERT_K5(38)),0xFE);
+  const __m512i i3=_mm512_add_epi64(slot,_mm512_slli_epi64(slot,1));
+  const long long* const mb=(const long long*)c.memo;
+  const __m512i gk=VERT_GX5(i3,mb,8),gc=VERT_GX5(i3,mb+1,8);
+  days=VERT_GX5(i3,mb+2,8);
+  const __m512i dk=_mm512_or_si512(_mm512_srli_epi64(ts0,16),_mm512_slli_epi64(ts1,48));
+  hits=_mm512_mask_cmpeq_epi64_mask(_mm512_cmpeq_epi64_mask(gk,dk),_mm512_and_si512(gc,VERT_K5(39)),_mm512_and_si512(ts0,VERT_K5(40)));}
+ const __m512i tods=tod8k_v5(ts1,ts2,oks);
+ const __mmask8 dt=_kand_mask8(oks,hits);                                       // valid time of day and known date
+ const __m512i ep=epoch8k_v5(ts0,ts1,okep);
+ const __m512i base=_mm512_mask_mov_epi64(_mm512_add_epi64(days,tods),is13,ep);
+ const __mmask8 t13=_kand_mask8(is13,okep);
+ const __m512i b19=_mm512_srli_epi64(ts2,56);
+ const __mmask8 tokA=_kor_mask8(t13,_mm512_mask_cmpeq_epi64_mask(_mm512_mask_cmpeq_epi64_mask(dt,l3,VERT_K5(51)),b19,VERT_K5(48))); // 13 digits, or 20 bytes ending in 'Z'
+ const __m512i off=off8k_v5(ts3,okoff);
+ const __mmask8 o25=_kand_mask8(dt,_mm512_mask_cmpeq_epi64_mask(okoff,l3,VERT_K5(52)));                                             // 25 bytes with a valid offset
+ const __mmask8 p25=_mm512_mask_cmpeq_epi64_mask(o25,b19,VERT_K5(49));
+ __m512i ts=_mm512_mask_sub_epi64(base,p25,base,off);
+ const __mmask8 m25=_mm512_mask_cmpeq_epi64_mask(o25,b19,VERT_K5(50));
+ ts=_mm512_mask_add_epi64(ts,m25,ts,off);
+ // ts decided by the kernel: 13 digits, or (valid time and known date) and (Z form, or offset form with a valid offset)
+ const __mmask8 tsk=_kand_mask8(nz,_kor_mask8(tokA,_kor_mask8(p25,m25)));
+ const __m512i trel=_mm512_sub_epi64(ts,VERT_C5(c.clickStart));
+ const __mmask8 inw=_mm512_mask_cmplt_epu64_mask(tsk,trel,VERT_C5(c.wlen));
+ const __mmask8 ok=_kand_mask8(inw,okIU);
+ const __mmask8 drop=_kor_mask8(dropE,_kandn_mask8(inw,tsk));                   // an empty ID, or ts outside the window
+ _mm512_store_si512((void*)o.kcn,kcn);_mm512_store_si512((void*)o.so,_mm512_slli_epi64(kcn,CSLOT_SHIFT));
+ _mm512_store_si512((void*)o.ckh,_mm512_slli_epi64(trel,16));
+ _mm512_store_si512((void*)o.user,user);
+ _mm512_store_si512((void*)o.sc,_mm512_add_epi64(P,o2));_mm512_store_si512((void*)o.lc,l2);
+ // maxima over the ok rows, both in one pass of 32-bit lanes: low dword = user, high dword = (uint32_t)kcn + 1
+ {const __m512i pk=_mm512_maskz_or_epi64(ok,user,_mm512_slli_epi64(_mm512_add_epi64(kcn,one),32));
+  const __m256i m4=_mm256_max_epu32(_mm512_castsi512_si256(pk),_mm512_extracti64x4_epi64(pk,1));
+  __m128i m2=_mm_max_epu32(_mm256_castsi256_si128(m4),_mm256_extracti128_si256(m4,1));
+  m2=_mm_max_epu32(m2,_mm_unpackhi_epi64(m2,m2));
+  _mm_storel_epi64((__m128i*)(void*)&o.umax,m2);}
+ o.ok=(uint8_t)ok;o.drop=(uint8_t)drop;o.idok=(uint8_t)idok;
+ #undef VERT_KC5
+ #undef VERT_G5
+ #undef VERT_GX5
+ #undef VERT_TZ5
+}
+VERT_T5 static inline void cdec8_v5(const char* const* ls,const char* const* nx,const Cl8Scan& s,const ClConst& c,Cl8Out& o){cdec8t_v5<VERT_CL8_OPT>(ls,nx,s,c,o);}
+VERT_T5 static inline void cl8_v5(const char* const* ls,const char* const* nx,const ClConst& c,Cl8Out& o){
+ Cl8Scan s;cscan8_v5(ls,s);cdec8_v5(ls,nx,s,c,o);
+}
+static_assert(offsetof(Cl8Out,kend)==offsetof(Cl8Out,umax)+4);
+#undef VERT_C5
+#undef VERT_LD5
+#undef VERT_K5
+} // namespace vcl
+static_assert(sizeof(vcl::DateEnt)==sizeof(DateMemo3)&&offsetof(vcl::DateEnt,k)==offsetof(DateMemo3,k)&&offsetof(vcl::DateEnt,cc)==offsetof(DateMemo3,cc)&&offsetof(vcl::DateEnt,ms)==offsetof(DateMemo3,ms));
+static_assert(vcl::MASK40==dn::MASK&&vcl::I1==dn::I1&&vcl::I2==dn::I2&&vcl::DAYMS==DAY);
+static_assert(vcl::CL_GEN_ALIAS_BITS==dn::GEN_ALIAS_BITS&&vcl::CL_ALIAS_BITS==dn::ALIAS_BITS&&vcl::DENSE_USER_BIT==DENSE_USER&&sizeof(CSlot)==(1u<<vcl::CSLOT_SHIFT));
+static inline void cl8_scan_none(const char* const*,vcl::Cl8Scan&){}
+[[gnu::noinline]] static void cl8_dec_ref(const char* const* ls,const char* const* nx,const vcl::Cl8Scan&,const vcl::ClConst& c,vcl::Cl8Out& o){vcl::cl8_ref(ls,nx,c,o);}
+#define SS_CL8_SLOT(O_,i_) (*(CSlot*)((char*)lp.cl+O_.so[i_]))
+// One ok row: the row code's campaign lookup; a campaign that is not found drops the row without a trace.
+#define SS_CL8_ROW(O_,i_) {uint64_t k0_;uint32_t k1_;const string_view camp_(O_.sc[i_],(size_t)O_.lc[i_]); \
+   const uint32_t ci_=__builtin_expect(KeyTable::pack(camp_,k0_,k1_),1)?lp.camps.find_packed(k0_,k1_):lp.camps.find(camp_); \
+   if(__builtin_expect(ci_!=KeyTable::NONE,1)){found_|=1u<<(i_);cslot_commit(SS_CL8_SLOT(O_,i_),O_.ckh[i_]|(uint16_t)ci_,(uint32_t)O_.user[i_],lp.tid);}}
+// Finishing the first N rows of a group in line order. The maxima of the group (umax, kend) cover all its ok rows:
+// they are used only if every ok row was committed, otherwise the committed rows are taken one by one.
+#define SS_CL8_FINISH(O,LS,NX,N,MASKS) {const vcl::Cl8Out& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
+  const unsigned ok_=O_.ok&((1u<<n_)-1);unsigned found_=0; \
+  if(__builtin_expect(ok_==0xFFu,1)){SS_CL8_ROW(O_,0) SS_CL8_ROW(O_,1) SS_CL8_ROW(O_,2) SS_CL8_ROW(O_,3) SS_CL8_ROW(O_,4) SS_CL8_ROW(O_,5) SS_CL8_ROW(O_,6) SS_CL8_ROW(O_,7)} \
+  else for(unsigned i_=0;i_<n_;++i_){ \
+   if((ok_>>i_)&1)SS_CL8_ROW(O_,i_) \
+   else if(!((O_.drop>>i_)&1)){const char* const q_=L_[i_];++slow;click_line_v3<true>(q_,MASKS(q_),X_[i_]-1,lp,pend,pp,dmax,send,ring,rpos,general);}} \
+  if(__builtin_expect(found_==ok_,1)){dmax=max(dmax,O_.umax);send=max(send,O_.kend);} \
+  else for(unsigned x_=found_;x_;x_&=x_-1){const unsigned i_=(unsigned)__builtin_ctz(x_);dmax=max(dmax,(uint32_t)O_.user[i_]);send=max(send,(uint32_t)O_.kcn[i_]+1);} }
+#define SS_CL8_PF(O_,i_) __builtin_prefetch(&SS_CL8_SLOT(O_,i_),1,3);
+// The line index and the three groups under way (N scanned, D decoded and its slots asked for, F finished) are those
+// of SS_EVENT_LOOP_EV8; see there. A short last group is filled up with the pointer behind its last line (a row with
+// nx == ls is never ok, drop or idok; the row masks cut it off as well).
+#define SS_CLICK_LOOP_CL8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const char* const end=base+len; \
+ ClLoop lp_(tl,tab,camps,PC,end,clickStart);lp_.ahead=0;const ClLoop& lp=lp_; /* no ring: a slow row writes its slot at the end of its line, a group after the kernel asked for it */ \
+ PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CRing* const ring=nullptr;unsigned rpos=0;uint64_t rows=0,slow=0; \
+ const char* ls[EV8_BLOCK+64+64];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
+ const vcl::ClConst cc{lp.kc,lp.limC,lp.ku,dense.limI,denseComplex,lp.clickStart,lp.wlen,(const vcl::DateEnt*)lp.memo}; \
+ vcl::Cl8Out out[2];vcl::Cl8Scan sc[2];const char* tls[9]; \
+ const char* const* gl[3]={ls,ls,ls};unsigned gn[3]={0,0,0}; /* lines (the next line of row i is [i+1]) and number of rows of N, D, F */ \
+ unsigned iN=0,iD=1,iF=2,sN=0,oD=0;bool more=true; /* sc[sN]: N's scan, sc[sN^1]: D's; out[oD]: D's results, out[oD^1]: F's */ \
+ while(more||gn[iD]||gn[iF]){ \
+  unsigned n=0; \
+  if(more){ \
+   if(pos+8>m){ /* fewer than eight whole lines known: what is still needed moves to the front and the index goes on */ \
+    const size_t s_=pos-(gn[iD]?8:0)-(gn[iF]?8:0); \
+    if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_; \
+     if(gn[iD]){gl[iD]-=s_;} \
+     if(gn[iF]){gl[iF]-=s_;}} \
+    while(m-pos<8&&scan<end&&ls[m]<lim){ \
+     const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
+     do{uint64_t x_=NLMASK(scan);while(x_){ls[++m]=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);}scan+=64;}while(scan<stop);} \
+   } \
+   if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[iN]=ls+pos;} \
+   else{ /* the last lines of the chunk: a short group */ \
+    more=false; \
+    while(pos+n<m&&ls[pos+n]<lim)++n; \
+    if(n){for(unsigned i_=0;i_<9;++i_)tls[i_]=ls[pos+(i_<n?i_:n)];gl[iN]=tls;} \
+   } \
+   pos+=n;rows+=n; \
+   if(n)SCAN(gl[iN],sc[sN]); \
+  } \
+  gn[iN]=n; \
+  if(gn[iD]){ \
+   vcl::Cl8Out& o_=out[oD];const unsigned nd_=gn[iD]; \
+   DEC(gl[iD],gl[iD]+1,sc[sN^1],cc,o_); \
+   if(__builtin_expect((nd_==8)&(o_.idok==0xFFu),1)){SS_CL8_PF(o_,0) SS_CL8_PF(o_,1) SS_CL8_PF(o_,2) SS_CL8_PF(o_,3) SS_CL8_PF(o_,4) SS_CL8_PF(o_,5) SS_CL8_PF(o_,6) SS_CL8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&((1u<<nd_)-1);x_;x_&=x_-1)SS_CL8_PF(o_,__builtin_ctz(x_)) \
+  } \
+  if(gn[iF])SS_CL8_FINISH(out[oD^1],gl[iF],gl[iF]+1,gn[iF],MASKS) \
+  {const unsigned t_=iF;iF=iD;iD=iN;iN=t_;sN^=1;oD^=1;} \
+ } \
+ if(pos==m&&ls[m]<lim)line_general<4>(ls[m],end,general); /* the last line has no newline */ \
+ tl.denseMax=max(tl.denseMax,dmax);tl.clEnd=max(tl.clEnd,send);tl.cl8Rows+=rows;tl.cl8Slow+=slow; \
+}
+SS_CLICK_LOOP_CL8(clicks_avx2_c8,SS_V3,win_masks_avx2,nl_mask_avx2,cl8_scan_none,cl8_dec_ref)
+SS_CLICK_LOOP_CL8(clicks_avx512z_c8,SS_V5,win_masks_avx512z,nl_mask_avx512z,vcl::cscan8_v5,vcl::cdec8_v5)
+SS_CLICK_LOOP_CL8(clicks_avx512y_c8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vcl::cscan8_v5,vcl::cdec8_v5)
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  // With SS_STATS=1 every TIME line is followed by a CPU line: processor time (all threads, user+system) of that stage.
@@ -2750,7 +3415,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // has the AVX-512 kernel it is also the default (decided at the parse stage, see ev8Auto); SS_LINES=2p keeps the
  // two-phase loop there.
  dparse.ev8=dparse.twoPhase&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="ev8";
- cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<" batch "<<dparse.batch<<" ev8 "<<dparse.ev8<<"\n";
+ // SS_CLICKS=cl8: the click loop that hands eight lines at a time to a kernel (SS_CLICK_LOOP_CL8; slot form only).
+ // Where the CPU has the AVX-512 kernel it is also the default (see cl8Auto); any other SS_CLICKS value (SS_CLICKS=ix)
+ // keeps the click loop with the line index (SS_CLICK_LOOP_IX). SS_CLICKS=cl8 with the avx2 masks runs the scalar twin.
+ dparse.cl8=dparse.clicks&&!dparse.bucket&&getenv("SS_CLICKS")&&string_view(getenv("SS_CLICKS"))=="cl8";
+ cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<" batch "<<dparse.batch<<" ev8 "<<dparse.ev8<<" cl8 "<<dparse.cl8<<"\n";
  // First pass over the link files.
  // Without dense users it only counts lines (the table and the union-find arrays are sized by them).
  // With dense users it is the only pass that reads the files: a "simple" line - two dense user IDs
@@ -3011,8 +3680,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // files stay on the avx2 loop; with SS_ISA=avx512z|avx512y everything follows that choice. Any SS_LINES value
  // switches the default off (SS_LINES=ev8 asks for the loop explicitly, also on avx2 with the scalar kernel).
  const bool ev8Auto=hasE8&&dparse.twoPhase&&!getenv("SS_LINES")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
+ // The same for click files (vcl::cl8, SS_CLICK_LOOP_CL8; dense click records in slot form): the default on a CPU
+ // with the kernel's extensions, with the avx512z masks when no SS_ISA is given. Any SS_CLICKS value other than cl8,
+ // SS_ISA=avx2 or SS_DENSE_AHEAD (which asks for the ring of the old loop) keeps the click loop with the line index.
+ const bool cl8Auto=hasE8&&dparse.clicks&&!dparse.bucket&&!getenv("SS_CLICKS")&&!getenv("SS_DENSE_AHEAD")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
-  <<(ev8Auto?" events: ev8 kernel":"")<<"\n";
+  <<(ev8Auto?" events: ev8 kernel":"")<<(cl8Auto?" clicks: cl8 kernel":"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -3140,9 +3813,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // Dense records (DREC loops) exist with the line index only; SS_LINES=plain then applies to the other kind of file.
    const bool drec=ck.click?dparse.clicks:dparse.events;
    const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
+   const bool cl8Use=(dparse.cl8&&(isaUse==ISA_AVX2||hasE8))||(cl8Auto&&isaUse!=ISA_AVX2); // as ev8Use
+   if(ck.click&&drec&&cl8Auto&&isaUse==ISA_AVX2){clicks_avx512z_c8(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);continue;} // the default on an AVX-512 CPU
    if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){events_avx512z_e8(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);continue;} // the default on an AVX-512 CPU
    #define SS_RUN_LOOPS(ISA) \
-    if(ck.click){if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
+    if(ck.click){if(drec&&cl8Use)clicks_##ISA##_c8(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
+     else if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else clicks_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);} \
     else{if(drec&&ev8Use)events_##ISA##_e8(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
@@ -3226,7 +3902,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const uint32_t totalIds=tab.end_parallel();
  __mark("RESOLVE");
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
-  cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";}
+  cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";
+  uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
+  if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
  if(dumpDir){
   // Test only (fuzz/dense_check.py): rows-T.txt = what the general handlers saw (raw texts, written above),
@@ -3322,11 +4000,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   const uint32_t d=person-denseBase,root=d&7;const uint64_t idx=d>>3;
   const uint32_t stored=denseComp[idx].load(memory_order_relaxed);
   if(__builtin_expect(stored==0,1))return text36_fast('u',dn::value_of((idx<<dn::GEN_ALIAS_BITS)|root,dense.ku),buf); // nothing grouped under this index
-  const uint32_t w=stored^COMP_IDENT;uint64_t best=~0ull,bestV=0;
-  for(uint32_t a=root;a<8;++a)if(comp_root(w,a)==root){ // the root is its group's smallest alias
+  // The members of the root's group: the fields of the word that hold the root (bit 3a for alias a).
+  const uint32_t x=(stored^COMP_IDENT)^(root*0x249249u);uint32_t members=~(x|(x>>1)|(x>>2))&0x249249u;
+  uint64_t best=~0ull,bestV=0;
+  do{
+   const uint32_t a=(uint32_t)__builtin_ctz(members)/3u;members&=members-1;
    const uint64_t v=dn::value_of((idx<<dn::GEN_ALIAS_BITS)|a,dense.ku),key=order36(v);
-   if(key<best){best=key;bestV=v;}
-  }
+   const uint64_t lt=0-(uint64_t)(key<best);bestV^=(bestV^v)&lt;best^=(best^key)&lt; // (masks: the compiler makes a branch of a ?: here)
+  }while(members);
   return text36_fast('u',bestV,buf);
  };
  auto name_of=[&](uint32_t person)->string_view{
@@ -3808,7 +4489,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   HugePool& pool=surv[tid].pool;
   Totals* const tot=(Totals*)pool.take(ncells*sizeof(Totals));threadTotals[tid]=tot;
   uint64_t* const assists=(uint64_t*)pool.take(ncells*sizeof(uint64_t));threadAssists[tid]=assists;
-  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp);size_t nact=0;
+  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp+1);size_t nact=0; // active: one free place after a full list (see the fast lane's large click sets)
   vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
   PqFile file;
   auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
@@ -3961,7 +4642,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
    // One index's sessions (start time; number of its rows before the session) and purchases
    // (session<<40 | category<<24 | price), written by the walk over its event slots.
-   Scratch<uint64_t> sessTs,purBuf,clickKeys;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;fastC2.pool=&pool;
+   Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;fastC2.pool=&pool;
+   uint32_t* const sortCnt=(uint32_t*)pool.take((CLICK_SORT_BUCKETS+1)*sizeof(uint32_t)); // click_key_sort's counters
    vector<uint8_t> lastOfV(ncamp+1,0xFF);uint8_t* const lastOf=lastOfV.data(); // small click sets: last position of a campaign
    // The 32-bit click arithmetic below counts times from the window start (clicks: -7 days and up), so
    // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
@@ -4031,7 +4713,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(__builtin_expect(n!=ec||m!=cc,0)){fprintf(stderr,"ERROR dense slots changed under the reader\n");_exit(1);}
       // One person: every alias in use has the same smallest alias of its group.
       const uint32_t a0=(uint32_t)__builtin_ctz(mask|0x100u);root=a0^((stored>>(3*a0))&7);
-      if(mask&(mask-1))for(uint32_t a=a0+1;a<8;++a)if(((mask>>a)&1)&&(a^((stored>>(3*a))&7))!=root){fast=false;why=6;}
+      // (The group fields of all eight aliases against the root at once; SPREAD3 puts the aliases in use on the fields.)
+      {const uint32_t x=(stored^COMP_IDENT)^(root*0x249249u),differs=(x|(x>>1)|(x>>2))&0x249249u;
+       if(differs&SPREAD3[mask&255u]){fast=false;why=6;}}
      }
      if(fast){
       const uint32_t person=dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|root);
@@ -4061,7 +4745,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       alignas(16) int32_t cts[16];uint16_t ccamp[16],credit[17];uint16_t dupMask[17];size_t nvec=0;uint64_t cntLo=0,cntHi=0;
       if(mode==SMALL){
        uint64_t keys[16];
-       for(size_t i=0;i<m;++i){const uint64_t key=((C[i].key>>16)<<32)|i;size_t j=i;while(j>0&&keys[j-1]>key){keys[j]=keys[j-1];--j;}keys[j]=key;}
+       // In time order, clicks of one moment by position, without a data-dependent branch: the place of a
+       // click is the number of clicks with an earlier time (counted for all sixteen places at once, one
+       // click after the other) plus the number of clicks of the same moment placed before it.
+       {alignas(16) int32_t tm[16];alignas(16) uint8_t rnk[16];uint8_t taken[16];
+        for(size_t i=0;i<16;++i)tm[i]=INT32_MAX; // later than every click: times from the window start stay below it
+        for(size_t i=0;i<m;++i)tm[i]=(int32_t)((int64_t)(C[i].key>>16)-WEEK);
+        const __m128i T0=_mm_load_si128((const __m128i*)tm),T1=_mm_load_si128((const __m128i*)(tm+4)),T2=_mm_load_si128((const __m128i*)(tm+8)),T3=_mm_load_si128((const __m128i*)(tm+12));
+        __m128i acc=_mm_setzero_si128();
+        for(size_t j=0;j<m;++j){const __m128i b=_mm_set1_epi32(tm[j]); // one byte per place: all ones where that click is later than click j
+         acc=_mm_sub_epi8(acc,_mm_packs_epi16(_mm_packs_epi32(_mm_cmpgt_epi32(T0,b),_mm_cmpgt_epi32(T1,b)),_mm_packs_epi32(_mm_cmpgt_epi32(T2,b),_mm_cmpgt_epi32(T3,b))));}
+        _mm_store_si128((__m128i*)rnk,acc);memset(taken,0,16);
+        for(size_t i=0;i<m;++i){const unsigned r=rnk[i];keys[r+taken[r]++]=((C[i].key>>16)<<32)|i;}}
        // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
        for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
         const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
@@ -4095,7 +4790,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        else{
         for(size_t i=0;i<m;++i)keys[i]=((C[i].key>>16)<<32)|i;
-        sort(keys,keys+m);
+        click_key_sort(keys,m,clickKeys2.get(m),sortCnt);
         for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
          const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
          const uint64_t key=keys[i];size_t j=i;
@@ -4147,8 +4842,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        else if(mode==LARGE){
         const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
-        while(add<ce&&add->key<addLim){const uint16_t c=(uint16_t)add->key;if(fr[c]++==0){pos[c]=(uint32_t)na;act[na++]=c;}++add;}
-        while(expire<add&&expire->key<expLim){const uint16_t c=(uint16_t)expire->key;if(--fr[c]==0){const uint32_t at=pos[c];const uint16_t back=act[--na];act[at]=back;pos[back]=at;}++expire;}
+        // Whether a click is the first (last) of its campaign in the window is as good as random, so the
+        // list of active campaigns is kept without a branch on it: a write that must not happen goes to the
+        // free place after the list (act has one place more than there are campaigns) or rewrites what is there.
+        while(add<ce&&add->key<addLim){
+         const uint16_t c=(uint16_t)add->key;const uint32_t f=fr[c],isNew=f==0,p=pos[c];
+         fr[c]=f+1;act[na]=c;pos[c]=p^((p^(uint32_t)na)&(0u-isNew));na+=isNew;++add;} // (masks, not ?: - the compiler makes branches of those)
+        while(expire<add&&expire->key<expLim){
+         const uint16_t c=(uint16_t)expire->key;const uint32_t f=fr[c]-1,gone=f==0;
+         fr[c]=f;na-=gone;
+         const uint16_t back=act[na];const uint32_t at=(uint32_t)na^(((uint32_t)na^pos[c])&(0u-gone)),pb=pos[back];
+         act[at]=back;pos[back]=pb^((pb^at)&(0u-gone));++expire;}
         if(add>expire)credited=(uint16_t)add[-1].key;
         uint64_t* const arow=assists+(size_t)d*ncamp;
         #pragma GCC unroll 4
