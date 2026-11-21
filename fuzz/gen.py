@@ -21,7 +21,13 @@ TS=[b'2027-12-09T00:00:00Z',b'2027-12-08T23:59:59Z',b'2027-12-23T00:00:00Z',b'20
  b'2027-11-30T12:34:56Z',b'2027-12-1AT10:00:00Z',b'2027-1B-10T10:00:00Z',b'202G-12-10T10:00:00Z',b'2027-12-10T10:00:00+0A:00',b'2027-12-10T10:00:00+00:0A']
 if NONUL: TS=[t for t in TS if not t.startswith(b'\x00')]
 def rid(n): return bytes(R.choice(b'abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(n))
-def junk(): return R.choice([b'"',b'""',b'"""',b'""""',b'a"b',b'"a',b'a"',b'"a"b"',b' ',b'\r',b'\x00',b'*',b'(',b'.',b'\t',b'"\r"',b' "x"',b'"x" ',b'x'*R.choice([12,15,16,17,31,40,70,130]),b'\xc3\xa9',b'\xe2\x82\xac'])
+NOCDUP=os.environ.get('FZ_NOCDUP')=='1'      # no click copies with other content (undefined by the rules; event copies stay)
+ALL=os.environ.get('FZ_ALL')=='1'            # every file of the source, whole (a generated set then keeps its dense ID counters in range)
+CLEAN=int(os.environ.get('FZ_CLEAN','0'))   # this many first lines of every file stay as they are (the ID keys are read from them)
+LONG=os.environ.get('FZ_LONG')=='1'          # some fields of several KB (longer than a round of the two-stage loops)
+def junk():
+    if LONG and R.random()<0.04: return R.choice([b'y',b'y,',b'"',b'y"y'])*R.choice([700,2100,5000])
+    return R.choice([b'"',b'""',b'"""',b'""""',b'a"b',b'"a',b'a"',b'"a"b"',b' ',b'\r',b'\x00',b'*',b'(',b'.',b'\t',b'"\r"',b' "x"',b'"x" ',b'x'*R.choice([12,15,16,17,31,40,70,130]),b'\xc3\xa9',b'\xe2\x82\xac'])
 def q(f): return b'"'+f+b'"'
 def mutate(f,kind):
     try: return mutate1(list(f),kind)
@@ -62,17 +68,18 @@ def mutate1(f,kind):
 def strip(x): return x[1:-1] if len(x)>=2 and x[:1]==b'"' and x[-1:]==b'"' else x
 def proc(path,dst,kind,rate):
     data=open(path,'rb').read().split(b'\n'); hdr=data[0]; lines=[l for l in data[1:] if l]
-    if len(lines)>1: lines=lines[:R.randrange(len(lines)//2,len(lines))]
+    if len(lines)>1 and not ALL: lines=lines[:R.randrange(len(lines)//2,len(lines))]
     outl=[hdr]; prev=None
-    for l in lines:
+    for ln,l in enumerate(lines):
         r=R.random()
-        if r<rate:
+        if ln<CLEAN: pass
+        elif r<rate:
             f=l.split(b','); f=mutate(f,kind)
             if R.random()<0.3: f=mutate(f,kind)
             if UNIQ and f:   # a changed line must not collide with an unchanged copy of itself (same ID, other content: which one wins is order-dependent)
                 uniq[0]+=1; f[0]=(b'kz%07d' if kind=='c' else b'ez%07d')%uniq[0]
             l=b','.join(f)
-        elif r<rate+0.03 and prev is not None and not NODUP:
+        elif r<rate+0.03 and prev is not None and not NODUP and not (NOCDUP and kind=='c'):
             f=prev.split(b','); g=l.split(b',')   # same id, other content: exercises dedup
             if len(f)==len(g): g[0]=f[0]; l=b','.join(g)
         elif r<rate+0.05 and prev is not None:
@@ -82,6 +89,6 @@ def proc(path,dst,kind,rate):
     open(dst,'wb').write(b'\n'.join(outl)+tail)
 ev=sorted(glob.glob(os.path.join(src,'events','*.csv'))); cl=sorted(glob.glob(os.path.join(src,'clicks','*.csv')))
 R.shuffle(ev); R.shuffle(cl)
-for i,f in enumerate(ev[:3]): proc(f,os.path.join(out,'events','part-%05d.csv'%i),'e',R.choice([0.05,0.3,0.8]))
-for i,f in enumerate(cl[:3]): proc(f,os.path.join(out,'clicks','part-%05d.csv'%i),'c',R.choice([0.05,0.3,0.8]))
-open(os.path.join(out,'events','part-00009.csv'),'wb').write(b'event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents'+R.choice([b'',b'\n',b'\ne1,u1,2027-12-10T10:00:00Z,2027-12-10T10:00:01Z,view,p1,']))
+for i,f in enumerate(ev if ALL else ev[:3]): proc(f,os.path.join(out,'events','part-%05d.csv'%i),'e',R.choice([0.05,0.3,0.8]))
+for i,f in enumerate(cl if ALL else cl[:3]): proc(f,os.path.join(out,'clicks','part-%05d.csv'%i),'c',R.choice([0.05,0.3,0.8]))
+open(os.path.join(out,'events','part-09999.csv'),'wb').write(b'event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents'+R.choice([b'',b'\n',b'\ne1,u1,2027-12-10T10:00:00Z,2027-12-10T10:00:01Z,view,p1,']))

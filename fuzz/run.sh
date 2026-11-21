@@ -7,6 +7,11 @@
 #   (one with SS_TEST_TAG0, one with a forced fallback) like the next line.
 #   new AVX2 3 threads vs 1 thread: only meaningful with FZ_UNIQ=1. Without it a changed line can share its ID with an unchanged
 #   copy, and then the surviving copy depends on thread timing (the v20 baseline behaves the same way).
+# Note: this data is a few cut files of dev, so its ID counters lie above the limits estimated from the file
+# sizes and the dense route switches itself off: these runs test the general route only. The dense route and
+# the two-stage loops are tested by struct_run.sh (whole generated sets) and dense_run.sh / dense_check.py.
+# gen.py also makes click copies with other content (undefined by the rules) unless FZ_NOCDUP=1; the general
+# route happens to be stable on them, the slot route keeps whichever copy is written last.
 W=/home/claude/wtA; CMP=/home/claude/bb/starter-pyspark/starter-pyspark/scripts/compare.py; D=$W/fz_data
 mkdir -p $W/fzo
 for seed in "$@"; do
