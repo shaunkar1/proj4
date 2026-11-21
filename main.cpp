@@ -5708,6 +5708,28 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  static const size_t SMALL_BUCKET=[]{const char* v=getenv("SS_SMALLBUCKET");const long x=v?atol(v):4096;return (size_t)(x<0?0:x);}();
  if(personSess)cerr<<"test: every person through sessionize_person\n";
  uint64_t num_sessions=0;
+ // campaign_daily: the totals of all threads added up, one row per campaign and day with a session or an assist,
+ // one file. By default one worker does this as soon as every thread has left the last sessionizing loop, while
+ // the others flush and close their user_daily files and hand memory back (it used to follow the parallel
+ // region on one thread: the WRITE stage). SS_CAMPWRITE=end: after the region, as before. Same bytes either way.
+ static const bool campEarly=!(getenv("SS_CAMPWRITE")&&string_view(getenv("SS_CAMPWRITE"))=="end");
+ string campCsv; // SS_DEBUG_CSV rows
+ const auto write_campaigns=[&]{
+  vector<Totals> campTotals(ncamp*(size_t)ndays);
+  for(const Totals* tt:threadTotals)if(tt)for(size_t i=0;i<ncells;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
+  for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=0;i<ncells;++i)campTotals[i].assists+=ta[i];
+  string cid,chan;string& csv=campCsv;vector<int32_t> days;vector<int64_t> s,p,r,a;
+  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
+   put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
+   s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
+   if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
+  }
+  PqFile f;
+  f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
+   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});
+  if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
+  f.close();
+ };
  // Input files nobody reads any more are unmapped by the worker threads, a few large pieces each,
  // instead of leaving every page of them to process exit, which tears mappings down on one thread.
  vector<pair<char*,size_t>> unmapFirst,unmapLast;
@@ -6392,6 +6414,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(nrows>=FLUSH)flush_rows();
    }
   }
+  // The loop above ended with a barrier: every thread's totals are final. (A failed write ends the run from
+  // inside the region, as a failed write of a user_daily file does.)
+  #pragma omp single nowait
+  {if(campEarly)write_campaigns();}
   // Every row is in the output buffers now (names are copied there): nothing points into an input file.
   #pragma omp for schedule(static,1) nowait
   for(size_t i=0;i<unmapLast.size();++i)munmap(unmapLast[i].first,unmapLast[i].second);
@@ -6399,9 +6425,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
   if(file.is_open())file.close();
  }
- vector<Totals> campTotals(ncamp*(size_t)ndays);
- for(const Totals* tt:threadTotals)if(tt)for(size_t i=0;i<ncells;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
- for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=0;i<ncells;++i)campTotals[i].assists+=ta[i];
+ if(!campEarly)write_campaigns();
 __mark("AGGREGATE");
  if(slots&&stats){
   fprintf(stderr,"STATS dense reader: slots %llu events %llu clicks, fast lane %llu indexes %llu events %llu clicks, handed over %llu events %llu clicks, deferred indexes %llu\n",
@@ -6411,17 +6435,7 @@ __mark("AGGREGATE");
   fprintf(stderr,"STATS person buckets: %zu of 2^%u table persons, %zu of 2^%u dense persons\n",nA,shA,UPn-nA,shB);
  }
  {
-  string cid,chan,csv;vector<int32_t> days;vector<int64_t> s,p,r,a;
-  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
-   put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
-   s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
-   if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
-  }
-  PqFile f;
-  f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
-   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});
-  if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
-  f.close();
+  const string& csv=campCsv;
   if(debugCsv){
    fs::create_directories(scratch);
    ofstream uout(scratch/"user_rows.csv",ios::binary|ios::trunc),cout(scratch/"campaign_rows.csv",ios::binary|ios::trunc);
