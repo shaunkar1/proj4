@@ -390,16 +390,20 @@ int main(){
  auto add=[&](const char* group,int reps,vector<pair<string,string>> env,const char* bin="",bool hs=false){for(int i=0;i<reps;++i)vars.push_back({string(group)+"#"+to_string(i),env,bin,hs});};
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
- #define NE {"SS_NOEARLYUNMAP","1"}
+ #define V3 {"SS_EV8","3"}
  #define ST {"SS_STATS","1"}
  for(int r=0;r<4;++r){
-  add("B",1,{N8});add("ne",1,{N8,NE});add("Bs",1,{N8,ST});add("nes",1,{N8,NE,ST});add("fo",1,{N8,{"SS_FILEALIGN","off"}});add("fone",1,{N8,NE,{"SS_FILEALIGN","off"}});
+  add("B",1,{N8});add("v3",1,{N8,V3});add("O",1,{N8});add("Bs",1,{N8,ST});add("Os",1,{N8,ST});
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hne",1,{N8,NE},"",true);add("HBs",1,{N8,ST},"",true);add("Hnes",1,{N8,NE,ST},"",true);add("Hfone",1,{N8,NE,{"SS_FILEALIGN","off"}},"",true);}
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hv3",1,{N8,V3},"",true);add("HO",1,{N8},"",true);add("HBs",1,{N8,ST},"",true);add("HOs",1,{N8,ST},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
- for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
+ // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
+ // every other one into the scratch mount: the two mounts may not cost the same.
+ for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;
+  if(v.label[0]=='O'||(v.label[0]=='H'&&v.label.size()>1&&v.label[1]=='O')){const string ro=string(outdir)+"/zz_tmp";pipeline(v.label,v.hugeSet?H:B,ro,v.env,v.bin);error_code ec;fs::remove_all(ro,ec);}
+  else pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
  string eqText="eq60 not run";
  if(timeleft(40)){
@@ -410,9 +414,9 @@ int main(){
    close(fd);unlink(pth.c_str());return true;};
   uint64_t ur[3]={0,0,0},us_[3]={0,0,0},cr[3]={0,0,0},cs[3]={0,0,0};bool ok[3]={false,false,false};
   for(int i=0;i<3;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
-   if(i==2)env.push_back({"SS_NOEARLYUNMAP","1"});pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+   if(i==2)env.push_back({"SS_EV8","3"});pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,od(),env,"");ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c59 dense %s (u%llu c%llu), c59 no-early-unmap dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0],
+  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c60 (kernel v4) dense %s (u%llu c%llu), c60 kernel v3 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0],
    same(2)?"SAME":"DIFF",(unsigned long long)ur[2],(unsigned long long)cr[2]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
@@ -444,10 +448,10 @@ int main(){
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=eqText+" | wPRYXA/us/exit: "+fmt("c59","B","wPRYXAusE")+fmt("noearly","ne","wPRYXAusE")+fmt("alignoff","fo","wPXAusE")+fmt("alignoff+noearly","fone","wPXAusE");
-  a+="| stats w/sysP,R,X,A/cpuP,R,X,A: "+fmt("c59","Bs","wyhzgpqxa")+fmt("noearly","nes","wyhzgpqxa");
-  c+="60x wPRYXA/us/exit: "+fmt("c59","HB","wPRYXAusE")+fmt("noearly","Hne","wPRYXAusE")+fmt("alignoff+noearly","Hfone","wPXAusE");
-  c+="| stats w/sysP,R,X,A/cpuP,R,X,A: "+fmt("c59","HBs","wyhzgpqxa")+fmt("noearly","Hnes","wyhzgpqxa");
+  a+=eqText+" | wPRYXAW/us/exit: "+fmt("v4","B","wPRYXAWusE")+fmt("v3","v3","wPRYXAWusE")+fmt("v4 to /output","O","wPRYXAWusE");
+  a+="| stats w/sysP,R,X,A/cpuP,R,X,A: "+fmt("v4","Bs","wyhzgpqxa")+fmt("v4 to /output","Os","wyhzgpqxa");
+  c+="60x wPRYXAW/us/exit: "+fmt("v4","HB","wPRYXAWusE")+fmt("v3","Hv3","wPRYXAWusE")+fmt("v4 to /output","HO","wPRYXAWusE");
+  c+="| stats w/sysP,R,X,A/cpuP,R,X,A: "+fmt("v4","HBs","wyhzgpqxa")+fmt("v4 to /output","HOs","wyhzgpqxa");
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
