@@ -158,7 +158,7 @@ static bool fields_slow(string_view line,int n,string_view* out){
  }
  return p==end+1;
 }
-static bool fields(string_view line,int n,string_view* out){
+[[maybe_unused]] static bool fields(string_view line,int n,string_view* out){ // reference splitter; the stages use scan_line + take_fields
  if(line.empty())return false;
  const char *p=line.data(),*end=p+line.size();
  if(memchr(p,'"',end-p))return fields_slow(line,n,out);
@@ -275,6 +275,34 @@ template<class FN> static void read_lines(const fs::path& path,FN&& fn){
  Mapped m=map_file(path);if(!m.len)return;
  for_lines(m.base,m.len,0,m.len,fn);
 }
+// Calls fn(fields, ok) for every data line of a two-field CSV file; ok is false for a line that is not
+// exactly two well-formed fields (the fields are then unspecified). Same line and dialect rules as for_lines + fields.
+template<class FN> static void read_pairs(const fs::path& path,FN&& fn){
+ Mapped m=map_file(path);if(!m.len)return;
+ const char* end=m.base+m.len;
+ const char* nl=(const char*)memchr(m.base,'\n',m.len);
+ if(!nl)return;
+ for(const char* p=nl+1;p<end;){
+  const char* comma[2];int ncomma,nquote;const char* lineEnd;string_view f[2];
+  const char* next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
+  fn(f,take_fields(p,lineEnd,comma,ncomma,nquote,2,f));
+  p=next;
+ }
+}
+// Number of '\n' bytes in [p,p+n).
+static size_t count_newlines(const char* p,size_t n){
+ const __m128i nl=_mm_set1_epi8('\n'),zero=_mm_setzero_si128();
+ __m128i total=zero;
+ while(n>=16){
+  const size_t blk=min<size_t>(n/16,255); // each byte lane can count 255 matches before it is summed
+  __m128i acc=zero;
+  for(size_t i=0;i<blk;++i){acc=_mm_sub_epi8(acc,_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)p),nl));p+=16;}
+  total=_mm_add_epi64(total,_mm_sad_epu8(acc,zero));n-=blk*16;
+ }
+ size_t c=(size_t)_mm_cvtsi128_si64(total)+(size_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(total,total));
+ for(;n;--n)c+=*p++=='\n';
+ return c;
+}
 static string read_all(const fs::path& path){ifstream in(path,ios::binary);if(!in)throw runtime_error("Cannot open "+path.string());return string(istreambuf_iterator<char>(in),{});}
 static string json_string(const string& s,const string& key){
  auto p=s.find('"'+key+'"');if(p==string::npos)throw runtime_error("manifest missing "+key);
@@ -310,11 +338,26 @@ struct PName{
   if(s.size()<=15){memset(b,0,16);memcpy(b,s.data(),s.size());b[15]=(char)s.size();}
   else{const char* p=s.data();uint32_t n=(uint32_t)s.size();memcpy(b,&p,8);memcpy(b+8,&n,4);b[15]=(char)0xFF;anyLongName.store(true,memory_order_relaxed);}
  }
+ // Same as set() for a key of at most 11 bytes in the table's packed form (k1's top byte is length+1).
+ void set_packed(uint64_t k0,uint32_t k1){
+  const uint64_t hi=(uint64_t)(k1&0x00ffffffu)|((uint64_t)((k1>>24)-1)<<56);
+  memcpy(b,&k0,8);memcpy(b+8,&hi,8);
+ }
  string_view view()const{
   if((unsigned char)b[15]!=0xFF)return string_view(b,(size_t)(unsigned char)b[15]);
   const char* p;uint32_t n;memcpy(&p,b,8);memcpy(&n,b+8,4);return string_view(p,n);
  }
 };
+// Byte-wise order of two names. Names stored in place are zero-padded with the length in the last byte,
+// so comparing the 16 bytes as one big-endian number gives the same answer as comparing the strings.
+static inline bool name_less(const PName& a,const PName& b){
+ if((unsigned char)a.b[15]!=0xFF&&(unsigned char)b.b[15]!=0xFF){
+  uint64_t ah,al,bh,bl;memcpy(&ah,a.b,8);memcpy(&al,a.b+8,8);memcpy(&bh,b.b,8);memcpy(&bl,b.b+8,8);
+  if(ah!=bh)return __builtin_bswap64(ah)<__builtin_bswap64(bh);
+  return __builtin_bswap64(al)<__builtin_bswap64(bl);
+ }
+ return a.view()<b.view();
+}
 // Open-addressing string -> uint32 table built for one cache miss per lookup:
 // keys of up to 11 bytes (every generated user ID) live inside the 16-byte slot,
 // so a probe never follows a pointer. Longer keys fall back to a side list.
@@ -365,6 +408,7 @@ struct KeyTable{
  void grow(size_t want=0){
   const auto R=memory_order_relaxed;
   Slot* old=slots;size_t oldcap=cap;alloc(max(cap*2,want));
+  if(!count){munmap((void*)old,oldcap*sizeof(Slot));return;} // nothing to move: do not even touch the old pages
   for(size_t i=0;i<oldcap;++i){Slot& e=old[i];uint32_t c=e.k1.load(R);if(!c)continue;
    size_t j=(c==LONGK?e.k0.load(R):hash_packed(e.k0.load(R),c))&mask;
    while(slots[j].k1.load(R))j=(j+1)&mask;
@@ -393,6 +437,14 @@ struct KeyTable{
    if(!c)return NONE;
   }
  }
+ // Replaces the value of a key that is in the table (packed form). Other threads may do the same for other keys.
+ void set_packed(uint64_t k0,uint32_t k1,uint32_t v){
+  const auto R=memory_order_relaxed;
+  for(size_t j=hash_packed(k0,k1)&mask;;j=(j+1)&mask){Slot& e=slots[j];const uint32_t c=e.k1.load(R);
+   if(c==k1&&e.k0.load(R)==k0){e.v.store(v,R);return;}
+   if(!c)return;
+  }
+ }
  uint32_t find(string_view s)const{
   const auto R=memory_order_relaxed;
   uint64_t k0;uint32_t k1;
@@ -411,7 +463,7 @@ struct KeyTable{
   return find_or_add_packed(k0,k1,hash_packed(k0,k1)&mask,s);
  }
  // Same, for a key that is already packed (k0,k1 from pack(s)) with j = hash_packed(k0,k1)&mask.
- uint32_t find_or_add_packed(uint64_t k0,uint32_t k1,size_t j,string_view s){
+ uint32_t find_or_add_packed(uint64_t k0,uint32_t k1,size_t j,string_view){
   const auto R=memory_order_relaxed;
   for(;;){
    Slot& e=slots[j];uint32_t c=e.k1.load(memory_order_acquire);
@@ -422,7 +474,7 @@ struct KeyTable{
     if(!e.k1.compare_exchange_strong(expect,BUSY,memory_order_acquire))continue; // somebody took the slot: look at it again
     uint32_t id=nextId.fetch_add(1,R);
     if(id>=idLimit){e.k1.store(0,memory_order_release);return NONE;}
-    newNames[id].set(s);e.k0.store(k0,R);e.v.store(idBase+id,R);e.k1.store(k1,memory_order_release);
+    newNames[id].set_packed(k0,k1);e.k0.store(k0,R);e.v.store(idBase+id,R);e.k1.store(k1,memory_order_release);
     return idBase+id;
    }
    else if(c==BUSY){__builtin_ia32_pause();continue;}
@@ -494,10 +546,56 @@ template<class T> struct ArenaAlloc{
 };
 template<class T> using AVec=vector<T,ArenaAlloc<T>>;
 static void unmap_regions(vector<Region> regions){for(const Region& r:regions)munmap(r.base,r.len);}
-static constexpr uint8_t F_VALID=1,F_PURCHASE=2,F_DEAD=4;
 static constexpr uint32_t LOCAL_USER=0x80000000u;
-// One parsed event line, bucketed by event_id hash so duplicates meet in one bucket.
-struct PRec{const char* id;uint64_t h;int64_t ingest;int64_t ts;uint32_t idlen;uint32_t user;int32_t price;uint16_t cat;uint8_t flags;};
+// One parsed event line, 32 bytes (two per cache line), bucketed by event_id hash so duplicates meet in one bucket.
+//  id    start of the event_id text in the mapped input. Its length is not kept: the text ends at the
+//        first ',' or '"' (an ID holds neither, and field 0 is always followed by one of them).
+//  k     for a valid line Ev::k (see below) with PR_VALID set on top, else 0.
+//  user  the user/person number (filled in by resolve_users on the AVX2 path); may carry LOCAL_USER.
+//  cat   category number of a purchase, else 0.
+//  hx    hash bits 25-40 of the event_id.
+//  ih    ingest code << 25 | hash bits 0-24. The ingest code is ingest_ts in whole seconds counted from
+//        INGEST_BASE_S; INGEST_SIDE means "not representable": the true milliseconds are then in the
+//        thread's ingestSide list under this id pointer (only the general parser path can produce that).
+struct PRec{const char* id;uint64_t k;uint32_t user;uint16_t cat;uint16_t hx;uint64_t ih;};
+static_assert(sizeof(PRec)==32);
+static constexpr uint64_t PR_VALID=1ull<<63; // Ev::k never reaches bit 62
+static constexpr unsigned PR_HBITS=25;
+static constexpr uint64_t PR_HMASK=(1ull<<PR_HBITS)-1;
+// One day before 0000-01-01T00:00:00Z: every F1/F2 timestamp (years 0000-9999, offsets up to 23:59)
+// lies above it and less than 2^39-1 seconds past it.
+static constexpr int64_t INGEST_BASE_S=-62167219200LL-86400;
+static constexpr uint64_t INGEST_SIDE=(1ull<<39)-1;
+// Ingest code of a timestamp in milliseconds, INGEST_SIDE if it is not whole seconds or out of range.
+static inline uint64_t ingest_code(int64_t ms){
+ if(ms%1000!=0)return INGEST_SIDE;
+ const int64_t sec=ms/1000;
+ if(sec<INGEST_BASE_S)return INGEST_SIDE;
+ const uint64_t c=(uint64_t)(sec-INGEST_BASE_S);
+ return c<INGEST_SIDE?c:INGEST_SIDE;
+}
+// h = hkey(event_id); code = ingest code; k and cat as described above.
+static inline __attribute__((always_inline)) PRec make_prec(const char* id,uint64_t h,uint64_t code,uint64_t k,unsigned cat){
+ PRec r;r.id=id;r.k=k;r.user=0;r.cat=(uint16_t)cat;r.hx=(uint16_t)(h>>PR_HBITS);
+ r.ih=(code<<PR_HBITS)|(h&PR_HMASK);return r;
+}
+// True if the event IDs starting at a and b are the same text (each ends at its first ',' or '"').
+// Both point into mapped inputs, which may be read a little past the end of the text.
+static inline bool same_event_id(const char* a,const char* b){
+ const __m128i vc=_mm_set1_epi8(','),vq=_mm_set1_epi8('"');
+ for(;;a+=16,b+=16){
+  const __m128i x=_mm_loadu_si128((const __m128i*)a),y=_mm_loadu_si128((const __m128i*)b);
+  const unsigned ta=(unsigned)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(x,vc),_mm_cmpeq_epi8(x,vq)));
+  const unsigned tb=(unsigned)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(y,vc),_mm_cmpeq_epi8(y,vq)));
+  const unsigned ne=~(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x,y))&0xFFFFu;
+  if(ta|tb){
+   if(!ta||!tb)return false; // one ends in this block, the other goes on
+   const unsigned ea=(unsigned)__builtin_ctz(ta),eb=(unsigned)__builtin_ctz(tb);
+   return ea==eb&&(ne&((1u<<ea)-1))==0;
+  }
+  if(ne)return false;
+ }
+}
 // One valid click line, bucketed by click_id hash.
 struct CRec{const char* id;uint64_t h;int64_t ts;uint32_t idlen;uint32_t user;uint16_t campaign;uint8_t flags;};
 struct Chunk{const char* base;size_t len,from,to;bool click;};
@@ -506,7 +604,6 @@ struct Chunk{const char* base;size_t len,from,to;bool click;};
 struct Ev{uint64_t k;uint32_t person;uint16_t cat;uint16_t pad;};
 static constexpr uint64_t EV_PURCHASE=1ull<<24,EV_PRICE=EV_PURCHASE-1;
 static constexpr unsigned EV_TS=25;
-static_assert(((uint64_t)F_PURCHASE<<23)==EV_PURCHASE); // the flag bit is shifted straight into place
 // One surviving click, 24 bytes. key = (ts - (window_start - 7 days))<<16 | campaign.
 struct Click{uint64_t key;const char* id;uint32_t person;uint32_t idlen;};
 // Order of a person's clicks: by ts, and at equal ts the byte-wise larger ID first, so the last click
@@ -559,6 +656,7 @@ template<class T,size_t BYTES> struct Blocks{
 using EvList=Blocks<Ev,4096>;using ClickList=Blocks<Click,4096>;
 struct alignas(64) ThreadState{
  SmallTable users; // IDs that did not fit in the shared table
+ vector<pair<const char*,int64_t>> ingestSide; // (event id pointer, ingest ms) of records whose ingest code is INGEST_SIDE
  vector<AVec<PRec>> eb;vector<AVec<CRec>> cb; // parsed lines by event/click ID hash
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
 };
@@ -857,9 +955,9 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
    // B2 is its start mark, and no end mark of a later field can sit that low.
    const bool has5=(_blsi_u64(B2)&E2)==0;
    const char* const s1=p+b1;const char* const s2=p+b2;
-   PRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
+   const uint64_t h=hkey_v3(s0,l0);
    const unsigned kind=event_kind(string_view(b+b4,l4));
-   bool valid=false;
+   bool valid=false;uint64_t k=0;unsigned cat=0;
    if(kind&&l1!=0&&has5){
     int64_t ts;bool tsOk;
     uint64_t a8,b8;uint16_t a2,b2_;
@@ -869,7 +967,8 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
      if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
     }else tsOk=ts_v3(s2,l2,memo,ts);
     // window_start <= ts < window_end as one unsigned compare (the window is far shorter than 2^63 ms)
-    if(tsOk&&(uint64_t)ts-(uint64_t)wstart<wlen&&ingest-ts<=DAY){
+    uint64_t tsrel;
+    if(tsOk&&(tsrel=(uint64_t)ts-(uint64_t)wstart)<wlen&&ingest-ts<=DAY){
      int32_t price=0;const bool purchase=kind==3;
      if(purchase){
       const unsigned b5=(unsigned)_tzcnt_u64(B2),l5=(unsigned)_tzcnt_u64(E2)-b5;
@@ -877,12 +976,14 @@ template<class GEN> SS_V3 static void events_v3(const char* base,size_t len,size
       const unsigned b6=(unsigned)_tzcnt_u64(B2),l6=(unsigned)_tzcnt_u64(E2)-b6;
       if(price_value(string_view(b+b6,l6),price)){
        const uint32_t ci=products.find(string_view(b+b5,l5));
-       r.cat=ci==KeyTable::NONE?0:(uint16_t)ci;r.flags=F_VALID|F_PURCHASE;r.ts=ts;r.price=price;valid=true;
+       cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;k=PR_VALID|(tsrel<<EV_TS)|EV_PURCHASE|(uint64_t)(uint32_t)price;valid=true;
       }
-     }else{r.flags=F_VALID;r.ts=ts;valid=true;}
+     }else{k=PR_VALID|(tsrel<<EV_TS);valid=true;}
     }
    }
-   AVec<PRec>& vec=buckets[(size_t)(((r.h>>40)*PE)>>24)];
+   // an F1 ingest_ts is whole seconds within years 0000-9999, so its code always fits
+   const PRec r=make_prec(s0,h,(uint64_t)(ingest-INGEST_BASE_S*1000)/1000u,k,cat);
+   AVec<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
    if(__builtin_expect(vec.size()==vec.capacity(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record pushed below stays put
    if(valid){
     uint64_t k0;uint32_t k1;
@@ -992,15 +1093,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  add_files(data/"clicks",true,clickBytes);
  // Lines per byte, measured on the start of the largest event file, sizes the bucket buffers tightly.
  uint64_t estEvents=eventBytes/70;
- if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count(sampleBase,sampleBase+n,'\n');
+ if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
  __mark("MAP");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0;
  for(const auto& p:csv_files(data/"links")){Mapped m=map_file(p);if(!m.len)continue;
-  linkLines+=(uint64_t)count(m.base,m.base+m.len,'\n')+1;
+  ++linkLines; // a last line without '\n'
   for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+ #pragma omp parallel for num_threads(T) schedule(dynamic,1) reduction(+:linkLines)
+ for(size_t c=0;c<linkChunks.size();++c){const Chunk& ck=linkChunks[c];linkLines+=count_newlines(ck.base+ck.from,min(ck.to,ck.len)-ck.from);}
  const uint64_t maxLinked=2*linkLines; // every link line names at most two IDs
  // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
  // If a dataset has more, the extra ones take the thread-private fallback path (slower, still exact).
@@ -1020,62 +1123,126 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    u=gp;
   }
  };
+ // best[r]: the ID with the byte-wise smallest name seen so far in root r's group.
+ unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[maxLinked+1]);
  atomic<size_t> nextLink{0};
  #pragma omp parallel num_threads(T)
  {
   #pragma omp for schedule(static)
-  for(uint64_t i=0;i<maxLinked;++i)parent[i].store((uint32_t)i,memory_order_relaxed);
+  for(uint64_t i=0;i<maxLinked;++i){parent[i].store((uint32_t)i,memory_order_relaxed);best[i].store((uint32_t)i,memory_order_relaxed);}
+  // Lines are handled in small batches so the table slots of a batch, and then the parent entries of
+  // its IDs, are on their way into the cache before they are needed.
+  static constexpr int LB=16;
+  struct LinkPend{string_view f[2];uint64_t k0[2];uint32_t k1[2];uint32_t j[2];}; // k1 == 0: key too long to pack
+  LinkPend pend[LB];uint32_t ida[LB],idb[LB];
+  const size_t tmask=tab.mask;
+  auto resolve=[&](int nb){
+   for(int i=0;i<nb;++i){const LinkPend& q=pend[i];
+    // cannot be full: the table holds 2 IDs per link line
+    const uint32_t a=q.k1[0]?tab.find_or_add_packed(q.k0[0],q.k1[0],q.j[0],q.f[0]):tab.find_or_add_long(q.f[0]);
+    const uint32_t b=q.k1[1]?tab.find_or_add_packed(q.k0[1],q.k1[1],q.j[1],q.f[1]):tab.find_or_add_long(q.f[1]);
+    ida[i]=a;idb[i]=b;__builtin_prefetch(&parent[a],1,1);__builtin_prefetch(&parent[b],1,1);
+   }
+   for(int i=0;i<nb;++i){
+    uint32_t a=ida[i],b=idb[i];
+    for(;;){
+     a=find_root(a);b=find_root(b);if(a==b)break;
+     if(a<b)swap(a,b);
+     uint32_t expect=a;if(parent[a].compare_exchange_strong(expect,b))break;
+    }
+   }
+  };
   for(;;){
    size_t c=nextLink.fetch_add(1,memory_order_relaxed);if(c>=linkChunks.size())break;
    const Chunk& ck=linkChunks[c];
-   for_lines(ck.base,ck.len,ck.from,ck.to,[&](string_view line){
-    string_view f[2];if(!fields(line,2,f)||f[0].empty()||f[1].empty())return;
-    uint32_t a=tab.find_or_add(f[0]),b=tab.find_or_add(f[1]); // cannot be full: the table holds 2 IDs per link line
-    for(;;){
-     a=find_root(a);b=find_root(b);if(a==b)return;
-     if(a<b)swap(a,b);
-     uint32_t expect=a;if(parent[a].compare_exchange_strong(expect,b))return;
+   // Every data line that begins in [from,to), as in for_lines; exactly two non-empty fields or the line is skipped.
+   if(ck.from>=ck.len)continue;
+   const char* const end=ck.base+ck.len;
+   const char* nl=(const char*)memchr(ck.from?ck.base+ck.from-1:ck.base,'\n',ck.from?ck.len-(ck.from-1):ck.len);
+   if(!nl)continue;
+   const char* const lim=ck.base+min(ck.to,ck.len);
+   int nb=0;
+   const __m128i vnl=_mm_set1_epi8('\n'),vc=_mm_set1_epi8(','),vq=_mm_set1_epi8('"');
+   for(const char* p=nl+1;p<lim;){
+    LinkPend& q=pend[nb];const char* next;bool ok,done=false;
+    // Usual shape: a line of under 32 bytes with one comma and no quote, cut from two 16-byte compares.
+    if(end-p>=32){
+     const __m128i x0=_mm_loadu_si128((const __m128i*)p),x1=_mm_loadu_si128((const __m128i*)(p+16));
+     const uint32_t mnl=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vnl))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vnl))<<16);
+     if(mnl){
+      const unsigned L=(unsigned)__builtin_ctz(mnl);const uint32_t keep=(1u<<L)-1;
+      const uint32_t mc=((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vc))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vc))<<16))&keep;
+      const uint32_t mq=((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vq))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vq))<<16))&keep;
+      if(!mq&&mc&&!(mc&(mc-1))){
+       const unsigned P=(unsigned)__builtin_ctz(mc);
+       done=true;next=p+L+1;ok=P>0&&P+1<L; // both IDs non-empty
+       q.f[0]=string_view(p,P);q.f[1]=string_view(p+P+1,L-P-1);
+      }
+     }
     }
-   });
+    if(!done){ // anything else: the general splitter decides
+     const char* comma[2];int ncomma,nquote;const char* lineEnd;
+     next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
+     ok=take_fields(p,lineEnd,comma,ncomma,nquote,2,q.f)&&!q.f[0].empty()&&!q.f[1].empty();
+    }
+    if(ok){
+     for(int k=0;k<2;++k){
+      if(KeyTable::pack(q.f[k],q.k0[k],q.k1[k])){q.j[k]=(uint32_t)(KeyTable::hash_packed(q.k0[k],q.k1[k])&tmask);__builtin_prefetch(&tab.slots[q.j[k]],1,1);}
+      else q.k1[k]=0;
+     }
+     if(++nb==LB){resolve(nb);nb=0;}
+    }
+    p=next;
+   }
+   resolve(nb);
   }
  }
  const uint32_t nlinked=tab.nextId.load();
  if(getenv("SS_TEST_MAXNEW"))tab.idLimit=min<uint64_t>(tab.idLimit,(uint64_t)nlinked+maxNew64); // tests: leave room for only that many unlinked IDs
  __mark("LINKREAD");
- // Flatten, then name each person by the byte-wise smallest of their IDs.
- vector<uint32_t> root(nlinked);
+ // Flatten: every linked ID that is not its group's root offers its name to the root (the byte-wise
+ // smallest wins) and has its table entry pointed at the root, which is the person number.
  {
   PName* names=tab.newNames;
-  unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[(size_t)nlinked+1]);
   #pragma omp parallel num_threads(T)
   {
    #pragma omp for schedule(static)
-   for(uint32_t i=0;i<nlinked;++i){root[i]=find_root(i);best[i].store(i,memory_order_relaxed);}
-   #pragma omp for schedule(static)
    for(uint32_t i=0;i<nlinked;++i){
-    const uint32_t r=root[i];if(r==i)continue;
-    uint32_t cur=best[r].load();
-    while(names[i].view()<names[cur].view()&&!best[r].compare_exchange_weak(cur,i)){}
+    const uint32_t r=find_root(i);if(r==i)continue;
+    uint32_t cur=best[r].load(memory_order_relaxed);
+    while(name_less(names[i],names[cur])&&!best[r].compare_exchange_weak(cur,i)){}
+    uint64_t k0;uint32_t k1;
+    if(KeyTable::pack(names[i].view(),k0,k1))tab.set_packed(k0,k1,r); // longer keys are in tab.longs, below
    }
    // A root's own name is no longer needed once every member has been compared, and no other person reads it.
    #pragma omp for schedule(static)
-   for(uint32_t i=0;i<nlinked;++i)if(root[i]==i)names[i]=names[best[i].load()];
-   // The table now maps a linked ID straight to its person.
-   #pragma omp for schedule(static)
-   for(size_t j=0;j<tab.cap;++j){auto& e=tab.slots[j];uint32_t c=e.k1.load(memory_order_relaxed);
-    if(c&&c!=KeyTable::LONGK){uint32_t v=e.v.load(memory_order_relaxed);if(v<nlinked)e.v.store(root[v],memory_order_relaxed);}}
+   for(uint32_t i=0;i<nlinked;++i)if(parent[i].load(memory_order_relaxed)==i)names[i]=names[best[i].load(memory_order_relaxed)];
   }
-  for(auto& l:tab.longs)if(l.v<nlinked)l.v=root[l.v];
+  for(auto& l:tab.longs)if(l.v<nlinked)l.v=find_root(l.v);
  }
- vector<uint32_t>().swap(root);
+ best.reset();
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
  cat_id("unknown",categories,catnames);
  KeyTable products(1<<17); // product_id -> category number
- read_lines(data/"products.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean products.csv");products.intern(f[0],cat_id(f[1],categories,catnames));});
+ // Categories repeat: a small memo of the last category texts seen saves most of the string-map lookups.
+ struct CatMemo{const char* p;uint32_t n;uint16_t id;};
+ CatMemo catMemo[64]={};
+ read_pairs(data/"products.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean products.csv");
+  const string_view c=f[1];
+  uint64_t w;memcpy(&w,c.data(),8);w&=LOW_BYTES[min<size_t>(c.size(),8)]; // mapped input: reading past the end is safe
+  CatMemo& e=catMemo[((w^c.size())*0x9e3779b97f4a7c15ULL)>>58];
+  uint16_t id;
+  if(e.p&&e.n==c.size()&&memcmp(e.p,c.data(),c.size())==0)id=e.id;
+  else{id=cat_id(c,categories,catnames);e.p=c.data();e.n=(uint32_t)c.size();e.id=id;}
+  products.intern(f[0],id);
+ });
  vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
- read_lines(data/"campaigns.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean campaigns.csv");if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
+ read_pairs(data/"campaigns.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean campaigns.csv");
+  if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
   const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
  uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
 
@@ -1087,6 +1254,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(const char* isa=getenv("SS_ISA"))if(string_view(isa)=="sse2")useV3=false;
  cerr<<"splitter: "<<(useV3?"avx2":"sse2")<<"\n";
  vector<ThreadState> tls(T);
+ // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
+ // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
+ // ID text on every occupied slot it probes instead of only on a tag match.
+ const bool testSide=getenv("SS_TEST_SIDE")!=nullptr;
+ const uint32_t tagKeep=getenv("SS_TEST_TAG0")?0u:~0u;
  atomic<size_t> nextChunk{0};
  const int64_t clickStart=window_start-WEEK;
  #pragma omp parallel num_threads(T)
@@ -1110,7 +1282,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    int64_t ingest=0,ingestDay=0,ms;const char* pi=f[3].data();
    const bool ingestF1=f[3].size()==20&&pi[19]=='Z'&&hms_ms(pi,ms)&&f1_date(pi,ingestDay);
    if(ingestF1)ingest=ingestDay+ms;else if(!parse_ts(f[3],ingest))return;
-   PRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
+   const uint64_t h=hkey(f[0]);uint64_t k=0;unsigned cat=0;uint32_t user=0;
    const unsigned kind=event_kind(f[4]);
    if(kind&&!f[1].empty()&&!f[5].empty()){
     int64_t ts;bool tsOk;const char* pt=f[2].data();
@@ -1121,12 +1293,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(tsOk&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY){
      int32_t price=0;const bool purchase=kind==3;
      if(!purchase||price_value(f[6],price)){
-      r.flags=F_VALID|(purchase?F_PURCHASE:0);r.ts=ts;r.price=price;r.user=user_of(f[1]);
-      if(purchase){const uint32_t c=products.find(f[5]);r.cat=c==KeyTable::NONE?0:(uint16_t)c;}
+      k=PR_VALID|((uint64_t)(ts-window_start)<<EV_TS)|(purchase?EV_PURCHASE:0)|(uint64_t)(uint32_t)price;user=user_of(f[1]);
+      if(purchase){const uint32_t c=products.find(f[5]);cat=c==KeyTable::NONE?0:(unsigned)(uint16_t)c;}
      }
     }
    }
-   tl.eb[(size_t)(((r.h>>40)*PE)>>24)].push_back(r);
+   uint64_t code=testSide?INGEST_SIDE:ingest_code(ingest);
+   if(code==INGEST_SIDE)tl.ingestSide.emplace_back(f[0].data(),ingest); // rare: keep the exact value on the side
+   PRec r=make_prec(f[0].data(),h,code,k,cat);r.user=user;
+   tl.eb[(size_t)(((h>>40)*PE)>>24)].push_back(r);
   };
   auto on_click=[&](const string_view* f){
    if(f[0].empty())return;
@@ -1169,6 +1344,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(person<totalIds)return personNames[person].view();
   return extraNames[person-totalIds];
  };
+ // Ingest values that did not fit a record (see PRec::ih), by event id pointer. Normally empty.
+ unordered_map<const char*,int64_t> sideIngest;
+ for(int t=0;t<T;++t)for(const auto& e:tls[t].ingestSide)sideIngest.emplace(e.first,e.second);
+ if(!sideIngest.empty())cerr<<"ingest values kept on the side: "<<sideIngest.size()<<"\n";
+ auto ingest_ms=[&](const PRec& r)->int64_t{
+  const uint64_t c=r.ih>>PR_HBITS;
+  return c==INGEST_SIDE?sideIngest.find(r.id)->second:((int64_t)c+INGEST_BASE_S)*1000;
+ };
  const uint32_t newCount=totalIds-nlinked;
  cerr<<"unlinked IDs: "<<newCount<<" (+"<<extraNames.size()<<" via fallback)\n";
  // ---- Person buckets: bucket = person >> pshift, so a bucket is a dense range of W person numbers
@@ -1208,22 +1391,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Ev** const emitted=emitBuf.get(n); // where record g's event went (only read for valid winners)
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
    size_t dups=0,dead=0;
-   const int64_t ws=window_start;
    for(int t=0;t<T;++t){
     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
     const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
     for(;r!=rend;++r,++g1){
-     const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
-     size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
+     // 41 hash bits per record: the low 25 pick the slot, the tag is the other 16 plus the lowest of the 25.
+     const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
+     const uint32_t tg=((((uint32_t)r->hx|(hl<<16))&tagKeep)<<ib);
+     size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
      for(uint32_t e;(e=S[j])!=0;){
       if((e^tg)<=imask){ // same tag: compare the IDs themselves
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const PRec& o=tls[ot].eb[p][og-off[ot]];
-       if(o.idlen==r->idlen&&memcmp(o.id,r->id,r->idlen)==0){
+       if(same_event_id(o.id,r->id)){
         // Keep the earliest ingested copy; copies with equal ingest_ts are identical.
         ++dups;
-        if(r->ingest>=o.ingest)goto next_event;
-        if(o.flags&F_VALID){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
+        const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
+        const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi; // codes order like the times
+        if(notEarlier)goto next_event;
+        if(o.k&PR_VALID){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
       }
@@ -1231,12 +1417,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      }
      S[j]=tg|g1;
      {
-      const unsigned fl=r->flags;
-      if(fl&F_VALID){
+      const uint64_t rk=r->k;
+      if(rk&PR_VALID){
        uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
        Ev* const out=myEv[u>>pshift].slot(pool);
        emitted[g1-1]=out;
-       out->k=((uint64_t)(r->ts-ws)<<EV_TS)|((uint64_t)(fl&F_PURCHASE)<<23)|(uint64_t)(uint32_t)r->price;
+       out->k=rk&~PR_VALID; // otherwise already in its final form
        const uint64_t w=(uint64_t)u|((uint64_t)r->cat<<32);memcpy((void*)&out->person,&w,8);
       }
      }
