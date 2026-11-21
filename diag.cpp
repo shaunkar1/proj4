@@ -286,38 +286,37 @@ int main(){
   fprintf(stderr,"DIAG replica: %d x %d copies, %.1f MB written in %.2fs (elapsed %.1fs)\n",PARTS,BIG,b/1e6,now()-t,now()-T0);}
  const string B=big.string(),H=huge.string();
  auto timeleft=[&](double need){if(now()-T0+need>150){fprintf(stderr,"DIAG skipping the rest: out of time (%.1fs elapsed)\n",now()-T0);return false;}return true;};
- struct Var{const char* label;vector<pair<string,string>> env;const char* bin="";bool hugeSet=false;};
+ struct Var{string label;vector<pair<string,string>> env;const char* bin="";bool hugeSet=false;};
  #define N8 {"NCPU","8"}
- const vector<Var> vars={
-  {"d1",{N8}},{"s1",{N8},"core-v35"},{"r1",{N8},"core-v33"},{"q1",{N8},"core-v32"},{"p1",{N8},"core-v31"},{"d2",{N8}},{"s2",{N8},"core-v35"},{"r2",{N8},"core-v33"},{"q2",{N8},"core-v32"},{"d3",{N8}},{"s3",{N8},"core-v35"},{"r3",{N8},"core-v33"},
-  {"snoprobe",{N8,{"SS_NOSIMDPROBE","1"}},"core-v35"},{"sslot150",{N8,{"SS_SLOTPCT","150"}},"core-v35"},{"spfe0",{N8,{"SS_PFE","0"}},"core-v35"},{"spfa128",{N8,{"SS_PFA","128"}},"core-v35"},
-  {"snoprobe2",{N8,{"SS_NOSIMDPROBE","1"}},"core-v35"},{"sslot1502",{N8,{"SS_SLOTPCT","150"}},"core-v35"},{"spfe02",{N8,{"SS_PFE","0"}},"core-v35"},{"spfa1282",{N8,{"SS_PFA","128"}},"core-v35"},
-  {"idx",{N8,{"SS_LINES","index"}}},{"idxz",{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}}},{"idx2",{N8,{"SS_LINES","index"}}},{"idxz2",{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}}},
-  {"tabfull",{N8,{"SS_TABLE_FULL","1"}}},{"noidblk",{N8,{"SS_NOIDBLOCKS","1"}}},{"tabfull2",{N8,{"SS_TABLE_FULL","1"}}},{"noidblk2",{N8,{"SS_NOIDBLOCKS","1"}}},
-  {"abl1",{N8,{"SS_ABL","1"}},"core-abl"},{"abl2",{N8,{"SS_ABL","2"}},"core-abl"},{"abl6",{N8,{"SS_ABL","6"}},"core-abl"},{"abl3",{N8,{"SS_ABL","3"}},"core-abl"},
-  {"abl4",{N8,{"SS_ABL","4"}},"core-abl"},{"abl5",{N8,{"SS_ABL","5"}},"core-abl"},
-  {"x0",{N8},"core-x"},
-  {"per16k",{N8,{"SS_PER","16384"}},"core-x"},{"per8k",{N8,{"SS_PER","8192"},{"SS_CAP","8192"}},"core-x"},{"per4k",{N8,{"SS_PER","4096"},{"SS_CAP","16384"}},"core-x"},
-  {"uper8k",{N8,{"SS_UPER","8192"}},"core-x"},{"uper32k",{N8,{"SS_UPER","32768"}},"core-x"},
-  {"pfw128",{N8,{"SS_PFW","128"}},"core-x"},{"pfw256",{N8,{"SS_PFW","256"}},"core-x"},
-  {"pfe128",{N8,{"SS_PFE","128"}},"core-x"},{"pfe256",{N8,{"SS_PFE","256"}},"core-x"},
-  {"combo",{N8,{"SS_PER","8192"},{"SS_CAP","8192"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x"},
-  {"avx512z",{N8,{"SS_ISA","avx512z"}}},{"avx512y",{N8,{"SS_ISA","avx512y"}}},
-  {"noearly",{N8,{"SS_NOEARLYUNMAP","1"}}},{"nowill",{N8,{"SS_NOWILLNEED","1"}}},
-  // final-sized set
-  {"Hd1",{N8},"",true},{"Hs1",{N8},"core-v35",true},{"Hsnoprobe",{N8,{"SS_NOSIMDPROBE","1"}},"core-v35",true},{"Hr1",{N8},"core-v33",true},{"Hq1",{N8},"core-v32",true},{"Hp1",{N8},"core-v31",true},{"Hd2",{N8},"",true},{"Hx0",{N8},"core-x",true},{"Htabfull",{N8,{"SS_TABLE_FULL","1"}},"",true},
-  {"Hper16k",{N8,{"SS_PER","16384"},{"SS_CAP","8192"}},"core-x",true},{"Hper8k",{N8,{"SS_PER","8192"},{"SS_CAP","16384"}},"core-x",true},
-  {"Huper8k",{N8,{"SS_UPER","8192"}},"core-x",true},{"Hpf",{N8,{"SS_PFW","128"},{"SS_PFE","128"}},"core-x",true},
-  {"Hcombo",{N8,{"SS_PER","8192"},{"SS_CAP","16384"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x",true},
-  {"Havx512z",{N8,{"SS_ISA","avx512z"}},"",true},{"Hnoearly",{N8,{"SS_NOEARLYUNMAP","1"}},"",true},{"Hd3",{N8},"",true},
-  // repeats and lower-priority runs on the practice-sized set
-  {"x0b",{N8},"core-x"},{"per8kb",{N8,{"SS_PER","8192"},{"SS_CAP","8192"}},"core-x"},{"pfw128b",{N8,{"SS_PFW","128"}},"core-x"},{"pfe128b",{N8,{"SS_PFE","128"}},"core-x"},
-  {"combob",{N8,{"SS_PER","8192"},{"SS_CAP","8192"},{"SS_UPER","8192"},{"SS_PFW","128"},{"SS_PFE","128"}},"core-x"},
-  {"avx512z2",{N8,{"SS_ISA","avx512z"}}},{"avx512y2",{N8,{"SS_ISA","avx512y"}}},{"noearly2",{N8,{"SS_NOEARLYUNMAP","1"}}},
-  {"nohuge",{N8,{"SS_NOHUGE","1"}}},{"prefault",{N8,{"SS_PREFAULT","1"}}},
-  {"n4",{{"NCPU","4"}}},{"n1",{{"NCPU","1"}}},{"n2",{{"NCPU","2"}}},{"n6",{{"NCPU","6"}}},
-  {"1abl1",{{"NCPU","1"},{"SS_ABL","1"}},"core-abl"},{"1abl2",{{"NCPU","1"},{"SS_ABL","2"}},"core-abl"},{"1abl3",{{"NCPU","1"},{"SS_ABL","3"}},"core-abl"},{"1abl4",{{"NCPU","1"},{"SS_ABL","4"}},"core-abl"},
-  {"d4",{N8}},{"s4",{N8},"core-v35"},{"d5",{N8}},{"s5",{N8},"core-v35"}};
+ vector<Var> vars;
+ auto add=[&](const char* group,int reps,vector<pair<string,string>> env,const char* bin="",bool hs=false){for(int i=0;i<reps;++i)vars.push_back({string(group)+"#"+to_string(i),env,bin,hs});};
+ // practice-sized set: the first run only warms the page cache
+ add("warm",1,{N8});
+ add("B",2,{N8});
+ add("z",2,{N8,{"SS_ISA","avx512z"}});add("y",2,{N8,{"SS_ISA","avx512y"}});
+ add("idx",1,{N8,{"SS_LINES","index"}});add("idxz",1,{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}});
+ add("pop",1,{N8,{"SS_INPUT","populate"}});add("seq",1,{N8,{"SS_INPUT","seq"}});add("chk",1,{N8,{"SS_INPUT","chunk"}});
+ add("tsk",2,{N8},"core-tsk");
+ for(int r=0;r<2;++r)for(const char* a:{"1","2","6","3","4","5"})vars.push_back({string("a")+a+"#"+to_string(r),{N8,{"SS_ABL",a}},"core-abl",false});
+ add("B",1,{N8});
+ add("pb4k",1,{N8,{"SS_PERSONBUCKET","4096"}});add("pb8k",2,{N8,{"SS_PERSONBUCKET","8192"}});add("pb32k",1,{N8,{"SS_PERSONBUCKET","32768"}});
+ add("cell",2,{N8,{"SS_CELLPASS","1"}});add("tabfull",2,{N8,{"SS_TABLE_FULL","1"}});add("noidblk",1,{N8,{"SS_NOIDBLOCKS","1"}});
+ add("nowill",1,{N8,{"SS_NOWILLNEED","1"}});add("noearly",2,{N8,{"SS_NOEARLYUNMAP","1"}});
+ add("ev2k",1,{N8,{"SS_PER","16384"}},"core-x");add("ev512",1,{N8,{"SS_PER","65536"}},"core-x");
+ add("z",1,{N8,{"SS_ISA","avx512z"}});add("y",1,{N8,{"SS_ISA","avx512y"}});add("idx",1,{N8,{"SS_LINES","index"}});add("idxz",1,{N8,{"SS_LINES","index"},{"SS_ISA","avx512z"}});
+ add("pop",1,{N8,{"SS_INPUT","populate"}});add("seq",1,{N8,{"SS_INPUT","seq"}});add("chk",1,{N8,{"SS_INPUT","chunk"}});
+ add("B",1,{N8});
+ // final-sized set
+ add("Hwarm",1,{N8},"",true);
+ add("HB",2,{N8},"",true);
+ add("Hz",1,{N8,{"SS_ISA","avx512z"}},"",true);
+ add("Hpb8k",1,{N8,{"SS_PERSONBUCKET","8192"}},"",true);add("Hpb32k",1,{N8,{"SS_PERSONBUCKET","32768"}},"",true);add("Hpb49k",1,{N8,{"SS_PERSONBUCKET","49152"}},"",true);
+ add("Hev4k",1,{N8,{"SS_PER","16384"},{"SS_CAP","8192"}},"core-x",true);add("Hev8k",1,{N8,{"SS_PER","8192"},{"SS_CAP","16384"}},"core-x",true);add("Hev1k",1,{N8,{"SS_CAP","1024"}},"core-x",true);
+ add("Hcell",1,{N8,{"SS_CELLPASS","1"}},"",true);add("Hchk",1,{N8,{"SS_INPUT","chunk"}},"",true);add("Htabfull",1,{N8,{"SS_TABLE_FULL","1"}},"",true);
+ add("Hslot150",1,{N8,{"SS_SLOTPCT","150"}},"",true);add("Hnoprobe",1,{N8,{"SS_NOSIMDPROBE","1"}},"",true);
+ add("HB",1,{N8},"",true);add("Hz",1,{N8,{"SS_ISA","avx512z"}},"",true);
+ // thread counts, practice-sized
+ add("n4",1,{{"NCPU","4"}});add("n1",1,{{"NCPU","1"}});add("n6",1,{{"NCPU","6"}});add("B",1,{N8});
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -335,41 +334,32 @@ int main(){
   auto row=[&](const string& label,const string& text,int64_t a,int64_t b,int64_t c,int64_t d){
    char id[16];snprintf(id,sizeof id,"!%02d ",idx++);put_bytes(cid,string(id)+label);put_bytes(chan,text);days.push_back(20000+idx);
    c1.push_back(a);c2.push_back(b);c3.push_back(c);c4.push_back(d);};
-  auto g1=[&](const RunResult& r,const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};
-  auto brief=[&](const char* l)->string{const RunResult* r=get(l);char one[96];if(!r){snprintf(one,sizeof one,"%s=- ",l);return one;}
-   snprintf(one,sizeof one,"%s=%.0f(%.0f/%.0f/%.0f) ",l,r->wall*1e3,g1(*r,"PARSE"),g1(*r,"DEDUP"),g1(*r,"AGGREGATE"));return one;};
-  // row 0: v32 against v31 on both sizes; best default run in full with hardware counters
-  {const RunResult* d=bestd();RunResult z;if(!d)d=&z;char pc[160];snprintf(pc,sizeof pc," | perf err%d ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",d->perfErr,d->pc[0]/1e9,d->pc[1]/1e9,d->pc[2]/1e6,d->pc[3]/1e6);
-   string all;for(const char* l:{"d1","d2","d3","d4","d5","s1","s2","s3","s4","s5","r1","r2","r3","q1","q2","p1","Hd1","Hd2","Hd3","Hs1","Hr1","Hq1","Hp1"}){const RunResult* r=get(l);char one[32];snprintf(one,sizeof one,"%s=%.0f ",l,r?r->wall*1e3:-1.0);all+=one;}
-   string det=stages(*d)+pc;
-   {const RunResult* pb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='p'&&r.rc==0&&(!pb||r.wall<pb->wall))pb=&r;if(pb)det+=" || v31: "+stages(*pb);}
-   {const RunResult* h=get("Hd1");const RunResult* h2=get("Hd2");if(h2&&(!h||h2->wall<h->wall))h=h2;if(h)det+=" || 60x: "+stages(*h);}
-   {const RunResult* qb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='q'&&r.rc==0&&(!qb||r.wall<qb->wall))qb=&r;if(qb)det+=" || v32: "+stages(*qb);}
-   {const RunResult* qb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='r'&&r.rc==0&&(!qb||r.wall<qb->wall))qb=&r;if(qb)det+=" || v33: "+stages(*qb);}
-   {const RunResult* qb=nullptr;for(auto& r:results)if(r.label.size()==2&&r.label[0]=='s'&&r.rc==0&&(!qb||r.wall<qb->wall))qb=&r;if(qb)det+=" || v35: "+stages(*qb);}
-   row("v35 s*, v34 d*, v33 r*, v32 q*, v31 p*, H=60x: "+all,det,us(d->wall),us(d->user),us(d->sys),d->minflt);}
-  // row 1: tuning experiments, wall(parse/dedup/agg)
-  {string a,b2;for(const char* l:{"snoprobe","snoprobe2","sslot150","sslot1502","spfe0","spfe02","spfa128","spfa1282","x0","x0b","per16k","per8k","per8kb","per4k","uper8k","uper32k","pfw128","pfw128b","pfw256","pfe128","pfe128b","pfe256","combo","combob"})a+=brief(l);
-   for(const char* l:{"Hd1","Hd2","Hd3","Hs1","Hsnoprobe","Hr1","Hq1","Hp1","Hx0","Htabfull","Hper16k","Hper8k","Huper8k","Hpf","Hcombo","Havx512z","Hnoearly"})b2+=brief(l);
-   row("tuning 20x wall(P/D/A): "+a,"60x: "+b2,0,0,0,0);}
-  // row 2: parser ablation (PARSE stage ms; the run stops after that stage)
-  {string a,detail;for(auto& r:results)if(r.label.find("abl")!=string::npos){char one[64];snprintf(one,sizeof one,"%s=%.0f ",r.label.c_str(),g1(r,"PARSE"));a+=one;
-    char d2[96];snprintf(d2,sizeof d2,"%s:u%.0f,s%.0f,f%ld,w%.0f ",r.label.c_str(),r.user*1e3,r.sys*1e3,r.minflt,r.wall*1e3);detail+=d2;}
-   row("ablation PARSE ms (1 scan,2 +fields,6 +record to a ring,3 +bucket push,4 +users,5 clicks only): "+a,detail,0,0,0,0);}
-  // row 3: switches and thread counts
-  {string a,b2;for(const char* l:{"idx","idx2","idxz","idxz2","tabfull","tabfull2","noidblk","noidblk2","avx512z","avx512z2","avx512y","avx512y2","noearly","noearly2","nowill","nohuge","prefault"})a+=brief(l);
-   for(const char* l:{"n1","n2","n4","n6"})b2+=brief(l);
-   const RunResult* n1=get("n1");if(n1){char pc[160];snprintf(pc,sizeof pc," || n1: u%.0f s%.0f perf ins %.2fG cyc %.2fG cm %.1fM bm %.1fM",n1->user*1e3,n1->sys*1e3,n1->pc[0]/1e9,n1->pc[1]/1e9,n1->pc[2]/1e6,n1->pc[3]/1e6);b2+=pc;}
-   row("switches: "+a,"threads: "+b2,0,0,0,0);}
-  // row 4: every run, compact
-  {string all;for(auto& r:results){char one[96];
-    snprintf(one,sizeof one,"%s:%.0f/%.0f/%.0f/%.0f/L%.0f/u%.0f/s%.0f/f%ld ",r.label.c_str(),r.wall*1e3,g1(r,"PARSE"),g1(r,"DEDUP"),g1(r,"AGGREGATE"),g1(r,"LINKMAP")+g1(r,"LINKSETUP")+g1(r,"LINKREAD")+g1(r,"FLATTEN"),r.user*1e3,r.sys*1e3,r.minflt);all+=one;}
-   row("all runs: label:wall/parse/dedup/agg/links/user/sys/faults",all,0,0,0,0);}
-  // row 5: machine
-  {char t[400];snprintf(t,sizeof t,"%s | kernel %s | thp %s | defrag %s | aff %d | fs %s | memset8 %.1fGB/s touch1 %.2fus/page touch8(1.5GB) %.0f/%.0f/%.0f/%.0f ms munmap %.0f/%.0f ms | spin1/4/8 %.0f/%.0f/%.0f ms | read %.1f/%.1f GB/s | replica %.1fs",
-    gCpu.c_str(),gKernel.c_str(),gThp.c_str(),gDefrag.c_str(),gAff,gFs.c_str(),gMemsetGBs,gTouchUsPage,gTouch8[0]*1e3,gTouch8[1]*1e3,gTouch8[2]*1e3,gTouch8[3]*1e3,gMunmap[0]*1e3,gMunmap[1]*1e3,gSpin[0]*1e3,gSpin[1]*1e3,gSpin[2]*1e3,gReadGBs[0],gReadGBs[1],gReplicaSec);
-   string extra=string("cpu.max ")+slurp("/sys/fs/cgroup/cpu.max",40)+" | cpuset "+slurp("/sys/fs/cgroup/cpuset.cpus.effective",40)+" | mem.max "+slurp("/sys/fs/cgroup/memory.max",30)+" | L2 "+slurp("/sys/devices/system/cpu/cpu0/cache/index2/size",12)+" L3 "+slurp("/sys/devices/system/cpu/cpu0/cache/index3/size",12)+" | sib0 "+slurp("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",16)+" | flags "+to_string(gFlags);
-   row("machine: "+extra,t,gAff,gFlags,0,0);}
+  // Smallest value over the repeats of a run group; -1 if the group never ran.
+  auto mn=[&](const string& grp,const char* key)->long{double best=-1;for(auto& r:results){if(r.rc!=0||r.label.compare(0,grp.size()+1,grp+"#")!=0)continue;
+    double v;const string k=key;
+    if(k=="w")v=r.wall;else if(k=="u")v=r.user;else if(k=="s")v=r.sys;
+    else if(k=="L"){v=0;for(auto& kv:r.t)if(kv.first.rfind("LINK",0)==0||kv.first=="FLATTEN")v+=kv.second;}
+    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":key);v=it==r.t.end()?0:it->second;}
+    if(best<0||v<best)best=v;}
+   return best<0?-1:(long)(best*1e3+0.5);};
+  auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
+  string a,c;
+  a+=fmt("B wPDALus","B","wPDALus");
+  a+="| P: ";for(const char* g:{"z","y","idx","idxz","pop","seq","chk","tsk","nowill","tabfull"})a+=fmt(g,g,"P");
+  a+="| abl P: ";for(const char* g:{"a1","a2","a6","a3","a4","a5"})a+=fmt(g+1,g,"P");
+  a+="| w: ";for(const char* g:{"z","y","idxz","chk","tsk","noearly","tabfull","noidblk","n4","n6","n1"})a+=fmt(g,g,"w");
+  a+="| n1 u/s: "+to_string(mn("n1","u"))+"/"+to_string(mn("n1","s"));
+  c+="DA: ";for(const char* g:{"pb4k","pb8k","pb32k","cell"})c+=fmt(g,g,"wDA");
+  c+=fmt("ev2k wPD","ev2k","wPD")+fmt("ev512","ev512","wPD")+fmt("noidblk L","noidblk","L")+fmt("tabfull L","tabfull","L");
+  c+="| 60x: "+fmt("B wPDALus","HB","wPDALus")+fmt("z wP","Hz","wP")+fmt("chk wP","Hchk","wP")+fmt("tabfull wP","Htabfull","wP");
+  for(const char* g:{"Hpb8k","Hpb32k","Hpb49k","Hcell","Hslot150","Hnoprobe"})c+=fmt(string(g+1)+" wDA",g,"wDA");
+  for(const char* g:{"Hev1k","Hev4k","Hev8k"})c+=fmt(string(g+1)+" wPDA",g,"wPDA");
+  {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
+   row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
+  // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
+  {string all;for(auto& r:results){auto g=[&](const char* k){auto it=r.t.find(k);return it==r.t.end()?0.0:it->second*1e3;};char one[96];
+    snprintf(one,sizeof one,"%s:%.0f/%.0f/%.0f/%.0f ",r.label.c_str(),r.wall*1e3,g("PARSE"),g("DEDUP"),g("AGGREGATE"));all+=one;}
+   row("all runs w/P/D/A",all,0,0,0,0);}
   PqFile f;
   f.open(fs::path(outdir)/"campaign_daily"/"part-00099.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
    {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});

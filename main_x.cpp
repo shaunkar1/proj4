@@ -12,6 +12,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <cstddef>
 #include <climits>
 #include <cerrno>
 #include <cstdio>
@@ -200,6 +201,15 @@ static Mapped map_file(const fs::path& path){
 // followed by at least one page of zeros (as in map_file). One mmap per file instead of two, and the
 // whole folder can be unmapped later in a few large pieces.
 struct FileGroup{char* base=nullptr;size_t len=0;vector<size_t> ends;}; // ends: offset just past each mapped file's slot
+// Measuring switch SS_INPUT for how the pages of the event/click/link files get into the page table
+// (default: on first touch, with the kernel's fault-around):
+//   populate  the whole file when it is mapped (MAP_POPULATE; serial, in the MAP stage)
+//   seq       as default plus MADV_SEQUENTIAL
+//   chunk     each 2 MB chunk in one call right before the thread parses it (MADV_POPULATE_READ, Linux 5.14+)
+static int optInput=0;
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
 static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
  vector<size_t> lens(paths.size(),0);size_t total=0;
  for(size_t i=0;i<paths.size();++i){
@@ -216,10 +226,11 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
   if(!lens[i])continue;
   int fd=open(paths[i].c_str(),O_RDONLY);
   if(fd<0)throw runtime_error("Cannot open "+paths[i].string());
-  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
+  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED|(optInput==1?MAP_POPULATE:0),fd,0);
   close(fd);
   if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
   if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
+  if(optInput==2)madvise(got,lens[i],MADV_SEQUENTIAL);
   out[i]={g.base+off,lens[i]};
   off+=((lens[i]+4095)&~size_t(4095))+4096;g.ends.push_back(off);
  }
@@ -378,6 +389,11 @@ struct HugePool{
  void* take(size_t bytes){
   bytes=(bytes+63)&~size_t(63);
   if((size_t)(lim-cur)<bytes)grow(bytes);
+  void* r=cur;cur+=bytes;return r;
+ }
+ void* take_page(size_t bytes){ // a multiple of 4096 bytes, starting at a 4096-byte boundary
+  cur=(char*)(((uintptr_t)cur+4095)&~(uintptr_t)4095);
+  if(cur>lim||(size_t)(lim-cur)<bytes)grow(bytes); // regions start 2 MB aligned
   void* r=cur;cur+=bytes;return r;
  }
 };
@@ -752,19 +768,24 @@ template<class T> struct Scratch{
  void reserve(size_t n){if(n>cap){cap=n;p=(T*)pool->take(cap*sizeof(T));}}
  T* get(size_t n){if(n>cap)reserve(n+n/4+64);return p;}
 };
-// Append-only list of fixed-size blocks: nothing is ever copied when it grows, and an element's address stays valid.
+// Append-only list of 4096-byte blocks at 4096-byte boundaries: nothing is ever copied when it grows,
+// an element's address stays valid, and (block count at the time, index in the block) names an element.
 template<class T,size_t BYTES> struct Blocks{
  static constexpr size_t PER=(BYTES-16)/sizeof(T);
- struct Block{Block* next;size_t pad;T items[PER];};
+ struct Block{Block* next;Block* prev;T items[PER];};
+ static_assert(BYTES==4096&&sizeof(Block)<=BYTES&&PER<256);
  T* cur=nullptr;T* end=nullptr;Block* head=nullptr;Block* tail=nullptr;size_t nblocks=0;
  __attribute__((noinline,cold)) void grow(HugePool& pool){
-  Block* b=(Block*)pool.take(sizeof(Block));
-  b->next=nullptr;if(tail)tail->next=b;else head=b;
+  Block* b=(Block*)pool.take_page(BYTES);
+  b->next=nullptr;b->prev=tail;if(tail)tail->next=b;else head=b;
   tail=b;++nblocks;cur=b->items;end=b->items+PER;
  }
  T* slot(HugePool& pool){if(cur==end)grow(pool);return cur++;} // the place for the next element
  size_t size()const{return nblocks?(nblocks-1)*PER+(size_t)(cur-tail->items):0;}
  size_t count(const Block* b)const{return b==tail?(size_t)(cur-b->items):PER;}
+ // 32-bit name of the element just returned by slot(), and the way back from it.
+ uint32_t mark(const T* p)const{return (uint32_t)(nblocks<<8)|(uint32_t)((((uintptr_t)p&(BYTES-1))-16)/sizeof(T));}
+ T* at_mark(uint32_t m)const{Block* b=tail;for(size_t k=nblocks-(m>>8);k;--k)b=b->prev;return &b->items[m&255];}
 };
 using EvList=Blocks<Ev,4096>;using ClickList=Blocks<Click,4096>;
 struct alignas(64) ThreadState{
@@ -773,7 +794,7 @@ struct alignas(64) ThreadState{
  vector<Bucket<PRec>> eb;vector<Bucket<CRec>> cb; // parsed lines by event/click ID hash
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
 };
-static size_t gPer=32768,gCap=2048,gUPer=16384;static long gPfw=0,gPfe=0;
+static size_t gPer=32768,gCap=2048;
 static size_t pow2_parts(uint64_t est){size_t p=1;while(p<gCap&&p*gPer<est)p<<=1;return p;}
 struct Camp{string id,channel;};
 struct Totals{uint64_t sessions=0,purchasing_sessions=0,revenue=0,assists=0;};
@@ -988,6 +1009,49 @@ SS_V3I bool ts_v3(const char* p,unsigned n,DateMemo3* memo,int64_t& out){
  }
  return parse_ts(string_view(p,n),out);
 }
+// Two experiments for the branch predictor, off by default (compile with -DSS_TS_SELECT / -DSS_KIND_ARITH).
+// Simulated on dev (callgrind --branch-sim): SS_TS_SELECT removes 0.49 mispredicts per event line for 54
+// more instructions, SS_KIND_ARITH 0.14 for 8.5; on the development machine both measured equal or slower.
+// The same answer as ts_v3, organised for the branch predictor: which form a ts has (F1, epoch
+// milliseconds, F2) changes from line to line with no pattern, so the two common forms are both worked
+// out without a branch and one is selected; only what is neither (F2, other lengths, a date not in the
+// memo yet, bad text) takes a branch, to ts_v3, which decides everything.
+SS_V3I bool ts_v3b(const char* p,unsigned n,DateMemo3* memo,int64_t& out){
+ // F1: time of day and memo lookup, valid or not
+ const __m128i x=_mm_loadu_si128((const __m128i*)(p+3));
+ const __m128i tmpl=_mm_setr_epi8(0,0,0,0,0,0,0,'T','0','0',':','0','0',':','0','0');
+ const __m128i lim=_mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,0,2,9,0,5,9,0,5,9);
+ const __m128i v=_mm_sub_epi8(x,tmpl);
+ const unsigned shape=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(v,lim),lim));
+ const __m128i sm=_mm_madd_epi16(_mm_maddubs_epi16(v,_mm_setr_epi8(0,0,0,0,0,0,0,0,10,1,0,10,1,0,10,1)),_mm_setr_epi16(0,0,0,0,3600,60,60,1));
+ const uint64_t r=(uint64_t)_mm_extract_epi64(sm,1);
+ const uint64_t tod=((uint64_t)(uint32_t)r+(r>>32))*1000u; // exact whenever shape is all ones (see tod_v3); otherwise unused
+ uint64_t k;uint16_t cc;memcpy(&k,p+2,8);memcpy(&cc,p,2);
+ const DateMemo3& e=memo[((k&0x0F03000F01000000ULL)*((1ULL<<4)|(1ULL<<22)|(1ULL<<34)))>>52];
+ const uint64_t dayms=(uint64_t)e.ms; // read whether or not it is the right entry
+ // all-ones if the text is a valid F1 stamp whose date the memo knows, else zero (plain arithmetic, so it stays branch-free)
+ const uint64_t f1=0-(uint64_t)((unsigned)(n==20)&(unsigned)(p[19]=='Z')&(unsigned)(shape==0xFFFFu)&(unsigned)(tod<86400000ULL)&(unsigned)(e.k==k)&(unsigned)(e.cc==cc));
+ // epoch milliseconds: thirteen digits
+ const __m128i d=_mm_sub_epi8(_mm_loadu_si128((const __m128i*)p),_mm_set1_epi8('0'));
+ const __m128i dlim=_mm_setr_epi8(9,9,9,9,9,9,9,9,9,9,9,9,9,-1,-1,-1);
+ const unsigned digits=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(d,dlim),dlim));
+ const __m128i a=_mm_maddubs_epi16(d,_mm_setr_epi8(10,1,10,1,10,1,10,1,10,1,10,1,1,0,0,0));
+ const __m128i b=_mm_madd_epi16(a,_mm_setr_epi16(100,1,100,1,100,1,1,0));
+ const __m128i c=_mm_packus_epi32(b,b);
+ const uint64_t q=(uint64_t)_mm_cvtsi128_si64(_mm_madd_epi16(c,_mm_setr_epi16(10000,1,10,1,0,0,0,0)));
+ const int64_t epoch=(int64_t)((q&0xFFFFFFFFULL)*100000ULL+(q>>32)); // exact whenever digits is all ones (see epoch13_v3)
+ const uint64_t f3=0-(uint64_t)((unsigned)(n==13)&(unsigned)(digits==0xFFFFu));
+ out=(int64_t)(((dayms+tod)&f1)|((uint64_t)epoch&~f1));
+ if(__builtin_expect((f1|f3)!=0,1))return true;
+ return ts_v3(p,n,memo,out);
+}
+// event_kind() with the view/cart choice as arithmetic: which of the two a line is has no pattern,
+// while "four letters" is almost always true and predicts well.
+static inline __attribute__((always_inline)) unsigned event_kind_b(const char* p,unsigned n){
+ if(__builtin_expect(n==4,1)){uint32_t w;memcpy(&w,p,4);return (unsigned)(w==0x77656976u)+2u*(unsigned)(w==0x74726163u);}
+ if(n==8){uint64_t w;memcpy(&w,p,8);return w==0x6573616863727570ULL?3u:0u;}
+ return 0;
+}
 // hkey() of the n bytes at p, without the loop for the usual short IDs.
 // HKEY_START[n] is hkey's starting value for length n.
 static constexpr array<uint64_t,16> HKEY_START=[]{array<uint64_t,16> a{};for(uint64_t n=0;n<16;++n)a[n]=0x9e3779b97f4a7c15ULL^(n*0xbf58476d1ce4e5b9ULL);return a;}();
@@ -1130,16 +1194,26 @@ template<class GEN> SS_V3I const char* event_line_v3(const char* const p,const c
    const bool has5=(_blsi_u64(B2)&E2)==0;
    const char* const s1=p+b1;const char* const s2=p+b2;
    const uint64_t h=hkey_v3(s0,l0);
+#ifdef SS_KIND_ARITH
+   const unsigned kind=event_kind_b(b+b4,l4);
+#else
    const unsigned kind=event_kind(string_view(b+b4,l4));
+#endif
    uint64_t k=0;unsigned cat=0; // k stays 0 unless the line is a valid event
    if(kind&&l1!=0&&has5){
     int64_t ts;bool tsOk;
-    uint64_t a8,b8;uint16_t a2,b2_;
-    // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
-    if(l2==20&&s2[19]=='Z'&&(memcpy(&a8,s2,8),memcpy(&b8,s3,8),memcpy(&a2,s2+8,2),memcpy(&b2_,s3+8,2),((a8^b8)|(uint64_t)(a2^b2_))==0)){
-     const int64_t tod2=tod_v3(s2);
-     if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
-    }else tsOk=ts_v3(s2,l2,memo,ts);
+#ifdef SS_TS_SELECT
+    tsOk=ts_v3b(s2,l2,memo,ts);
+#else
+    {
+     uint64_t a8,b8;uint16_t a2,b2_;
+     // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
+     if(l2==20&&s2[19]=='Z'&&(memcpy(&a8,s2,8),memcpy(&b8,s3,8),memcpy(&a2,s2+8,2),memcpy(&b2_,s3+8,2),((a8^b8)|(uint64_t)(a2^b2_))==0)){
+      const int64_t tod2=tod_v3(s2);
+      if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
+     }else tsOk=ts_v3(s2,l2,memo,ts);
+    }
+#endif
     // window_start <= ts < window_end as one unsigned compare (the window is far shorter than 2^63 ms)
     uint64_t tsrel;
     if(tsOk&&(tsrel=(uint64_t)ts-(uint64_t)wstart)<wlen&&ingest-ts<=DAY){
@@ -1165,7 +1239,6 @@ template<class GEN> SS_V3I const char* event_line_v3(const char* const p,const c
     __builtin_prefetch(&slots[j],0,1);
     PendUser<PRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.e;pu.k1=k1;
    }
-   if(gPfw&&((uintptr_t)vec.e&63)==0)__builtin_prefetch((const char*)vec.e+gPfw,1,3);
    vec.append(r);
    if(pp==pend+V3_BATCH){resolve_users(pend,pp,tab,tl);pp=pend;}
   }while(0);
@@ -1244,7 +1317,12 @@ template<class GEN> SS_V3I const char* click_line_v3(const char* const p,const W
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
    uint64_t trel;
-   if(!ts_v3(p+b3,l3,memo,ts)||(trel=(uint64_t)ts-(uint64_t)clickStart)>=wlen)break; // clickStart <= ts < window_end
+#ifdef SS_TS_SELECT
+   const bool tsOk=ts_v3b(p+b3,l3,memo,ts);
+#else
+   const bool tsOk=ts_v3(p+b3,l3,memo,ts);
+#endif
+   if(!tsOk||(trel=(uint64_t)ts-(uint64_t)clickStart)>=wlen)break; // clickStart <= ts < window_end
    uint64_t k0;uint32_t k1;
    const string_view camp(p+b2,l2);
    const uint32_t ci=__builtin_expect(KeyTable::pack(camp,k0,k1),1)?camps.find_packed(k0,k1):camps.find(camp);if(ci==KeyTable::NONE)break;
@@ -1256,7 +1334,6 @@ template<class GEN> SS_V3I const char* click_line_v3(const char* const p,const W
    Bucket<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
    if(__builtin_expect(vec.full(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record appended below stays put
    PendUser<CRec>& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.rec=vec.e;pu.k1=k1;
-   if(gPfw&&((uintptr_t)vec.e&63)==0)__builtin_prefetch((const char*)vec.e+gPfw,1,3);
    vec.append(r);
    if(pp==pend+V3_BATCH){resolve_users(pend,pp,tab,tl);pp=pend;}
   }while(0);
@@ -1302,9 +1379,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  double __cpu0=__cpu_now();
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;}};
- if(const char* v=getenv("SS_PER"))gPer=strtoull(v,nullptr,10);if(const char* v=getenv("SS_CAP"))gCap=strtoull(v,nullptr,10);if(const char* v=getenv("SS_UPER"))gUPer=strtoull(v,nullptr,10);
- if(const char* v=getenv("SS_PFW"))gPfw=atol(v);if(const char* v=getenv("SS_PFE"))gPfe=atol(v);
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
+ if(const char* v=getenv("SS_INPUT")){const string_view w(v);optInput=w=="populate"?1:w=="seq"?2:w=="chunk"?3:0;}
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
@@ -1331,6 +1407,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
+ if(const char* v=getenv("SS_PER"))gPer=strtoull(v,nullptr,10);if(const char* v=getenv("SS_CAP"))gCap=strtoull(v,nullptr,10);
  __mark("MAP");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0;
@@ -1532,7 +1609,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   else if(w=="avx512y"&&hasV5)isaUse=ISA_AVX512Y;}
  // SS_LINES=index: the vector loops locate line starts ahead of cutting the lines (see SS_EVENT_LOOP_IX).
  const bool lineIndex=isaUse!=ISA_SSE2&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="index";
- cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")<<"\n";
+ cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
+#ifdef SS_TS_SELECT
+  <<"+tsselect"
+#endif
+#ifdef SS_KIND_ARITH
+  <<"+kindarith"
+#endif
+  <<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -1595,6 +1679,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
+   if(optInput==3){ // files start on a page boundary, so chunk offsets are page offsets
+    const size_t a=ck.from&~size_t(4095),b=min(ck.to,ck.len);
+    if(b>a)madvise((void*)(ck.base+a),(b-a+4095)&~size_t(4095),MADV_POPULATE_READ); // only a hint: any failure is ignored
+   }
    if(lineIndex){
     if(isaUse==ISA_AVX2){
      if(ck.click)clicks_avx2_ix(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);
@@ -1675,7 +1763,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
  for(size_t p=0;p<PC;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].cb.size())n+=tls[t].cb[p].size();parsedClicks+=n;maxClBucket=max(maxClBucket,n);}
  unsigned pshift=0;
- {const uint64_t want=max<uint64_t>(1,parsedEvents/gUPer);while(pshift<16&&(npersons>>pshift)>want)++pshift;}
+ // SS_PERSONBUCKET: events per person bucket to aim for (measuring switch; the last stage sorts one
+ // bucket at a time in two buffers of 16 bytes per event, so this sets its working set).
+ static const uint64_t perBucket=[]{const char* v=getenv("SS_PERSONBUCKET");const long long x=v?atoll(v):16384;return (uint64_t)(x<256?256:x>(1<<24)?(1<<24):x);}();
+ {const uint64_t want=max<uint64_t>(1,parsedEvents/perBucket);while(pshift<16&&(npersons>>pshift)>want)++pshift;}
  if(const char* v=getenv("SS_TEST_PSHIFT")){int s=atoi(v);if(s>=0&&s<=16)pshift=(unsigned)s;} // tests force odd bucket widths
  const uint32_t W=1u<<pshift;
  const size_t UPn=(size_t)((npersons?npersons-1:0)>>pshift)+1;
@@ -1684,9 +1775,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  vector<Survivors> surv(T);
  // One region per thread should hold its share of the survivors plus its dedup tables; a thread that
  // does more than its share continues in smaller regions.
- const size_t slotCap=2*max(maxEvBucket,maxClBucket)+2;
+ // Measuring switches for the dedup stage.
+ static const bool simdProbe=!getenv("SS_NOSIMDPROBE"); // first probe of eight slots at once
+ static const size_t slotPct=[]{const char* v=getenv("SS_SLOTPCT");const long x=v?atol(v):200;return (size_t)(x<110?110:x>800?800:x);}(); // table slots per 100 records
+ static const size_t pfe=[]{const char* v=getenv("SS_PFE");const long x=v?atol(v):128;return (size_t)(x<0?0:x>4096?4096:x);}(); // write prefetch this many bytes ahead of each survivor list's tail (0: only the line being written)
+ const size_t slotCap=max(maxEvBucket,maxClBucket)*slotPct/100+2+4; // +4: the four-slot probe may read past the last slot
  for(int t=0;t<T;++t){surv[t].ev.resize(UPn);surv[t].cl.resize(UPn);tls[t].uev.clear();tls[t].ucl.clear();
-  surv[t].pool.first=(size_t)((parsedEvents*sizeof(Ev)+parsedClicks*sizeof(Click))/(uint64_t)T*9/8)+slotCap*sizeof(uint32_t)+maxEvBucket*sizeof(Ev*)+(size_t(2)<<20);
+  surv[t].pool.first=(size_t)((parsedEvents*sizeof(Ev)+parsedClicks*sizeof(Click))/(uint64_t)T*9/8)+slotCap*sizeof(uint32_t)+maxEvBucket*sizeof(uint32_t)+(size_t(2)<<20);
   surv[t].pool.next=max<size_t>(size_t(8)<<20,surv[t].pool.first/4);}
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
@@ -1697,7 +1792,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();HugePool& pool=surv[tid].pool;
   // Slot = tag<<ib | (record number+1), 0 = empty; ib bits are enough for the bucket's record count.
   // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
-  Scratch<uint32_t> slotBuf;Scratch<Ev*> emitBuf;vector<size_t> off(T+1);
+  Scratch<uint32_t> slotBuf,emitBuf;vector<size_t> off(T+1);
   slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);emitBuf.reserve(maxEvBucket);
   auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
   // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
@@ -1708,10 +1803,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=bucket_size(tls[t].eb,p);}off[T]=n;
    if(!n)continue;
    if(n>=0x7fffffffu){fprintf(stderr,"ERROR event ID bucket too large\n");_exit(1);}
-   const size_t cap=2*n+2;
-   uint32_t* const S=slotBuf.get(cap);memset(S,0,cap*sizeof(uint32_t));
-   Ev** const emitted=emitBuf.get(n); // where record g's event went (only read for valid winners)
+   const size_t cap=n*slotPct/100+2;
+   uint32_t* const S=slotBuf.get(cap+4);memset(S,0,cap*sizeof(uint32_t));memset(S+cap,0xff,4*sizeof(uint32_t)); // the pad is never empty
+   uint32_t* const emitted=emitBuf.get(n); // where record g's event went: its list mark (only read for valid winners)
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
+   const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
    size_t dups=0,dead=0;
    for(int t=0;t<T;++t){
     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
@@ -1721,7 +1817,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
      const uint32_t tg=((((uint32_t)r->hx|(hl<<16))&tagKeep)<<ib);
      size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
-     for(uint32_t e;(e=S[j])!=0;){
+     // First look at four slots at once: which are empty, and which carry this record's tag? Almost
+     // always the first empty one comes before any such tag, and the record goes there without a
+     // data-dependent loop. Everything else (and a run into the never-empty pad) goes slot by slot.
+     unsigned mz=0,mt=1;
+     if(simdProbe){
+      const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
+      mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
+      mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
+     }
+     const unsigned any=mz|mt; // quick if the lowest slot that is empty or carries the tag is an empty one
+     if(__builtin_expect(((any&(0u-any))&mz)!=0,1))j+=(unsigned)__builtin_ctz(mz);
+     else for(uint32_t e;(e=S[j])!=0;){
       if((e^tg)<=imask){ // same tag: compare the IDs themselves
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const PRec& o=tls[ot].eb[p][og-off[ot]];
@@ -1731,7 +1838,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
         const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi;
         if(notEarlier)goto next_event;
-        if(o.k){Ev* const gone=emitted[og];gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
+        if(o.k){uint32_t ou=o.user;if(ou&LOCAL_USER)ou=trans[ot][ou&~LOCAL_USER];
+         Ev* const gone=myEv[ou>>pshift].at_mark(emitted[og]);gone->person=((gone->person>>pshift)+1)<<pshift;++dead;}
         break;
        }
        ++stEvFalse; // same tag, other ID
@@ -1743,8 +1851,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       const uint64_t rk=r->k;
       if(rk){
        uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
-       Ev* const out=myEv[u>>pshift].slot(pool);if(gPfe&&((uintptr_t)out&63)==0)__builtin_prefetch((const char*)out+gPfe,1,3);
-       emitted[g1-1]=out;
+       EvList& L=myEv[u>>pshift];Ev* const out=L.slot(pool);
+       emitted[g1-1]=L.mark(out);
+       __builtin_prefetch((const char*)out+pfe,1,3); // every time: testing for a new cache line would be an unpredictable branch
        out->k=rk-PR_KBIAS; // otherwise already in its final form
        const uint64_t w=(uint64_t)u|((uint64_t)r->cat<<32);memcpy((void*)&out->person,&w,8);
       }
@@ -1765,16 +1874,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=bucket_size(tls[t].cb,p);}off[T]=n;
    if(!n)continue;
    if(n>=0x7fffffffu){fprintf(stderr,"ERROR click ID bucket too large\n");_exit(1);}
-   const size_t cap=2*n+2;
-   uint32_t* const S=slotBuf.get(cap);memset(S,0,cap*sizeof(uint32_t));
+   const size_t cap=n*slotPct/100+2;
+   uint32_t* const S=slotBuf.get(cap+4);memset(S,0,cap*sizeof(uint32_t));memset(S+cap,0xff,4*sizeof(uint32_t));
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
+   const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
    for(int t=0;t<T;++t){
     const size_t m=bucket_size(tls[t].cb,p);if(!m)continue;
     const CRec* r=tls[t].cb[p].data();const CRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;const uint32_t* const tr=trans[t].data();
     for(;r!=rend;++r,++g1){
      const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
      size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
-     for(uint32_t e;(e=S[j])!=0;){
+     unsigned mz=0,mt=1; // four slots at once, as for events
+     if(simdProbe){
+      const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
+      mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
+      mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
+     }
+     const unsigned any=mz|mt; // quick if the lowest slot that is empty or carries the tag is an empty one
+     if(__builtin_expect(((any&(0u-any))&mz)!=0,1))j+=(unsigned)__builtin_ctz(mz);
+     else for(uint32_t e;(e=S[j])!=0;){
       if((e^tg)<=imask){
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const CRec& o=tls[ot].cb[p][og-off[ot]];
@@ -1787,6 +1905,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       uint32_t u=r->user;if(u&LOCAL_USER)u=tr[u&~LOCAL_USER];
       Click* const out=myCl[u>>pshift].slot(pool);
+      __builtin_prefetch((const char*)out+pfe,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
      }
      next_click:;
@@ -1836,7 +1955,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  for(unsigned done=0;done<ccellBits||cpass.empty();){const unsigned b=min(digitBits,ccellBits-done);cpass.push_back({CCSH+done,(uint32_t)((1u<<b)-1)});done+=b;if(!b)break;}
  for(const Pass& q:cpass)maxDigit=max(maxDigit,q.mask);
  const size_t ncells=ncamp*(size_t)ndays;
- {const size_t need=ncells*(sizeof(Totals)+sizeof(uint64_t))+2*maxEvPerson*sizeof(Ev)+2*maxClPerson*sizeof(Click)+(size_t(50000)+(size_t)ndays)*48+(size_t(4)<<20);
+ {const size_t need=ncells*(sizeof(Totals)+sizeof(uint64_t))+2*maxEvPerson*sizeof(Ev)+2*maxClPerson*sizeof(Click)+(maxEvPerson+1)*24+(size_t(50000)+(size_t)ndays)*48+(size_t(4)<<20);
   for(int t=0;t<T;++t)surv[t].pool.next=max<size_t>(size_t(8)<<20,need);} // one more region per thread at most, unless names are very long
  vector<Totals*> threadTotals(T,nullptr);vector<uint64_t*> threadAssists(T,nullptr);vector<string> dbg(debugCsv?T:0);
  // sessions and events of one row can never exceed the number of parsed event lines, so they are written
@@ -1845,6 +1964,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const int countType=narrow?PQ_INT32:PQ_INT64;
  const vector<PqCol> userCols={{"user_id",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},{"sessions",countType,false,CONV_NONE},
   {"events",countType,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"top_category",PQ_BYTES,true,CONV_UTF8}};
+ static const size_t pfa=[]{const char* v=getenv("SS_PFA");const long x=v?atol(v):128;return (size_t)(x<0?0:x>4096?4096:x);}(); // write prefetch this many bytes ahead in the two event counting passes (0 = off; 128 measured ~1% faster overall on the scoring machine)
+ // Measuring switch, off by default: cut a person's events into cells in a separate pass without data-dependent
+ // branches. On dev it trades about 29 more instructions per event for 0.35 fewer mispredicted branches.
+ static const bool cellPass=getenv("SS_CELLPASS")!=nullptr;
  uint64_t num_sessions=0;
  // Input files nobody reads any more are unmapped by the worker threads, a few large pieces each,
  // instead of leaving every page of them to process exit, which tears mappings down on one thread.
@@ -1898,6 +2021,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   Scratch<Ev> bufA,bufB;Scratch<Click> bufC,bufD;
   bufA.pool=bufB.pool=&pool;bufC.pool=bufD.pool=&pool;
   bufA.reserve(maxEvPerson);bufB.reserve(maxEvPerson);bufC.reserve(maxClPerson);bufD.reserve(maxClPerson);
+  // One person's cells: earliest and latest key, the OR of the keys' low halves (purchase flag), and where the cell ends.
+  struct Cell{uint64_t mn,mx;uint32_t anyLo,end;};
+  static_assert(sizeof(Cell)==24&&offsetof(Cell,end)==offsetof(Cell,anyLo)+4);
+  Scratch<Cell> cellBuf;cellBuf.pool=&pool;if(cellPass)cellBuf.reserve(maxEvPerson+2);
+  Cell* const cells=cellBuf.p;
   vector<uint32_t> thist((size_t)maxDigit+2),phist((size_t)W+3),chist((size_t)W+2);
   uint32_t* const th=thist.data();uint32_t* const pp=phist.data();uint32_t* const cp=chist.data();
   #pragma omp for schedule(dynamic,1)
@@ -1925,6 +2053,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Ev* A=bufA.get(nE);Ev* B=bufB.get(nE);
    for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
     for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
+     if(pfa)for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));Ev* const d=A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+     else
      #pragma GCC unroll 4
      for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));_mm_storeu_si128((__m128i*)(A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++),e);}}}
    for(size_t q=1;q<tpass.size();++q){
@@ -1936,6 +2066,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     swap(A,B);
    }
    {uint32_t* const pq=pp+1;
+    if(pfa)for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));Ev* const d=B+pq[A[i].person-base]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+    else
     #pragma GCC unroll 4
     for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+pq[A[i].person-base]++),e);}}
    const Ev* const E=B;
@@ -1989,13 +2121,29 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const Click *add=cb,*expire=cb;
     int currentday=-1;uint64_t dsess=0,devs=0,drev=0;
     Totals* cur=nullptr;bool purchasing=false;uint64_t prevmax=0;
+    // Cells: events are ordered by cell, so a cell ends at the first key at or past its upper bound.
+    // With the cell pass the person's cells are first written out by a loop without data-dependent
+    // branches (every event updates the current cell's entry; a new cell just moves to the next entry).
+    const Cell* nextCell=cells+1; // entry 0 is a dummy the first event steps over
+    if(cellPass){
+     Cell* c=cells;uint64_t cellEnd=0,mn=0,mx=0,any=0;
+     for(size_t i=es;i<ee;++i){
+      const uint64_t x=E[i].k;const uint64_t nw=0-(uint64_t)(x>=cellEnd); // all ones if x starts a new cell
+      c=(Cell*)((char*)c+(nw&sizeof(Cell)));
+      cellEnd^=(cellEnd^(((x>>CSH)+1)<<CSH))&nw;
+      mn=min(mn|nw,x);mx=max(mx&~nw,x);any=(any&~nw)|x; // written with masks: a new cell must not be a branch
+      c->mn=mn;c->mx=mx;const uint64_t tail=(uint64_t)(uint32_t)any|((uint64_t)(i+1)<<32);memcpy((void*)&c->anyLo,&tail,8); // anyLo and end in one store
+     }
+    }
     for(size_t a=es;;){
-     // One cell: earliest and latest time, and whether it holds a purchase. Events are ordered by cell,
-     // so the cell ends at the first key at or past its upper bound.
+     // One cell: earliest and latest time, and whether it holds a purchase.
      uint64_t mn=0,mx=0,any=0;size_t b=a;bool fresh=false;int d=currentday;
      if(a<ee){
-      mn=E[a].k;mx=mn;any=mn;const uint64_t cellEnd=((mn>>CSH)+1)<<CSH;
-      for(b=a+1;b<ee;++b){const uint64_t x=E[b].k;if(x>=cellEnd)break;mn=min(mn,x);mx=max(mx,x);any|=x;}
+      if(cellPass){mn=nextCell->mn;mx=nextCell->mx;any=nextCell->anyLo;b=nextCell->end;++nextCell;}
+      else{
+       mn=E[a].k;mx=mn;any=mn;const uint64_t cellEnd=((mn>>CSH)+1)<<CSH;
+       for(b=a+1;b<ee;++b){const uint64_t x=E[b].k;if(x>=cellEnd)break;mn=min(mn,x);mx=max(mx,x);any|=x;}
+      }
       // A session starts with this cell if it is the person's first or the gap to the previous cell is too long.
       // Its day is the UTC date of its first event.
       if(!cur||(mn>>EV_TS)-prevmax>(uint64_t)GAP){fresh=true;d=(int)(((mn>>EV_TS)+dayOff)/(uint64_t)DAY);}
