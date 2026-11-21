@@ -178,6 +178,7 @@ struct KeyTable{
   size_t c=1024;while(c<want)c<<=1;
   void* mem=mmap(nullptr,c*sizeof(Slot),PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); // zero pages, touched lazily
   if(mem==MAP_FAILED)throw bad_alloc();
+  madvise(mem,c*sizeof(Slot),MADV_HUGEPAGE); // fewer page faults and TLB misses where the kernel allows it
   slots=(Slot*)mem;cap=c;mask=c-1;
  }
  static bool pack(string_view s,uint64_t& k0,uint32_t& k1){
@@ -273,22 +274,6 @@ struct KeyTable{
 struct SmallTable{
  unordered_map<string_view,uint32_t> m;vector<string_view> keys;
  uint32_t intern(string_view s){auto [it,isnew]=m.try_emplace(s,(uint32_t)keys.size());if(isnew)keys.push_back(s);return it->second;}
-};
-struct IdGraph{
- KeyTable tab;
- explicit IdGraph(size_t slotsWanted):tab(slotsWanted){}
- vector<uint32_t> parent,sz;
- vector<string_view> names; // at a root: byte-wise smallest ID of the person
- uint32_t intern(string_view s){uint32_t n=(uint32_t)parent.size();
-  if(n>=0x7ffffff0u)throw runtime_error("Too many IDs");
-  uint32_t id=tab.intern(s,n);
-  if(id==n){parent.push_back(n);sz.push_back(1);names.push_back(s);}return id;
- }
- uint32_t find(uint32_t x){uint32_t y=x;while(parent[y]!=y)y=parent[y];while(parent[x]!=x){auto z=parent[x];parent[x]=y;x=z;}return y;}
- void link(string_view a,string_view b){uint32_t x=find(intern(a)),y=find(intern(b));if(x==y)return;
-  if(sz[x]<sz[y])swap(x,y);
-  parent[y]=x;sz[x]+=sz[y];if(names[y]<names[x])names[x]=names[y];
- }
 };
 static constexpr uint8_t F_VALID=1,F_PURCHASE=2,F_DEAD=4;
 static constexpr uint32_t LOCAL_USER=0x80000000u;
@@ -426,23 +411,76 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  add_files(data/"events",false,eventBytes);
  add_files(data/"clicks",true,clickBytes);
  __mark("MAP");
- // Size the shared ID table once: linked IDs plus room for IDs that only appear in events and clicks.
- uint64_t linkBytes=0;const auto linkFiles=csv_files(data/"links");
- for(const auto& p:linkFiles)linkBytes+=fs::file_size(p);
- uint64_t maxNew64=(eventBytes/70+clickBytes/35)/12+4096;
+ // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
+ vector<Chunk> linkChunks;uint64_t linkLines=0;
+ for(const auto& p:csv_files(data/"links")){Mapped m=map_file(p);if(!m.len)continue;
+  linkLines+=(uint64_t)count(m.base,m.base+m.len,'\n')+1;
+  for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+ const uint64_t maxLinked=2*linkLines; // every link line names at most two IDs
+ uint64_t maxNew64=(eventBytes/70+clickBytes/35)/12+4096; // room for IDs that only appear in events and clicks
  if(const char* v=getenv("SS_TEST_MAXNEW"))maxNew64=strtoull(v,nullptr,10); // tests force the fallback path with a tiny value
- if(maxNew64>0x30000000u)maxNew64=0x30000000u;
- const uint32_t maxNew=(uint32_t)maxNew64;
- IdGraph graph((size_t)(linkBytes/8+maxNew)*2);
- for(const auto& p:linkFiles)read_lines(p,[&](string_view line){string_view f[2];if(fields(line,2,f)&&!f[0].empty()&&!f[1].empty())graph.link(f[0],f[1]);});
+ if(maxLinked+maxNew64>=0x60000000u)throw runtime_error("Too many IDs");
+ const uint32_t maxIds=(uint32_t)(maxLinked+maxNew64);
+ KeyTable tab((size_t)maxIds*2);
+ tab.begin_parallel(0,maxIds);
+ // parent[x] <= x always (a root links to a smaller root), so the forest can never form a cycle.
+ unique_ptr<atomic<uint32_t>[]> parent(new atomic<uint32_t>[maxLinked+1]);
+ auto find_root=[&](uint32_t u)->uint32_t{
+  for(;;){
+   uint32_t p=parent[u].load(memory_order_relaxed);if(p==u)return u;
+   uint32_t gp=parent[p].load(memory_order_relaxed);if(gp==p)return p;
+   parent[u].compare_exchange_weak(p,gp); // path halving; losing the race is harmless
+   u=gp;
+  }
+ };
+ atomic<size_t> nextLink{0};
+ #pragma omp parallel num_threads(T)
+ {
+  #pragma omp for schedule(static)
+  for(uint64_t i=0;i<maxLinked;++i)parent[i].store((uint32_t)i,memory_order_relaxed);
+  for(;;){
+   size_t c=nextLink.fetch_add(1,memory_order_relaxed);if(c>=linkChunks.size())break;
+   const Chunk& ck=linkChunks[c];
+   for_lines(ck.base,ck.len,ck.from,ck.to,[&](string_view line){
+    string_view f[2];if(!fields(line,2,f)||f[0].empty()||f[1].empty())return;
+    uint32_t a=tab.find_or_add(f[0]),b=tab.find_or_add(f[1]); // cannot be full: the table holds 2 IDs per link line
+    for(;;){
+     a=find_root(a);b=find_root(b);if(a==b)return;
+     if(a<b)swap(a,b);
+     uint32_t expect=a;if(parent[a].compare_exchange_strong(expect,b))return;
+    }
+   });
+  }
+ }
+ const uint32_t nlinked=tab.nextId.load();
  __mark("LINKREAD");
- // Flatten: after this the table maps a linked ID straight to its person.
- const uint32_t nlinked=(uint32_t)graph.parent.size();
- {vector<uint32_t> root(nlinked);for(uint32_t i=0;i<nlinked;++i)root[i]=graph.find(i);
-  graph.tab.remap([&](uint32_t v){return root[v];});}
+ // Flatten, then name each person by the byte-wise smallest of their IDs.
+ vector<uint32_t> root(nlinked);
+ {
+  string_view* names=tab.newNames;
+  unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[(size_t)nlinked+1]);
+  #pragma omp parallel num_threads(T)
+  {
+   #pragma omp for schedule(static)
+   for(uint32_t i=0;i<nlinked;++i){root[i]=find_root(i);best[i].store(i,memory_order_relaxed);}
+   #pragma omp for schedule(static)
+   for(uint32_t i=0;i<nlinked;++i){
+    const uint32_t r=root[i];if(r==i)continue;
+    uint32_t cur=best[r].load();
+    while(names[i]<names[cur]&&!best[r].compare_exchange_weak(cur,i)){}
+   }
+   // A root's own name is no longer needed once every member has been compared, and no other person reads it.
+   #pragma omp for schedule(static)
+   for(uint32_t i=0;i<nlinked;++i)if(root[i]==i)names[i]=names[best[i].load()];
+   // The table now maps a linked ID straight to its person.
+   #pragma omp for schedule(static)
+   for(size_t j=0;j<tab.cap;++j){auto& e=tab.slots[j];uint32_t c=e.k1.load(memory_order_relaxed);
+    if(c&&c!=KeyTable::LONGK){uint32_t v=e.v.load(memory_order_relaxed);if(v<nlinked)e.v.store(root[v],memory_order_relaxed);}}
+  }
+  for(auto& l:tab.longs)if(l.v<nlinked)l.v=root[l.v];
+ }
+ vector<uint32_t>().swap(root);
  __mark("FLATTEN");
- if((uint64_t)nlinked+maxNew>=0x70000000u)throw runtime_error("Too many IDs");
- graph.tab.begin_parallel(nlinked,maxNew);
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
  cat_id("unknown",categories,catnames);
@@ -465,7 +503,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   {size_t r=(size_t)(eventBytes/70/((uint64_t)T*PE)*5/4)+16;for(auto& v:tl.eb)v.reserve(r);}
   {size_t r=(size_t)(clickBytes/40/((uint64_t)T*PC)*5/4)+16;for(auto& v:tl.cb)v.reserve(r);}
   auto user_of=[&](string_view u)->uint32_t{
-   uint32_t g=graph.tab.find_or_add(u);
+   uint32_t g=tab.find_or_add(u);
    if(g!=KeyTable::NONE)return g;
    return LOCAL_USER|tl.users.intern(u);
   };
@@ -500,26 +538,26 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    else for_lines(ck.base,ck.len,ck.from,ck.to,on_event);
   }
  }
- const uint32_t newCount=graph.tab.end_parallel();
+ const uint32_t totalIds=tab.end_parallel();
  __mark("PARSE");
  // ---- Fallback only: IDs that did not fit in the shared table get their person number here. ----
  vector<vector<uint32_t>> trans(T);vector<string_view> extraNames;
- const uint32_t extraBase=nlinked+maxNew;
+ const uint32_t extraBase=maxIds;
  for(int t=0;t<T;++t){auto& keys=tls[t].users.keys;trans[t].resize(keys.size());
   for(size_t i=0;i<keys.size();++i){
    if(extraNames.size()>=0x08000000u)throw runtime_error("Too many IDs");
    uint32_t n=extraBase+(uint32_t)extraNames.size();
-   uint32_t id=graph.tab.intern(keys[i],n);
+   uint32_t id=tab.intern(keys[i],n);
    if(id==n)extraNames.push_back(keys[i]);
    trans[t][i]=id;
   }
  }
- const string_view* newNames=graph.tab.newNames;
+ const string_view* personNames=tab.newNames;
  auto name_of=[&](uint32_t person)->string_view{
-  if(person<nlinked)return graph.names[person];
-  if(person<extraBase)return newNames[person-nlinked];
+  if(person<extraBase)return personNames[person];
   return extraNames[person-extraBase];
  };
+ const uint32_t newCount=totalIds-nlinked;
  cerr<<"unlinked IDs: "<<newCount<<" (+"<<extraNames.size()<<" via fallback)\n";
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  auto person_bucket=[UP](uint32_t person)->size_t{return (size_t)(((uint64_t)(person*0x9E3779B1u)*UP)>>32);};
