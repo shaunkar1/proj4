@@ -452,6 +452,7 @@ int main(){
   c+="c58: "+fmt("stats w/us/sysMAP,PARSE,RESOLVE,DENSE,AGG/fltkMAP,PARSE/cpuP,R,X","S","wusiyhzgkjpqx")+fmt("| align+huge wPus","fa","wPus")+fmt("align smaps: pmdMB,fltkPARSE,sysPARSE","fs","ejy")
    +fmt("| bg4 wMPus","p4","wMPus")+fmt("bg8 wMPus","p8","wMPus")+fmt("all wMPus sysMAP,PARSE","pa","wMPusiy")+fmt("ahead wPus","ph","wPus")+fmt("random wPus","fr","wPus");
   c+="| 60x "+fmt("stats w/us/sysMAP,PARSE,RESOLVE,DENSE,AGG","HS","wusiyhzg")+fmt("align wPus","Hfa","wPus")+fmt("bg4 wPus","Hp4","wPus");
+  c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
