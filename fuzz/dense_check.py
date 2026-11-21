@@ -2,39 +2,33 @@
 """Checks the parse stage of the dense route (DENSE.md stage 3) with the SS_DENSE_DUMP text dumps.
 
 usage: dense_check.py CORE DATA_DIR WORK_DIR [K=V ...]      (K=V: extra environment for the dense runs,
-                                                             e.g. SS_TEST_LIME=5000 SS_DSHIFT=6)
+                                                             e.g. SS_TEST_LIME=5000 SS_TEST_COMPLEX=3)
 Runs CORE on DATA_DIR
-  A  with SS_NODENSE=1, SS_ISA=sse2, one thread            (the reference: every line through the general handlers)
-  B  with the dense switches on, SS_ISA=sse2, one thread
-  V  with the dense switches on, every vector ISA and sse2, one and three threads
-and checks
-  1. rows of B == rows of A as multisets of (event_id, ingest, k, cat, user ID text) and (click_id, key, user ID text);
-     A has no dense record and no dense user code
-  2. in B the route of every ID is the one an independent decoder (below) gives for its text: an event / click
-     ID takes the dense route iff it is letter + canonical base 36 with a counter below the limit; a user ID
-     gets a dense code iff it is canonical, alias < 8, index below the limit and the index is not complex;
-     no ID text appears on both routes
-  3. a dense user code regenerates the user ID text; a table number is the number the ID table has for the text
-  4. the records of B (texts rebuilt from the records alone) == the rows of B
-  5. the records of every V run == the records of B (multisets; table users are named by their person)
-Prints DENSE_PARSE_OK or the first differences and exits 1.
-Every run writes its dump into the same folder WORK_DIR/dump and is read before the next run overwrites it,
-so the scratch space is one dump (dev: about 130 MB), whatever the number of runs. WORK_DIR may be reused."""
+  A  with SS_NODENSE=1, SS_ISA=sse2, one thread: the reference. Its rows-*.txt hold every event / click line
+     that produces a record, with the raw ID texts, as the general handlers saw it.
+  R  with SS_DENSE_RECORDS=1 on every ISA with 1, 3 and 8 threads and several SS_DENSE_AHEAD values.
+From A and an independent decoder of the ID texts (below) the script works out what the parse stage must
+leave behind, and compares every run R with it:
+  1. event slots: exactly the dense event IDs of A are in use; each slot holds the copy with the smallest
+     ingest_ts (ingest, k, category, user), or "not a valid event" if that copy is not valid; no slot is busy
+  2. click slots: exactly the dense click IDs of A's valid clicks, with key and user of the click
+  3. bucket records (general route): the multiset of all other rows of A
+  4. users: a dense user code regenerates the user ID text, and exactly the texts the decoder calls dense
+     (canonical, alias < 8, index below the limit and not complex) have one; a table number is the number
+     the run's ID table has for the text
+An ID takes the dense route iff it is letter + canonical base 36 with a counter below the limit.
+IDs whose copies leave the result undefined (equal smallest ingest_ts but different content; clicks that
+differ) are counted and skipped.
+With SS_TEST_MAXNEW (full ID table) the users that are not dense are only checked for "not dense":
+which of them still got a table number depends on the order the threads met them.
+Every dense run writes its dump into WORK_DIR/dump and is read before the next run overwrites it;
+A's dump stays in WORK_DIR/dumpA. WORK_DIR may be reused. Prints DENSE_PARSE_OK or the first differences."""
 import os, subprocess, sys
 from collections import Counter
 
 core, data, work = sys.argv[1], sys.argv[2], sys.argv[3]
 extra = dict(a.split("=", 1) for a in sys.argv[4:])
 FALLBACK = "SS_TEST_MAXNEW" in extra
-LIGHT = os.environ.get("DC_LIGHT") == "1"   # big data: compare multisets by count and sum of line hashes (no listing of differences)
-
-class HashBag:
-    def __init__(self): self.n = 0; self.s = 0
-    def add(self, x): self.n += 1; self.s = (self.s + hash(x)) & ((1 << 64) - 1)
-    def __eq__(self, o): return self.n == o.n and self.s == o.s
-class ListBag(Counter):
-    def add(self, x): self[x] += 1
-Bag = HashBag if LIGHT else ListBag
 MASK = (1 << 40) - 1
 M1 = 0x9E3779B97F4B & MASK; M2 = 0xD6E8FEB86659 & MASK
 I1 = pow(M1, -1, 1 << 40); I2 = pow(M2, -1, 1 << 40)
@@ -62,12 +56,10 @@ def counter(text, letter, key):
     if v > MASK: return None
     return index_of(v, key)
 
-def run(name, env, threads):
-    global THREADS
-    THREADS = threads
-    out = os.path.join(work, "dump")
+def run(name, env, threads, sub="dump"):
+    out = os.path.join(work, sub)
     e = dict(os.environ); e.update(env)
-    for k in ("SS_NODENSE", "SS_DENSE_USERS", "SS_DENSE_RECORDS", "SS_ISA"):
+    for k in ("SS_NODENSE", "SS_DENSE_USERS", "SS_DENSE_RECORDS", "SS_ISA", "SS_DENSE_AHEAD"):
         if k not in env: e.pop(k, None)
     o = os.path.join(work, "out"); os.makedirs(o, exist_ok=True)
     e.update(DATA_DIR=data, OUTPUT_DIR=o, SCRATCH_DIR=o, NCPU=str(threads), SS_DENSE_DUMP=out, SS_STATS="1")
@@ -77,121 +69,125 @@ def run(name, env, threads):
     for line in p.stderr.decode("latin-1").split("\n"):
         if line.startswith("STATS dense keys"):
             w = line.split(); keys = [int(x) for x in w[3:6] + w[7:10]] + on
-        elif line.startswith("dense: events"):     # whether the keys were found at all (printed before the STATS line)
+        elif line.startswith("dense: events"):       # whether the keys were found at all (printed before the STATS line)
             w = line.split(); on = [int(w[2]), int(w[4])]
         elif line.startswith("dense parse: users"):  # what the parse stage really does (printed after the links stage)
             w = line.split(); sw = [int(w[3]), int(w[6]), int(w[9])]
     if keys: keys = keys + sw
     return out, keys
 
-def lines(d, kind):
-    for t in range(THREADS):     # only this run's files: an earlier run with more threads may have left others
+def lines(d, kind, threads):
+    for t in range(threads):     # only this run's files: an earlier run with more threads may have left others
         with open(os.path.join(d, "%s-%d.txt" % (kind, t)), "rb") as f:
             for ln in f: yield ln.rstrip(b"\n").split(b"\t")
 
 def users(d):
-    """ID table of a run: text -> number, number -> name of the person (its smallest text)."""
-    num, name = {}, {}
+    num = {}
     with open(os.path.join(d, "users.txt"), "rb") as f:
         for ln in f:
             n, t = ln.split()
             num[t] = n
-            if n not in name or t < name[n]: name[n] = t
-    return num, name
-
-def label(desc, name):
-    """What a record's user field stands for, in a form that does not depend on the run."""
-    # With SS_TEST_MAXNEW the table fills up and the remaining new users get thread-local numbers; which users
-    # still got a table number depends on the order the threads met them, so there both kinds are only "not dense".
-    if FALLBACK and desc[:2] in (b"T:", b"L:"): return b"TL"
-    if desc[:2] == b"T:": return b"T:" + name.get(desc[2:], b"?" + desc[2:])
-    if desc[:2] == b"L:": return b"L"
-    return desc
-
-def recs(d):
-    _, name = users(d)
-    c = Bag()
-    for f in lines(d, "recs"):
-        c.add(tuple(f[:-1]) + (label(f[-1], name),))
-    return c
+    return num
 
 def diff(what, a, b):
     if a == b: return
-    if LIGHT: fail("%s: %d lines vs %d lines, or other lines" % (what, a.n, b.n)); return
     only_a, only_b = a - b, b - a
     fail("%s: %d lines only in the first, %d only in the second" % (what, sum(only_a.values()), sum(only_b.values())))
     for x in list(only_a)[:3]: print("   first :", x)
     for x in list(only_b)[:3]: print("   second:", x)
 
-dense_env = dict(extra); dense_env.update(SS_DENSE_USERS="1", SS_DENSE_RECORDS="1")
-A, _ = run("A-nodense-sse2", {"SS_NODENSE": "1", "SS_ISA": "sse2"}, 1)
-rowsA, rowsB = Bag(), Bag()
-for f in lines(A, "rows"):
-    if f[1] != b"P": fail("dense record in the SS_NODENSE run: %r" % f)
-    if f[-1][:2] == b"U:": fail("dense user in the SS_NODENSE run: %r" % f)
-    rowsA.add((f[0],) + tuple(f[2:-1]))
-B, keys = run("B-dense-sse2", dict(dense_env, SS_ISA="sse2"), 1)
-if not keys: sys.exit("no 'STATS dense keys' line")
-KE, KU, KC, LIME, LIMC, LIMI, ON_E, ON_C, SW_U, SW_E, SW_C = keys
-if not (ON_E and SW_E): LIME = 0   # keys not found for a column, or its dense route not in use: nothing of it may take the dense route
-if not (ON_C and SW_C): LIMC = 0
-if not SW_U: LIMI = 0
-with open(os.path.join(B, "complex.txt")) as f: complex_idx = set(int(x) for x in f.read().split())
+dense_env = dict(extra); dense_env.update(SS_DENSE_RECORDS="1")
+A, _ = run("A-nodense-sse2", {"SS_NODENSE": "1", "SS_ISA": "sse2"}, 1, "dumpA")
+plan = [("sse2", 1, None), ("sse2", 3, None), ("avx2", 1, None), ("avx2", 3, None), ("avx2", 8, None), ("avx2", 3, "0"), ("avx2", 2, "16"),
+        ("avx512z", 1, None), ("avx512z", 3, "1"), ("avx512y", 1, None), ("avx512y", 3, None), ("sse2", 8, None)]
+if os.environ.get("DC_PLAN"):   # e.g. DC_PLAN=avx2:8:2,avx2:8:0
+    plan = [(a.split(":")[0], int(a.split(":")[1]), a.split(":")[2] if a.count(":") > 1 else None) for a in os.environ["DC_PLAN"].split(",")]
+keys = None; done = []
+for isa, threads, ahead in plan:
+    env = dict(dense_env, SS_ISA=isa)
+    if ahead is not None: env["SS_DENSE_AHEAD"] = ahead
+    name = "%s/%d%s" % (isa, threads, "" if ahead is None else "/ahead" + ahead)
+    R, k = run(name, env, threads)
+    if not k: sys.exit("no 'STATS dense keys' line")
+    if keys is None:
+        # ---- what the parse stage must leave behind, from the reference rows ----
+        keys = k
+        KE, KU, KC, LIME, LIMC, LIMI, ON_E, ON_C, SW_U, SW_E, SW_C = keys
+        if not (ON_E and SW_E): LIME = 0   # keys not found for a column, or its dense route not in use
+        if not (ON_C and SW_C): LIMC = 0
+        if not SW_U: LIMI = 0
+        exp_ev, exp_cl = {}, {}            # dense ID -> [ingest, k, cat, user text, undefined?] / [key, user text, undefined?]
+        gen_rows = []                      # rows of the general route: (E, id, ingest, k, cat, user text) / (C, id, key, user text)
+        nE = nC = 0
+        for f in lines(A, "rows", 1):
+            if f[1] != b"P" or f[-1][:2] == b"U:": fail("dense route in the SS_NODENSE run: %r" % f)
+            idt = bytes.fromhex(f[2].decode())
+            if f[0] == b"E":
+                nE += 1
+                c = counter(idt, 0x65, KE)
+                row = [int(f[3]), f[4], f[5], f[6], False]
+                if c is not None and c < LIME:
+                    e = exp_ev.get(f[2])
+                    if e is None or row[0] < e[0]: exp_ev[f[2]] = row     # (a smaller copy also clears an earlier tie)
+                    elif row[0] == e[0] and row[1:4] != e[1:4]: e[4] = True
+                else: gen_rows.append((b"E", f[2], f[3], f[4], f[5], f[6]))
+            else:
+                nC += 1
+                c = counter(idt, 0x6B, KC)
+                if c is not None and c < LIMC:
+                    e = exp_cl.get(f[2])
+                    if e is None: exp_cl[f[2]] = [f[3], f[4], False]
+                    elif e[0] != f[3] or e[1] != f[4]: e[2] = True
+                else: gen_rows.append((b"C", f[2], f[3], f[4]))
+        undefE = sum(1 for e in exp_ev.values() if e[4]); undefC = sum(1 for e in exp_cl.values() if e[2])
+    elif k != keys: fail("keys or switches differ in %s: %r vs %r" % (name, k, keys))
+    num = users(R)
+    with open(os.path.join(R, "complex.txt")) as f: complex_idx = set(int(x) for x in f.read().split())
+    ucache = {}
+    def user_label(utext):          # what a record's user field must show for this user ID text
+        r = ucache.get(utext)
+        if r is None:
+            c = counter(bytes.fromhex(utext.decode()), 0x75, KU)
+            if c is not None and (c & 511) < 8 and (c >> 9) < LIMI and (c >> 9) not in complex_idx: r = b"U:" + utext
+            else: r = b"TL" if FALLBACK else b"T:" + num.get(utext, b"?")
+            ucache[utext] = r
+        return r
+    def shown(desc):
+        if FALLBACK and desc[:2] in (b"T:", b"L:"): return b"TL"
+        return desc
+    # 1./2. the slots
+    seenE = seenC = 0
+    with open(os.path.join(R, "slots.txt"), "rb") as fh:
+        for ln in fh:
+            f = ln.rstrip(b"\n").split(b"\t")
+            if f[1] != b"D": fail("%s: slot left busy: %r" % (name, f)); continue
+            if f[0] == b"E":      # E D id ingest k cat user thread
+                seenE += 1; e = exp_ev.get(f[2])
+                if e is None: fail("%s: slot in use for an ID without a dense row: %r" % (name, f)); continue
+                if e[4]: continue
+                if int(f[3]) != e[0] or f[4] != e[1]: fail("%s: slot %r, expected ingest %d k %s" % (name, f, e[0], e[1].decode())); continue
+                if e[1] != b"0" and (f[5] != e[2] or shown(f[6]) != user_label(e[3])):
+                    fail("%s: slot %r, expected cat %s user %s" % (name, f, e[2].decode(), user_label(e[3]).decode()))
+            else:                 # C D id key user thread
+                seenC += 1; e = exp_cl.get(f[2])
+                if e is None: fail("%s: click slot in use for an ID without a dense valid click: %r" % (name, f)); continue
+                if e[2]: continue
+                if f[3] != e[0] or shown(f[4]) != user_label(e[1]): fail("%s: click slot %r, expected key %s user %s" % (name, f, e[0].decode(), user_label(e[1]).decode()))
+    if seenE != len(exp_ev): fail("%s: %d event slots in use, expected %d" % (name, seenE, len(exp_ev)))
+    if seenC != len(exp_cl): fail("%s: %d click slots in use, expected %d" % (name, seenC, len(exp_cl)))
+    # 3. the bucket records
+    want = Counter()
+    for g in gen_rows:
+        if g[0] == b"E": want[(b"E", g[1], g[2], g[3], g[4], user_label(g[5]) if g[3] != b"0" else b"-")] += 1
+        else: want[(b"C", g[1], g[2], user_label(g[3]))] += 1
+    got = Counter()
+    for f in lines(R, "recs", threads):
+        if f[1] != b"P": fail("%s: unknown record %r" % (name, f)); continue
+        got[(f[0],) + tuple(f[2:-1]) + (shown(f[-1]),)] += 1
+    diff("%s: bucket records, expected vs found" % name, want, got)
+    done.append(name)
 
-# 1. same lines as the reference
-numB, nameB = users(B)
-route = {}; ukind = {}; rowsBl = Bag()
-nE = nEd = nC = nCd = nU = nUd = nUcomplex = 0
-for f in lines(B, "rows"):
-    rowsB.add((f[0],) + tuple(f[2:-1]))
-    idt = bytes.fromhex(f[2].decode())
-    # 2. route of the ID
-    if f[0] == b"E":
-        c = counter(idt, 0x65, KE); want = b"D" if c is not None and c < LIME else b"P"
-        nE += 1; nEd += want == b"D"
-    else:
-        c = counter(idt, 0x6B, KC); want = b"D" if c is not None and c < LIMC else b"P"
-        nC += 1; nCd += want == b"D"
-    if f[1] != want: fail("route %s, expected %s: %r" % (f[1].decode(), want.decode(), f))
-    if not LIGHT and route.setdefault((f[0], f[2]), f[1]) != f[1]: fail("ID on both routes: %r" % f)   # (implied by the line above)
-    # 2./3. the user
-    desc, utext = f[-1], f[-2]
-    if desc != b"-":
-        c = counter(bytes.fromhex(utext.decode()), 0x75, KU)
-        dense_u = c is not None and (c & 511) < 8 and (c >> 9) < LIMI
-        if dense_u and (c >> 9) in complex_idx: dense_u = False; nUcomplex += 1
-        nU += 1; nUd += dense_u
-        if desc[:2] == b"U:":
-            if not dense_u: fail("dense user code for a user that must use the table: %r" % f)
-            if desc[2:] != utext: fail("dense user code regenerates another text: %r" % f)
-        elif desc[:2] == b"T:":
-            if dense_u: fail("table number for a dense user: %r" % f)
-            if numB.get(utext) != desc[2:]: fail("table number %r is not the table's number for the text (%r): %r" % (desc, numB.get(utext), f))
-        elif desc[:2] == b"L:":
-            if dense_u: fail("local number for a dense user: %r" % f)
-        else: fail("unknown user field: %r" % f)
-        if not LIGHT and ukind.setdefault(utext, desc[:1]) != desc[:1]: fail("user ID with two kinds of code: %r" % f)
-    rowsBl.add(tuple(f[:-2]) + (label(desc, nameB),))
-diff("rows: reference vs dense", rowsA, rowsB)
-del rowsA, rowsB, route, ukind
-
-# 4. records == rows
-recB = recs(B)
-diff("dense sse2: rows vs records", rowsBl, recB)
-del rowsBl
-
-# 5. every other path
-done = []
-for isa in ("sse2", "avx2", "avx512z", "avx512y"):
-    for t in (1, 3):
-        if isa == "sse2" and t == 1: continue
-        d, k = run("V-%s-%d" % (isa, t), dict(dense_env, SS_ISA=isa), t)
-        if k != keys: fail("keys differ in %s/%d: %r vs %r" % (isa, t, k, keys))
-        general = sum(1 for _ in lines(d, "rows"))
-        diff("records: dense sse2 vs %s with %d threads" % (isa, t), recB, recs(d))
-        done.append("%s/%d(%d general)" % (isa, t, general))
-
-print("events %d (dense %d), clicks %d (dense %d), valid-line users %d (dense %d, complex index %d); keys found: events %d clicks %d; in use: users %d events %d clicks %d; limits %d %d %d; runs: %s"
-      % (nE, nEd, nC, nCd, nU, nUd, nUcomplex, ON_E, ON_C, SW_U, SW_E, SW_C, LIME, LIMC, LIMI, " ".join(done)))
+print("events %d rows (%d dense IDs, %d undefined), clicks %d rows (%d dense IDs, %d undefined), general-route rows %d; keys found: events %d clicks %d; in use: users %d events %d clicks %d; limits %d %d %d; runs: %s"
+      % (nE, len(exp_ev), undefE, nC, len(exp_cl), undefC, len(gen_rows), ON_E, ON_C, SW_U, SW_E, SW_C, LIME, LIMC, LIMI, " ".join(done)))
 print("DENSE_PARSE_OK" if not bad else "DENSE_PARSE_FAIL (%d)" % bad)
 sys.exit(1 if bad else 0)

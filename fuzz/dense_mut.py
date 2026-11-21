@@ -110,6 +110,34 @@ def mutate(tab, ncomma, letter, key, lim, share):
         changed += len(rows)
     return changed
 ne = mutate(ev, 6, "e", KE, LIME, 0.12)
+# Copy storms: some events get up to a dozen more copies, each with its own ingest_ts (earlier and later than
+# the copies already there, never equal: a tie between copies that differ would be undefined) and often with
+# another user, another type or no valid ts. They land in any file, so in any thread.
+def storms(share):
+    g = groups(ev, 6); pool = [unq(ev[r[0][0]][r[0][1]].split(",")[1]) for r in R.sample(list(g.values()), min(len(g), 3000))]
+    made = 0
+    for i, rows in list(g.items()):
+        if R.random() > share: continue
+        have = set()
+        for fn, n in rows: have.add(unq(ev[fn][n].split(",")[3]))
+        f = [unq(v) for v in ev[rows[0][0]][rows[0][1]].split(",")]
+        t = f[3]
+        if len(t) != 20 or t[-1] != "Z" or not (t[14:16] + t[17:19]).isdigit(): continue
+        for _ in range(R.randrange(2, 13)):
+            n = t[:14] + "%02d:%02dZ" % (R.randrange(60), R.randrange(60))
+            if n in have: continue
+            have.add(n); w = list(f); w[3] = n
+            c = R.randrange(8)
+            if c == 0: w[1] = R.choice(pool)
+            elif c == 1: w[1] = forged_user()
+            elif c == 2: w[4] = R.choice(["view", "cart", "purchase", "VIEW", ""])
+            elif c == 3: w[2] = "not-a-time"
+            elif c == 4: w[1] = ""
+            elif c == 5: w[0] = q(w[0])
+            if "," in w[1] or '"' in w[1]: continue
+            ev[R.choice(list(ev))].append(",".join(w)); made += 1
+    return made
+ns = storms(0.02)
 nc = mutate(cl, 3, "k", KC, LIMC, 0.12)
 for sub, tab in (("events", ev), ("clicks", cl)):
     os.makedirs(os.path.join(out, sub), exist_ok=True)
@@ -119,4 +147,4 @@ for sub, tab in (("events", ev), ("clicks", cl)):
         with open(os.path.join(out, sub, fn), "w", newline="", encoding="latin-1") as f: f.write("\n".join([head] + body) + "\n")
 shutil.copytree(os.path.join(base, "links"), os.path.join(out, "links"))
 for fn in ("products.csv", "campaigns.csv", "manifest.json"): shutil.copy(os.path.join(base, fn), os.path.join(out, fn))
-print("dense_mut: %d event lines and %d click lines changed" % (ne, nc))
+print("dense_mut: %d event lines and %d click lines changed, %d storm copies" % (ne, nc, ns))
