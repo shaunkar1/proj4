@@ -3125,7 +3125,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // two-phase loop there.
  dparse.ev8=dparse.twoPhase&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="ev8";
  // SS_CLICKS=cl8: the click loop that hands eight lines at a time to a kernel (SS_CLICK_LOOP_CL8; slot form only).
- // Any other SS_CLICKS value keeps the click loop with the line index (SS_CLICK_LOOP_IX).
+ // Where the CPU has the AVX-512 kernel it is also the default (see cl8Auto); any other SS_CLICKS value (SS_CLICKS=ix)
+ // keeps the click loop with the line index (SS_CLICK_LOOP_IX). SS_CLICKS=cl8 with the avx2 masks runs the scalar twin.
  dparse.cl8=dparse.clicks&&!dparse.bucket&&getenv("SS_CLICKS")&&string_view(getenv("SS_CLICKS"))=="cl8";
  cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<" batch "<<dparse.batch<<" ev8 "<<dparse.ev8<<" cl8 "<<dparse.cl8<<"\n";
  // First pass over the link files.
@@ -3388,8 +3389,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // files stay on the avx2 loop; with SS_ISA=avx512z|avx512y everything follows that choice. Any SS_LINES value
  // switches the default off (SS_LINES=ev8 asks for the loop explicitly, also on avx2 with the scalar kernel).
  const bool ev8Auto=hasE8&&dparse.twoPhase&&!getenv("SS_LINES")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
- // The same for click files (vcl::cl8, SS_CLICK_LOOP_CL8).
- const bool cl8Auto=false;
+ // The same for click files (vcl::cl8, SS_CLICK_LOOP_CL8; dense click records in slot form): the default on a CPU
+ // with the kernel's extensions, with the avx512z masks when no SS_ISA is given. Any SS_CLICKS value other than cl8,
+ // SS_ISA=avx2 or SS_DENSE_AHEAD (which asks for the ring of the old loop) keeps the click loop with the line index.
+ const bool cl8Auto=hasE8&&dparse.clicks&&!dparse.bucket&&!getenv("SS_CLICKS")&&!getenv("SS_DENSE_AHEAD")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
   <<(ev8Auto?" events: ev8 kernel":"")<<(cl8Auto?" clicks: cl8 kernel":"")<<"\n";
  vector<ThreadState> tls(T);
