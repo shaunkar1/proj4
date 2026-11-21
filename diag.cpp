@@ -387,16 +387,30 @@ int main(){
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
  for(int r=0;r<3;++r){
-  add("B",1,{N8});add("pf",1,{N8,{"SS_PREFAULT","1"}});add("af",1,{N8,{"SS_ASYNCFREE","1"}});
-  add("n6",1,{{"NCPU","6"}});add("n7",1,{{"NCPU","7"}});add("n12",1,{{"NCPU","12"}});add("n16",1,{{"NCPU","16"}});
-  add("a16",1,{N8,{"SS_DENSE_AHEAD","16"}});add("nh",1,{N8,{"SS_NOHUGE","1"}});
-  add("ra",1,{N8},"core-a");add("rc",1,{N8,{"SS_DENSE_USERS","code"}},"core-a");
+  add("B",1,{N8});add("r8",1,{N8,{"SS_DENSE_AHEAD","8"}});add("m",1,{N8},"core-m");
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hpf",1,{N8,{"SS_PREFAULT","1"}},"",true);add("Hn12",1,{{"NCPU","12"}},"",true);add("Hra",1,{N8},"core-a",true);}
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hr8",1,{N8,{"SS_DENSE_AHEAD","8"}},"",true);add("Hm",1,{N8},"core-m",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
+ // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
+ string eqText="eq60 not run";
+ if(timeleft(40)){
+  auto csvhash=[&](const char* name,uint64_t& rows,uint64_t& sum){rows=0;sum=0;const string pth=scratch+"/"+name;int fd=open(pth.c_str(),O_RDONLY);if(fd<0)return false;struct stat st;fstat(fd,&st);
+   if(st.st_size){const char* b=(const char*)mmap(nullptr,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);uint64_t h=1469598103934665603ull;
+    for(off_t k=0;k<st.st_size;++k){if(b[k]=='\n'){h^=h>>29;h*=0xBF58476D1CE4E5B9ull;h^=h>>32;sum+=h;++rows;h=1469598103934665603ull;}else{h^=(unsigned char)b[k];h*=1099511628211ull;}}
+    munmap((void*)b,st.st_size);}
+   close(fd);unlink(pth.c_str());return true;};
+  uint64_t ur[2]={0,0},us_[2]={0,0},cr[2]={0,0},cs[2]={0,0};bool ok[2]={false,false};
+  for(int i=0;i<2;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i)env.push_back({"SS_NODENSE","1"});
+   pipeline(i?"Hcn":"Hcd",H,od(),env);ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+  char t[200];snprintf(t,sizeof t,"eq60 user rows %llu/%llu %s campaign rows %llu/%llu %s",(unsigned long long)ur[0],(unsigned long long)ur[1],ok[0]&&ok[1]&&ur[0]==ur[1]&&us_[0]==us_[1]&&ur[0]>0?"SAME":"DIFF",
+   (unsigned long long)cr[0],(unsigned long long)cr[1],ok[0]&&ok[1]&&cr[0]==cr[1]&&cs[0]==cs[1]&&cr[0]>0?"SAME":"DIFF");eqText=t;fprintf(stderr,"DIAG %s\n",t);}
+ string benchText="bench not run";
+ {const string vb=fs::path(core).parent_path().string()+"/vert_bench";
+  if(fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
+   fprintf(stderr,"DIAG bench: %s\n",benchText.c_str());}}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
  pipeline("final /data -> /output",data,outdir,{{"NCPU","8"}});
  // Put the findings into extra campaign_daily rows: the dev check reports a few rows that differ, as JSON.
@@ -423,11 +437,9 @@ int main(){
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  {const RunResult* r=get("B#0");a+="B: "+(r?stages(*r):string("none"));}
-  a+=" || "+fmt("pf wPXus","pf","wPXus")+fmt("af wPXus","af","wPXus")+fmt("n6 wPX","n6","wPX")+fmt("n7 wPX","n7","wPX")+fmt("n12 wPXus","n12","wPXus")+fmt("n16 wPX","n16","wPX")+fmt("a16 wP","a16","wP")+fmt("nohuge wPus","nh","wPus")+fmt("| A raw wPYXus","ra","wPYXus")+fmt("A code wPYXus","rc","wPYXus");
-  {const RunResult* r=get("HB#0");c+="60x B: "+(r?stages(*r):string("none"));}
-  c+=" || "+fmt("pf wPXus","Hpf","wPXus")+fmt("n12 wPXus","Hn12","wPXus")+fmt("A raw wPYXus","Hra","wPYXus");
-  {struct utsname u;uname(&u);c+=string("| ")+u.release+" thp ";for(const char* f:{"/sys/kernel/mm/transparent_hugepage/enabled","/sys/kernel/mm/transparent_hugepage/defrag"}){ifstream in(f);string l;getline(in,l);size_t x=l.find('['),y=l.find(']');c+=(x!=string::npos&&y!=string::npos?l.substr(x+1,y-x-1):string("?"))+"/";}}
+  a+=eqText+" | "+fmt("c46 wPYXus","B","wPYXus")+fmt("c46 ring8 wPYXus","r8","wPYXus")+fmt("main wPYXus","m","wPYXus");
+  a+="| 60x "+fmt("c46 wPYXus","HB","wPYXus")+fmt("ring8 wPYX","Hr8","wPYX")+fmt("main wPYX","Hm","wPYX");
+  c+=benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
