@@ -29,7 +29,7 @@ def create(root, *, start, end, links, events, clicks, products=None, campaigns=
     put(root/'campaigns.csv','campaign_id,channel',campaigns or [('cA','ads'),('cB','social')])
 
 def run_core(data, scratch):
-    env=dict(os.environ,DATA_DIR=str(data),SCRATCH_DIR=str(scratch))
+    env=dict(os.environ,DATA_DIR=str(data),SCRATCH_DIR=str(scratch),OUTPUT_DIR=str(scratch/'out'),SS_DEBUG_CSV='1')
     p=subprocess.run([str(BIN)],env=env,capture_output=True,text=True)
     if p.returncode:raise RuntimeError(p.stderr)
     def parse(path):

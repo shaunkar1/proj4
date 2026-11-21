@@ -6,11 +6,10 @@ all: shopping-core
 shopping-core: main.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 test: shopping-core
-	python -m unittest discover -s tests -v
+	python3 -m unittest discover -s tests -v
 docker-build:
 	docker build --platform linux/amd64 -t shopping-sessions .
 run: shopping-core
-	DATA_DIR="$(DATA_DIR)" SCRATCH_DIR="$(SCRATCH_DIR)" ./shopping-core
-	DATA_DIR="$(DATA_DIR)" SCRATCH_DIR="$(SCRATCH_DIR)" OUTPUT_DIR="$(OUTPUT_DIR)" python write_parquet.py
+	DATA_DIR="$(DATA_DIR)" SCRATCH_DIR="$(SCRATCH_DIR)" OUTPUT_DIR="$(OUTPUT_DIR)" ./shopping-core
 clean:
 	rm -f shopping-core

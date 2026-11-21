@@ -1,5 +1,5 @@
 // Shopping Sessions: exact CSV / identity / attribution core.
-// No third-party C++ libraries, intermediate output is hex-encoded to preserve raw identifiers.
+// No third-party C++ libraries; the two Parquet tables are written directly.
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -9,6 +9,8 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <cerrno>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -270,14 +272,104 @@ static uint16_t cat_id(string_view cat,FastMap<uint16_t>& ids,vector<string>& na
  if(names.size()>=65535)throw runtime_error("Too many categories");
  uint16_t n=names.size();names.emplace_back(cat);ids.emplace(names.back(),n);return n;
 }
-static void run(const fs::path& data,const fs::path& scratch){
+// ---- Minimal Parquet writer: PLAIN encoding, no compression, one data page per column chunk. ----
+enum{PQ_INT32=1,PQ_INT64=2,PQ_BYTES=6};
+enum{CONV_NONE=-1,CONV_UTF8=0,CONV_DATE=6};
+struct PqCol{const char* name;int type;bool optional;int conv;};
+static void put_varint(string& o,uint64_t v){while(v>=0x80){o.push_back((char)(v|0x80));v>>=7;}o.push_back((char)v);}
+static void put_zz(string& o,int64_t v){put_varint(o,((uint64_t)v<<1)^(uint64_t)(v>>63));}
+static void put_le32(string& o,uint32_t v){o.append((const char*)&v,4);}
+// Thrift compact protocol, just enough for the Parquet footer and page headers.
+struct Thrift{
+ string& o;vector<int> stack;int last=0;
+ explicit Thrift(string& out):o(out){}
+ void field(int id,int type){int d=id-last;if(d>0&&d<=15)o.push_back((char)((d<<4)|type));else{o.push_back((char)type);put_zz(o,id);}last=id;}
+ void i32(int id,int64_t v){field(id,5);put_zz(o,v);}
+ void i64(int id,int64_t v){field(id,6);put_zz(o,v);}
+ void str(int id,string_view s){field(id,8);put_varint(o,s.size());o.append(s);}
+ void list(int id,int elem,size_t n){field(id,9);if(n<15)o.push_back((char)((n<<4)|elem));else{o.push_back((char)(0xF0|elem));put_varint(o,n);}}
+ void open_struct(int id){field(id,12);stack.push_back(last);last=0;}
+ void open_elem(){stack.push_back(last);last=0;}
+ void close(){o.push_back(0);last=stack.back();stack.pop_back();}
+};
+struct PqFile{
+ struct Chunk{int64_t offset,size,nvalues;};
+ struct Group{int64_t rows,bytes;vector<Chunk> cols;};
+ int fd=-1;int64_t pos=0,rows=0;vector<PqCol> cols;vector<Group> groups;string buf;
+ bool is_open()const{return fd>=0;}
+ void write_all(const char* p,size_t n){
+  while(n){ssize_t w=::write(fd,p,n);if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}p+=w;n-=(size_t)w;}
+ }
+ void open(const fs::path& path,vector<PqCol> c){
+  cols=std::move(c);fd=::open(path.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
+  if(fd<0)throw runtime_error("Cannot create "+path.string());
+  write_all("PAR1",4);pos=4;
+ }
+ // bodies[i] is the finished page body of column i: optional definition levels, then PLAIN values.
+ void row_group(int64_t nrows,const vector<string_view>& bodies){
+  buf.clear();Group g;g.rows=nrows;g.bytes=0;
+  for(size_t i=0;i<cols.size();++i){
+   size_t start=buf.size();
+   if(bodies[i].size()>0x7fff0000u)throw runtime_error("Parquet page too large");
+   Thrift h(buf);
+   h.i32(1,0);h.i32(2,(int64_t)bodies[i].size());h.i32(3,(int64_t)bodies[i].size());
+   h.open_struct(5);h.i32(1,nrows);h.i32(2,0);h.i32(3,3);h.i32(4,3);h.close();
+   buf.push_back(0);
+   buf.append(bodies[i]);
+   int64_t size=(int64_t)(buf.size()-start);
+   g.cols.push_back({pos+(int64_t)start,size,nrows});g.bytes+=size;
+  }
+  write_all(buf.data(),buf.size());pos+=(int64_t)buf.size();rows+=nrows;groups.push_back(std::move(g));
+ }
+ void close(){
+  buf.clear();Thrift m(buf);
+  m.i32(1,1);
+  m.list(2,12,cols.size()+1);
+  m.open_elem();m.str(4,"schema");m.i32(5,(int64_t)cols.size());m.close();
+  for(const auto& c:cols){
+   m.open_elem();m.i32(1,c.type);m.i32(3,c.optional?1:0);m.str(4,c.name);
+   if(c.conv!=CONV_NONE){m.i32(6,c.conv);m.open_struct(10);m.open_struct(c.conv==CONV_UTF8?1:6);m.close();m.close();}
+   m.close();
+  }
+  m.i64(3,rows);
+  m.list(4,12,groups.size());
+  for(const auto& g:groups){
+   m.open_elem();
+   m.list(1,12,cols.size());
+   for(size_t i=0;i<cols.size();++i){const auto& ch=g.cols[i];
+    m.open_elem();m.i64(2,ch.offset);
+    m.open_struct(3);
+    m.i32(1,cols[i].type);
+    m.list(2,5,2);put_zz(buf,0);put_zz(buf,3);
+    m.list(3,8,1);put_varint(buf,strlen(cols[i].name));buf.append(cols[i].name);
+    m.i32(4,0);m.i64(5,ch.nvalues);m.i64(6,ch.size);m.i64(7,ch.size);m.i64(9,ch.offset);
+    m.close();
+    m.close();
+   }
+   m.i64(2,g.bytes);m.i64(3,g.rows);
+   m.close();
+  }
+  m.str(6,"shopping-core");
+  buf.push_back(0);
+  put_le32(buf,(uint32_t)buf.size());buf.append("PAR1",4);
+  write_all(buf.data(),buf.size());
+  if(::close(fd)!=0)throw runtime_error("Parquet close failed");
+  fd=-1;
+ }
+};
+static void put_bytes(string& o,string_view s){put_le32(o,(uint32_t)s.size());o.append(s);}
+template<class V> static string_view raw(const V& v){return string_view((const char*)v.data(),v.size()*sizeof(v[0]));}
+static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;};
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  int nday=(int)((window_end-window_start+DAY-1)/DAY);
  if(nday<=0||nday>1000)throw runtime_error("Unreasonable window length");
- const int T=max(1,omp_get_max_threads());
+ // The scorer may limit CPU by quota rather than by affinity, so trust NCPU when it is set.
+ int T=max(1,omp_get_max_threads());
+ if(const char* n=getenv("NCPU")){int v=atoi(n);if(v>=1&&v<=1024)T=v;}
+ omp_set_num_threads(T);
  // Map the big inputs up front so the kernel starts reading them while links are processed.
  vector<Chunk> chunks;uint64_t eventBytes=0,clickBytes=0;
  static constexpr size_t CH=size_t(2)<<20;
@@ -452,70 +544,122 @@ static void run(const fs::path& data,const fs::path& scratch){
   if(a.user!=b.user)return a.user<b.user;if(a.ts!=b.ts)return a.ts<b.ts;
   return a.id>b.id; // last click at equal timestamp has lexicographically smallest ID
  });
-__mark("SORT"); fs::create_directories(scratch);
- ofstream uout(scratch/"user_rows.csv",ios::binary|ios::trunc);
- ofstream cout(scratch/"campaign_rows.csv",ios::binary|ios::trunc);
- if(!uout||!cout)throw runtime_error("Cannot open scratch files");
- vector<Totals> campTotals(campaigns.size()*(size_t)nday);
- vector<uint32_t> freq(campaigns.size());vector<uint32_t> positions(campaigns.size());vector<uint16_t> active;
- vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
- int64_t firstday=divfloor(window_start,DAY);
- auto day_index=[&](int64_t ts)->int{return int(divfloor(ts,DAY)-firstday);};
- auto add_campaign=[&](uint16_t c){if(freq[c]++==0){positions[c]=(uint32_t)active.size();active.push_back(c);}};
- auto remove_campaign=[&](uint16_t c){if(--freq[c]==0){size_t pos=positions[c];uint16_t back=active.back();active[pos]=back;positions[back]=pos;active.pop_back();}};
- size_t cptr=0;size_t num_sessions=0;
- for(size_t ei=0;ei<events.size();){
-  uint32_t person=events[ei].user;
-  size_t end=ei+1;while(end<events.size()&&events[end].user==person)++end;
-  while(cptr<clicks.size()&&clicks[cptr].user<person)++cptr;
-  size_t cstart=cptr;while(cptr<clicks.size()&&clicks[cptr].user==person)++cptr;
-  size_t add=cstart,expire=cstart;
-  UserTotals userday;int currentday=-1;
-  auto flushday=[&](){
-   if(currentday<0)return;
-   uint16_t top=0;uint64_t best=0;
-   for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
-   touched.clear();
-   uout<<hexstr(graph.names[person])<<','<<(firstday+currentday)<<','<<userday.sessions<<','<<userday.events<<','<<userday.revenue<<',';
-   if(best==0)uout<<"NULL";else uout<<hexstr(catnames[top]);
-   uout<<'\n';userday={};
-  };
-  for(size_t a=ei;a<end;){
-   int64_t start=events[a].ts;size_t b=a+1;
-   while(b<end&&events[b].ts-events[b-1].ts<=GAP)++b;
-   int d=day_index(start);if(d<0||d>=nday)throw runtime_error("Session day outside manifest");
-   if(d!=currentday){flushday();currentday=d;}
-   uint64_t revenue=0;bool purchasing=false;
-   for(size_t k=a;k<b;++k){auto& e=events[k];
-    if(e.purchase){purchasing=true;revenue+=e.price;
-      if(catsum[e.cat]==0)touched.push_back(e.cat);
-      catsum[e.cat]+=e.price;
+__mark("SORT");
+ // ---- Sessionize and attribute blocks of people in parallel; each thread writes its own Parquet file. ----
+ fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");
+ const bool debugCsv=getenv("SS_DEBUG_CSV")!=nullptr; // unit tests read these hex rows from SCRATCH_DIR
+ const size_t nE=events.size(),nC=clicks.size(),ncamp=campaigns.size();
+ const size_t NB=max<size_t>(1,min<size_t>(nE/200000+1,8192));
+ vector<size_t> bstart(NB+1,0);
+ for(size_t b=1;b<NB;++b){size_t pos=max(bstart[b-1],nE/NB*b);while(pos>0&&pos<nE&&events[pos].user==events[pos-1].user)++pos;bstart[b]=pos;}
+ bstart[NB]=nE;
+ const int64_t firstday=divfloor(window_start,DAY);
+ vector<vector<Totals>> threadTotals(T);vector<string> dbg(debugCsv?NB:0);
+ const vector<PqCol> userCols={{"user_id",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},{"sessions",PQ_INT64,false,CONV_NONE},
+  {"events",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"top_category",PQ_BYTES,true,CONV_UTF8}};
+ uint64_t num_sessions=0;
+ #pragma omp parallel num_threads(T) reduction(+:num_sessions)
+ {
+  const int tid=omp_get_thread_num();
+  auto& campTotals=threadTotals[tid];campTotals.assign(ncamp*(size_t)nday,Totals{});
+  vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active;
+  vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
+  auto add_campaign=[&](uint16_t c){if(freq[c]++==0){positions[c]=(uint32_t)active.size();active.push_back(c);}};
+  auto remove_campaign=[&](uint16_t c){if(--freq[c]==0){size_t pos=positions[c];uint16_t back=active.back();active[pos]=back;positions[back]=pos;active.pop_back();}};
+  PqFile file;
+  auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
+  string uid,catv,catbody;vector<int32_t> days;vector<int64_t> sess,evs,rev;vector<uint8_t> hascat;
+  #pragma omp for schedule(dynamic,1)
+  for(size_t blk=0;blk<NB;++blk){
+   size_t ei=bstart[blk];const size_t eend=bstart[blk+1];
+   if(ei>=eend)continue;
+   uid.clear();catv.clear();days.clear();sess.clear();evs.clear();rev.clear();hascat.clear();
+   size_t cptr=(size_t)(lower_bound(clicks.begin(),clicks.end(),events[ei].user,[](const Click& c,uint32_t u){return c.user<u;})-clicks.begin());
+   while(ei<eend){
+    uint32_t person=events[ei].user;
+    size_t end=ei+1;while(end<eend&&events[end].user==person)++end;
+    while(cptr<nC&&clicks[cptr].user<person)++cptr;
+    size_t cstart=cptr;while(cptr<nC&&clicks[cptr].user==person)++cptr;
+    size_t add=cstart,expire=cstart;
+    UserTotals userday;int currentday=-1;
+    auto flushday=[&](){
+     if(currentday<0)return;
+     uint16_t top=0;uint64_t best=0;
+     for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
+     touched.clear();
+     put_bytes(uid,graph.names[person]);days.push_back((int32_t)(firstday+currentday));
+     sess.push_back((int64_t)userday.sessions);evs.push_back((int64_t)userday.events);rev.push_back((int64_t)userday.revenue);
+     hascat.push_back(best!=0);if(best!=0)put_bytes(catv,catnames[top]);
+     if(debugCsv){string& o=dbg[blk];
+      o+=hexstr(graph.names[person]);o+=',';o+=to_string(firstday+currentday);o+=',';o+=to_string(userday.sessions);o+=',';o+=to_string(userday.events);o+=',';o+=to_string(userday.revenue);o+=',';
+      o+=best==0?string("NULL"):hexstr(catnames[top]);o+='\n';
+     }
+     userday={};
+    };
+    for(size_t a=ei;a<end;){
+     int64_t start=events[a].ts;size_t b=a+1;
+     while(b<end&&events[b].ts-events[b-1].ts<=GAP)++b;
+     int d=(int)(divfloor(start,DAY)-firstday); // in [0,nday): every surviving event is inside the window
+     if(d!=currentday){flushday();currentday=d;}
+     uint64_t revenue=0;bool purchasing=false;
+     for(size_t k=a;k<b;++k){auto& e=events[k];
+      if(e.purchase){purchasing=true;revenue+=e.price;
+       if(catsum[e.cat]==0)touched.push_back(e.cat);
+       catsum[e.cat]+=e.price;
+      }
+     }
+     userday.sessions++;userday.events+=b-a;userday.revenue+=revenue;
+     // Sliding seven-day window, inclusive on both ends.
+     while(add<cptr&&clicks[add].ts<=start){add_campaign(clicks[add].campaign);++add;}
+     while(expire<add&&clicks[expire].ts<start-WEEK){remove_campaign(clicks[expire].campaign);++expire;}
+     uint16_t credited=organic;
+     if(add>expire)credited=clicks[add-1].campaign;
+     auto& t=campTotals[(size_t)credited*nday+d];t.sessions++;t.purchasing_sessions+=purchasing;t.revenue+=revenue;
+     for(uint16_t ci:active)campTotals[(size_t)ci*nday+d].assists++;
+     num_sessions++;a=b;
     }
+    flushday();
+    for(uint16_t ci:active)freq[ci]=0;
+    active.clear();ei=end;
    }
-   userday.sessions++;userday.events+=b-a;userday.revenue+=revenue;
-   // Sliding seven-day window, inclusive on both ends.
-   while(add<cptr&&clicks[add].ts<=start){add_campaign(clicks[add].campaign);++add;}
-   while(expire<add&&clicks[expire].ts<start-WEEK){remove_campaign(clicks[expire].campaign);++expire;}
-   uint16_t credited=organic;
-   if(add>expire)credited=clicks[add-1].campaign;
-   auto& t=campTotals[(size_t)credited*nday+d];t.sessions++;t.purchasing_sessions+=purchasing;t.revenue+=revenue;
-   for(uint16_t ci:active)campTotals[(size_t)ci*nday+d].assists++;
-   num_sessions++;a=b;
+   if(days.empty())continue;
+   // top_category page: 1-bit definition levels as one bit-packed run, then the non-null values.
+   const size_t n=days.size(),groups=(n+7)/8;
+   string levels;put_varint(levels,(groups<<1)|1);size_t at=levels.size();levels.resize(at+groups,0);
+   for(size_t i=0;i<n;++i)if(hascat[i])levels[at+i/8]|=(char)(1<<(i%8));
+   catbody.clear();put_le32(catbody,(uint32_t)levels.size());catbody+=levels;catbody+=catv;
+   if(!file.is_open())open_file();
+   file.row_group((int64_t)n,{uid,raw(days),raw(sess),raw(evs),raw(rev),catbody});
   }
-  flushday();
-  for(uint16_t ci:active)freq[ci]=0;
-  active.clear();ei=end;
+  if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
+  if(file.is_open())file.close();
  }
-__mark("AGGREGATE"); for(size_t ci=0;ci<campaigns.size();++ci){
-  for(int d=0;d<nday;++d){auto& t=campTotals[ci*(size_t)nday+d];if(t.sessions==0&&t.assists==0)continue;
-   cout<<hexstr(campaigns[ci].id)<<','<<hexstr(campaigns[ci].channel)<<','<<(firstday+d)<<','<<t.sessions<<','<<t.purchasing_sessions<<','<<t.revenue<<','<<t.assists<<'\n';
+ vector<Totals> campTotals(ncamp*(size_t)nday);
+ for(const auto& tt:threadTotals)for(size_t i=0;i<tt.size();++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;campTotals[i].assists+=tt[i].assists;}
+__mark("AGGREGATE");
+ {
+  string cid,chan,csv;vector<int32_t> days;vector<int64_t> s,p,r,a;
+  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<nday;++d){const auto& t=campTotals[ci*(size_t)nday+d];if(t.sessions==0&&t.assists==0)continue;
+   put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
+   s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
+   if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
+  }
+  PqFile f;
+  f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
+   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});
+  if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
+  f.close();
+  if(debugCsv){
+   fs::create_directories(scratch);
+   ofstream uout(scratch/"user_rows.csv",ios::binary|ios::trunc),cout(scratch/"campaign_rows.csv",ios::binary|ios::trunc);
+   for(const auto& part:dbg)uout<<part;
+   cout<<csv;uout.close();cout.close();
+   if(!uout||!cout)throw runtime_error("Failed writing debug CSV");
   }
  }
- uout.close();cout.close();
- if(!uout||!cout)throw runtime_error("Failed writing intermediate CSV");
 __mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
 }
 int main(){try{
- const char* d=getenv("DATA_DIR");const char* s=getenv("SCRATCH_DIR");
- run(d?d:"/data",s?s:"/scratch");return 0;
+ const char* d=getenv("DATA_DIR");const char* s=getenv("SCRATCH_DIR");const char* o=getenv("OUTPUT_DIR");
+ run(d?d:"/data",s?s:"/scratch",o?o:"/output");return 0;
  }catch(const exception& e){cerr<<"ERROR "<<e.what()<<'\n';return 1;}}
