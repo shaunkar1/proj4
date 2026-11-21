@@ -12,6 +12,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <cstddef>
 #include <climits>
 #include <cerrno>
@@ -798,6 +799,7 @@ struct alignas(64) ThreadState{
  vector<pair<const char*,int64_t>> ingestSide; // (event id pointer, ingest ms) of records whose ingest code is INGEST_SIDE
  vector<Bucket<PRec>> eb;vector<Bucket<CRec>> cb; // parsed lines by event/click ID hash
  uint32_t tid=0; // index of this thread's state (a LOCAL_USER number only means something together with it)
+ deque<array<char,16>> rawNames; // texts of raw users that ended up with a LOCAL_USER number (they need a place that stays)
  vector<Bucket<DRec>> db;vector<Bucket<DCRec>> dcb; // dense rows in bucket form, by counter range (SS_DENSE_RECORDS=bucket)
  uint64_t slotWaits=0; // eslotWaits of this thread
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
@@ -854,6 +856,8 @@ static inline uint64_t order36(uint64_t y){
  const unsigned n=1+(y>=36u)+(y>=1296u)+(y>=46656u)+(y>=1679616u)+(y>=60466176u)+(y>=2176782336ull)+(y>=78364164096ull);
  return y*POW36[8-n]*16+n;
 }
+// SPREAD8[m]: byte j is 1 where bit j of m is set (eight one-byte counters bumped by one add).
+static constexpr array<uint64_t,256> SPREAD8=[]{array<uint64_t,256> a{};for(unsigned m=0;m<256;++m){uint64_t v=0;for(unsigned j=0;j<8;++j)if((m>>j)&1)v|=1ull<<(8*j);a[m]=v;}return a;}();
 static inline size_t text36_fast(char letter,uint64_t y,char* out){
  unsigned n;const uint64_t v=digits36(y,n);
  out[0]=letter;memcpy(out+1,&v,8);return (size_t)n+1;
@@ -861,9 +865,14 @@ static inline size_t text36_fast(char letter,uint64_t y,char* out){
 // ---- Dense route, the reader of the slot arrays (DENSE stage) ----
 // What the reader knows about a user index: where its events and clicks sit in the slot arrays
 // (ef/el, cf/cl: first and last counter + 1, 0 = none; ec/cc: how many), whether any of its rows
-// went through the general lane instead, and what was decided for it.
-struct DInfo{atomic<uint32_t> ef,el,ec,cf,cl,cc;atomic<uint8_t> general,state;uint8_t pad[6];};
-static_assert(sizeof(DInfo)==32);
+// went through the general lane instead, and what was decided for it. The sweep also leaves the
+// session list of the index's first run of event slots: sess points at ns entries "start time << 24 |
+// rows of the run before this session", one end entry with the run's row count, then the run's
+// purchases (session << 40 | category << 24 | price) and an all-ones entry. amask: the aliases the
+// run uses. The list is the whole index only if no second run was found (multi) and bit 31 of ns is
+// clear (rows in time order, fewer than 2^24 of them).
+struct DInfo{atomic<uint32_t> ef,el,ec,cf,cl,cc;atomic<uint8_t> general,state,multi,amask;atomic<uint32_t> ns;atomic<uint64_t*> sess;};
+static_assert(sizeof(DInfo)==40);
 static DInfo* denseInfo=nullptr; // highest reported user index + 2 entries, zero pages until touched
 static constexpr uint8_t DSTATE_DEFER=1; // rows are handed to the general lane by the sweep after the index pass
 // first-counter fields hold counter + 1, so that zero memory means "none".
@@ -1114,12 +1123,26 @@ static thread_local uint64_t eslotWaits=0; // times this thread found a slot bus
 // uct = user, cat and thread as the eight bytes they occupy in the slot (eslot_uct): one store instead of three.
 static inline __attribute__((always_inline)) uint64_t eslot_uct(uint32_t user,unsigned cat,unsigned thread){return (uint64_t)user|((uint64_t)(uint16_t)cat<<32)|((uint64_t)thread<<48);}
 static_assert(offsetof(ESlot,user)==8&&offsetof(ESlot,cat)==12&&offsetof(ESlot,thread)==14&&offsetof(ESlot,ingest)==16);
-static inline __attribute__((always_inline)) void eslot_commit(ESlot& s,uint64_t kk,uint64_t uct,int64_t ingest){
+// Raw users (dparse.raw). On a dense-record event line the vector loops do not decode the user ID: if the
+// user text is 'u' + 0 to 8 bytes, the slot gets
+//   user  = DENSE_USER_RAW | number of bytes after the 'u' (0-8)       (top two bits set: no table number,
+//           no DENSE_USER code and no LOCAL_USER number looks like this)
+//   spare = those bytes as they stand in the file, zero-padded to a 64-bit word (first byte lowest)
+// and any other user text is resolved in the loop as before. Text and code are one-to-one, so nothing is
+// lost; resolve_raw_users() (in run(), after all lines are parsed and before the ID table closes) turns
+// every raw slot into what the loop would have written: a DENSE_USER code if the text is a dense user
+// (canonical, alias < 8, index below the limit and not complex), else the table number of the text, or a
+// LOCAL_USER number of the resolving thread, with `thread` set to that thread. It also reports the highest
+// dense index (dense_note_index). After it no slot is raw, and spare is not looked at again. Whoever folds
+// this into another pass over the slots has to do exactly that, before tab.end_parallel() if table IDs can
+// still be new. Only slots with a valid event (k >= PR_KBIAS) carry a user at all.
+static constexpr uint32_t DENSE_USER_RAW=0xC0000000u;
+static inline __attribute__((always_inline)) void eslot_commit(ESlot& s,uint64_t kk,uint64_t uct,int64_t ingest,uint64_t spare=0){
  uint64_t cur=s.k.load(memory_order_relaxed);
  for(;;){
   if(__builtin_expect(cur==ESLOT_BUSY,0)){++eslotWaits;_mm_pause();cur=s.k.load(memory_order_relaxed);continue;}
   if(__builtin_expect(!s.k.compare_exchange_weak(cur,ESLOT_BUSY,memory_order_acquire,memory_order_relaxed),0)){++eslotWaits;continue;} // cur is reloaded
-  if(cur==0||ingest<s.ingest){memcpy((char*)&s+offsetof(ESlot,user),&uct,8);s.ingest=ingest;s.k.store(kk,memory_order_release);}
+  if(cur==0||ingest<s.ingest){memcpy((char*)&s+offsetof(ESlot,user),&uct,8);s.ingest=ingest;s.spare=spare;s.k.store(kk,memory_order_release);}
   else s.k.store(cur,memory_order_release);
   return;
  }
@@ -1151,7 +1174,7 @@ static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32
 //           decoded and write it at the end of the line, or `ahead` dense rows later (SS_DENSE_AHEAD, 1-16).
 //   bucket  the row is appended to a per-thread bucket by counter range (counter >> shE / shC); a later pass
 //           fills the slot arrays bucket by bucket, so the random writes stay inside a small range.
-struct DenseParse{bool users=false,events=false,clicks=false,bucket=false;unsigned ahead=8,shE=14,shC=14;};
+struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false;unsigned ahead=8,shE=14,shC=14;};
 // A dense event line in bucket form, valid or not. k as in PRec (0 = not a valid event), ingest = exact
 // ingest_ts in ms, lo = the low shE bits of the counter: counter = (bucket index << shE) | lo.
 struct DRec{uint64_t k;int64_t ingest;uint32_t user;uint16_t cat;uint16_t lo;};
@@ -1162,7 +1185,7 @@ static_assert(sizeof(DCRec)==16);
 // A dense row waiting for its slot (slot form with ahead > 0). uct overlays nothing else: the user is final when
 // the row enters. A free place points at a scratch slot of the loop, so leaving the ring needs no test.
 static constexpr unsigned RING_MAX=16;
-struct ERing{uint64_t k;int64_t ingest;uint64_t uct;ESlot* slot;};
+struct ERing{uint64_t k;int64_t ingest;uint64_t uct;uint64_t spare;ESlot* slot;};
 struct CRing{uint64_t key;CSlot* slot;uint32_t user;uint32_t pad;};
 static DenseParse dparse;
 // The route of an ID depends on its text only. These are the definitions every path must agree with
@@ -1475,17 +1498,18 @@ static inline bool chunk_lines(const char* base,size_t len,size_t from,size_t to
 }
 // What an event loop keeps across lines (never changes during a chunk).
 struct EvLoop{ThreadState& tl;KeyTable& tab;const KeyTable& products;size_t PE;const char* end;DateMemo3* memo;int64_t wstart;uint64_t wlen,ibase;Bucket<PRec>* buckets;KeyTable::Slot* slots;size_t tmask;
- bool dUsers;uint64_t ke,ku,limE;ESlot* ev;uint64_t tid48;bool bucket;unsigned ahead,shE;uint32_t loMask;Bucket<DRec>* db; // dense route (dparse); tid48 = thread index << 48 (eslot_uct)
+ bool dUsers;uint64_t ke,ku,limE;ESlot* ev;uint64_t tid48;bool bucket,raw;unsigned ahead,shE;uint32_t loMask;Bucket<DRec>* db; // dense route (dparse); tid48 = thread index << 48 (eslot_uct)
  EvLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& products_,size_t PE_,const char* end_):tl(tl_),tab(tab_),products(products_),PE(PE_),end(end_),memo(date_memo3()),
   wstart(window_start),wlen((uint64_t)(window_end-window_start)),ibase((uint64_t)ingestBase),buckets(tl_.eb.data()),slots(tab_.slots),tmask(tab_.mask),
-  dUsers(dparse.users),ke(dense.ke),ku(dense.ku),limE(dense.limE),ev(denseEv),tid48((uint64_t)tl_.tid<<48),bucket(dparse.bucket),ahead(dparse.ahead),shE(dparse.shE),loMask((1u<<dparse.shE)-1),db(tl_.db.data()){}
+  dUsers(dparse.users),ke(dense.ke),ku(dense.ku),limE(dense.limE),ev(denseEv),tid48((uint64_t)tl_.tid<<48),bucket(dparse.bucket),raw(dparse.raw),ahead(dparse.ahead),shE(dparse.shE),loMask((1u<<dparse.shE)-1),db(tl_.db.data()){}
 };
 // Start of window 2 of an event line: one past the third comma of window 1 (p+65 if there is none).
 SS_V3I const char* event_window2(const char* p,uint64_t c){return p+_tzcnt_u64(_blsr_u64(_blsr_u64(c)))+1;}
 // One event line at p, given the masks of its two windows (w1 at p, w2 at b=event_window2(p,w1.c)).
 // Does exactly what for_records<7> + the general event handler would do with the line; `general` is
 // that handler and gets the line if the short path passes it on. Returns the start of the next line.
-template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const char* const nl,const EvLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,ERing* const ring,unsigned& rpos,GEN&& general){
+static constexpr uint32_t NOPRE=0xFFFFFFFFu; // event_pre_v3: the line's event_id is not dense
+template<bool DREC,bool PRE,class GEN> SS_V3I const char* event_line_v3(const char* const p,const char* const b,const WinMasks w1,const WinMasks w2,const char* const nl,const uint32_t pre,const EvLoop& lp,PendUser* const pend,PendUser*& pp,uint32_t& dmax,uint32_t& send,ERing* const ring,unsigned& rpos,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& products=lp.products;const size_t PE=lp.PE;
  DateMemo3* const memo=lp.memo;const int64_t wstart=lp.wstart;const uint64_t wlen=lp.wlen,ibase=lp.ibase;
  Bucket<PRec>* const buckets=lp.buckets;KeyTable::Slot* const slots=lp.slots;const size_t tmask=lp.tmask;
@@ -1538,7 +1562,11 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
    // Dense route (DENSE.md). DREC (dense records, which need dense users): both IDs are decoded in one pass;
    // a dense event_id sends the row to its slot (ask for the slot's memory right away), a dense user needs no table.
    uint64_t ve=0;bool dEv=false;uint32_t ucode=0;bool uDense=false;
-   if(DREC){
+   if(PRE){ve=pre;dEv=pre!=NOPRE;} // two-phase loop: decoded (and its slot asked for) a block of lines ago, see event_pre_v3
+   else if(DREC&&lp.raw){ // raw users: only the event ID is decoded on the line
+    uint64_t ye;
+    if(__builtin_expect(s0[0]=='e'&&parse36_v3(s0+1,l0-1,ye)&&(ve=dn::index_of(ye,lp.ke))<lp.limE,1)){dEv=true;__builtin_prefetch(&lp.ev[ve],1,3);}
+   }else if(DREC){
     uint64_t ye,yu;unsigned me,mu;
     if(__builtin_expect(parse36x2_v3(s0+1,l0-1,s1+1,l1-1,ye,yu,me,mu),1)){
      if(__builtin_expect(s0[0]=='e'&&parse36x2_ok(ye,me)&&(ve=dn::index_of(ye,lp.ke))<lp.limE,1)){dEv=true;if(!lp.bucket)__builtin_prefetch(&lp.ev[ve],1,3);}
@@ -1579,7 +1607,16 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
    if(DREC){
     // Dense records: the row goes straight into its slot. The slot's memory was requested when the ID was decoded
     // and has arrived by now (measured on the scoring machine: waiting longer changes nothing).
-    if(k&&uDense){tableUser=false;dmax=max(dmax,ucode);}else ucode=0; // (no user in the record of a line that is not a valid event)
+    uint64_t rawU=0;
+    if(PRE||lp.raw){
+     ucode=0;
+     if(k){
+      const unsigned n1=l1-1; // l1 >= 1 on a valid line
+      if(__builtin_expect((s1[0]=='u')&(n1<=8u)&dEv,1)){ // left as text for resolve_raw_users (see DENSE_USER_RAW)
+       uint64_t w;memcpy(&w,s1+1,8);rawU=_bzhi_u64(w,8*n1);ucode=DENSE_USER_RAW|n1;tableUser=false;
+      }else if(dense_user(s1,l1,ucode)){tableUser=false;dmax=max(dmax,ucode);} // other shapes, and rows for the general buckets: decided here
+     }
+    }else if(k&&uDense){tableUser=false;dmax=max(dmax,ucode);}else ucode=0; // (no user in the record of a line that is not a valid event)
     uint32_t user=ucode;
     if(__builtin_expect(tableUser,0)){ // a general user (about 1% of the rows): through the ID table right here
      PendUser pu;
@@ -1588,7 +1625,8 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
      resolve_users(&pu,&pu+1,tab,tl);
     }
     if(__builtin_expect(dEv,1)){
-     if(lp.bucket){ // bucket form: appended by counter range, like a PRec
+     if(PRE){send=max(send,(uint32_t)ve+1);eslot_commit(lp.ev[ve],k?k:ESLOT_INVALID,(uint64_t)user|((uint64_t)cat<<32)|lp.tid48,ingest,rawU);}
+     else if(lp.bucket){ // bucket form: appended by counter range, like a PRec
       Bucket<DRec>& vec=lp.db[ve>>lp.shE];
       if(__builtin_expect(vec.full(),0))vec.reserve(max<size_t>(16,2*vec.capacity()));
       DRec r;r.k=k;r.ingest=ingest;r.user=user;r.cat=(uint16_t)cat;r.lo=(uint16_t)((uint32_t)ve&lp.loMask);
@@ -1598,10 +1636,10 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
       const uint64_t kk=k?k:ESLOT_INVALID,uct=(uint64_t)user|((uint64_t)cat<<32)|lp.tid48; // cat < 2^16
       if(lp.ahead){ // the row waits; the row it replaces has had `ahead` rows of time for its slot's memory to arrive
        ERing& e=ring[rpos];
-       eslot_commit(*e.slot,e.k,e.uct,e.ingest);
-       e.k=kk;e.ingest=ingest;e.uct=uct;e.slot=&lp.ev[ve];
+       eslot_commit(*e.slot,e.k,e.uct,e.ingest,e.spare);
+       e.k=kk;e.ingest=ingest;e.uct=uct;e.spare=rawU;e.slot=&lp.ev[ve];
        rpos=rpos+1==lp.ahead?0:rpos+1;
-      }else eslot_commit(lp.ev[ve],kk,uct,ingest);
+      }else eslot_commit(lp.ev[ve],kk,uct,ingest,rawU);
      }
     }else{ // an event_id that is not dense: a bucket record, as in the other loops
      const uint64_t h=hkey_v3(s0,l0);
@@ -1634,16 +1672,56 @@ template<bool DREC,class GEN> SS_V3I const char* event_line_v3(const char* const
   return next;
  }
 }
+// resolve_raw_users (see DENSE_USER_RAW), one thread's range of event slots. A raw text that is not a dense
+// user goes through the ID table here (rare: other aliases, complex indexes, odd spellings).
+[[gnu::noinline]] static uint32_t raw_user_table(uint64_t raw,uint32_t len,KeyTable& tab,ThreadState& tl){
+ char tx[16]={'u',0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};memcpy(tx+1,&raw,8);
+ const string_view text(tx,len+1);
+ uint32_t code=tab.find_or_add(text); // at most 9 bytes: the table keeps the bytes, not the pointer
+ if(code==KeyTable::NONE){            // the table is full: a number of this thread, with a text that stays
+  const auto it=tl.users.m.find(text);
+  if(it!=tl.users.m.end())code=LOCAL_USER|it->second;
+  else{tl.rawNames.push_back({});memcpy(tl.rawNames.back().data(),tx,16);code=LOCAL_USER|tl.users.intern(string_view(tl.rawNames.back().data(),len+1));}
+ }
+ return code;
+}
+// A user's events sit in neighbouring slots but under several aliases (texts), so a small table of the last
+// texts seen saves most decodes. RAW_MEMO entries, indexed by a few bits of the text.
+static constexpr unsigned RAW_MEMO=64;
+struct RawMemo{uint64_t raw;uint32_t len,code;};
+#define SS_RESOLVE_RAW(NAME,TARGET,PARSE36) \
+TARGET static void NAME(ESlot* const ev,const size_t from,const size_t to,KeyTable& tab,ThreadState& tl,uint32_t& dmaxOut){ \
+ RawMemo memo[RAW_MEMO];for(RawMemo& m:memo){m.raw=0;m.len=~0u;m.code=0;} \
+ uint32_t dmax=0;const uint64_t ku=dense.ku;const uint16_t tid=(uint16_t)tl.tid; \
+ for(size_t c=from;c<to;++c){ \
+  ESlot& sl=ev[c]; \
+  if(sl.k.load(memory_order_relaxed)<PR_KBIAS)continue; /* empty, or not a valid event: no user */ \
+  const uint32_t u=sl.user; \
+  if((u&DENSE_USER_RAW)!=DENSE_USER_RAW)continue;       /* resolved on its line already */ \
+  const uint32_t len=u&15u;const uint64_t raw=sl.spare; \
+  RawMemo& m=memo[(size_t)(((raw^len)*0x9E3779B97F4A7C15ULL)>>58)]; \
+  if(__builtin_expect(m.raw!=raw||m.len!=len,0)){ \
+   uint32_t code=0;uint64_t y; \
+   if(PARSE36((const char*)&raw,len,y)&&dense_user_code(dn::index_of(y,ku),code))dmax=max(dmax,code); \
+   else code=raw_user_table(raw,len,tab,tl); \
+   m.raw=raw;m.len=len;m.code=code; \
+  } \
+  sl.user=m.code;sl.thread=tid; \
+ } \
+ dmaxOut=dmax; \
+}
+SS_RESOLVE_RAW(resolve_raw_v3,SS_V3,parse36_v3)
+SS_RESOLVE_RAW(resolve_raw_plain,,dn::parse36)
 // The event loop of one chunk for one mask builder.
 #define SS_EVENT_LOOP(NAME,TARGET,MASKS) \
 template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const EvLoop lp(tl,tab,products,PE,base+len);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* send: one past the highest counter written to a slot */ \
- ESlot scratch;scratch.k.store(0,memory_order_relaxed);ERing ring[RING_MAX];unsigned rpos=0;for(ERing& e:ring){e.k=ESLOT_INVALID;e.ingest=0;e.uct=0;e.slot=&scratch;} /* dmax: largest dense user code seen */ \
+ ESlot scratch;scratch.k.store(0,memory_order_relaxed);ERing ring[RING_MAX];unsigned rpos=0;for(ERing& e:ring){e.k=ESLOT_INVALID;e.ingest=0;e.uct=0;e.spare=0;e.slot=&scratch;} /* dmax: largest dense user code seen */ \
  static_assert(!DREC,"the dense-record line code needs the line index"); \
- while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),nullptr,lp,pend,pp,dmax,send,ring,rpos,general);} \
+ while(p<lim){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC,false>(p,b,w1,MASKS(b),nullptr,0,lp,pend,pp,dmax,send,ring,rpos,general);} \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
- for(const ERing& e:ring)eslot_commit(*e.slot,e.k,e.uct,e.ingest); /* the rows still waiting (free places write the scratch slot) */ \
+ for(const ERing& e:ring)eslot_commit(*e.slot,e.k,e.uct,e.ingest,e.spare); /* the rows still waiting (free places write the scratch slot) */ \
  tl.evEnd=max(tl.evEnd,send); \
 }
 // The same loop with a line index (SS_LINES=index): the newlines of the next IX_BLOCK bytes are located
@@ -1656,17 +1734,17 @@ template<bool DREC,class GEN> TARGET static void NAME(const char* base,size_t le
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
  const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* send: one past the highest counter written to a slot */ \
- ESlot scratch;scratch.k.store(0,memory_order_relaxed);ERing ring[RING_MAX];unsigned rpos=0;for(ERing& e:ring){e.k=ESLOT_INVALID;e.ingest=0;e.uct=0;e.slot=&scratch;} /* dmax: largest dense user code seen */ \
+ ESlot scratch;scratch.k.store(0,memory_order_relaxed);ERing ring[RING_MAX];unsigned rpos=0;for(ERing& e:ring){e.k=ESLOT_INVALID;e.ingest=0;e.uct=0;e.spare=0;e.slot=&scratch;} /* dmax: largest dense user code seen */ \
  const char* starts[IX_BLOCK+64];const char* scan=p; \
  while(p<lim){ \
   size_t n=0; \
   for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){starts[n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}} \
-  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3<DREC>(p,b,w1,MASKS(b),starts[i]-1,lp,pend,pp,dmax,send,ring,rpos,general);p=starts[i];} \
+  for(size_t i=0;i<n&&p<lim;++i){const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);event_line_v3<DREC,false>(p,b,w1,MASKS(b),starts[i]-1,0,lp,pend,pp,dmax,send,ring,rpos,general);p=starts[i];} \
   if(scan>=end&&p<lim){ /* the last line has no newline */ \
-   if(DREC){p=line_general<7>(p,end,general);break;} const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC>(p,b,w1,MASKS(b),nullptr,lp,pend,pp,dmax,send,ring,rpos,general);break;} \
+   if(DREC){p=line_general<7>(p,end,general);break;} const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<DREC,false>(p,b,w1,MASKS(b),nullptr,0,lp,pend,pp,dmax,send,ring,rpos,general);break;} \
  } \
  resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
- for(const ERing& e:ring)eslot_commit(*e.slot,e.k,e.uct,e.ingest); /* the rows still waiting (free places write the scratch slot) */ \
+ for(const ERing& e:ring)eslot_commit(*e.slot,e.k,e.uct,e.ingest,e.spare); /* the rows still waiting (free places write the scratch slot) */ \
  tl.evEnd=max(tl.evEnd,send); \
 }
 SS_EVENT_LOOP_IX(events_avx2_ix,SS_V3,win_masks_avx2,nl_mask_avx2)
@@ -1675,6 +1753,49 @@ SS_EVENT_LOOP_IX(events_avx512y_ix,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 SS_EVENT_LOOP(events_avx2,SS_V3,win_masks_avx2)
 SS_EVENT_LOOP(events_avx512z,SS_V5,win_masks_avx512z)
 SS_EVENT_LOOP(events_avx512y,SS_V5,win_masks_avx512y)
+// Two-phase event loop (the default for dense records with raw users). The line index gives the starts of
+// the next block of lines before any of them is parsed, so phase 1 runs over a whole block and only decodes
+// each line's event_id and asks for its slot's memory (event_pre_v3); phase 2 is the usual line code with
+// that counter handed in, writing the slot directly. Phase 1 of a block runs before phase 2 of the block
+// before it, so every slot has had at least a block of lines (about 13) of time to arrive: no ring.
+// The event_id of a well-formed line is what lies before the first comma, without the quotes of a quoted
+// field; a line that is not well-formed never uses the result (it goes to the general handler).
+SS_V3I uint32_t event_pre_v3(const char* const p,const EvLoop& lp){
+ const unsigned cm=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)p),_mm_set1_epi8(',')));
+ const unsigned c=(unsigned)_tzcnt_u32(cm|0x10000u); // the first comma; 16 if there is none that near (no dense ID is that long)
+ const unsigned z=(unsigned)(p[0]=='"');
+ const char* const s0=p+z;const unsigned l0=c-2*z;    // odd shapes give lengths that parse36_v3 refuses
+ uint64_t y,ve;
+ if(__builtin_expect(s0[0]=='e'&&parse36_v3(s0+1,l0-1,y)&&(ve=dn::index_of(y,lp.ke))<lp.limE,1)){__builtin_prefetch(&lp.ev[ve],1,3);return (uint32_t)ve;}
+ return NOPRE;
+}
+struct IxBlock{const char* first;size_t n;const char* starts[IX_BLOCK+64];uint32_t pre[IX_BLOCK+64];}; // lines first, starts[0], ...; n newlines found
+// Index a block starting at line FIRST (at least one newline unless the file ends first), then phase 1 on its lines.
+#define SS_IX_FILL(B,FIRST,NLMASK) {(B).first=(FIRST);(B).n=0; \
+ while((B).n==0&&scan<end){for(const char* const stop=scan+IX_BLOCK;scan<stop&&scan<end;scan+=64){uint64_t m=NLMASK(scan);while(m){(B).starts[(B).n++]=scan+_tzcnt_u64(m)+1;m=_blsr_u64(m);}}} \
+ {const char* q_=(B).first;for(size_t i_=0;i_<(B).n;++i_){(B).pre[i_]=event_pre_v3(q_,lp);q_=(B).starts[i_];}}}
+#define SS_EVENT_LOOP_2P(NAME,TARGET,MASKS,NLMASK) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ const char* const end=base+len; \
+ const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;ERing* const ring=nullptr;unsigned rpos=0; /* no pending batch, no ring here */ \
+ IxBlock blk[2];const char* scan=p; \
+ SS_IX_FILL(blk[0],p,NLMASK) \
+ for(int cur=0;;cur^=1){ \
+  IxBlock& b=blk[cur]; \
+  if(b.first>=lim)break; \
+  if(b.n==0){line_general<7>(b.first,end,general);break;} /* the last line has no newline */ \
+  IxBlock& nx=blk[cur^1];const char* const nf=b.starts[b.n-1]; \
+  if(nf<lim){SS_IX_FILL(nx,nf,NLMASK)}else{nx.first=nf;nx.n=0;} \
+  const char* q=b.first; \
+  for(size_t i=0;i<b.n&&q<lim;++i){const WinMasks w1=MASKS(q);const char* const bb=event_window2(q,w1.c);event_line_v3<true,true>(q,bb,w1,MASKS(bb),b.starts[i]-1,b.pre[i],lp,pend,pp,dmax,send,ring,rpos,general);q=b.starts[i];} \
+ } \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send); \
+}
+SS_EVENT_LOOP_2P(events_avx2_2p,SS_V3,win_masks_avx2,nl_mask_avx2)
+SS_EVENT_LOOP_2P(events_avx512z_2p,SS_V5,win_masks_avx512z,nl_mask_avx512z)
+SS_EVENT_LOOP_2P(events_avx512y_2p,SS_V5,win_masks_avx512y,nl_mask_avx512y)
+#undef SS_IX_FILL
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
@@ -1926,7 +2047,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  dparse.users=denseUsers;
  if(!denseUsers)dparse.events=dparse.clicks=false; // the record loops decode both IDs of a line together
  if(!dparse.events&&!dparse.clicks)dparse.bucket=false;
- cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<"\n";
+ // SS_DENSE_USERS=code: the line loops decode the user ID of every dense-record event line themselves (default:
+ // raw, the text goes into the slot and is decoded once per run of equal users after parsing; slot form only).
+ {const char* v=getenv("SS_DENSE_USERS");dparse.raw=dparse.events&&!dparse.bucket&&!(v&&string_view(v)=="code");}
+ // Event lines with raw users use the two-phase loop (SS_EVENT_LOOP_2P) unless SS_DENSE_AHEAD is given: then the
+ // loop with the ring of that length (0 = write at the end of the line) runs, for comparison.
+ dparse.twoPhase=dparse.raw&&!getenv("SS_DENSE_AHEAD");
+ cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<"\n";
  // First pass over the link files.
  // Without dense users it only counts lines (the table and the union-find arrays are sized by them).
  // With dense users it is the only pass that reads the files: a "simple" line - two dense user IDs
@@ -2312,7 +2439,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(ck.click){if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else clicks_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);} \
-    else{if(drec)events_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+    else{if(drec&&dparse.twoPhase)events_##ISA##_2p(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+     else if(drec)events_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(lineIndex)events_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else events_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);}
    if(isaUse==ISA_AVX2){SS_RUN_LOOPS(avx2)}
@@ -2327,6 +2455,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(tl.denseMax)dense_note_index((tl.denseMax&~DENSE_USER)>>dn::ALIAS_BITS); // sizes the person numbers of the dense users
   dense_note_end(denseEvEnd,tl.evEnd);dense_note_end(denseClEnd,tl.clEnd);
   tl.slotWaits=eslotWaits;
+ }
+ // ---- Raw users in the event slots become what the line loop would have written (see DENSE_USER_RAW). ----
+ // The ID table still takes new IDs here; a thread's part of the slots is one contiguous range.
+ if(dparse.raw&&denseEv){
+  const size_t evEnd=denseEvEnd.load();
+  #pragma omp parallel num_threads(T)
+  {
+   const size_t t=(size_t)omp_get_thread_num();ThreadState& tl=tls[t];uint32_t dmax=0;
+   const size_t from=evEnd*t/(size_t)T,to=evEnd*(t+1)/(size_t)T;
+   if(hasV3)resolve_raw_v3(denseEv,from,to,tab,tl,dmax);else resolve_raw_plain(denseEv,from,to,tab,tl,dmax);
+   if(dmax)dense_note_index((dmax&~DENSE_USER)>>dn::ALIAS_BITS);
+  }
  }
  const uint32_t totalIds=tab.end_parallel();
  __mark("PARSE");
@@ -2740,23 +2880,69 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    DInfo* const info=denseInfo;IdText txt;
    const auto bad_user=[]{fprintf(stderr,"ERROR dense user index above the reported maximum\n");_exit(1);};
    // The sweep of one stretch of counters (events, then clicks).
-   const auto sweep_events=[&](size_t lo,size_t hi){
-    for(size_t c=lo;c<hi;){
-     const ESmall& sl=ev_at(c);const uint64_t k=sl.k;
-     if(k<PR_KBIAS){++c;continue;} // empty, or present but not valid
+   // Session lists go to pieces of this thread's pool, one block per run.
+   uint64_t* acur=nullptr;uint64_t* aend=nullptr;vector<uint64_t> purTmp;
+   // The event sweep of [lo,hi). A run is a stretch of valid slots of one user index, not broken by a
+   // valid slot of anybody else; it belongs to the piece it starts in and may run past `hi` (cross),
+   // so a piece first steps over the run that reaches into it. While a run is read its sessions are
+   // made as well: every row either continues the current session or starts one (more than GAP after
+   // the row before), written without a branch on that - each row writes "a session starts here" into
+   // the next free entry, and the entry only stays if the row really starts one.
+   const auto sweep_events=[&](size_t lo,size_t hi,bool cross){
+    size_t c=lo;
+    if(cross&&lo>0){
+     size_t p=lo;uint32_t code0=0;bool reaches=false;
+     while(p>0){--p;const ESmall& sl=ev_at(p);if(sl.k>=PR_KBIAS){if(sl.user&DENSE_USER){code0=sl.user&~7u;reaches=true;}break;}}
+     if(reaches)for(;c<hi;++c){const ESmall& sl=ev_at(c);if(sl.k>=PR_KBIAS&&(sl.user&~7u)!=code0)break;}
+    }
+    const size_t stop=cross?evEnd:hi; // how far a run may go
+    while(c<hi){
+     const ESmall& sl=ev_at(c);const uint64_t k0=sl.k;
+     if(k0<PR_KBIAS){++c;continue;} // empty, or present but not valid
      const uint32_t u=sl.user;
-     if(!(u&DENSE_USER)){hand_event(myEv,pool,k,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++rdHandEv;++rdSlotEv;++c;if(stats)++rdWhy[why_table(u)];continue;}
+     if(!(u&DENSE_USER)){hand_event(myEv,pool,k0,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++rdHandEv;++rdSlotEv;++c;if(stats)++rdWhy[why_table(u)];continue;}
      if(__builtin_expect(u>denseTop,0))bad_user();
-     // A run of this user index: up to the next valid slot of anybody else.
-     const uint32_t code=u&~7u;const size_t first=c;size_t last=c;uint32_t cnt=1;
-     for(++c;c<hi;++c){
-      if(ev_at(c).k<PR_KBIAS)continue;
-      if((ev_at(c).user&~7u)!=code)break;
-      last=c;++cnt;
+     const uint32_t code=u&~7u;const size_t first=c;size_t lastSlot=c;
+     // Room: one entry per slot looked at, at most, plus the end entry.
+     if((size_t)(aend-acur)<hi-c+2){const size_t want=max<size_t>(hi-c+2,size_t(1)<<19);acur=(uint64_t*)pool.take(want*8);aend=acur+want;}
+     uint64_t* blk=acur;size_t cap=(size_t)(aend-blk);
+     size_t n=0,ns=0;uint64_t last=0-(uint64_t)(GAP+1),disorder=0;uint32_t mask=0;purTmp.clear();
+     size_t j=c;
+     const size_t stride=size_t(1)<<evShift;
+     for(;;){
+      const size_t lim=min(stop,c+cap-2);
+      const char* p=(const char*)&ev_at(j);const char* const pe=(const char*)&ev_at(lim);const char* lastp=p;
+      for(;p<pe;p+=stride){
+       const ESmall& r=*(const ESmall*)(const void*)p;const uint64_t k=r.k;
+       if(k<PR_KBIAS)continue;
+       const uint32_t al=r.user^code; // the alias if the row is this index's
+       if(al>7)break;
+       mask|=1u<<al;
+       const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
+       disorder|=step; // its top bit: a row before its predecessor
+       blk[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
+       if(__builtin_expect((k&EV_PURCHASE)!=0,0))purTmp.push_back(((uint64_t)(ns-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
+       ++n;lastp=p;
+      }
+      j=(size_t)(p-(const char*)&ev_at(0))>>evShift;
+      if(n)lastSlot=(size_t)(lastp-(const char*)&ev_at(0))>>evShift;
+      if(p<pe)goto run_done; // a valid slot of somebody else
+      if(j>=stop)break;
+      {const size_t cap2=cap*2;uint64_t* const nb=(uint64_t*)pool.take(cap2*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=cap2;aend=nb+cap2;} // a long run past the piece: a bigger block
      }
+     run_done:;
+     {const size_t np=purTmp.size(),need=ns+1+np+1;
+      if(cap<need){uint64_t* const nb=(uint64_t*)pool.take(need*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=need;aend=nb+need;}
+      blk[ns]=n;if(np)memcpy(blk+ns+1,purTmp.data(),np*8);blk[ns+1+np]=~0ull;
+      acur=blk+need;}
      DInfo& f=info[(code&~DENSE_USER)>>dn::ALIAS_BITS];
-     dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)last+1);f.ec.fetch_add(cnt,memory_order_relaxed);
-     rdSlotEv+=cnt;
+     dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)lastSlot+1);f.ec.fetch_add((uint32_t)n,memory_order_relaxed);
+     uint64_t* none=nullptr;
+     if(f.sess.compare_exchange_strong(none,blk,memory_order_relaxed)){
+      f.ns.store((uint32_t)ns|(((disorder>>63)||n>=(size_t(1)<<24))?0x80000000u:0u),memory_order_relaxed);f.amask.store((uint8_t)mask,memory_order_relaxed);}
+     else f.multi.store(1,memory_order_relaxed); // the index has another run
+     rdSlotEv+=n;
+     c=j;
     }
    };
    const auto sweep_clicks=[&](size_t lo,size_t hi){
@@ -2801,7 +2987,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      if(!any)continue; // nothing was written to this stretch
      const size_t hi=min(evEnd,lo+(size_t(1)<<bshE));
      fillEndE=max<uint64_t>(fillEndE,hi);
-     sweep_events(lo,hi);
+     sweep_events(lo,hi,false); // the next stretch may still be filling: runs end with this one
     }
     #pragma omp for schedule(dynamic,1) reduction(max:fillEndC)
     for(size_t b=0;b<nClBuckets;++b){
@@ -2823,7 +3009,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    }
    else{
     #pragma omp for schedule(dynamic,1) nowait
-    for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH));
+    for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH),true);
     #pragma omp for schedule(dynamic,1)
     for(size_t lo=0;lo<clEnd;lo+=CCH)sweep_clicks(lo,min(clEnd,lo+CCH));
    }
@@ -3032,6 +3218,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // A click of the fast lane: time and campaign as in Click, and its counter, which stands for its ID.
    struct FClick{uint64_t key;uint32_t user;uint32_t ctr;};
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
+   // One index's sessions (start time; number of its rows before the session) and purchases
+   // (session<<40 | category<<24 | price), written by the walk over its event slots.
+   Scratch<uint64_t> sessTs,purBuf,clickKeys;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;fastC2.pool=&pool;
+   vector<uint8_t> lastOfV(ncamp+1,0xFF);uint8_t* const lastOf=lastOfV.data(); // small click sets: last position of a campaign
+   // The 32-bit click arithmetic below counts times from the window start (clicks: -7 days and up), so
+   // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
+   const bool smallClicksOk=(uint64_t)(window_end-window_start)<0x7fffffffull&&!getenv("SS_TEST_NOSMALLCLICKS");
+   uint32_t* const fr=freq.data();uint32_t* const pos=positions.data();uint16_t* const act=active.data();
    const atomic<uint32_t>* const comp=denseComp;const uint32_t dBase=denseBase;
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
    for(size_t i0=0;i0<idxEnd;i0+=ICH){
@@ -3058,21 +3252,34 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      int why=5; // why the index is handed over, if it is
      if(noFastN&&ix%noFastN==0){if(fast)why=7;fast=false;}
      size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;
+     uint64_t* sTs=nullptr;uint32_t* sOrd=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0;
+     // The sweep's session list, if the index is one run of rows in time order.
+     const uint64_t* const sweepList=f.multi.load(memory_order_relaxed)?nullptr:f.sess.load(memory_order_relaxed);
+     const uint32_t sweepNs=f.ns.load(memory_order_relaxed);
+     const bool listed=ec&&sweepList&&!(sweepNs>>31);
      if(fast){
-      // Pick the index's rows out of the two stretches. An event slot starts like an Ev (k, user, cat),
-      // so its first 16 bytes are copied as they are, minus the k bias; the copy only counts if the
-      // slot is a valid row of this index. `mask` collects the aliases in use.
       uint32_t mask=0;
-      E=fastE.get((size_t)ec+1);
-      const __m128i bias=_mm_set_epi64x(0,(long long)PR_KBIAS);
-      for(size_t c=ef;c<el;++c){
-       const ESmall& sl=ev_at(c);
-       const __m128i v=_mm_loadu_si128((const __m128i*)(const void*)&sl);
-       const uint64_t k=(uint64_t)_mm_cvtsi128_si64(v);const uint32_t u=sl.user;
-       _mm_storeu_si128((__m128i*)(void*)(E+n),_mm_sub_epi64(v,bias));
-       const uint32_t ok=(uint32_t)(k>=PR_KBIAS)&(uint32_t)((u^code)<8);
-       mask|=ok<<(u&7);n+=ok;
+      sTs=sessTs.get((size_t)ec+2);sOrd=sessOrd.get((size_t)ec+2);
+      if(listed){
+       ns=sweepNs;n=ec;mask=f.amask.load(memory_order_relaxed);
+       for(size_t i=0;i<=ns;++i){const uint64_t e=sweepList[i];sTs[i]=e>>24;sOrd[i]=(uint32_t)(e&0xFFFFFFu);}
+       pur=sweepList+ns+1;
       }
+      // Otherwise (several runs, or a row out of order) walk the index's stretch of event slots here
+      // the way the sweep does, skipping other people's slots; `disorder` says whether a row was out of order.
+      uint64_t* const myPur=listed?nullptr:purBuf.get((size_t)ec+2);size_t np=0;
+      uint64_t last=0-(uint64_t)(GAP+1); // the first row starts a session
+      if(!listed)for(size_t c=ef;c<el;++c){
+       const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t u=sl.user;
+       if(!((uint32_t)(k>=PR_KBIAS)&(uint32_t)((u^code)<8)))continue;
+       mask|=1u<<(u&7);
+       const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
+       disorder|=step>>63;
+       sTs[ns]=ts;sOrd[ns]=(uint32_t)n;ns+=step>(uint64_t)GAP;last=ts;
+       if(__builtin_expect((k&EV_PURCHASE)!=0,0))myPur[np++]=((uint64_t)(ns-1)<<40)|((uint64_t)sl.cat<<24)|(k&EV_PRICE);
+       ++n;
+      }
+      if(!listed){myPur[np]=~0ull;pur=myPur;}
       C=fastC.get((size_t)cc+1);
       for(size_t c=cf;c<cl;++c){
        const CSlot& sl=denseCl[c];const uint32_t u=sl.user;
@@ -3087,18 +3294,131 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      }
      if(fast){
       const uint32_t person=dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|root);
-      ev_time_sort(E,E+n);
-      // Clicks in click_before order: by time, and at the same moment the larger ID text first.
-      // (They come in no particular order, so only short runs are sorted by insertion.)
-      if(m>1){
-       const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
-        return ta!=tb?ta<tb:order36(dn::value_of(a.ctr,kc))>order36(dn::value_of(b.ctr,kc));};
-       if(m>16)sort(C,C+m,before);
-       else for(FClick* x=C+1;x<C+m;++x){
-        if(before(*x,x[-1])){const FClick v=*x;FClick* y=x;do{*y=y[-1];--y;}while(y>C&&before(v,y[-1]));*y=v;}
+      if(__builtin_expect(disorder!=0,0)){
+       // Not in time order: copy the rows out, sort them, and make the session list from the copy.
+       E=fastE.get((size_t)ec+1);size_t q=0;
+       for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);
+        if(sl.k>=PR_KBIAS&&(sl.user^code)<8){E[q].k=sl.k-PR_KBIAS;E[q].person=person;E[q].cat=sl.cat;E[q].pad=0;++q;}}
+       ev_time_sort(E,E+n);
+       uint64_t* const sortedPur=purBuf.get((size_t)ec+2);size_t np=0;
+       ns=0;uint64_t last=0-(uint64_t)(GAP+1);
+       for(size_t i=0;i<n;++i){
+        const uint64_t k=E[i].k,ts=k>>EV_TS,step=ts-last;
+        sTs[ns]=ts;sOrd[ns]=(uint32_t)i;ns+=step>(uint64_t)GAP;last=ts;
+        if(k&EV_PURCHASE)sortedPur[np++]=((uint64_t)(ns-1)<<40)|((uint64_t)E[i].cat<<24)|(k&EV_PRICE);
+       }
+       sortedPur[np]=~0ull;pur=sortedPur;
+      }
+      sOrd[ns]=(uint32_t)n;
+      // The person's clicks. A small set (most are) is put in order once and kept as plain arrays: a
+      // session then finds the clicks of its seven days with one vector compare, the credited campaign
+      // is that of the last one, and the assists are counted in one byte per click (bumped only for the
+      // first click of its campaign inside the window) and added to the totals when the row is done.
+      // A larger set takes the sliding window over the sorted clicks, as the general lane does.
+      enum{NONE,SMALL,LARGE} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:LARGE;
+      alignas(16) int32_t cts[16];uint16_t ccamp[16],credit[17];uint16_t dupMask[17];size_t nvec=0;uint64_t cntLo=0,cntHi=0;
+      if(mode==SMALL){
+       uint64_t keys[16];
+       for(size_t i=0;i<m;++i){const uint64_t key=((C[i].key>>16)<<32)|i;size_t j=i;while(j>0&&keys[j-1]>key){keys[j]=keys[j-1];--j;}keys[j]=key;}
+       // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
+       for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
+        const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
+        const uint64_t key=keys[i];size_t j=i;
+        while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
+        keys[j]=key;
+       }
+       bool dup=false;uint16_t nextMask[16];
+       for(size_t i=0;i<16;++i){cts[i]=INT32_MAX;nextMask[i]=0;}
+       for(size_t i=0;i<m;++i){const FClick& x=C[(uint32_t)keys[i]];const uint16_t c=(uint16_t)x.key;
+        cts[i]=(int32_t)((int64_t)(keys[i]>>32)-WEEK);ccamp[i]=c;credit[i+1]=c; // times from the window start, like session times
+        const uint8_t p=lastOf[c];if(p!=0xFF){nextMask[p]|=(uint16_t)(1u<<i);dup=true;}
+        lastOf[c]=(uint8_t)i;}
+       for(size_t i=0;i<m;++i)lastOf[ccamp[i]]=0xFF;
+       credit[0]=organic; // read when no click is in the window
+       dupMask[16]=0;
+       if(dup)for(int a=15;a>=0;--a)dupMask[a]=dupMask[a+1]|nextMask[a]; // bit i: click i has an earlier click of its campaign at position a or later
+       else memset(dupMask,0,sizeof dupMask);
+       nvec=(m+3)/4;
+      }
+      else if(mode==LARGE&&m>1){
+       // Order by time through 8-byte keys (time, position), which sort faster than the clicks
+       // themselves; clicks of one moment are then put in text order, and the clicks are copied out
+       // in the final order.
+       uint64_t* const keys=clickKeys.get(m);
+       const bool wide=(C[0].key>>16)>>32!=0||(uint64_t)(window_end-clickStart)>>32!=0; // times that do not fit 32 bits: sort the clicks themselves
+       if(wide||m>4096){
+        const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
+         return ta!=tb?ta<tb:order36(dn::value_of(a.ctr,kc))>order36(dn::value_of(b.ctr,kc));};
+        sort(C,C+m,before);
+       }
+       else{
+        for(size_t i=0;i<m;++i)keys[i]=((C[i].key>>16)<<32)|i;
+        sort(keys,keys+m);
+        for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
+         const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
+         const uint64_t key=keys[i];size_t j=i;
+         while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
+         keys[j]=key;
+        }
+        FClick* const S=fastC2.get(m+1);
+        for(size_t i=0;i<m;++i)S[i]=C[(uint32_t)keys[i]];
+        C=S;
        }
       }
-      char tmp[16];sessionize_person(person_name(person,tmp),E,n,C,C+m);
+      char tmp[16];const NameRef nm=person_name(person,tmp);
+      const FClick *add=C,*expire=C,*const ce=C+m;size_t na=0;
+      int currentday=-1;uint64_t dsess=0,drev=0;uint32_t rowStart=0;size_t pi=0;
+      const auto count_assists=[&](int day){ // the row's byte counters into the totals
+       if(!(cntLo|cntHi))return;
+       uint64_t* const arow=assists+(size_t)day*ncamp;
+       for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));
+       cntLo=0;cntHi=0;};
+      for(size_t sn=0;sn<ns;++sn){
+       const uint64_t ts=sTs[sn];const int d=(int)((ts+dayOff)/(uint64_t)DAY);
+       if(d!=currentday){
+        if(currentday>=0){
+         if(mode==SMALL)count_assists(currentday);
+         put_row(nm,currentday,dsess,sOrd[sn]-rowStart,drev);dsess=0;drev=0;
+        }
+        currentday=d;rowStart=sOrd[sn];
+       }
+       ++dsess;
+       uint16_t credited=organic;
+       if(mode==SMALL){
+        // In the window: start - seven days <= click time <= start.
+        const __m128i vlo=_mm_set1_epi32((int)((int64_t)ts-WEEK)),vhi=_mm_set1_epi32((int)ts);
+        uint32_t out=0;
+        for(size_t v=0;v<nvec;++v){const __m128i x=_mm_load_si128((const __m128i*)(cts+4*v));
+         out|=(uint32_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(_mm_cmplt_epi32(x,vlo),_mm_cmpgt_epi32(x,vhi))))<<(4*v);}
+        const uint32_t in=~out&((1u<<(4*nvec))-1);
+        credited=credit[31-__builtin_clz((in<<1)|1u)]; // the last click in the window, or entry 0
+        const uint32_t firsts=in&~(uint32_t)dupMask[__builtin_ctz(in|0x10000u)]; // bit 16: nothing in the window
+        cntLo+=SPREAD8[firsts&255];cntHi+=SPREAD8[(firsts>>8)&255];
+       }
+       else if(mode==LARGE){
+        const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
+        while(add<ce&&add->key<addLim){const uint16_t c=(uint16_t)add->key;if(fr[c]++==0){pos[c]=(uint32_t)na;act[na++]=c;}++add;}
+        while(expire<add&&expire->key<expLim){const uint16_t c=(uint16_t)expire->key;if(--fr[c]==0){const uint32_t at=pos[c];const uint16_t back=act[--na];act[at]=back;pos[back]=at;}++expire;}
+        if(add>expire)credited=(uint16_t)add[-1].key;
+        uint64_t* const arow=assists+(size_t)d*ncamp;
+        #pragma GCC unroll 4
+        for(size_t q=0;q<na;++q)++arow[act[q]];
+       }
+       Totals* const cur=&tot[(size_t)d*ncamp+credited];cur->sessions++;
+       if((pur[pi]>>40)==sn){ // the list ends with an all-ones entry, which is no session's
+        cur->purchasing_sessions++;
+        do{const uint64_t price=pur[pi]&EV_PRICE;const uint16_t cat=(uint16_t)(pur[pi]>>24);
+         drev+=price;cur->revenue+=price;
+         if(catsum[cat]==0)touched.push_back(cat);
+         catsum[cat]+=price;
+        }while((pur[++pi]>>40)==sn);
+       }
+      }
+      if(mode==SMALL)count_assists(currentday);
+      put_row(nm,currentday,dsess,(uint32_t)n-rowStart,drev);
+      for(size_t q=0;q<na;++q)fr[act[q]]=0;
+      num_sessions+=ns;
+      if(nrows>=FLUSH)flush_rows();
       ++rdFastIdx;rdFastEv+=n;rdFastCl+=m;
      }
      else{
