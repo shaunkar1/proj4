@@ -21,6 +21,8 @@ IDs whose copies leave the result undefined (equal smallest ingest_ts but differ
 differ) are counted and skipped.
 With SS_TEST_MAXNEW (full ID table) the users that are not dense are only checked for "not dense":
 which of them still got a table number depends on the order the threads met them.
+DC_FALLBACK=1 asks for the same without SS_TEST_MAXNEW: needed on sets with so many forged user IDs that the
+ID table of a dense run (an eighth of the room for new IDs) fills up by itself, e.g. the dense_run.sh sets.
 Every dense run writes its dump into WORK_DIR/dump and is read before the next run overwrites it;
 A's dump stays in WORK_DIR/dumpA. WORK_DIR may be reused. Prints DENSE_PARSE_OK or the first differences."""
 import os, subprocess, sys
@@ -28,7 +30,7 @@ from collections import Counter
 
 core, data, work = sys.argv[1], sys.argv[2], sys.argv[3]
 extra = dict(a.split("=", 1) for a in sys.argv[4:])
-FALLBACK = "SS_TEST_MAXNEW" in extra
+FALLBACK = "SS_TEST_MAXNEW" in extra or os.environ.get("DC_FALLBACK") == "1"
 MASK = (1 << 40) - 1
 M1 = 0x9E3779B97F4B & MASK; M2 = 0xD6E8FEB86659 & MASK
 I1 = pow(M1, -1, 1 << 40); I2 = pow(M2, -1, 1 << 40)
