@@ -4510,6 +4510,39 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
  int nday=(int)((window_end-window_start+DAY-1)/DAY);
  if(nday<=0||nday>1000)throw runtime_error("Unreasonable window length");
+ // ---- Products and campaigns: two small files that depend on nothing else. They are read by a side thread
+ // while this one maps the inputs and the link stages run (about 9 million instructions that used to sit, on one
+ // thread, in front of the parse stage). The tables are only used after the join below, where a failure of the
+ // side thread is thrown again. SS_CATALOG=inline: read them on this thread at that place, as before.
+ FastMap<uint16_t> categories;vector<string> catnames;
+ KeyTable products(1<<17); // product_id -> category number
+ vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
+ uint16_t organic=0;
+ const auto load_catalog=[&]{
+ cat_id("unknown",categories,catnames);
+ // Categories repeat: a small memo of the last category texts seen saves most of the string-map lookups.
+ struct CatMemo{const char* p;uint32_t n;uint16_t id;};
+ CatMemo catMemo[64]={};
+ read_pairs(data/"products.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean products.csv");
+  const string_view c=f[1];
+  uint64_t w;memcpy(&w,c.data(),8);w&=LOW_BYTES[min<size_t>(c.size(),8)]; // mapped input: reading past the end is safe
+  CatMemo& e=catMemo[((w^c.size())*0x9e3779b97f4a7c15ULL)>>58];
+  uint16_t id;
+  if(e.p&&e.n==c.size()&&memcmp(e.p,c.data(),c.size())==0)id=e.id;
+  else{id=cat_id(c,categories,catnames);e.p=c.data();e.n=(uint32_t)c.size();e.id=id;}
+  products.intern(f[0],id);
+ });
+ read_pairs(data/"campaigns.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean campaigns.csv");
+  if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
+  const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
+ organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
+ };
+ const bool catalogBg=!(getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="inline");
+ exception_ptr catalogErr;thread catalogThread;
+ struct Joiner{thread& t;~Joiner(){if(t.joinable())t.join();}} catalogJoiner{catalogThread}; // an exception on the way must not meet a running thread
+ if(catalogBg)catalogThread=thread([&]{try{load_catalog();}catch(...){catalogErr=current_exception();}});
  // The scorer may limit CPU by quota rather than by affinity, so trust NCPU when it is set.
  int T=max(1,omp_get_max_threads());
  if(const char* n=getenv("NCPU")){int v=atoi(n);if(v>=1&&v<=1024)T=v;}
@@ -4851,28 +4884,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked-idHoles<<"\n";
- FastMap<uint16_t> categories;vector<string> catnames;
- cat_id("unknown",categories,catnames);
- KeyTable products(1<<17); // product_id -> category number
- // Categories repeat: a small memo of the last category texts seen saves most of the string-map lookups.
- struct CatMemo{const char* p;uint32_t n;uint16_t id;};
- CatMemo catMemo[64]={};
- read_pairs(data/"products.csv",[&](const string_view* f,bool ok){
-  if(!ok)throw runtime_error("Malformed clean products.csv");
-  const string_view c=f[1];
-  uint64_t w;memcpy(&w,c.data(),8);w&=LOW_BYTES[min<size_t>(c.size(),8)]; // mapped input: reading past the end is safe
-  CatMemo& e=catMemo[((w^c.size())*0x9e3779b97f4a7c15ULL)>>58];
-  uint16_t id;
-  if(e.p&&e.n==c.size()&&memcmp(e.p,c.data(),c.size())==0)id=e.id;
-  else{id=cat_id(c,categories,catnames);e.p=c.data();e.n=(uint32_t)c.size();e.id=id;}
-  products.intern(f[0],id);
- });
- vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
- read_pairs(data/"campaigns.csv",[&](const string_view* f,bool ok){
-  if(!ok)throw runtime_error("Malformed clean campaigns.csv");
-  if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
-  const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
- uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
+ if(catalogBg){catalogThread.join();if(catalogErr)rethrow_exception(catalogErr);}else load_catalog();
 
  // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
  const size_t PE=pow2_parts(eventBytes/70),PC=pow2_parts(clickBytes/40);
