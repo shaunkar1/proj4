@@ -4441,7 +4441,11 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
      if(gn[iF]){gl[iF]-=s_;}} \
     while(m-pos<8&&scan<end&&ls[m]<lim){ \
      const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
-     do{uint64_t x_=NLMASK(scan);while(x_){ls[++m]=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);}scan+=64;}while(scan<stop);} \
+     const char** w_=ls+m; /* the first two newlines of a window are stored without a branch (click lines are shorter than a window: one or two per window; a missing one stores a value past the last entry, never read); a third one is rare */ \
+     do{uint64_t x_=NLMASK(scan);const uint64_t y_=_blsr_u64(x_);w_[1]=scan+_tzcnt_u64(x_)+1;w_[2]=scan+_tzcnt_u64(y_)+1;w_+=(x_!=0)+(y_!=0);x_=_blsr_u64(y_); \
+      while(__builtin_expect(x_!=0,0)){*++w_=scan+_tzcnt_u64(x_)+1;x_=_blsr_u64(x_);} \
+      scan+=64;}while(scan<stop); \
+     m=(size_t)(w_-ls);} \
    } \
    if(__builtin_expect(pos+8<=m&&ls[pos+7]<lim,1)){n=8;gl[iN]=ls+pos;} \
    else{ /* the last lines of the chunk: a short group */ \
