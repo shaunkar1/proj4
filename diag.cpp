@@ -384,14 +384,20 @@ int main(){
  auto add=[&](const char* group,int reps,vector<pair<string,string>> env,const char* bin="",bool hs=false){for(int i=0;i<reps;++i)vars.push_back({string(group)+"#"+to_string(i),env,bin,hs});};
  // practice-sized set: the first run only warms the page cache
  add("warm",1,{N8});
- for(int r=0;r<3;++r){add("B",1,{N8});add("st",1,{N8,{"SS_LINES","struct"}});add("nod",1,{N8,{"SS_NODENSE","1"}});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("z",1,{N8,{"SS_ISA","avx512z"}});}
- add("stz",2,{N8,{"SS_LINES","struct"},{"SS_ISA","avx512z"}});
- add("nohuge",1,{N8,{"SS_NOHUGE","1"}});add("n4",1,{{"NCPU","4"}});add("n6",1,{{"NCPU","6"}});add("n1",1,{{"NCPU","1"}});add("n16",1,{{"NCPU","16"}});
- add("B",1,{N8});
+ auto ring=[&](const char* name,const char* ahead,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DENSE_AHEAD",ahead}},"core-ring",hs);};
+ auto bkt=[&](const char* name,const char* sh,bool hs){add(name,1,{N8,{"SS_DENSE_RECORDS","1"},{"SS_DENSE_DUMP","-"},{"SS_DSHIFT",sh},{"SS_CSHIFT",sh}},"core-bkt",hs);};
+ for(int r=0;r<2;++r){
+  add("B",1,{N8});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("nod",1,{N8,{"SS_NODENSE","1"}});
+  ring("r0","0",false);ring("r1","1",false);ring("r2","2",false);ring("r4","4",false);ring("r8","8",false);ring("r16","16",false);
+  bkt("k12","12",false);bkt("k14","14",false);bkt("k16","16",false);
+  add("pu",1,{N8,{"SS_DENSE_RECORDS","0"},{"SS_DENSE_DUMP","-"}},"core-ring"); // parse only, dense users, general buckets
+ }
+ add("B",1,{N8});add("rec0",1,{N8,{"SS_DENSE_RECORDS","0"}});add("nod",1,{N8,{"SS_NODENSE","1"}});
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hst",1,{N8,{"SS_LINES","struct"}},"",true);add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);}
- add("Hz",1,{N8,{"SS_ISA","avx512z"}},"",true);add("Hn16",1,{{"NCPU","16"}},"",true);
+ for(int r=0;r<2;++r){add("HB",1,{N8},"",true);add("Hrec0",1,{N8,{"SS_DENSE_RECORDS","0"}},"",true);add("Hnod",1,{N8,{"SS_NODENSE","1"}},"",true);
+  ring("Hr0","0",true);ring("Hr4","4",true);ring("Hr16","16",true);bkt("Hk14","14",true);bkt("Hk16","16",true);
+  add("Hpu",1,{N8,{"SS_DENSE_RECORDS","0"},{"SS_DENSE_DUMP","-"}},"core-ring",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;pipeline(v.label,v.hugeSet?H:B,od(),v.env,v.bin);}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
@@ -419,9 +425,11 @@ int main(){
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
   string a,c;
-  a+=fmt("dense B w/PARSE/DEDUP/DENSE/AGG/links/keys/write/user/sys/kfaults/rssGB","B","wPDXALKWusfr")+fmt("| nodense wPDALus","nod","wPDALusfr")+fmt("| records0 wPDXAL","rec0","wPDXAL");
-  a+=fmt("| struct wPX","st","wPX")+fmt("struct+avx512z wPX","stz","wPX")+fmt("| avx512z wPX","z","wPX")+fmt("nohuge wPX","nohuge","wPX")+fmt("n4 wPXA","n4","wPXA")+fmt("n6 wPXA","n6","wPXA")+fmt("n16 wPXA","n16","wPXA")+fmt("n1 wPXAus","n1","wPXAus");
-  c+="60x: "+fmt("dense wPDXALKWusfr","HB","wPDXALKWusfr")+fmt("| nodense wPDALusfr","Hnod","wPDALusfr")+fmt("| struct wPX","Hst","wPX")+fmt("| avx512z wPX","Hz","wPX")+fmt("n16 wPX","Hn16","wPX");
+  a+=fmt("slots B w/PARSE/DEDUP/DENSE/AGG/links/user/sys","B","wPDXALus")+fmt("| users+general-buckets wPDXALus","rec0","wPDXALus")+fmt("| nodense wPDALus","nod","wPDALus");
+  a+="| PARSE only: "+fmt("dense users, general buckets","pu","P")+"slots by AHEAD: ";for(const char* g:{"r0","r1","r2","r4","r8","r16"})a+=fmt(g+1,g,"P");
+  a+="counter buckets by shift: ";for(const char* g:{"k12","k14","k16"})a+=fmt(g+1,g,"P");
+  c+="60x: "+fmt("slots wPDXALus","HB","wPDXALus")+fmt("| users+buckets wPDXALus","Hrec0","wPDXALus")+fmt("| nodense wPDALus","Hnod","wPDALus");
+  c+="| PARSE only: "+fmt("users+general","Hpu","P")+fmt("slots AHEAD 0","Hr0","P")+fmt("4","Hr4","P")+fmt("16","Hr16","P")+fmt("counter buckets shift 14","Hk14","P")+fmt("16","Hk16","P");
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)

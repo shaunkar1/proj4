@@ -1697,174 +1697,6 @@ SS_EVENT_LOOP_IX(events_avx512y_ix,SS_V5,win_masks_avx512y,nl_mask_avx512y)
 SS_EVENT_LOOP(events_avx2,SS_V3,win_masks_avx2)
 SS_EVENT_LOOP(events_avx512z,SS_V5,win_masks_avx512z)
 SS_EVENT_LOOP(events_avx512y,SS_V5,win_masks_avx512y)
-// ---- Two-stage line loops (SS_LINES=struct), for the dense-record loops ----
-// Stage 1 looks at a round of ST_WORDS x 64 bytes that starts at a line start and writes down, without reading
-// any field: the positions of all separators (commas and newlines), the positions of the newlines, one bit per
-// separator saying whether the field it ends is wrapped in quotes, and one bit per newline saying whether its
-// line has a quote that this simple reading cannot explain. Stage 2 walks the lines: a line whose seventh
-// separator is its newline and whose quotes are all explained has its seven fields between neighbouring
-// separator positions (one byte in from each side if quoted); every other line goes to event_line_v3, so
-// what is right for odd lines is decided by one piece of code only. Nothing of a line depends on the line
-// before it any more. The next round starts at the first line the round did not finish (its bytes are looked
-// at twice; with 2 KB rounds that is about 2%).
-// Quotes, per 64-byte word with carries between the words of a round (the same arithmetic as quote_errors_v3):
-//   O   quotes right after a separator (opening), Cq quotes right before a separator (closing)
-//   EO  separators whose field began with O: adding O to the non-separator bits carries up to the field's separator
-//   EC  separators right after a Cq
-//   bad = quotes that are neither O nor Cq, a quote that is both (a field of one quote), and EO != EC;
-//   adding the bad bits to the non-newline bits carries them up to the line's newline.
-static constexpr unsigned ST_WORDS=32;
-struct StBlock{
- uint32_t sep[ST_WORDS*64+16]; // separator positions relative to the round's first byte; eight entries of ~0 after the last
- uint32_t nl[ST_WORDS*64+8];   // newline positions
- uint64_t bad[ST_WORDS];       // per word: the newlines of lines with unexplained quotes
- uint64_t qw[ST_WORDS+2];      // bit i: the field ending at separator i is quoted (read through byte offsets, see st_flags)
- unsigned ns,nn;
-};
-SS_V3I void st_build(const WinMasks* const m,const unsigned nw,StBlock& b){ // m[nw] = the word after the round (zeros past the file)
- unsigned ns=0,nn=0;uint64_t carryS=1,carryC=0;unsigned char cEO=0,cBad=0;
- b.qw[0]=0;
- for(unsigned j=0;j<nw;++j){
-  const uint64_t q=m[j].q,n=m[j].n,S=m[j].c|n,Snext=m[j+1].c|m[j+1].n;
-  const uint64_t ST=(S<<1)|carryS;carryS=S>>63;
-  const uint64_t O=q&ST,Cq=q&((S>>1)|(Snext<<63));
-  unsigned long long sum;cEO=_addcarry_u64(cEO,~S,O,&sum);
-  const uint64_t EO=sum&S,EC=(Cq<<1)|carryC;carryC=Cq>>63;
-  const uint64_t bad=(q&~(O|Cq))|(O&Cq)|(EO^EC);
-  unsigned long long sum2;cBad=_addcarry_u64(cBad,~n,bad&~n,&sum2);
-  b.bad[j]=(sum2|bad)&n;
-  // one "quoted" bit per separator, appended to the bit string
-  const uint64_t f=_pext_u64(EO,S);const unsigned sh=ns&63;
-  b.qw[ns>>6]|=f<<sh;b.qw[(ns>>6)+1]=(f>>1)>>(63-sh);
-  // positions: eight at a time without a test (a word of event lines has about six separators)
-  const uint32_t o=64u*j;const unsigned cnt=(unsigned)_mm_popcnt_u64(S);uint64_t t=S;
-  #define SS_ST_PUT(i) b.sep[ns+i]=o+(uint32_t)_tzcnt_u64(t);t=_blsr_u64(t);
-  SS_ST_PUT(0) SS_ST_PUT(1) SS_ST_PUT(2) SS_ST_PUT(3) SS_ST_PUT(4) SS_ST_PUT(5) SS_ST_PUT(6) SS_ST_PUT(7)
-  #undef SS_ST_PUT
-  if(__builtin_expect(cnt>8,0))for(unsigned i=8;i<cnt;++i){b.sep[ns+i]=o+(uint32_t)_tzcnt_u64(t);t=_blsr_u64(t);}
-  ns+=cnt;
-  uint64_t u=n;const unsigned cn=(unsigned)_mm_popcnt_u64(n);
-  b.nl[nn]=o+(uint32_t)_tzcnt_u64(u);u=_blsr_u64(u);b.nl[nn+1]=o+(uint32_t)_tzcnt_u64(u);u=_blsr_u64(u);
-  if(__builtin_expect(cn>2,0))for(unsigned i=2;i<cn;++i){b.nl[nn+i]=o+(uint32_t)_tzcnt_u64(u);u=_blsr_u64(u);}
-  nn+=cn;
- }
- for(unsigned i=0;i<8;++i)b.sep[ns+i]=~0u; // a line with too few separators must not meet a stale position
- b.ns=ns;b.nn=nn;
-}
-// The quoted bits of the separators i, i+1, ... (at least 57 of them).
-SS_V3I uint64_t st_flags(const StBlock& b,unsigned i){uint64_t w;__builtin_memcpy(&w,(const char*)b.qw+(i>>3),8);return w>>(i&7);}
-// One event line of the dense-record loops from its separator positions: the line starts at bp+a0, sp[0..6] are
-// its separators (sp[6] the newline), bit j of f says field j is quoted. The same work as event_line_v3<true>
-// after its field cutting. Returns false if the general handler has to take the line (nothing stored yet).
-SS_V3I bool event_fields_v3(const char* const bp,const uint32_t a0,const uint32_t* const sp,const unsigned f,const EvLoop& lp,uint32_t& dmax,uint32_t& send){
- ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const KeyTable& products=lp.products;const size_t PE=lp.PE;
- DateMemo3* const memo=lp.memo;const int64_t wstart=lp.wstart;const uint64_t wlen=lp.wlen,ibase=lp.ibase;
- Bucket<PRec>* const buckets=lp.buckets;const size_t tmask=lp.tmask;
- const unsigned f0=f&1,f1=(f>>1)&1,f2=(f>>2)&1,f3=(f>>3)&1,f4=(f>>4)&1,f5=(f>>5)&1;
- const char* const s0=bp+a0+f0;const unsigned l0=sp[0]-a0-2*f0;
- if(l0==0)return true; // no event_id: dropped
- const char* const s3=bp+sp[2]+1+f3;const unsigned l3=sp[3]-sp[2]-1-2*f3;
- // ingest_ts is F1 in generated data; anything else is left to the general handler.
- int64_t tod3,ingestDay;
- if(__builtin_expect(l3!=20||s3[19]!='Z'||(tod3=tod_v3(s3))<0||!date3(s3,memo,ingestDay),0))return false;
- const int64_t ingest=ingestDay+tod3;
- const uint64_t icode=(uint64_t)ingest-ibase; // in range: date3 only knows days whose codes fit
- const char* const s1=bp+sp[0]+1+f1;const unsigned l1=sp[1]-sp[0]-1-2*f1;
- const char* const s2=bp+sp[1]+1+f2;const unsigned l2=sp[2]-sp[1]-1-2*f2;
- const char* const s4=bp+sp[3]+1+f4;const unsigned l4=sp[4]-sp[3]-1-2*f4;
- const unsigned l5=sp[5]-sp[4]-1-2*f5;
- uint64_t ve=0;bool dEv=false;uint32_t ucode=0;bool uDense=false;
- {
-  uint64_t ye,yu;unsigned me,mu;
-  if(__builtin_expect(parse36x2_v3(s0+1,l0-1,s1+1,l1-1,ye,yu,me,mu),1)){
-   if(__builtin_expect(s0[0]=='e'&&parse36x2_ok(ye,me)&&(ve=dn::index_of(ye,lp.ke))<lp.limE,1)){dEv=true;__builtin_prefetch(&lp.ev[ve],1,3);}
-   uDense=s1[0]=='u'&&parse36x2_ok(yu,mu)&&dense_user_code(dn::index_of(yu,lp.ku),ucode);
-  }else{ // a byte that is no digit in one of the two texts: each on its own
-   if(s0[0]=='e'&&parse36_v3(s0+1,l0-1,ye)&&(ve=dn::index_of(ye,lp.ke))<lp.limE){dEv=true;__builtin_prefetch(&lp.ev[ve],1,3);}
-   uDense=s1[0]=='u'&&parse36_v3(s1+1,l1-1,yu)&&dense_user_code(dn::index_of(yu,lp.ku),ucode);
-  }
- }
- const unsigned kind=event_kind(string_view(s4,l4));
- uint64_t k=0;unsigned cat=0; // k stays 0 unless the line is a valid event
- if(kind&&l1!=0&&l5!=0){
-  int64_t ts;bool tsOk;
-  {
-   uint64_t a8,b8;uint16_t a2,b2_;
-   // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
-   if(l2==20&&s2[19]=='Z'&&(__builtin_memcpy(&a8,s2,8),__builtin_memcpy(&b8,s3,8),__builtin_memcpy(&a2,s2+8,2),__builtin_memcpy(&b2_,s3+8,2),((a8^b8)|(uint64_t)(a2^b2_))==0)){
-    const int64_t tod2=tod_v3(s2);
-    if(tod2>=0){ts=ingestDay+tod2;tsOk=true;}else tsOk=parse_ts(string_view(s2,l2),ts);
-   }else tsOk=ts_v3(s2,l2,memo,ts);
-  }
-  uint64_t tsrel;
-  if(tsOk&&(tsrel=(uint64_t)ts-(uint64_t)wstart)<wlen&&ingest-ts<=DAY){
-   int32_t price=0;const bool purchase=kind==3;
-   if(purchase){
-    const unsigned f6=(f>>6)&1;
-    const char* const s5=bp+sp[4]+1+f5;
-    const char* const s6=bp+sp[5]+1+f6;const unsigned l6=sp[6]-sp[5]-1-2*f6;
-    if(price_value(string_view(s6,l6),price)){
-     const uint32_t ci=products.find(string_view(s5,l5));
-     cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;k=((tsrel+1)<<EV_TS)|EV_PURCHASE|(uint64_t)(uint32_t)price;
-    }
-   }else k=(tsrel+1)<<EV_TS;
-  }
- }
- bool tableUser=k!=0;
- if(k&&uDense){tableUser=false;dmax=max(dmax,ucode);}else ucode=0; // (no user in the record of a line that is not a valid event)
- uint32_t user=ucode;
- if(__builtin_expect(tableUser,0)){ // a general user (about 1% of the rows): through the ID table right here
-  PendUser pu;
-  if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),pu.k0,pu.k1),0))return false; // long user ID: nothing has been stored yet
-  pu.j=(uint32_t)(KeyTable::hash_packed(pu.k0,pu.k1)&tmask);pu.u=s1;pu.up=&user;
-  resolve_users(&pu,&pu+1,tab,tl);
- }
- if(__builtin_expect(dEv,1)){
-  send=max(send,(uint32_t)ve+1);
-  eslot_commit(lp.ev[ve],k?k:ESLOT_INVALID,(uint64_t)user|((uint64_t)cat<<32)|lp.tid48,ingest); // cat < 2^16
- }else{ // an event_id that is not dense: a bucket record, as in the other loops
-  const uint64_t h=hkey_v3(s0,l0);
-  Bucket<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
-  if(__builtin_expect(vec.full(),0))vec.reserve(max<size_t>(16,2*vec.capacity()));
-  vec.append(make_prec(s0,h,icode,k,cat,user));
- }
- return true;
-}
-#define SS_EVENT_LOOP_ST(NAME,TARGET,MASKS) \
-template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
- const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
- const char* const end=base+len; \
- const EvLoop lp(tl,tab,products,PE,end);PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0; /* the pending batch stays empty in these loops */ \
- StBlock blk;WinMasks m[ST_WORDS+1]; \
- while(p<lim){ \
-  const char* const bp=p;unsigned nw=0; \
-  for(const char* s=bp;nw<ST_WORDS&&s<end;s+=64)m[nw++]=MASKS(s); \
-  if(bp+64*(size_t)nw<end)m[nw]=MASKS(bp+64*(size_t)nw);else m[nw]=WinMasks{0,0,0}; \
-  st_build(m,nw,blk); \
-  if(__builtin_expect(blk.nn==0,0)){ /* no line ends in this round: a very long line, or the last line has no newline */ \
-   const WinMasks w1=MASKS(p);const char* const b=event_window2(p,w1.c);p=event_line_v3<true>(p,b,w1,MASKS(b),lp,pend,pp,dmax,send,general);continue;} \
-  unsigned si=0;uint32_t a0=0; \
-  for(unsigned k=0;k<blk.nn;++k){ \
-   const uint32_t e=blk.nl[k];const char* const ls=bp+a0; \
-   if(__builtin_expect(ls>=lim,0))break; \
-   if(__builtin_expect((blk.sep[si+6]!=e)|((blk.bad[e>>6]>>(e&63))&1),0)){ \
-    const WinMasks w1=MASKS(ls);const char* const b=event_window2(ls,w1.c);event_line_v3<true>(ls,b,w1,MASKS(b),lp,pend,pp,dmax,send,general); \
-    while(blk.sep[si]<e)++si; \
-    ++si; \
-   }else{ \
-    if(__builtin_expect(!event_fields_v3(bp,a0,blk.sep+si,(unsigned)st_flags(blk,si),lp,dmax,send),0))line_general<7>(ls,end,general); \
-    si+=7; \
-   } \
-   a0=e+1; \
-  } \
-  p=bp+a0; \
- } \
- resolve_users(pend,pp,tab,tl);tl.denseMax=max(tl.denseMax,dmax); \
- tl.evEnd=max(tl.evEnd,send); \
-}
-SS_EVENT_LOOP_ST(events_avx2_st,SS_V3,win_masks_avx2)
-SS_EVENT_LOOP_ST(events_avx512z_st,SS_V5,win_masks_avx512z)
-SS_EVENT_LOOP_ST(events_avx512y_st,SS_V5,win_masks_avx512y)
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid; // dense route (dparse)
@@ -2339,9 +2171,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // The vector loops locate line starts ahead of cutting the lines (see SS_EVENT_LOOP_IX): measured 5% faster
  // in the parse stage on the scoring machine. SS_LINES=plain switches back to the loop without the index.
  const bool lineIndex=isaUse!=ISA_SSE2&&!(getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="plain");
- // SS_LINES=struct: the two-stage loops (SS_EVENT_LOOP_ST) for the dense-record event lines; everything else as with the index.
- const bool lineStruct=isaUse!=ISA_SSE2&&getenv("SS_LINES")&&string_view(getenv("SS_LINES"))=="struct";
- cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")<<(lineStruct?"+struct":"")
+ cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
 #ifdef SS_TS_SELECT
   <<"+tsselect"
 #endif
@@ -2447,8 +2277,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(ck.click){if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else clicks_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);} \
-    else{if(drec&&lineStruct)events_##ISA##_st(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
-     else if(drec)events_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+    else{if(drec)events_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(lineIndex)events_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else events_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);}
    if(isaUse==ISA_AVX2){SS_RUN_LOOPS(avx2)}
