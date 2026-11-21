@@ -856,6 +856,8 @@ static inline uint64_t order36(uint64_t y){
  const unsigned n=1+(y>=36u)+(y>=1296u)+(y>=46656u)+(y>=1679616u)+(y>=60466176u)+(y>=2176782336ull)+(y>=78364164096ull);
  return y*POW36[8-n]*16+n;
 }
+// SPREAD8[m]: byte j is 1 where bit j of m is set (eight one-byte counters bumped by one add).
+static constexpr array<uint64_t,256> SPREAD8=[]{array<uint64_t,256> a{};for(unsigned m=0;m<256;++m){uint64_t v=0;for(unsigned j=0;j<8;++j)if((m>>j)&1)v|=1ull<<(8*j);a[m]=v;}return a;}();
 static inline size_t text36_fast(char letter,uint64_t y,char* out){
  unsigned n;const uint64_t v=digits36(y,n);
  out[0]=letter;memcpy(out+1,&v,8);return (size_t)n+1;
@@ -863,9 +865,14 @@ static inline size_t text36_fast(char letter,uint64_t y,char* out){
 // ---- Dense route, the reader of the slot arrays (DENSE stage) ----
 // What the reader knows about a user index: where its events and clicks sit in the slot arrays
 // (ef/el, cf/cl: first and last counter + 1, 0 = none; ec/cc: how many), whether any of its rows
-// went through the general lane instead, and what was decided for it.
-struct DInfo{atomic<uint32_t> ef,el,ec,cf,cl,cc;atomic<uint8_t> general,state;uint8_t pad[6];};
-static_assert(sizeof(DInfo)==32);
+// went through the general lane instead, and what was decided for it. The sweep also leaves the
+// session list of the index's first run of event slots: sess points at ns entries "start time << 24 |
+// rows of the run before this session", one end entry with the run's row count, then the run's
+// purchases (session << 40 | category << 24 | price) and an all-ones entry. amask: the aliases the
+// run uses. The list is the whole index only if no second run was found (multi) and bit 31 of ns is
+// clear (rows in time order, fewer than 2^24 of them).
+struct DInfo{atomic<uint32_t> ef,el,ec,cf,cl,cc;atomic<uint8_t> general,state,multi,amask;atomic<uint32_t> ns;atomic<uint64_t*> sess;};
+static_assert(sizeof(DInfo)==40);
 static DInfo* denseInfo=nullptr; // highest reported user index + 2 entries, zero pages until touched
 static constexpr uint8_t DSTATE_DEFER=1; // rows are handed to the general lane by the sweep after the index pass
 // first-counter fields hold counter + 1, so that zero memory means "none".
@@ -2873,23 +2880,69 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    DInfo* const info=denseInfo;IdText txt;
    const auto bad_user=[]{fprintf(stderr,"ERROR dense user index above the reported maximum\n");_exit(1);};
    // The sweep of one stretch of counters (events, then clicks).
-   const auto sweep_events=[&](size_t lo,size_t hi){
-    for(size_t c=lo;c<hi;){
-     const ESmall& sl=ev_at(c);const uint64_t k=sl.k;
-     if(k<PR_KBIAS){++c;continue;} // empty, or present but not valid
+   // Session lists go to pieces of this thread's pool, one block per run.
+   uint64_t* acur=nullptr;uint64_t* aend=nullptr;vector<uint64_t> purTmp;
+   // The event sweep of [lo,hi). A run is a stretch of valid slots of one user index, not broken by a
+   // valid slot of anybody else; it belongs to the piece it starts in and may run past `hi` (cross),
+   // so a piece first steps over the run that reaches into it. While a run is read its sessions are
+   // made as well: every row either continues the current session or starts one (more than GAP after
+   // the row before), written without a branch on that - each row writes "a session starts here" into
+   // the next free entry, and the entry only stays if the row really starts one.
+   const auto sweep_events=[&](size_t lo,size_t hi,bool cross){
+    size_t c=lo;
+    if(cross&&lo>0){
+     size_t p=lo;uint32_t code0=0;bool reaches=false;
+     while(p>0){--p;const ESmall& sl=ev_at(p);if(sl.k>=PR_KBIAS){if(sl.user&DENSE_USER){code0=sl.user&~7u;reaches=true;}break;}}
+     if(reaches)for(;c<hi;++c){const ESmall& sl=ev_at(c);if(sl.k>=PR_KBIAS&&(sl.user&~7u)!=code0)break;}
+    }
+    const size_t stop=cross?evEnd:hi; // how far a run may go
+    while(c<hi){
+     const ESmall& sl=ev_at(c);const uint64_t k0=sl.k;
+     if(k0<PR_KBIAS){++c;continue;} // empty, or present but not valid
      const uint32_t u=sl.user;
-     if(!(u&DENSE_USER)){hand_event(myEv,pool,k,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++rdHandEv;++rdSlotEv;++c;if(stats)++rdWhy[why_table(u)];continue;}
+     if(!(u&DENSE_USER)){hand_event(myEv,pool,k0,(u&LOCAL_USER)?trans[sl.thread][u&~LOCAL_USER]:u,sl.cat);++rdHandEv;++rdSlotEv;++c;if(stats)++rdWhy[why_table(u)];continue;}
      if(__builtin_expect(u>denseTop,0))bad_user();
-     // A run of this user index: up to the next valid slot of anybody else.
-     const uint32_t code=u&~7u;const size_t first=c;size_t last=c;uint32_t cnt=1;
-     for(++c;c<hi;++c){
-      if(ev_at(c).k<PR_KBIAS)continue;
-      if((ev_at(c).user&~7u)!=code)break;
-      last=c;++cnt;
+     const uint32_t code=u&~7u;const size_t first=c;size_t lastSlot=c;
+     // Room: one entry per slot looked at, at most, plus the end entry.
+     if((size_t)(aend-acur)<hi-c+2){const size_t want=max<size_t>(hi-c+2,size_t(1)<<19);acur=(uint64_t*)pool.take(want*8);aend=acur+want;}
+     uint64_t* blk=acur;size_t cap=(size_t)(aend-blk);
+     size_t n=0,ns=0;uint64_t last=0-(uint64_t)(GAP+1),disorder=0;uint32_t mask=0;purTmp.clear();
+     size_t j=c;
+     const size_t stride=size_t(1)<<evShift;
+     for(;;){
+      const size_t lim=min(stop,c+cap-2);
+      const char* p=(const char*)&ev_at(j);const char* const pe=(const char*)&ev_at(lim);const char* lastp=p;
+      for(;p<pe;p+=stride){
+       const ESmall& r=*(const ESmall*)(const void*)p;const uint64_t k=r.k;
+       if(k<PR_KBIAS)continue;
+       const uint32_t al=r.user^code; // the alias if the row is this index's
+       if(al>7)break;
+       mask|=1u<<al;
+       const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
+       disorder|=step; // its top bit: a row before its predecessor
+       blk[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
+       if(__builtin_expect((k&EV_PURCHASE)!=0,0))purTmp.push_back(((uint64_t)(ns-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
+       ++n;lastp=p;
+      }
+      j=(size_t)(p-(const char*)&ev_at(0))>>evShift;
+      if(n)lastSlot=(size_t)(lastp-(const char*)&ev_at(0))>>evShift;
+      if(p<pe)goto run_done; // a valid slot of somebody else
+      if(j>=stop)break;
+      {const size_t cap2=cap*2;uint64_t* const nb=(uint64_t*)pool.take(cap2*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=cap2;aend=nb+cap2;} // a long run past the piece: a bigger block
      }
+     run_done:;
+     {const size_t np=purTmp.size(),need=ns+1+np+1;
+      if(cap<need){uint64_t* const nb=(uint64_t*)pool.take(need*8);memcpy(nb,blk,(ns+1)*8);blk=nb;cap=need;aend=nb+need;}
+      blk[ns]=n;if(np)memcpy(blk+ns+1,purTmp.data(),np*8);blk[ns+1+np]=~0ull;
+      acur=blk+need;}
      DInfo& f=info[(code&~DENSE_USER)>>dn::ALIAS_BITS];
-     dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)last+1);f.ec.fetch_add(cnt,memory_order_relaxed);
-     rdSlotEv+=cnt;
+     dense_note_first(f.ef,(uint32_t)first+1);dense_note_end(f.el,(uint32_t)lastSlot+1);f.ec.fetch_add((uint32_t)n,memory_order_relaxed);
+     uint64_t* none=nullptr;
+     if(f.sess.compare_exchange_strong(none,blk,memory_order_relaxed)){
+      f.ns.store((uint32_t)ns|(((disorder>>63)||n>=(size_t(1)<<24))?0x80000000u:0u),memory_order_relaxed);f.amask.store((uint8_t)mask,memory_order_relaxed);}
+     else f.multi.store(1,memory_order_relaxed); // the index has another run
+     rdSlotEv+=n;
+     c=j;
     }
    };
    const auto sweep_clicks=[&](size_t lo,size_t hi){
@@ -2934,7 +2987,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      if(!any)continue; // nothing was written to this stretch
      const size_t hi=min(evEnd,lo+(size_t(1)<<bshE));
      fillEndE=max<uint64_t>(fillEndE,hi);
-     sweep_events(lo,hi);
+     sweep_events(lo,hi,false); // the next stretch may still be filling: runs end with this one
     }
     #pragma omp for schedule(dynamic,1) reduction(max:fillEndC)
     for(size_t b=0;b<nClBuckets;++b){
@@ -2956,7 +3009,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    }
    else{
     #pragma omp for schedule(dynamic,1) nowait
-    for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH));
+    for(size_t lo=0;lo<evEnd;lo+=ECH)sweep_events(lo,min(evEnd,lo+ECH),true);
     #pragma omp for schedule(dynamic,1)
     for(size_t lo=0;lo<clEnd;lo+=CCH)sweep_clicks(lo,min(clEnd,lo+CCH));
    }
@@ -3165,6 +3218,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // A click of the fast lane: time and campaign as in Click, and its counter, which stands for its ID.
    struct FClick{uint64_t key;uint32_t user;uint32_t ctr;};
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
+   // One index's sessions (start time; number of its rows before the session) and purchases
+   // (session<<40 | category<<24 | price), written by the walk over its event slots.
+   Scratch<uint64_t> sessTs,purBuf,clickKeys;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;fastC2.pool=&pool;
+   vector<uint8_t> lastOfV(ncamp+1,0xFF);uint8_t* const lastOf=lastOfV.data(); // small click sets: last position of a campaign
+   // The 32-bit click arithmetic below counts times from the window start (clicks: -7 days and up), so
+   // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
+   const bool smallClicksOk=(uint64_t)(window_end-window_start)<0x7fffffffull&&!getenv("SS_TEST_NOSMALLCLICKS");
+   uint32_t* const fr=freq.data();uint32_t* const pos=positions.data();uint16_t* const act=active.data();
    const atomic<uint32_t>* const comp=denseComp;const uint32_t dBase=denseBase;
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
    for(size_t i0=0;i0<idxEnd;i0+=ICH){
@@ -3191,21 +3252,34 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      int why=5; // why the index is handed over, if it is
      if(noFastN&&ix%noFastN==0){if(fast)why=7;fast=false;}
      size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;
+     uint64_t* sTs=nullptr;uint32_t* sOrd=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0;
+     // The sweep's session list, if the index is one run of rows in time order.
+     const uint64_t* const sweepList=f.multi.load(memory_order_relaxed)?nullptr:f.sess.load(memory_order_relaxed);
+     const uint32_t sweepNs=f.ns.load(memory_order_relaxed);
+     const bool listed=ec&&sweepList&&!(sweepNs>>31);
      if(fast){
-      // Pick the index's rows out of the two stretches. An event slot starts like an Ev (k, user, cat),
-      // so its first 16 bytes are copied as they are, minus the k bias; the copy only counts if the
-      // slot is a valid row of this index. `mask` collects the aliases in use.
       uint32_t mask=0;
-      E=fastE.get((size_t)ec+1);
-      const __m128i bias=_mm_set_epi64x(0,(long long)PR_KBIAS);
-      for(size_t c=ef;c<el;++c){
-       const ESmall& sl=ev_at(c);
-       const __m128i v=_mm_loadu_si128((const __m128i*)(const void*)&sl);
-       const uint64_t k=(uint64_t)_mm_cvtsi128_si64(v);const uint32_t u=sl.user;
-       _mm_storeu_si128((__m128i*)(void*)(E+n),_mm_sub_epi64(v,bias));
-       const uint32_t ok=(uint32_t)(k>=PR_KBIAS)&(uint32_t)((u^code)<8);
-       mask|=ok<<(u&7);n+=ok;
+      sTs=sessTs.get((size_t)ec+2);sOrd=sessOrd.get((size_t)ec+2);
+      if(listed){
+       ns=sweepNs;n=ec;mask=f.amask.load(memory_order_relaxed);
+       for(size_t i=0;i<=ns;++i){const uint64_t e=sweepList[i];sTs[i]=e>>24;sOrd[i]=(uint32_t)(e&0xFFFFFFu);}
+       pur=sweepList+ns+1;
       }
+      // Otherwise (several runs, or a row out of order) walk the index's stretch of event slots here
+      // the way the sweep does, skipping other people's slots; `disorder` says whether a row was out of order.
+      uint64_t* const myPur=listed?nullptr:purBuf.get((size_t)ec+2);size_t np=0;
+      uint64_t last=0-(uint64_t)(GAP+1); // the first row starts a session
+      if(!listed)for(size_t c=ef;c<el;++c){
+       const ESmall& sl=ev_at(c);const uint64_t k=sl.k;const uint32_t u=sl.user;
+       if(!((uint32_t)(k>=PR_KBIAS)&(uint32_t)((u^code)<8)))continue;
+       mask|=1u<<(u&7);
+       const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
+       disorder|=step>>63;
+       sTs[ns]=ts;sOrd[ns]=(uint32_t)n;ns+=step>(uint64_t)GAP;last=ts;
+       if(__builtin_expect((k&EV_PURCHASE)!=0,0))myPur[np++]=((uint64_t)(ns-1)<<40)|((uint64_t)sl.cat<<24)|(k&EV_PRICE);
+       ++n;
+      }
+      if(!listed){myPur[np]=~0ull;pur=myPur;}
       C=fastC.get((size_t)cc+1);
       for(size_t c=cf;c<cl;++c){
        const CSlot& sl=denseCl[c];const uint32_t u=sl.user;
@@ -3220,18 +3294,131 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      }
      if(fast){
       const uint32_t person=dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|root);
-      ev_time_sort(E,E+n);
-      // Clicks in click_before order: by time, and at the same moment the larger ID text first.
-      // (They come in no particular order, so only short runs are sorted by insertion.)
-      if(m>1){
-       const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
-        return ta!=tb?ta<tb:order36(dn::value_of(a.ctr,kc))>order36(dn::value_of(b.ctr,kc));};
-       if(m>16)sort(C,C+m,before);
-       else for(FClick* x=C+1;x<C+m;++x){
-        if(before(*x,x[-1])){const FClick v=*x;FClick* y=x;do{*y=y[-1];--y;}while(y>C&&before(v,y[-1]));*y=v;}
+      if(__builtin_expect(disorder!=0,0)){
+       // Not in time order: copy the rows out, sort them, and make the session list from the copy.
+       E=fastE.get((size_t)ec+1);size_t q=0;
+       for(size_t c=ef;c<el;++c){const ESmall& sl=ev_at(c);
+        if(sl.k>=PR_KBIAS&&(sl.user^code)<8){E[q].k=sl.k-PR_KBIAS;E[q].person=person;E[q].cat=sl.cat;E[q].pad=0;++q;}}
+       ev_time_sort(E,E+n);
+       uint64_t* const sortedPur=purBuf.get((size_t)ec+2);size_t np=0;
+       ns=0;uint64_t last=0-(uint64_t)(GAP+1);
+       for(size_t i=0;i<n;++i){
+        const uint64_t k=E[i].k,ts=k>>EV_TS,step=ts-last;
+        sTs[ns]=ts;sOrd[ns]=(uint32_t)i;ns+=step>(uint64_t)GAP;last=ts;
+        if(k&EV_PURCHASE)sortedPur[np++]=((uint64_t)(ns-1)<<40)|((uint64_t)E[i].cat<<24)|(k&EV_PRICE);
+       }
+       sortedPur[np]=~0ull;pur=sortedPur;
+      }
+      sOrd[ns]=(uint32_t)n;
+      // The person's clicks. A small set (most are) is put in order once and kept as plain arrays: a
+      // session then finds the clicks of its seven days with one vector compare, the credited campaign
+      // is that of the last one, and the assists are counted in one byte per click (bumped only for the
+      // first click of its campaign inside the window) and added to the totals when the row is done.
+      // A larger set takes the sliding window over the sorted clicks, as the general lane does.
+      enum{NONE,SMALL,LARGE} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:LARGE;
+      alignas(16) int32_t cts[16];uint16_t ccamp[16],credit[17];uint16_t dupMask[17];size_t nvec=0;uint64_t cntLo=0,cntHi=0;
+      if(mode==SMALL){
+       uint64_t keys[16];
+       for(size_t i=0;i<m;++i){const uint64_t key=((C[i].key>>16)<<32)|i;size_t j=i;while(j>0&&keys[j-1]>key){keys[j]=keys[j-1];--j;}keys[j]=key;}
+       // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
+       for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
+        const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
+        const uint64_t key=keys[i];size_t j=i;
+        while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
+        keys[j]=key;
+       }
+       bool dup=false;uint16_t nextMask[16];
+       for(size_t i=0;i<16;++i){cts[i]=INT32_MAX;nextMask[i]=0;}
+       for(size_t i=0;i<m;++i){const FClick& x=C[(uint32_t)keys[i]];const uint16_t c=(uint16_t)x.key;
+        cts[i]=(int32_t)((int64_t)(keys[i]>>32)-WEEK);ccamp[i]=c;credit[i+1]=c; // times from the window start, like session times
+        const uint8_t p=lastOf[c];if(p!=0xFF){nextMask[p]|=(uint16_t)(1u<<i);dup=true;}
+        lastOf[c]=(uint8_t)i;}
+       for(size_t i=0;i<m;++i)lastOf[ccamp[i]]=0xFF;
+       credit[0]=organic; // read when no click is in the window
+       dupMask[16]=0;
+       if(dup)for(int a=15;a>=0;--a)dupMask[a]=dupMask[a+1]|nextMask[a]; // bit i: click i has an earlier click of its campaign at position a or later
+       else memset(dupMask,0,sizeof dupMask);
+       nvec=(m+3)/4;
+      }
+      else if(mode==LARGE&&m>1){
+       // Order by time through 8-byte keys (time, position), which sort faster than the clicks
+       // themselves; clicks of one moment are then put in text order, and the clicks are copied out
+       // in the final order.
+       uint64_t* const keys=clickKeys.get(m);
+       const bool wide=(C[0].key>>16)>>32!=0||(uint64_t)(window_end-clickStart)>>32!=0; // times that do not fit 32 bits: sort the clicks themselves
+       if(wide||m>4096){
+        const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
+         return ta!=tb?ta<tb:order36(dn::value_of(a.ctr,kc))>order36(dn::value_of(b.ctr,kc));};
+        sort(C,C+m,before);
+       }
+       else{
+        for(size_t i=0;i<m;++i)keys[i]=((C[i].key>>16)<<32)|i;
+        sort(keys,keys+m);
+        for(size_t i=1;i<m;++i)if(__builtin_expect((keys[i]>>32)==(keys[i-1]>>32),0)){
+         const auto text_order=[&](uint64_t key){return order36(dn::value_of(C[(uint32_t)key].ctr,dense.kc));};
+         const uint64_t key=keys[i];size_t j=i;
+         while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
+         keys[j]=key;
+        }
+        FClick* const S=fastC2.get(m+1);
+        for(size_t i=0;i<m;++i)S[i]=C[(uint32_t)keys[i]];
+        C=S;
        }
       }
-      char tmp[16];sessionize_person(person_name(person,tmp),E,n,C,C+m);
+      char tmp[16];const NameRef nm=person_name(person,tmp);
+      const FClick *add=C,*expire=C,*const ce=C+m;size_t na=0;
+      int currentday=-1;uint64_t dsess=0,drev=0;uint32_t rowStart=0;size_t pi=0;
+      const auto count_assists=[&](int day){ // the row's byte counters into the totals
+       if(!(cntLo|cntHi))return;
+       uint64_t* const arow=assists+(size_t)day*ncamp;
+       for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));
+       cntLo=0;cntHi=0;};
+      for(size_t sn=0;sn<ns;++sn){
+       const uint64_t ts=sTs[sn];const int d=(int)((ts+dayOff)/(uint64_t)DAY);
+       if(d!=currentday){
+        if(currentday>=0){
+         if(mode==SMALL)count_assists(currentday);
+         put_row(nm,currentday,dsess,sOrd[sn]-rowStart,drev);dsess=0;drev=0;
+        }
+        currentday=d;rowStart=sOrd[sn];
+       }
+       ++dsess;
+       uint16_t credited=organic;
+       if(mode==SMALL){
+        // In the window: start - seven days <= click time <= start.
+        const __m128i vlo=_mm_set1_epi32((int)((int64_t)ts-WEEK)),vhi=_mm_set1_epi32((int)ts);
+        uint32_t out=0;
+        for(size_t v=0;v<nvec;++v){const __m128i x=_mm_load_si128((const __m128i*)(cts+4*v));
+         out|=(uint32_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(_mm_cmplt_epi32(x,vlo),_mm_cmpgt_epi32(x,vhi))))<<(4*v);}
+        const uint32_t in=~out&((1u<<(4*nvec))-1);
+        credited=credit[31-__builtin_clz((in<<1)|1u)]; // the last click in the window, or entry 0
+        const uint32_t firsts=in&~(uint32_t)dupMask[__builtin_ctz(in|0x10000u)]; // bit 16: nothing in the window
+        cntLo+=SPREAD8[firsts&255];cntHi+=SPREAD8[(firsts>>8)&255];
+       }
+       else if(mode==LARGE){
+        const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
+        while(add<ce&&add->key<addLim){const uint16_t c=(uint16_t)add->key;if(fr[c]++==0){pos[c]=(uint32_t)na;act[na++]=c;}++add;}
+        while(expire<add&&expire->key<expLim){const uint16_t c=(uint16_t)expire->key;if(--fr[c]==0){const uint32_t at=pos[c];const uint16_t back=act[--na];act[at]=back;pos[back]=at;}++expire;}
+        if(add>expire)credited=(uint16_t)add[-1].key;
+        uint64_t* const arow=assists+(size_t)d*ncamp;
+        #pragma GCC unroll 4
+        for(size_t q=0;q<na;++q)++arow[act[q]];
+       }
+       Totals* const cur=&tot[(size_t)d*ncamp+credited];cur->sessions++;
+       if((pur[pi]>>40)==sn){ // the list ends with an all-ones entry, which is no session's
+        cur->purchasing_sessions++;
+        do{const uint64_t price=pur[pi]&EV_PRICE;const uint16_t cat=(uint16_t)(pur[pi]>>24);
+         drev+=price;cur->revenue+=price;
+         if(catsum[cat]==0)touched.push_back(cat);
+         catsum[cat]+=price;
+        }while((pur[++pi]>>40)==sn);
+       }
+      }
+      if(mode==SMALL)count_assists(currentday);
+      put_row(nm,currentday,dsess,(uint32_t)n-rowStart,drev);
+      for(size_t q=0;q<na;++q)fr[act[q]]=0;
+      num_sessions+=ns;
+      if(nrows>=FLUSH)flush_rows();
       ++rdFastIdx;rdFastEv+=n;rdFastCl+=m;
      }
      else{
