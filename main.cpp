@@ -3078,6 +3078,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   group_pieces(eventFiles,(size_t)T,eventsFree?unmapFirst:unmapLast);
   group_pieces(clickFiles,(size_t)T,unmapLast); // click IDs still break ties while sessions are attributed
   group_pieces(linkFiles,1,unmapLast);
+  // The slot arrays are not read after the DENSE stage; the part of them that was written is handed
+  // back by the workers too (in pieces of whole huge pages) instead of at process exit.
+  const auto slot_pieces=[&](const char* base,size_t bytes){
+   const size_t huge=size_t(2)<<20,len=(bytes+huge-1)&~(huge-1),per=max(huge,(len/(size_t)T+huge-1)&~(huge-1));
+   for(size_t at=0;at<len;at+=per)unmapLast.push_back({(char*)base+at,min(per,len-at)});};
+  if(evBase&&evEnd)slot_pieces(evBase,(size_t)denseEvEnd.load()<<evShift);
+  if(denseCl&&clEnd)slot_pieces((const char*)denseCl,(size_t)denseClEnd.load()*sizeof(CSlot));
  }
  #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9])
  {
