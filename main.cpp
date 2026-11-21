@@ -1794,10 +1794,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Parse-stage switches of the dense route:
  //   SS_DENSE_USERS=0    dense user IDs go through the ID table like all others, links included (default: they get
  //                       DENSE_USER codes straight from the text if the links stage allows it; see denseUsers)
- //   SS_DENSE_RECORDS=1  event / click lines with a dense ID go to the slot arrays denseEv / denseCl (off until their reader exists)
+ //   SS_DENSE_RECORDS=0  event / click lines with a dense ID go to the general buckets (default: straight into the slot
+ //                       arrays denseEv / denseCl, which the DENSE stage reads)
  //   SS_DENSE_AHEAD=n    rows between asking for a slot's memory and writing the slot in the vector loops (0-16, default 2)
  //   SS_DENSE_DUMP=dir   test only: writes every record of the parse stage as text and stops after the parse stage ("-": only stops)
- dparse.events=dense.events&&getenv("SS_DENSE_RECORDS");dparse.clicks=dense.clicks&&getenv("SS_DENSE_RECORDS");
+ {const char* rec=getenv("SS_DENSE_RECORDS");const bool recOn=!(rec&&rec[0]=='0');
+  dparse.events=dense.events&&recOn;dparse.clicks=dense.clicks&&recOn;}
  if(const char* v=getenv("SS_DENSE_AHEAD")){const int x=atoi(v);if(x>=0&&x<=(int)RING_MAX)dparse.ahead=(unsigned)x;}
  const char* const dumpDir=getenv("SS_DENSE_DUMP");
  const bool dumpText=dumpDir&&strcmp(dumpDir,"-"); // "-": write nothing, only stop after the parse stage (for measuring it)
