@@ -1040,24 +1040,46 @@ static inline size_t text36(char letter,uint64_t y,char* out){
 // Candidates are tried in increasing counter order by all threads; the smallest hit wins.
 static bool find_key(const uint64_t* um,size_t n,uint64_t limit,uint64_t step,uint64_t& key,int T){
  if(n<6||limit<step)return false;
- const uint64_t cand=limit/step;atomic<uint64_t> best{UINT64_MAX};
+ const uint64_t cand=limit/step;
  const uint64_t inc=(M1*step)&MASK;
- #pragma omp parallel num_threads(T)
- {
-  const int t=omp_get_thread_num();
-  const uint64_t BL=1u<<16; // blocks are dealt round-robin so every thread stays near the low counters
-  for(uint64_t b=(uint64_t)t*BL;b<cand&&b<best.load(memory_order_relaxed);b+=(uint64_t)T*BL){
-   const uint64_t e=min(cand,b+BL);uint64_t a=(b*inc)&MASK;
-   for(uint64_t c=b;c<e;++c,a=(a+inc)&MASK){
-    const uint64_t k=um[0]^a;
-    if((((um[1]^k)*I1)&MASK)>=limit&&(((um[2]^k)*I1)&MASK)>=limit)continue; // two misses already
-    size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
-    if(miss<2){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}break;}
+ // The search costs one candidate per counter below sample 0's own, so the test per candidate is what
+ // counts. First round: sample 1 has to agree as well (one multiplication per candidate; a wrong key
+ // passes it once in limit / 2^40 tries). Only if that finds nothing - sample 1 is the odd one - the
+ // second round runs with the full rule (samples 1 and 2 both off: skip). Any key that passes the full
+ // rule is a valid key; which one is found only matters for speed.
+ for(int round=0;round<2;++round){
+  atomic<uint64_t> best{UINT64_MAX};
+  #pragma omp parallel num_threads(T)
+  {
+   const int t=omp_get_thread_num();
+   const uint64_t BL=1u<<16; // blocks are dealt round-robin so every thread stays near the low counters
+   const uint64_t u0=um[0],u1=um[1],u2=um[2];
+   for(uint64_t b=(uint64_t)t*BL;b<cand&&b<best.load(memory_order_relaxed);b+=(uint64_t)T*BL){
+    const uint64_t e=min(cand,b+BL);uint64_t a=(b*inc)&MASK;
+    if(round==0&&limit<=MASK){
+     // The first round's test with the 40-bit numbers held in the top 40 bits of a word: adding and
+     // multiplying then wrap as they should without masks ((x << 24) * I1 = ((x * I1) mod 2^40) << 24).
+     const uint64_t D1=(u0^u1)<<24,INC=inc<<24,LIM=limit<<24;uint64_t A=a<<24;
+     for(uint64_t c=b;c<e;++c,A+=INC){
+      if(__builtin_expect(((D1^A)*I1)>=LIM,1))continue; // sample 1 off
+      const uint64_t k=u0^(A>>24);
+      size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
+      if(miss<2){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}break;}
+     }
+     continue;
+    }
+    for(uint64_t c=b;c<e;++c,a=(a+inc)&MASK){
+     const uint64_t k=u0^a;
+     if((((u1^k)*I1)&MASK)>=limit&&(round==0||(((u2^k)*I1)&MASK)>=limit))continue; // sample 1 off (second round: and sample 2)
+     size_t miss=0;for(size_t i=1;i<n&&miss<2;++i)miss+=(((um[i]^k)*I1)&MASK)>=limit;
+     if(miss<2){uint64_t cur=best.load(memory_order_relaxed);while(c<cur&&!best.compare_exchange_weak(cur,c)){}break;}
+    }
    }
   }
+  const uint64_t c=best.load();
+  if(c!=UINT64_MAX){key=um[0]^((c*inc)&MASK);return true;}
  }
- const uint64_t c=best.load();if(c==UINT64_MAX)return false;
- key=um[0]^((c*inc)&MASK);return true;
+ return false;
 }
 struct Info{
  bool events=false,clicks=false; // dense route usable for events / for clicks (each also needs the user key)
