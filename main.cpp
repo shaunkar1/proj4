@@ -158,7 +158,7 @@ static bool fields_slow(string_view line,int n,string_view* out){
  }
  return p==end+1;
 }
-static bool fields(string_view line,int n,string_view* out){
+[[maybe_unused]] static bool fields(string_view line,int n,string_view* out){ // reference splitter; the stages use scan_line + take_fields
  if(line.empty())return false;
  const char *p=line.data(),*end=p+line.size();
  if(memchr(p,'"',end-p))return fields_slow(line,n,out);
@@ -275,6 +275,34 @@ template<class FN> static void read_lines(const fs::path& path,FN&& fn){
  Mapped m=map_file(path);if(!m.len)return;
  for_lines(m.base,m.len,0,m.len,fn);
 }
+// Calls fn(fields, ok) for every data line of a two-field CSV file; ok is false for a line that is not
+// exactly two well-formed fields (the fields are then unspecified). Same line and dialect rules as for_lines + fields.
+template<class FN> static void read_pairs(const fs::path& path,FN&& fn){
+ Mapped m=map_file(path);if(!m.len)return;
+ const char* end=m.base+m.len;
+ const char* nl=(const char*)memchr(m.base,'\n',m.len);
+ if(!nl)return;
+ for(const char* p=nl+1;p<end;){
+  const char* comma[2];int ncomma,nquote;const char* lineEnd;string_view f[2];
+  const char* next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
+  fn(f,take_fields(p,lineEnd,comma,ncomma,nquote,2,f));
+  p=next;
+ }
+}
+// Number of '\n' bytes in [p,p+n).
+static size_t count_newlines(const char* p,size_t n){
+ const __m128i nl=_mm_set1_epi8('\n'),zero=_mm_setzero_si128();
+ __m128i total=zero;
+ while(n>=16){
+  const size_t blk=min<size_t>(n/16,255); // each byte lane can count 255 matches before it is summed
+  __m128i acc=zero;
+  for(size_t i=0;i<blk;++i){acc=_mm_sub_epi8(acc,_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)p),nl));p+=16;}
+  total=_mm_add_epi64(total,_mm_sad_epu8(acc,zero));n-=blk*16;
+ }
+ size_t c=(size_t)_mm_cvtsi128_si64(total)+(size_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(total,total));
+ for(;n;--n)c+=*p++=='\n';
+ return c;
+}
 static string read_all(const fs::path& path){ifstream in(path,ios::binary);if(!in)throw runtime_error("Cannot open "+path.string());return string(istreambuf_iterator<char>(in),{});}
 static string json_string(const string& s,const string& key){
  auto p=s.find('"'+key+'"');if(p==string::npos)throw runtime_error("manifest missing "+key);
@@ -310,11 +338,26 @@ struct PName{
   if(s.size()<=15){memset(b,0,16);memcpy(b,s.data(),s.size());b[15]=(char)s.size();}
   else{const char* p=s.data();uint32_t n=(uint32_t)s.size();memcpy(b,&p,8);memcpy(b+8,&n,4);b[15]=(char)0xFF;anyLongName.store(true,memory_order_relaxed);}
  }
+ // Same as set() for a key of at most 11 bytes in the table's packed form (k1's top byte is length+1).
+ void set_packed(uint64_t k0,uint32_t k1){
+  const uint64_t hi=(uint64_t)(k1&0x00ffffffu)|((uint64_t)((k1>>24)-1)<<56);
+  memcpy(b,&k0,8);memcpy(b+8,&hi,8);
+ }
  string_view view()const{
   if((unsigned char)b[15]!=0xFF)return string_view(b,(size_t)(unsigned char)b[15]);
   const char* p;uint32_t n;memcpy(&p,b,8);memcpy(&n,b+8,4);return string_view(p,n);
  }
 };
+// Byte-wise order of two names. Names stored in place are zero-padded with the length in the last byte,
+// so comparing the 16 bytes as one big-endian number gives the same answer as comparing the strings.
+static inline bool name_less(const PName& a,const PName& b){
+ if((unsigned char)a.b[15]!=0xFF&&(unsigned char)b.b[15]!=0xFF){
+  uint64_t ah,al,bh,bl;memcpy(&ah,a.b,8);memcpy(&al,a.b+8,8);memcpy(&bh,b.b,8);memcpy(&bl,b.b+8,8);
+  if(ah!=bh)return __builtin_bswap64(ah)<__builtin_bswap64(bh);
+  return __builtin_bswap64(al)<__builtin_bswap64(bl);
+ }
+ return a.view()<b.view();
+}
 // Open-addressing string -> uint32 table built for one cache miss per lookup:
 // keys of up to 11 bytes (every generated user ID) live inside the 16-byte slot,
 // so a probe never follows a pointer. Longer keys fall back to a side list.
@@ -365,6 +408,7 @@ struct KeyTable{
  void grow(size_t want=0){
   const auto R=memory_order_relaxed;
   Slot* old=slots;size_t oldcap=cap;alloc(max(cap*2,want));
+  if(!count){munmap((void*)old,oldcap*sizeof(Slot));return;} // nothing to move: do not even touch the old pages
   for(size_t i=0;i<oldcap;++i){Slot& e=old[i];uint32_t c=e.k1.load(R);if(!c)continue;
    size_t j=(c==LONGK?e.k0.load(R):hash_packed(e.k0.load(R),c))&mask;
    while(slots[j].k1.load(R))j=(j+1)&mask;
@@ -393,6 +437,14 @@ struct KeyTable{
    if(!c)return NONE;
   }
  }
+ // Replaces the value of a key that is in the table (packed form). Other threads may do the same for other keys.
+ void set_packed(uint64_t k0,uint32_t k1,uint32_t v){
+  const auto R=memory_order_relaxed;
+  for(size_t j=hash_packed(k0,k1)&mask;;j=(j+1)&mask){Slot& e=slots[j];const uint32_t c=e.k1.load(R);
+   if(c==k1&&e.k0.load(R)==k0){e.v.store(v,R);return;}
+   if(!c)return;
+  }
+ }
  uint32_t find(string_view s)const{
   const auto R=memory_order_relaxed;
   uint64_t k0;uint32_t k1;
@@ -411,7 +463,7 @@ struct KeyTable{
   return find_or_add_packed(k0,k1,hash_packed(k0,k1)&mask,s);
  }
  // Same, for a key that is already packed (k0,k1 from pack(s)) with j = hash_packed(k0,k1)&mask.
- uint32_t find_or_add_packed(uint64_t k0,uint32_t k1,size_t j,string_view s){
+ uint32_t find_or_add_packed(uint64_t k0,uint32_t k1,size_t j,string_view){
   const auto R=memory_order_relaxed;
   for(;;){
    Slot& e=slots[j];uint32_t c=e.k1.load(memory_order_acquire);
@@ -422,7 +474,7 @@ struct KeyTable{
     if(!e.k1.compare_exchange_strong(expect,BUSY,memory_order_acquire))continue; // somebody took the slot: look at it again
     uint32_t id=nextId.fetch_add(1,R);
     if(id>=idLimit){e.k1.store(0,memory_order_release);return NONE;}
-    newNames[id].set(s);e.k0.store(k0,R);e.v.store(idBase+id,R);e.k1.store(k1,memory_order_release);
+    newNames[id].set_packed(k0,k1);e.k0.store(k0,R);e.v.store(idBase+id,R);e.k1.store(k1,memory_order_release);
     return idBase+id;
    }
    else if(c==BUSY){__builtin_ia32_pause();continue;}
@@ -992,15 +1044,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  add_files(data/"clicks",true,clickBytes);
  // Lines per byte, measured on the start of the largest event file, sizes the bucket buffers tightly.
  uint64_t estEvents=eventBytes/70;
- if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count(sampleBase,sampleBase+n,'\n');
+ if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
  __mark("MAP");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0;
  for(const auto& p:csv_files(data/"links")){Mapped m=map_file(p);if(!m.len)continue;
-  linkLines+=(uint64_t)count(m.base,m.base+m.len,'\n')+1;
+  ++linkLines; // a last line without '\n'
   for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+ #pragma omp parallel for num_threads(T) schedule(dynamic,1) reduction(+:linkLines)
+ for(size_t c=0;c<linkChunks.size();++c){const Chunk& ck=linkChunks[c];linkLines+=count_newlines(ck.base+ck.from,min(ck.to,ck.len)-ck.from);}
  const uint64_t maxLinked=2*linkLines; // every link line names at most two IDs
  // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
  // If a dataset has more, the extra ones take the thread-private fallback path (slower, still exact).
@@ -1020,62 +1074,126 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    u=gp;
   }
  };
+ // best[r]: the ID with the byte-wise smallest name seen so far in root r's group.
+ unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[maxLinked+1]);
  atomic<size_t> nextLink{0};
  #pragma omp parallel num_threads(T)
  {
   #pragma omp for schedule(static)
-  for(uint64_t i=0;i<maxLinked;++i)parent[i].store((uint32_t)i,memory_order_relaxed);
+  for(uint64_t i=0;i<maxLinked;++i){parent[i].store((uint32_t)i,memory_order_relaxed);best[i].store((uint32_t)i,memory_order_relaxed);}
+  // Lines are handled in small batches so the table slots of a batch, and then the parent entries of
+  // its IDs, are on their way into the cache before they are needed.
+  static constexpr int LB=16;
+  struct LinkPend{string_view f[2];uint64_t k0[2];uint32_t k1[2];uint32_t j[2];}; // k1 == 0: key too long to pack
+  LinkPend pend[LB];uint32_t ida[LB],idb[LB];
+  const size_t tmask=tab.mask;
+  auto resolve=[&](int nb){
+   for(int i=0;i<nb;++i){const LinkPend& q=pend[i];
+    // cannot be full: the table holds 2 IDs per link line
+    const uint32_t a=q.k1[0]?tab.find_or_add_packed(q.k0[0],q.k1[0],q.j[0],q.f[0]):tab.find_or_add_long(q.f[0]);
+    const uint32_t b=q.k1[1]?tab.find_or_add_packed(q.k0[1],q.k1[1],q.j[1],q.f[1]):tab.find_or_add_long(q.f[1]);
+    ida[i]=a;idb[i]=b;__builtin_prefetch(&parent[a],1,1);__builtin_prefetch(&parent[b],1,1);
+   }
+   for(int i=0;i<nb;++i){
+    uint32_t a=ida[i],b=idb[i];
+    for(;;){
+     a=find_root(a);b=find_root(b);if(a==b)break;
+     if(a<b)swap(a,b);
+     uint32_t expect=a;if(parent[a].compare_exchange_strong(expect,b))break;
+    }
+   }
+  };
   for(;;){
    size_t c=nextLink.fetch_add(1,memory_order_relaxed);if(c>=linkChunks.size())break;
    const Chunk& ck=linkChunks[c];
-   for_lines(ck.base,ck.len,ck.from,ck.to,[&](string_view line){
-    string_view f[2];if(!fields(line,2,f)||f[0].empty()||f[1].empty())return;
-    uint32_t a=tab.find_or_add(f[0]),b=tab.find_or_add(f[1]); // cannot be full: the table holds 2 IDs per link line
-    for(;;){
-     a=find_root(a);b=find_root(b);if(a==b)return;
-     if(a<b)swap(a,b);
-     uint32_t expect=a;if(parent[a].compare_exchange_strong(expect,b))return;
+   // Every data line that begins in [from,to), as in for_lines; exactly two non-empty fields or the line is skipped.
+   if(ck.from>=ck.len)continue;
+   const char* const end=ck.base+ck.len;
+   const char* nl=(const char*)memchr(ck.from?ck.base+ck.from-1:ck.base,'\n',ck.from?ck.len-(ck.from-1):ck.len);
+   if(!nl)continue;
+   const char* const lim=ck.base+min(ck.to,ck.len);
+   int nb=0;
+   const __m128i vnl=_mm_set1_epi8('\n'),vc=_mm_set1_epi8(','),vq=_mm_set1_epi8('"');
+   for(const char* p=nl+1;p<lim;){
+    LinkPend& q=pend[nb];const char* next;bool ok,done=false;
+    // Usual shape: a line of under 32 bytes with one comma and no quote, cut from two 16-byte compares.
+    if(end-p>=32){
+     const __m128i x0=_mm_loadu_si128((const __m128i*)p),x1=_mm_loadu_si128((const __m128i*)(p+16));
+     const uint32_t mnl=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vnl))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vnl))<<16);
+     if(mnl){
+      const unsigned L=(unsigned)__builtin_ctz(mnl);const uint32_t keep=(1u<<L)-1;
+      const uint32_t mc=((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vc))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vc))<<16))&keep;
+      const uint32_t mq=((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vq))|((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vq))<<16))&keep;
+      if(!mq&&mc&&!(mc&(mc-1))){
+       const unsigned P=(unsigned)__builtin_ctz(mc);
+       done=true;next=p+L+1;ok=P>0&&P+1<L; // both IDs non-empty
+       q.f[0]=string_view(p,P);q.f[1]=string_view(p+P+1,L-P-1);
+      }
+     }
     }
-   });
+    if(!done){ // anything else: the general splitter decides
+     const char* comma[2];int ncomma,nquote;const char* lineEnd;
+     next=scan_line(p,end,comma,2,ncomma,nquote,lineEnd);
+     ok=take_fields(p,lineEnd,comma,ncomma,nquote,2,q.f)&&!q.f[0].empty()&&!q.f[1].empty();
+    }
+    if(ok){
+     for(int k=0;k<2;++k){
+      if(KeyTable::pack(q.f[k],q.k0[k],q.k1[k])){q.j[k]=(uint32_t)(KeyTable::hash_packed(q.k0[k],q.k1[k])&tmask);__builtin_prefetch(&tab.slots[q.j[k]],1,1);}
+      else q.k1[k]=0;
+     }
+     if(++nb==LB){resolve(nb);nb=0;}
+    }
+    p=next;
+   }
+   resolve(nb);
   }
  }
  const uint32_t nlinked=tab.nextId.load();
  if(getenv("SS_TEST_MAXNEW"))tab.idLimit=min<uint64_t>(tab.idLimit,(uint64_t)nlinked+maxNew64); // tests: leave room for only that many unlinked IDs
  __mark("LINKREAD");
- // Flatten, then name each person by the byte-wise smallest of their IDs.
- vector<uint32_t> root(nlinked);
+ // Flatten: every linked ID that is not its group's root offers its name to the root (the byte-wise
+ // smallest wins) and has its table entry pointed at the root, which is the person number.
  {
   PName* names=tab.newNames;
-  unique_ptr<atomic<uint32_t>[]> best(new atomic<uint32_t>[(size_t)nlinked+1]);
   #pragma omp parallel num_threads(T)
   {
    #pragma omp for schedule(static)
-   for(uint32_t i=0;i<nlinked;++i){root[i]=find_root(i);best[i].store(i,memory_order_relaxed);}
-   #pragma omp for schedule(static)
    for(uint32_t i=0;i<nlinked;++i){
-    const uint32_t r=root[i];if(r==i)continue;
-    uint32_t cur=best[r].load();
-    while(names[i].view()<names[cur].view()&&!best[r].compare_exchange_weak(cur,i)){}
+    const uint32_t r=find_root(i);if(r==i)continue;
+    uint32_t cur=best[r].load(memory_order_relaxed);
+    while(name_less(names[i],names[cur])&&!best[r].compare_exchange_weak(cur,i)){}
+    uint64_t k0;uint32_t k1;
+    if(KeyTable::pack(names[i].view(),k0,k1))tab.set_packed(k0,k1,r); // longer keys are in tab.longs, below
    }
    // A root's own name is no longer needed once every member has been compared, and no other person reads it.
    #pragma omp for schedule(static)
-   for(uint32_t i=0;i<nlinked;++i)if(root[i]==i)names[i]=names[best[i].load()];
-   // The table now maps a linked ID straight to its person.
-   #pragma omp for schedule(static)
-   for(size_t j=0;j<tab.cap;++j){auto& e=tab.slots[j];uint32_t c=e.k1.load(memory_order_relaxed);
-    if(c&&c!=KeyTable::LONGK){uint32_t v=e.v.load(memory_order_relaxed);if(v<nlinked)e.v.store(root[v],memory_order_relaxed);}}
+   for(uint32_t i=0;i<nlinked;++i)if(parent[i].load(memory_order_relaxed)==i)names[i]=names[best[i].load(memory_order_relaxed)];
   }
-  for(auto& l:tab.longs)if(l.v<nlinked)l.v=root[l.v];
+  for(auto& l:tab.longs)if(l.v<nlinked)l.v=find_root(l.v);
  }
- vector<uint32_t>().swap(root);
+ best.reset();
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked<<"\n";
  FastMap<uint16_t> categories;vector<string> catnames;
  cat_id("unknown",categories,catnames);
  KeyTable products(1<<17); // product_id -> category number
- read_lines(data/"products.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean products.csv");products.intern(f[0],cat_id(f[1],categories,catnames));});
+ // Categories repeat: a small memo of the last category texts seen saves most of the string-map lookups.
+ struct CatMemo{const char* p;uint32_t n;uint16_t id;};
+ CatMemo catMemo[64]={};
+ read_pairs(data/"products.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean products.csv");
+  const string_view c=f[1];
+  uint64_t w;memcpy(&w,c.data(),8);w&=LOW_BYTES[min<size_t>(c.size(),8)]; // mapped input: reading past the end is safe
+  CatMemo& e=catMemo[((w^c.size())*0x9e3779b97f4a7c15ULL)>>58];
+  uint16_t id;
+  if(e.p&&e.n==c.size()&&memcmp(e.p,c.data(),c.size())==0)id=e.id;
+  else{id=cat_id(c,categories,catnames);e.p=c.data();e.n=(uint32_t)c.size();e.id=id;}
+  products.intern(f[0],id);
+ });
  vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
- read_lines(data/"campaigns.csv",[&](string_view line){string_view f[2];if(!fields(line,2,f))throw runtime_error("Malformed clean campaigns.csv");if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
+ read_pairs(data/"campaigns.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean campaigns.csv");
+  if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
   const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
  uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
 
