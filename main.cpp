@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <emmintrin.h>
 using namespace std;
 namespace fs=std::filesystem;
 static constexpr int64_t DAY=86400000LL, WEEK=7*DAY, GAP=1800000LL;
@@ -132,6 +133,58 @@ template<class FN> static void for_lines(const char* base,size_t len,size_t from
   nl=(const char*)memchr(p,'\n',end-p);
   if(nl){fn(string_view(p,(size_t)(nl-p)));p=nl+1;}
   else{fn(string_view(p,(size_t)(end-p)));break;}
+ }
+}
+// One pass over a line with SSE2: finds its end and records where the commas are and how many quotes it has.
+// Returns the start of the next line. Never reads past `end`.
+static inline const char* scan_line(const char* p,const char* end,const char** comma,int maxc,int& ncomma,int& nquote,const char*& lineEnd){
+ ncomma=0;nquote=0;const char* q=p;
+ const __m128i vnl=_mm_set1_epi8('\n'),vc=_mm_set1_epi8(','),vq=_mm_set1_epi8('"');
+ while(end-q>=16){
+  const __m128i x=_mm_loadu_si128((const __m128i*)q);
+  unsigned mnl=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x,vnl));
+  unsigned mc=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x,vc));
+  unsigned mq=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x,vq));
+  if(mnl){const unsigned cut=(unsigned)__builtin_ctz(mnl),keep=(1u<<cut)-1;mc&=keep;mq&=keep;
+   while(mq){++nquote;mq&=mq-1;}
+   while(mc){if(ncomma<maxc)comma[ncomma]=q+__builtin_ctz(mc);++ncomma;mc&=mc-1;}
+   lineEnd=q+cut;return q+cut+1;
+  }
+  while(mq){++nquote;mq&=mq-1;}
+  while(mc){if(ncomma<maxc)comma[ncomma]=q+__builtin_ctz(mc);++ncomma;mc&=mc-1;}
+  q+=16;
+ }
+ for(;q<end;++q){const char ch=*q;
+  if(ch=='\n'){lineEnd=q;return q+1;}
+  if(ch==','){if(ncomma<maxc)comma[ncomma]=q;++ncomma;}else if(ch=='"')++nquote;
+ }
+ lineEnd=end;return end;
+}
+// Splits a scanned line into exactly n fields under the track's CSV dialect: a quote may only wrap a whole field.
+static inline bool take_fields(const char* p,const char* lineEnd,const char* const* comma,int ncomma,int nquote,int n,string_view* out){
+ if(ncomma!=n-1||p==lineEnd)return false;
+ int quoted=0;const char* s=p;
+ for(int j=0;j<n;++j){const char* e=j==n-1?lineEnd:comma[j];
+  if(e>s&&*s=='"'){if(e-s<2||e[-1]!='"')return false;out[j]=string_view(s+1,(size_t)(e-s-2));++quoted;}
+  else out[j]=string_view(s,(size_t)(e-s));
+  s=e+1;
+ }
+ return nquote==2*quoted; // any other quote sits inside a field, which is malformed
+}
+// Like for_lines, but hands fn the split fields of every well-formed n-field line that begins in [from,to).
+template<int N,class FN> static void for_records(const char* base,size_t len,size_t from,size_t to,FN&& fn){
+ if(from>=len)return;
+ const char* end=base+len;
+ const char* nl=(const char*)memchr(from?base+from-1:base,'\n',from?len-(from-1):len);
+ if(!nl)return;
+ const char* p=nl+1;
+ const char* lim=base+min(to,len);
+ const char* comma[N];string_view f[N];
+ while(p<lim){
+  int ncomma,nquote;const char* lineEnd;
+  const char* next=scan_line(p,end,comma,N,ncomma,nquote,lineEnd);
+  if(take_fields(p,lineEnd,comma,ncomma,nquote,N,f))fn(f);
+  p=next;
  }
 }
 template<class FN> static void read_lines(const fs::path& path,FN&& fn){
@@ -507,8 +560,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(g!=KeyTable::NONE)return g;
    return LOCAL_USER|tl.users.intern(u);
   };
-  auto on_event=[&](string_view line){
-   string_view f[7];if(!fields(line,7,f)||f[0].empty())return;
+  auto on_event=[&](const string_view* f){
+   if(f[0].empty())return;
    int64_t ingest=0;if(!parse_ts(f[3],ingest))return; // ingest is guaranteed to be valid F1
    PRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
    int64_t ts;
@@ -522,8 +575,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    }
    tl.eb[(size_t)(((r.h>>40)*PE)>>24)].push_back(r);
   };
-  auto on_click=[&](string_view line){
-   string_view f[4];if(!fields(line,4,f)||f[0].empty())return;
+  auto on_click=[&](const string_view* f){
+   if(f[0].empty())return;
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
    if(f[1].empty()||!parse_ts(f[3],ts)||ts<clickStart||ts>=window_end)return;
@@ -534,8 +587,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(;;){
    size_t c=nextChunk.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;
    const Chunk& ck=chunks[c];
-   if(ck.click)for_lines(ck.base,ck.len,ck.from,ck.to,on_click);
-   else for_lines(ck.base,ck.len,ck.from,ck.to,on_event);
+   if(ck.click)for_records<4>(ck.base,ck.len,ck.from,ck.to,on_click);
+   else for_records<7>(ck.base,ck.len,ck.from,ck.to,on_event);
   }
  }
  const uint32_t totalIds=tab.end_parallel();
