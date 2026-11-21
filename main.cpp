@@ -95,27 +95,36 @@ static inline bool f1_date(const char* p,int64_t& dayms){
  dayms=days_from_civil(y,(unsigned)m,(unsigned)dd)*DAY;
  e.k8=k8;e.k2=k2;e.ms=dayms;return true;
 }
-// Same result as parse_ts. The two common shapes (F1 and 13-digit F3) take a short path;
+// Time of day of an F1/F2 timestamp ("....-..-..THH:MM:SS"): true and milliseconds since midnight if
+// the 'T', both colons and all six digits are in place and in range. The date and zone are not looked at.
+static inline bool hms_ms(const char* p,int64_t& ms){
+ uint64_t t;memcpy(&t,p+11,8);
+ const bool shape=(p[10]=='T')&((t&0xF0F0FFF0F0FFF0F0ULL)==0x30303A30303A3030ULL)
+  &(((t+0x0606000606000606ULL)&0xF0F000F0F000F0F0ULL)==0x3030003030003030ULL);
+ if(!shape)return false;
+ const unsigned h=(unsigned)((t&15)*10+((t>>8)&15)),mi=(unsigned)(((t>>24)&15)*10+((t>>32)&15)),se=(unsigned)(((t>>48)&15)*10+((t>>56)&15));
+ if(h>23||mi>59||se>59)return false;
+ ms=((h*60LL+mi)*60+se)*1000;return true;
+}
+// Same result as parse_ts. The common shapes (F1, F2 and 13-digit F3) take a short path;
 // anything they do not recognise as well-formed goes to parse_ts, which decides.
 static inline bool parse_ts_fast(string_view s,int64_t& out){
  const char* p=s.data();
  if(s.size()==20){
-  uint64_t t;memcpy(&t,p+11,8); // "HH:MM:SS": digits must be 0-9 and both colons in place
-  const bool shape=(p[10]=='T')&(p[19]=='Z')&((t&0xF0F0FFF0F0FFF0F0ULL)==0x30303A30303A3030ULL)
-   &(((t+0x0606000606000606ULL)&0xF0F000F0F000F0F0ULL)==0x3030003030003030ULL);
-  int64_t dayms;
-  if(shape&&f1_date(p,dayms)){
-   const unsigned h=(unsigned)((t&15)*10+((t>>8)&15)),mi=(unsigned)(((t>>24)&15)*10+((t>>32)&15)),se=(unsigned)(((t>>48)&15)*10+((t>>56)&15));
-   if(h>23||mi>59||se>59)return false;
-   out=dayms+((h*60LL+mi)*60+se)*1000;
-   return true;
-  }
+  int64_t dayms,ms;
+  if(p[19]=='Z'&&hms_ms(p,ms)&&f1_date(p,dayms)){out=dayms+ms;return true;}
  }else if(s.size()==13){
-  uint64_t lo;
-  if(parse8(p+5,lo)){
-   unsigned bad=0;uint64_t hi=0;
-   for(int i=0;i<5;++i){const unsigned c=(unsigned)(unsigned char)p[i]-'0';bad|=c>9;hi=hi*10+c;}
-   if(!bad){out=(int64_t)(hi*100000000ULL+lo);return true;}
+  uint64_t hi,lo; // digits 0-7 and 5-12; together they cover and check all thirteen
+  if(parse8(p,hi)&&parse8(p+5,lo)){out=(int64_t)(hi*100000ULL+lo%100000ULL);return true;}
+ }else if(s.size()==25){
+  int64_t dayms,ms;
+  const unsigned o1=(unsigned)(unsigned char)p[20]-'0',o2=(unsigned)(unsigned char)p[21]-'0',o3=(unsigned)(unsigned char)p[23]-'0',o4=(unsigned)(unsigned char)p[24]-'0';
+  if((p[19]=='+'||p[19]=='-')&&p[22]==':'&&o1<=9&&o2<=9&&o3<=9&&o4<=9&&hms_ms(p,ms)&&f1_date(p,dayms)){
+   const int oh=(int)(o1*10+o2),om=(int)(o3*10+o4);
+   if(oh>23||om>59)return false;
+   const int64_t off=(oh*60+om)*60000LL;
+   out=dayms+ms-(p[19]=='-'?-off:off);
+   return true;
   }
  }
  return parse_ts(s,out);
@@ -764,14 +773,24 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   auto warm_user=[&](const string_view* f){tab.prefetch(f[1]);}; // user_id is field 1 in both files
   auto on_event=[&](const string_view* f){
    if(f[0].empty())return;
-   int64_t ingest=0;if(!parse_ts_fast(f[3],ingest))return; // ingest is guaranteed to be valid F1
+   // ingest_ts is always F1 in generated data; anything else goes through the general parser.
+   int64_t ingest=0,ingestDay=0,ms;const char* pi=f[3].data();
+   const bool ingestF1=f[3].size()==20&&pi[19]=='Z'&&hms_ms(pi,ms)&&f1_date(pi,ingestDay);
+   if(ingestF1)ingest=ingestDay+ms;else if(!parse_ts(f[3],ingest))return;
    PRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.ingest=ingest;r.ts=0;r.user=0;r.price=0;r.cat=0;r.flags=0;
-   int64_t ts;const unsigned kind=event_kind(f[4]);
-   if(kind&&!f[1].empty()&&!f[5].empty()&&parse_ts_fast(f[2],ts)&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY){
-    int32_t price=0;const bool purchase=kind==3;
-    if(!purchase||price_value(f[6],price)){
-     r.flags=F_VALID|(purchase?F_PURCHASE:0);r.ts=ts;r.price=price;r.user=user_of(f[1]);
-     if(purchase){const uint32_t c=products.find(f[5]);r.cat=c==KeyTable::NONE?0:(uint16_t)c;}
+   const unsigned kind=event_kind(f[4]);
+   if(kind&&!f[1].empty()&&!f[5].empty()){
+    int64_t ts;bool tsOk;const char* pt=f[2].data();
+    uint64_t a8,b8;uint16_t a2,b2;
+    // An F1 ts on the same calendar day as ingest_ts (the usual case) needs no date work at all.
+    if(ingestF1&&f[2].size()==20&&pt[19]=='Z'&&(memcpy(&a8,pt,8),memcpy(&b8,pi,8),memcpy(&a2,pt+8,2),memcpy(&b2,pi+8,2),a8==b8&&a2==b2)&&hms_ms(pt,ms)){ts=ingestDay+ms;tsOk=true;}
+    else tsOk=parse_ts_fast(f[2],ts);
+    if(tsOk&&ts>=window_start&&ts<window_end&&ingest-ts<=DAY){
+     int32_t price=0;const bool purchase=kind==3;
+     if(!purchase||price_value(f[6],price)){
+      r.flags=F_VALID|(purchase?F_PURCHASE:0);r.ts=ts;r.price=price;r.user=user_of(f[1]);
+      if(purchase){const uint32_t c=products.find(f[5]);r.cat=c==KeyTable::NONE?0:(uint16_t)c;}
+     }
     }
    }
    tl.eb[(size_t)(((r.h>>40)*PE)>>24)].push_back(r);
