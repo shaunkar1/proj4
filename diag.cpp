@@ -507,17 +507,17 @@ int main(){
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  #define NL {"SS_LANES","0"}
  #define ND {"SS_NODENSE","1"}
- #define LO {"SS_LINKS","old"}
- #define LB {"SS_LINKS","base"}
- #define GO {"SS_GEV","old"}
- #define CW {"SS_CLWIN","1"}
+ #define GS {"SS_GCOMMIT","stream"}
+ #define AU {"SS_ABL","nouser"}
+ #define AR {"SS_ABL","norec"}
+ #define AK {"SS_ABL","nokern"}
  for(int r=0;r<3;++r){
-  add("Bs",1,{N8,ST});add("lo",1,{N8,ST,LO});add("lb",1,{N8,ST,LB});add("go",1,{N8,ST,GO});add("cw",1,{N8,ST,CW});
+  add("Bs",1,{N8,ST});add("gs",1,{N8,ST,GS});add("au",1,{N8,ST,AU});add("ar",1,{N8,ST,AR});add("ak",1,{N8,ST,AK});add("sr",1,{N8,ST,GS,AR});add("su",1,{N8,ST,GS,AU});
  }
  const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HBs",1,{N8,ST},"",true);if(r<2){add("Hlo",1,{N8,ST,LO},"",true);add("Hgo",1,{N8,ST,GO},"",true);}}
+ for(int r=0;r<3;++r){add("HBs",1,{N8,ST},"",true);add("Hgs",1,{N8,ST,GS},"",true);if(r<2){add("Hau",1,{N8,ST,AU},"",true);add("Har",1,{N8,ST,AR},"",true);add("Hak",1,{N8,ST,AK},"",true);}}
  if(quick){vars.clear();
   for(int r=0;r<4;++r){
    {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
@@ -617,14 +617,15 @@ int main(){
   {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c68 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   if(!quick&&gV5){
-   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE c72 | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
+   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE EV dbccecb | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
    const char* SK="MKLPDAWE";
    const char* SL="MLPDAE";
-   a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("links-old","lo")+mm("links-base","lb")+mm("gev-old","go")+mm("clwin-old","cw");
-   a+="| 20M stages MAP/LINKS(all)/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("links-old","lo",SL)+fmt("links-base","lb",SL)+fmt("gev-old","go",SL)+fmt("clwin-old","cw",SL)+"flatten/linkmap "+fmt("default","Bs","FN")+fmt("old","lo","FN");
-   a+="cpu LINKREAD/PARSE/DEDUP/AGG "+fmt("","Bs","lpda")+fmt("gev-old","go","lpda")+"sys P/D/A "+fmt("","Bs","ybg")+"faults(k) P/D/A "+fmt("","Bs","jnm")+"user/sys "+fmt("","Bs","us");
-   {const RunResult* r=get("Bs#0");if(r)a+="| "+r->raw.substr(0,330);}
-   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("links-old","Hlo")+mm("gev-old","Hgo")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("links-old","Hlo",SL)+fmt("gev-old","Hgo",SL)+"flatten/linkmap "+fmt("","HBs","FN")+"cpu L/P/D/A "+fmt("","HBs","lpda")+"sys P/D/A "+fmt("","HBs","ybg")+"faults(k) P/D/A "+fmt("","HBs","jnm")+allw("walls","HBs");
+   a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("gcommit-stream","gs");
+   a+="| 20M stages MAP/LINKS(all)/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("stream","gs",SL);
+   a+="| PARSE wall,cpu,sys ms: "+fmt("default","Bs","Ppy")+fmt("stream","gs","Ppy")+fmt("ABL-nouser","au","Ppy")+fmt("ABL-norec","ar","Ppy")+fmt("ABL-nokern","ak","Ppy")+fmt("stream+norec","sr","Ppy")+fmt("stream+nouser","su","Ppy");
+   a+="| cpu LINKREAD/PARSE/DEDUP/AGG "+fmt("default","Bs","lpda")+fmt("stream","gs","lpda")+"sys P/D/A "+fmt("","Bs","ybg")+fmt("stream","gs","ybg")+"faults P/D/A "+fmt("","Bs","jnm")+fmt("stream","gs","jnm");
+   {const RunResult* r=get("Bs#0");if(r)a+="| "+r->raw.substr(0,200);}
+   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("stream","Hgs")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("stream","Hgs",SL)+"PARSE wall,cpu,sys: "+fmt("default","HBs","Ppy")+fmt("stream","Hgs","Ppy")+fmt("nouser","Hau","Ppy")+fmt("norec","Har","Ppy")+fmt("nokern","Hak","Ppy")+"cpu L/P/D/A "+fmt("","HBs","lpda")+fmt("stream","Hgs","lpda")+allw("walls","HBs");
   }
   if(quick){
    a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);
