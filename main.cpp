@@ -4833,7 +4833,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
  organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
  };
- const bool catalogBg=!(getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="inline");
+ const bool catalogBg=getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="thread"; // default inline: on the scoring machine the side thread made KEYS wait 13-18 ms (diagnostic 17)
  exception_ptr catalogErr;thread catalogThread;
  struct Joiner{thread& t;~Joiner(){if(t.joinable())t.join();}} catalogJoiner{catalogThread}; // an exception on the way must not meet a running thread
  if(catalogBg)catalogThread=thread([&]{try{load_catalog();}catch(...){catalogErr=current_exception();}__fine("catalog-read-end");});
@@ -6138,7 +6138,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  //   bgfirst  the helper takes the event files only; the rest as today.
  //   late     the workers unmap everything after the last loop, nothing before the index loop.
  vector<pair<char*,size_t>> unmapLastBg;
- {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=w=="bg"?1:w=="bgfirst"?2:w=="late"?3:0;
+ {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=(w=="bg"||w.empty())?1:w=="bgfirst"?2:w=="late"?3:0; // default bg (scoring machine: DENSE -3 ms, AGGREGATE -4 ms at 20M; -10 and -13 at 60M); SS_UNMAP=workers = the workers unmap
   const auto unmap_bg=[](vector<pair<char*,size_t>> v){if(v.empty())return;
    thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();};
   // SS_POOLPRE=1 (measuring switch): every thread's pool gets its next region here, before any unmapping starts,
