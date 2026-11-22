@@ -615,7 +615,7 @@ int main(){
   {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c68 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   if(!quick&&gV5){
-   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE c68 | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
+   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE c69 | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
    const char* SK="MKLPDAWE";
    a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","B")+mm("personbucket4096","p4")+mm("personbucket65536","p64")+mm("unmap-workers","uw")+mm("4 threads","n4")+mm("16 threads","n16");
    a+="| 20M stages MAP/KEYS/LINKS/PARSE/DEDUP/AGG/WRITE/exit: "+fmt("default","Bs",SK)+"cpu PARSE/AGG "+fmt("","Bs","pa")+"sys MAP/PARSE/AGG "+fmt("","Bs","iyg")+"user/sys total "+fmt("","Bs","us")+"parse-only "+fmt("","po","wPus");
