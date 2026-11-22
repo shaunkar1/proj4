@@ -436,6 +436,9 @@ int main(){
   for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
   gReplicaSec=now()-t;
   fprintf(stderr,"DIAG replica: %d x %d copies, %.1f MB written in %.2fs (elapsed %.1fs)\n",PARTS,BIG,b/1e6,now()-t,now()-T0);}
+ // The public set as the scorer mounts it (/data) against a copy of it on the scratch mount: do file mappings behave the same?
+ const fs::path devcopy=fs::path(scratch)/"devcopy";
+ {error_code ec;fs::create_directories(devcopy,ec);fs::copy(fs::path(data),devcopy,fs::copy_options::recursive|fs::copy_options::overwrite_existing,ec);if(ec)fprintf(stderr,"DIAG devcopy failed: %s\n",ec.message().c_str());}
  double syncSec=0;{const double t=now();int fd=open(scratch.c_str(),O_RDONLY|O_DIRECTORY);if(fd>=0){syncfs(fd);close(fd);}syncSec=now()-t;fprintf(stderr,"DIAG syncfs of the scratch mount after the replica: %.2fs\n",syncSec);}
  const string B=big.string(),H=huge.string();
  auto timeleft=[&](double need){if(now()-T0+need>150){fprintf(stderr,"DIAG skipping the rest: out of time (%.1fs elapsed)\n",now()-T0);return false;}return true;};
@@ -451,17 +454,22 @@ int main(){
  #define UB {"SS_UNMAP","bg"}
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  #define NL {"SS_LANES","0"}
+ #define GOLD {"SS_MARKED","old"},{"SS_SEVERAL","old"},{"SS_TURNS","old"},{"SS_CLICKSORT","old"}
  for(int r=0;r<4;++r){
-  add("B",1,{N8});add("g",1,{N8},"core-g");
-  add("pB",1,{N8,PO});add("pN",1,{N8,PO},"core-n");add("pK",1,{N8,PO},"core-k");
-  add("qB",1,{N8,PO,NL});add("qK",1,{N8,PO,NL,{"SS_PF","none"}},"core-k");
-  if(r<3){add("Bs",1,{N8,ST});add("gs",1,{N8,ST},"core-g");}
+  add("B",1,{N8});add("c66",1,{N8},"core-b");add("gold",1,{N8,GOLD});add("told",1,{N8,{"SS_TURNS","old"}});add("sold",1,{N8,{"SS_SEVERAL","old"}});
+  if(r<3){add("Bs",1,{N8,ST});}
  }
+ const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hg",1,{N8},"core-g",true);add("HpB",1,{N8,PO},"",true);add("HpN",1,{N8,PO},"core-n",true);add("HpK",1,{N8,PO},"core-k",true);
-  if(r<2){add("HBs",1,{N8,ST},"",true);add("Hgs",1,{N8,ST},"core-g",true);}}
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H66",1,{N8},"core-b",true);add("Htold",1,{N8,{"SS_TURNS","old"}},"",true);
+  if(r<2){add("HBs",1,{N8,ST},"",true);}}
  pipeline("dev",data,od(),{{"NCPU","8"}});
+ (void)nSmall;
+ for(int r=0;r<6;++r){
+  {const string o=od();pipeline("dv#"+to_string(r),data,o,{N8,ST,{"SS_SMAPS","1"}});error_code ec;fs::remove_all(o,ec);}
+  {const string o=od();pipeline("dc#"+to_string(r),devcopy.string(),o,{N8,ST,{"SS_SMAPS","1"}});error_code ec;fs::remove_all(o,ec);}
+ }
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
  for(const Var& v:vars){if(!timeleft(v.hugeSet?14:6))break;
@@ -495,9 +503,9 @@ int main(){
    close(fd);unlink(pth.c_str());return true;};
   uint64_t ur[3]={0,0,0},us_[3]={0,0,0},cr[3]={0,0,0},cs[3]={0,0,0};bool ok[3]={false,false,false};
   for(int i=0;i<2;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
-   {const string o=od();pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,o,env,"core-g");error_code ec;fs::remove_all(o,ec);}ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+   {const string o=od();pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,o,env,"");error_code ec;fs::remove_all(o,ec);}ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: G build (c67) dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
+  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c68 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
   if(fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
@@ -540,13 +548,13 @@ int main(){
   auto mk=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wMKP";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one));}return o+"~"+to_string(med(grp,"w"))+" ";};
   {char t[64];snprintf(t,sizeof t," | syncfs after replica %.1fs",syncSec);eqText+=t;}
   {char t[96];snprintf(t,sizeof t," | BOT REPLICA: %zu bots hold %.1f%% of rows",gBots.size(),100.0*gBotRows/1072000.0);eqText+=t;}
-  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c66","B")+mm("G(bots)","g");
-  a+="| parse-only P/user/sys, lanes: "+fmt("c66","pB","Pus")+fmt("nolock","pN","Pus")+fmt("nocommit(prefetch stays)","pK","Pus")+"index loops: "+fmt("c66","qB","Pus")+fmt("nocommit+no prefetch","qK","Pus");
-  a+="| small stages MKLDYWE "+fmt("c66","Bs","MKLDYWE")+fmt("G","gs","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("c66","Bs","pqxa")+fmt("G","gs","pqxa");
-  {const RunResult* r=get("Bs#0");if(r)a+="| handed over c66: "+r->hand+" ";}
-  {const RunResult* r=get("gs#0");if(r)a+="| G: "+r->hand+" | DENSE threads G:"+squeeze(r->dth)+" ";}
-  c+="60M min~median w/P/R/X/A: "+mm("c66","HB")+mm("G","Hg")+"parse-only P/user/sys: "+fmt("c66","HpB","Pus")+fmt("nolock","HpN","Pus")+fmt("nocommit","HpK","Pus")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("c66","HBs","pqxa")+fmt("G","Hgs","pqxa");
-  {const RunResult* r=get("Hgs#0");if(r)c+="| G handed over: "+r->hand+" | DENSE threads G 60M:"+squeeze(r->dth)+" ";}
+  auto allw=[&](const string& name,const string& grp)->string{string o=name+"=";bool first=true;for(auto& r:results){if(r.rc!=0||r.label.compare(0,grp.size()+1,grp+"#")!=0)continue;if(!first)o+=",";first=false;o+=to_string((long)(r.wall*1e3+0.5));}return o+" ";};
+  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c68","B")+mm("c66","c66")+mm("c68 all four G switches old","gold")+mm("c68 turns old","told")+mm("c68 several old","sold");
+  a+="| PUBLIC SET AS MOUNTED (/data) vs A COPY ON /scratch, c68, min of 6: wall/PARSE/sysPARSE ms, PARSE faults (thousands), FilePmdMapped MB, MAP faults: "+fmt("/data","dv","wPyjek")+fmt("copy","dc","wPyjek")+allw("/data walls","dv")+allw("copy walls","dc");
+  a+="| small stages MKLDYWE "+fmt("c68","Bs","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("c68","Bs","pqxa");
+  {const RunResult* r=get("Bs#0");if(r)a+="| handed over c68: "+r->hand+" | DENSE threads:"+squeeze(r->dth)+" ";}
+  c+="60M min~median w/P/R/X/A: "+mm("c68","HB")+mm("c66","H66")+mm("c68 turns old","Htold")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("c68","HBs","pqxa");
+  {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c68 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
