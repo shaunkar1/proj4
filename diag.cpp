@@ -238,6 +238,37 @@ static void d_scan_max(const fs::path& dir,char l0,char l1){
     p=e+1;}}
   for(auto pr:{make_pair(&gMaxE,mE),make_pair(&gMaxC,mC),make_pair(&gMaxI,mI)}){uint64_t cur=pr.first->load();while(pr.second>cur&&!pr.first->compare_exchange_weak(cur,pr.second)){}}});
 }
+// ---- v5 data: IDs are opaque (letter + up to 8 lowercase base-36 characters, or letter + 32 lowercase hex). A copy
+// gets every canonical ID pushed through a per-copy bijection of its own form (so copies are distinct and IDs stay
+// canonical); the user IDs of the heaviest users ("whales") stay the same in every copy, so a whale of the replica
+// has the weight a whale has in real data of that size. Other texts get a two-character tag as before.
+static bool gV5=false;
+static unordered_map<string,int> gWhaleIds;
+static const uint64_t M36=2821109907456ull; // 36^8
+static inline bool v5_short(const char* s,size_t n,uint64_t& v){if(n<2||n>9)return false;v=0;for(size_t i=1;i<n;++i){unsigned d=(unsigned char)s[i]-(unsigned)'0';if(d>9){d=(unsigned char)s[i]-(unsigned)'a';if(d>25)return false;d+=10;}v=v*36+d;}return true;}
+static inline bool v5_long(const char* s,size_t n,unsigned char* out16){if(n!=33)return false;for(int i=0;i<16;++i){unsigned hi=(unsigned char)s[1+2*i],lo=(unsigned char)s[2+2*i];
+  auto hx=[](unsigned c)->int{if(c-'0'<10)return (int)(c-'0');if(c-'a'<6)return (int)(c-'a'+10);return -1;};const int h=hx(hi),l=hx(lo);if(h<0||l<0)return false;out16[i]=(unsigned char)(h*16+l);}return true;}
+static inline void v5_put_short(string& out,char letter,uint64_t v,uint64_t rep){
+ uint64_t A=(0x9E3779B97F4A7C15ull*(rep+1))%M36;A=A-(A%6)+1;const uint64_t B=(0xD6E8FEB86659FD93ull*(rep+7))%M36;
+ const uint64_t w=(uint64_t)(((unsigned __int128)v*A+B)%M36);
+ char buf[8];int at=8;uint64_t y=w;do{const unsigned d=(unsigned)(y%36);buf[--at]=(char)(d<10?'0'+d:'a'+(d-10));y/=36;}while(y);out.push_back(letter);out.append(buf+at,(size_t)(8-at));}
+static inline void v5_put_long(string& out,char letter,const unsigned char* b16,uint64_t rep){
+ static const char* H="0123456789abcdef";out.push_back(letter);uint64_t x=0x243F6A8885A308D3ull*(rep+1);
+ for(int i=0;i<16;++i){x^=x>>29;x*=0xBF58476D1CE4E5B9ull;x^=x>>32;const unsigned char c=(unsigned char)(b16[i]^(unsigned char)(x>>(8*(i&7))));out.push_back(H[c>>4]);out.push_back(H[c&15]);}}
+static void v5_find_whales(const fs::path& data,size_t top){
+ unordered_map<string,uint32_t> cnt;
+ for(auto& f:fs::directory_iterator(data/"events")){if(f.path().extension()!=".csv")continue;
+  string in;{ifstream g(f.path(),ios::binary);in.assign(istreambuf_iterator<char>(g),{});}
+  size_t p=in.find('\n');if(p==string::npos)continue;++p;
+  while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();size_t c0=in.find(',',p);
+   if(c0!=string::npos&&c0<e){size_t c1=in.find(',',c0+1);if(c1==string::npos||c1>e)c1=e;size_t ua=c0+1,ub=c1;if(ub-ua>=2&&in[ua]=='"'&&in[ub-1]=='"'){++ua;--ub;}if(ub>ua)++cnt[in.substr(ua,ub-ua)];}
+   p=e+1;}}
+ vector<pair<uint32_t,string>> v;v.reserve(cnt.size());for(auto& kv:cnt)v.push_back({kv.second,kv.first});
+ sort(v.begin(),v.end(),[](auto& x,auto& y){return x.first>y.first;});
+ uint64_t rows=0;for(size_t i=0;i<v.size()&&i<top;++i){gWhaleIds[v[i].second]=1;rows+=v[i].first;}
+ fprintf(stderr,"DIAG v5 whales: %zu user IDs kept in all copies, %llu event rows (heaviest %u, lightest kept %u), distinct user IDs %zu\n",gWhaleIds.size(),(unsigned long long)rows,v.empty()?0u:v[0].first,v.size()>top?v[top-1].first:0u,v.size());
+ gBotRows=rows;
+}
 // Writes each CSV of `src` into `dst` as `parts` files, each holding the header and `reps` copies of the data
 // lines. In copy r every dense ID in the first two fields is moved r steps up its counter space (events and
 // clicks by the number of counters in the source, users by the number of user indexes), so the copies are
@@ -280,7 +311,16 @@ static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int p
        size_t c=in.find(',',q);if(c==string::npos||c>e)c=e;
        if(c>q){size_t a=q,b=c;const bool quoted=b-a>=2&&in[a]=='"'&&in[b-1]=='"';if(quoted){++a;--b;}
         const char letter=k?l1:l0;uint64_t v;bool dense=false,keep=false,odd=false;
-        if((rep||bot||!bm.empty())&&d_counter(in.data()+a,b-a,letter,v)){
+        bool v5done=false;
+        if(gV5&&rep&&b>a&&in[a]==letter&&!(in[q]=='"'&&!quoted)){
+         uint64_t sv;unsigned char b16[16];
+         if(letter=='u'&&gWhaleIds.count(in.substr(a,b-a))){} // a whale's user ID: the same in every copy (written as it is below: keep)
+         else if(v5_short(in.data()+a,b-a,sv)){if(quoted)out.push_back('"');v5_put_short(out,letter,sv,rep);if(quoted)out.push_back('"');v5done=true;}
+         else if(v5_long(in.data()+a,b-a,b16)){if(quoted)out.push_back('"');v5_put_long(out,letter,b16,rep);if(quoted)out.push_back('"');v5done=true;}
+        }
+        if(gV5&&rep&&!v5done&&letter=='u'&&b>a&&gWhaleIds.count(in.substr(a,b-a)))keep=true;
+        if(v5done){}
+        else if(!gV5&&(rep||bot||!bm.empty())&&d_counter(in.data()+a,b-a,letter,v)){
          if(letter=='u'){if(!bm.empty()&&bm.count(v>>9))keep=true; // a bot's user ID is the same in every copy
           else if(rep&&(v>>9)<gOffI){v+=(rep*gOffI)<<9;dense=true;}}
          else if(bot&&letter=='e'&&v>=bot->ef&&v<bot->el){
@@ -289,7 +329,8 @@ static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int p
           else{v=bot->baseE+(v-bot->ef)*copies+rep;dense=true;}}
          else if(bot&&letter=='k'&&v>=bot->cf&&v<bot->cl){v=bot->baseC+(v-bot->cf)*copies+rep;dense=true;}
          else if(rep){const uint64_t off=letter=='e'?gOffE:gOffC;if(v<off){v+=rep*off;dense=true;}}}
-        if(in[q]=='"'&&!quoted){out.append(in,q,c-q);} // a lone quote: leave the field alone
+        if(v5done){}
+        else if(in[q]=='"'&&!quoted){out.append(in,q,c-q);} // a lone quote: leave the field alone
         else{if(quoted)out.push_back('"');
          if(odd){out.push_back('X');out.push_back((char)('A'+rep%26));out.push_back((char)('a'+rep/26));out.append(in,a,b-a);}
          else if(keep||(!rep&&!dense))out.append(in,a,b-a);
@@ -421,7 +462,7 @@ int main(){
  const int BIG=getenv("SS_DIAG_BIG")?atoi(getenv("SS_DIAG_BIG")):20;
  const int PARTS=getenv("SS_DIAG_PARTS")?atoi(getenv("SS_DIAG_PARTS")):3;
  const fs::path big=fs::path(scratch)/"big",huge=fs::path(scratch)/"huge";
- const bool quick=!(getenv("SS_DIAG_QUICK")&&atoi(getenv("SS_DIAG_QUICK"))==0); // this diagnostic: what does the new public set look like to the pipeline?
+ const bool quick=getenv("SS_DIAG_QUICK")&&atoi(getenv("SS_DIAG_QUICK"))!=0; // this diagnostic: what does the new public set look like to the pipeline?
  pipeline("keys",data,od(),{{"NCPU","8"},{"SS_STATS","1"}});
  string sampleText;
  for(const char* sub:{"events","clicks","links"}){vector<fs::path> fl;error_code ec;for(auto& f:fs::directory_iterator(fs::path(data)/sub,ec))fl.push_back(f.path());sort(fl.begin(),fl.end());
@@ -433,13 +474,15 @@ int main(){
  fprintf(stderr,"DIAG keys %d: counters per copy: events %llu clicks %llu user indexes %llu\n",(int)gKeys,(unsigned long long)gOffE,(unsigned long long)gOffC,(unsigned long long)gOffI);
  {double t=now();uint64_t b=0;
   if(!quick){
+  gV5=!gKeys;if(gV5)v5_find_whales(fs::path(data),40);
   const bool botMode=gKeys&&!(getenv("SS_DIAG_BOTS")&&atoi(getenv("SS_DIAG_BOTS"))==0);
   if(botMode)d_find_bots(fs::path(data),0.005);
   for(const char* sub:{"events","clicks","links"}){
    const char l0=sub[0]=='e'?'e':sub[0]=='c'?'k':'u';
    b+=replicate(fs::path(data)/sub,huge/sub,BIG,PARTS,l0,'u',botMode);
    fs::create_directories(big/sub);
-   if(botMode&&!gBots.empty())b+=replicate(fs::path(data)/sub,big/sub,BIG,1,l0,'u',true); // its own files: the bots' ranges depend on the number of copies
+   if(gV5)b+=replicate(fs::path(data)/sub,big/sub,BIG,1,l0,'u',false); // v5: its own files (line-interleaved copies 0..BIG-1)
+   else if(botMode&&!gBots.empty())b+=replicate(fs::path(data)/sub,big/sub,BIG,1,l0,'u',true); // its own files: the bots' ranges depend on the number of copies
    else for(auto& f:fs::directory_iterator(huge/sub)){const string n=f.path().filename().string();if(n.size()>6&&n.compare(n.size()-6,6,"-0.csv")==0)fs::create_symlink(f.path(),big/sub/n);}
   }
   for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
@@ -464,16 +507,15 @@ int main(){
  #define UB {"SS_UNMAP","bg"}
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  #define NL {"SS_LANES","0"}
- #define GOLD {"SS_MARKED","old"},{"SS_SEVERAL","old"},{"SS_TURNS","old"},{"SS_CLICKSORT","old"}
- for(int r=0;r<4;++r){
-  add("B",1,{N8});add("c66",1,{N8},"core-b");add("gold",1,{N8,GOLD});add("told",1,{N8,{"SS_TURNS","old"}});add("sold",1,{N8,{"SS_SEVERAL","old"}});
-  if(r<3){add("Bs",1,{N8,ST});}
+ #define ND {"SS_NODENSE","1"}
+ for(int r=0;r<3;++r){
+  add("Bs",1,{N8,ST});add("B",1,{N8});
+  if(r<2){add("n4",1,{{"NCPU","4"}});add("n16",1,{{"NCPU","16"}});add("p4",1,{N8,{"SS_PERSONBUCKET","4096"}});add("p64",1,{N8,{"SS_PERSONBUCKET","65536"}});add("uw",1,{N8,{"SS_UNMAP","workers"}});add("po",1,{N8,PO});}
  }
  const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H66",1,{N8},"core-b",true);add("Htold",1,{N8,{"SS_TURNS","old"}},"",true);
-  if(r<2){add("HBs",1,{N8,ST},"",true);}}
+ for(int r=0;r<3;++r){add("HBs",1,{N8,ST},"",true);add("HB",1,{N8},"",true);}
  if(quick){vars.clear();
   for(int r=0;r<4;++r){
    {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
@@ -482,7 +524,7 @@ int main(){
   }}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  (void)nSmall;
- for(int r=0;r<6;++r){
+ for(int r=0;r<(quick?6:2);++r){
   {const string o=od();pipeline("dv#"+to_string(r),data,o,{N8,ST,{"SS_SMAPS","1"}});error_code ec;fs::remove_all(o,ec);}
   {const string o=od();pipeline("dc#"+to_string(r),devcopy.string(),o,{N8,ST,{"SS_SMAPS","1"}});error_code ec;fs::remove_all(o,ec);}
  }
@@ -511,7 +553,7 @@ int main(){
   fprintf(stderr,"DIAG %s\n",floorText.c_str());}
  // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
  string eqText="eq60 not run";
- if(!quick&&timeleft(40)){
+ if(!quick&&gKeys&&timeleft(40)){
   auto csvhash=[&](const char* name,uint64_t& rows,uint64_t& sum){rows=0;sum=0;const string pth=scratch+"/"+name;int fd=open(pth.c_str(),O_RDONLY);if(fd<0)return false;struct stat st;fstat(fd,&st);
    if(st.st_size){const char* b=(const char*)mmap(nullptr,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);uint64_t h=1469598103934665603ull;
     for(off_t k=0;k<st.st_size;++k){if(b[k]=='\n'){h^=h>>29;h*=0xBF58476D1CE4E5B9ull;h^=h>>32;sum+=h;++rows;h=1469598103934665603ull;}else{h^=(unsigned char)b[k];h*=1099511628211ull;}}
@@ -572,6 +614,15 @@ int main(){
   c+="60M min~median w/P/R/X/A: "+mm("c68","HB")+mm("c66","H66")+mm("c68 turns old","Htold")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("c68","HBs","pqxa");
   {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c68 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
+  if(!quick&&gV5){
+   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE c68 | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
+   const char* SK="MKLPDAWE";
+   a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","B")+mm("personbucket4096","p4")+mm("personbucket65536","p64")+mm("unmap-workers","uw")+mm("4 threads","n4")+mm("16 threads","n16");
+   a+="| 20M stages MAP/KEYS/LINKS/PARSE/DEDUP/AGG/WRITE/exit: "+fmt("default","Bs",SK)+"cpu PARSE/AGG "+fmt("","Bs","pa")+"sys MAP/PARSE/AGG "+fmt("","Bs","iyg")+"user/sys total "+fmt("","Bs","us")+"parse-only "+fmt("","po","wPus");
+   {const RunResult* r=get("Bs#0");if(r)a+="| "+r->raw.substr(0,420);}
+   c="60M min~median w/P/R/X/A: "+mm("default","HB")+"stages MKLPDAWE "+fmt("","HBs",SK)+"cpu PARSE/AGG "+fmt("","HBs","pa")+"user/sys "+fmt("","HBs","us")+allw("walls","HB");
+   {const RunResult* r=get("HBs#0");if(r)c+="| "+r->raw.substr(0,420);}
+  }
   if(quick){
    a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);
    {const RunResult* r=get("dv#0");if(r)a+=" || dv: "+r->hand;}
