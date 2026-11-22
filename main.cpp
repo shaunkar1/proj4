@@ -5516,8 +5516,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(optPopulate==3)for(int i=0;i<optPopulateBg;++i)thread([&chunks,populate_chunk]{ // chunks outlives the threads' work: they stop before PARSE ends and the process leaves through _exit
   for(;;){if(populateStop.load(memory_order_relaxed))break;const size_t c=populateNext.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;populate_chunk(c);}}).detach();
  // ---- Dense IDs: find the generator's keys from the first lines of one event file and one click file. ----
- // (SS_NODENSE=1 turns the dense route off.)
- if(!getenv("SS_NODENSE")&&sampleLen){
+ // The route is OFF unless SS_DENSE=1 asks for it: IDs are opaque texts by the rules (one in eight is 32 hex digits, the
+ // rest come out of a keyed bijection), so no key exists to be found and the search would only cost time.
+ // (SS_NODENSE=1 keeps it off whatever SS_DENSE says.)
+ if(getenv("SS_DENSE")&&atoi(getenv("SS_DENSE"))!=0&&!getenv("SS_NODENSE")&&sampleLen){
   // 24 IDs per column: from the first lines of a small file, six each from four places of a larger one
   // (so that a few odd lines at the head of a file do not decide for the whole file).
   auto sample=[](const char* base,size_t len,int col,char letter){
