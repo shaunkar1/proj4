@@ -706,9 +706,10 @@ struct KeyTable{
  // A key over 11 bytes, lock-free like the packed keys: the slot is claimed (BUSY), the entry written at an index
  // of its own, then the slot published. (Until GFAST this path held one mutex for all threads and compared texts:
  // with one ID in eight long, every thread queued here.)
- uint32_t find_or_add_long(string_view s){
+ uint32_t find_or_add_long(string_view s){Long key;const uint64_t h=long_key(s,key);return find_or_add_long_key(key,h,s);}
+ // The same with the key at hand: h = long_key(s, key) (a caller that asked for the slot h & mask ahead of time).
+ uint32_t find_or_add_long_key(Long& key,const uint64_t h,string_view s){
   const auto R=memory_order_relaxed;
-  Long key;const uint64_t h=long_key(s,key);
   for(size_t j=h&mask;;){
    Slot& e=slots[j];uint32_t c=e.k1.load(memory_order_acquire);
    if(c==LONGK){if(e.k0.load(R)==h){const Long& l=longs.d[e.v.load(R)];if(same_long(l,key))return l.v;}}
@@ -1059,6 +1060,8 @@ struct alignas(64) ThreadState{
  deque<array<char,16>> rawNames; // texts of raw users that ended up with a LOCAL_USER number (they need a place that stays)
  vector<Bucket<DRec>> db;vector<Bucket<DCRec>> dcb; // dense rows in bucket form, by counter range (SS_DENSE_RECORDS=bucket)
  uint64_t slotWaits=0; // eslotWaits of this thread
+ uint64_t clWin2=0,clGeneral=0; // click line code: lines read through three windows (click_long_fields), lines left to the general handler (SS_STATS)
+ uint64_t clgRows=0,clgSlow=0; // cl8g click loop (general route): lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint64_t cl8Rows=0,cl8Slow=0; // cl8 click loop: lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
  uint64_t laneFixE=0,laneFixC=0; // lane loops: line ends of event / click rows looked up with memchr (SS_STATS)
@@ -2247,12 +2250,24 @@ static constexpr int V3_BATCH=16;
 static inline uint32_t long_user(const char* u,size_t n,KeyTable& tab,ThreadState& tl){
  const string_view t(u,n);const uint32_t g=tab.find_or_add(t);return g!=KeyTable::NONE?g:(LOCAL_USER|tl.users.intern(t));
 }
+// A waiting record whose user ID does not pack (click_line_v3, DREC=false): k1 = the length of the text (below 2^24,
+// so no packed k1 looks like it), k0 = KeyTable::long_key's hash, j = its slot (asked for when the line was read).
+static inline void pend_long_user(PendUser& pu,const char* u,size_t n,KeyTable& tab,uint32_t* up){
+ KeyTable::Long key;const uint64_t h=KeyTable::long_key(string_view(u,n),key);
+ const size_t j=h&tab.mask;__builtin_prefetch(&tab.slots[j],0,1);
+ pu.k0=h;pu.u=u;pu.up=up;pu.j=(uint32_t)j;pu.k1=(uint32_t)n;
+}
 static void resolve_users(const PendUser* pend,const PendUser* pendEnd,KeyTable& tab,ThreadState& tl){
  const auto R_=memory_order_relaxed;
  KeyTable::Slot* const slots=tab.slots;
  for(;pend!=pendEnd;++pend){
   const PendUser& q=*pend;KeyTable::Slot& e=slots[q.j];uint32_t g;
   if(__builtin_expect(e.k1.load(memory_order_acquire)==q.k1&&e.k0.load(R_)==q.k0,1))g=e.v.load(R_);
+  else if(!(q.k1>>24)){ // a text that does not pack (pend_long_user)
+   const string_view u(q.u,(size_t)q.k1);KeyTable::Long key;const uint64_t h=KeyTable::long_key(u,key);
+   g=tab.find_or_add_long_key(key,h,u);
+   if(g==KeyTable::NONE)g=LOCAL_USER|tl.users.intern(u);
+  }
   else{
    const string_view u(q.u,(size_t)(q.k1>>24)-1);
    g=tab.find_or_add_packed(q.k0,q.k1,q.j,u);
@@ -4347,6 +4362,7 @@ static constexpr size_t EV8_BLOCK=4096; // bytes indexed at a time
 // for in exclusive state; opt-in, no CPU test: every x86-64 CPU with AVX-512 has it); t1 = PREFETCHT1 (into the
 // second-level cache only); none = no request at all. Same output for all.
 static unsigned optPfw=0; // 0 default, 1 w, 2 t1, 3 none
+static unsigned optClickWin2=1; // click lines of 64+ bytes: 1 = three windows in the line code (click_long_fields), 0 = the general handler (SS_CLWIN=1), 2 = three windows, every such line checked against the portable splitter (SS_CLWIN=check)
 #define SS_PFW_ASM(p_) {if(pfw_==1)__asm__ volatile("prefetchw %0"::"m"(*(const char*)(p_)));else if(pfw_==2)__asm__ volatile("prefetcht1 %0"::"m"(*(const char*)(p_)));}
 #define SS_EV8_PFW(O_,i_) SS_PFW_ASM(&SS_EV8_SLOT(O_,i_))
 // NAME_slow: a row the kernel did not decide goes through the line code, kept out of the loop so that the loop
@@ -4634,9 +4650,59 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
 SS_EVENT_LOOP_G8L(events_avx2_g8l,SS_V3,win_masks_avx2,gev_scan_none,lane_live_scalar,gev_dec_ref)
 SS_EVENT_LOOP_G8L(events_avx512z_g8l,SS_V5,win_masks_avx512z,vertg::scang8_v5,lane_live_avx512,vertg::decg8_v5)
 // The same for click lines (4 fields, one 64-byte window).
+// A click line with no newline in its first window (GFAST.md "C": a long ID makes a line 64 to ~105 bytes): the fields
+// from three windows, A at the line start (click_id up to the first comma), B one past that comma (user_id up to the
+// second comma), C one past the second comma (campaign_id, ts and the newline). cA / qA: the comma and quote masks of
+// window A, which holds no newline. False: the line is not four well-formed fields cut this way (a part longer than
+// its window, a quote out of place, another number of commas): the general handler decides, as for any odd line.
+// Up to 192 bytes behind p are read (the mappings leave 4096 zero bytes behind each file).
+struct ClickLong{const char* s0;const char* next;unsigned l0,b1,l1,b2,l2,b3,l3;};
+SS_V3I bool click_long_fields(const char* const p,const uint64_t cA,const uint64_t qA,ClickLong& f){
+ if(!cA)return false;
+ const unsigned c0=(unsigned)_tzcnt_u64(cA);
+ uint64_t sqA,opA;const uint64_t errA=quote_errors_v3(qA&_blsmsk_u64(cA),1,_blsi_u64(cA),sqA,opA);
+ const char* const bB=p+c0+1;
+ const WinMasks wB=win_masks_avx2(bB);
+ if(!wB.c)return false;
+ const uint64_t mB=_blsmsk_u64(wB.c);
+ const unsigned e1=(unsigned)_tzcnt_u64(wB.c);
+ uint64_t sqB,opB;const uint64_t errB=quote_errors_v3(wB.q&mB,1,_blsi_u64(wB.c),sqB,opB);
+ const char* const bC=bB+e1+1;
+ const WinMasks wC=win_masks_avx2(bC);
+ const uint64_t L=_tzcnt_u64(wC.n);
+ if((wB.n&mB)|(L>>6))return false; // the line ends inside the user_id, or not inside window C
+ const uint64_t nbit=_blsi_u64(wC.n),keep=nbit-1;
+ const uint64_t c=wC.c&keep,q=wC.q&keep;
+ const uint64_t st=(c<<1)|1,en=c|nbit;
+ uint64_t sq,op;const uint64_t err=quote_errors_v3(q,st,en,sq,op);
+ if((errA|errB|err|(uint64_t)(_mm_popcnt_u64(c)^1))!=0)return false;
+ const unsigned z0=(unsigned)(qA&1),z1=(unsigned)(wB.q&1);
+ f.s0=p+z0;f.l0=c0-2*z0;
+ f.b1=(unsigned)(bB-p)+z1;f.l1=e1-2*z1;
+ uint64_t B=st+sq,E=en-(op>>1);
+ const unsigned oC=(unsigned)(bC-p);
+ const unsigned x2=(unsigned)_tzcnt_u64(B);f.b2=oC+x2;f.l2=(unsigned)_tzcnt_u64(E)-x2;
+ B=_blsr_u64(B);E=_blsr_u64(E);
+ const unsigned x3=(unsigned)_tzcnt_u64(B);f.b3=oC+x3;f.l3=(unsigned)_tzcnt_u64(E)-x3;
+ f.next=bC+L+1;
+ return true;
+}
+// SS_CLWIN=check: what click_long_fields said about the line at p against the portable splitter (scan_line +
+// take_fields, the general handler's own reading). A line it took must be well-formed there with the same four
+// fields and the same next line; a line it refused only has to be left to the general handler (which it is).
+[[gnu::noinline]] static void click_long_check(const char* p,const char* end,bool fine,const ClickLong& f){
+ if(!fine)return;
+ const char* comma[4];int nc,nq;const char* le;string_view g[4];
+ const char* const next=scan_line(p,end,comma,4,nc,nq,le);
+ const bool gen=take_fields(p,le,comma,nc,nq,4,g);
+ if(gen&&next==f.next&&g[0].data()==f.s0&&g[0].size()==f.l0&&g[1].data()==p+f.b1&&g[1].size()==f.l1
+  &&g[2].data()==p+f.b2&&g[2].size()==f.l2&&g[3].data()==p+f.b3&&g[3].size()==f.l3)return;
+ fprintf(stderr,"ERROR SS_CLWIN=check: long click line read differently: %.*s\n",(int)min<ptrdiff_t>(le-p,200),p);_exit(1);
+}
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
  CampLook cf=campTable.look; // campaign lookup (camp_find)
+ unsigned win2=optClickWin2; // lines without a newline in the first window: click_long_fields (SS_CLWIN=1: the general handler, as before)
  ClLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& camps_,size_t PC_,const char* end_,int64_t clickStart_):tl(tl_),tab(tab_),camps(camps_),PC(PC_),end(end_),memo(date_memo3()),
   clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask),
   dUsers(dparse.users),kc(dense.kc),ku(dense.ku),limC(dense.limC),cl(denseCl),tid(tl_.tid),bucket(dparse.bucket),ahead(dparse.ahead),shC(dparse.shC),dcb(tl_.dcb.data()){}
@@ -4654,13 +4720,29 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    const uint64_t c=w.c&keep,q=w.q&keep;
    const uint64_t st=(c<<1)|1,en=c|nbit;
    uint64_t sq,op;const uint64_t err=quote_errors_v3(q,st,en,sq,op);
+   const char* s0;unsigned l0,b1,l1,b2,l2,b3,l3; // field contents (quotes stripped): s0 and offsets from p
+   if(!DREC&&(L>>6)&&lp.win2){
+    // No newline in the window (a line of 64 bytes or more: every line with a long ID): two more windows, B one
+    // past the first comma (user_id up to the second comma) and C one past the second (campaign_id, ts, newline).
+    // The same decisions as below, field by field; anything else leaves through the general handler as before.
+    ClickLong f;const bool fine=click_long_fields(p,w.c,w.q,f);
+    if(__builtin_expect(lp.win2==2,0))click_long_check(p,lp.end,fine,f);
+    if(__builtin_expect(!fine,0))break;
+    next=f.next;done=true;++tl.clWin2;
+    s0=f.s0;l0=f.l0;b1=f.b1;l1=f.l1;b2=f.b2;l2=f.l2;b3=f.b3;l3=f.l3;
+   }else{
    if(__builtin_expect((err|(uint64_t)(_mm_popcnt_u64(c)^3)|(L>>6))!=0,0))break;
    next=DREC?nl+1:p+L+1;done=true; // well-formed, 4 fields
    uint64_t B=st+sq,E=en-(op>>1);
    const unsigned z0=(unsigned)(q&1);
-   const char* const s0=p+z0;const unsigned l0=(unsigned)_tzcnt_u64(E)-z0;
+   s0=p+z0;l0=(unsigned)_tzcnt_u64(E)-z0;
    B=_blsr_u64(B);E=_blsr_u64(E);
-   const unsigned b1=(unsigned)_tzcnt_u64(B),l1=(unsigned)_tzcnt_u64(E)-b1;
+   b1=(unsigned)_tzcnt_u64(B);l1=(unsigned)_tzcnt_u64(E)-b1;
+   B=_blsr_u64(B);E=_blsr_u64(E);
+   b2=(unsigned)_tzcnt_u64(B);l2=(unsigned)_tzcnt_u64(E)-b2;
+   B=_blsr_u64(B);E=_blsr_u64(E);
+   b3=(unsigned)_tzcnt_u64(B);l3=(unsigned)_tzcnt_u64(E)-b3;
+   }
    if(l0==0||l1==0)break;
    // Dense route (DENSE.md): a dense click_id sends a valid click to its slot; ask for the slot's memory right away.
    uint64_t kcn=0;bool dCl=false;uint32_t ucode=0;bool uDense=false;
@@ -4674,10 +4756,6 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
      uDense=p[b1]=='u'&&parse36_v3(p+b1+1,l1-1,yu)&&dense_user_code(dn::index_of(yu,lp.ku),ucode);
     }
    }
-   B=_blsr_u64(B);E=_blsr_u64(E);
-   const unsigned b2=(unsigned)_tzcnt_u64(B),l2=(unsigned)_tzcnt_u64(E)-b2;
-   B=_blsr_u64(B);E=_blsr_u64(E);
-   const unsigned b3=(unsigned)_tzcnt_u64(B),l3=(unsigned)_tzcnt_u64(E)-b3;
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
    uint64_t trel;
@@ -4722,21 +4800,25 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    }else{
     bool tableUser=true;
     if(lp.dUsers){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode)){tableUser=false;dmax=max(dmax,ucode);}}
-    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){ucode=long_user(s1,l1,tab,tl);tableUser=false;} // long user ID: its number right here
+    bool longUser=false; // a user ID that does not pack (over 11 bytes: every canonical long ID): waits in the batch like the others (SS_CLWIN=1: its number right here)
+    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){if(lp.win2)longUser=true;else{ucode=long_user(s1,l1,tab,tl);tableUser=false;}}
     CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=ckey;r.user=ucode;
     Bucket<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
     if(__builtin_expect(vec.full(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record appended below stays put
     uint32_t* const up=&vec.e->user;vec.append(r);
     if(tableUser){
-     const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
-     __builtin_prefetch(&slots[j],0,1);
-     PendUser& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.up=up;pu.k1=k1;
+     if(__builtin_expect(longUser,0))pend_long_user(*pp++,s1,l1,tab,up);
+     else{
+      const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
+      __builtin_prefetch(&slots[j],0,1);
+      PendUser& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.up=up;pu.k1=k1;
+     }
      if(pp==pend+V3_BATCH){resolve_users(pend,pp,tab,tl);pp=pend;}
     }
    }
   }while(0);
   if(!done){
-   resolve_users(pend,pp,tab,tl);pp=pend;
+   resolve_users(pend,pp,tab,tl);pp=pend;++tl.clGeneral;
    next=line_general<4>(p,lp.end,general);
   }
   return next;
@@ -5665,6 +5747,276 @@ static_assert(offsetof(Cl8Out,kend)==offsetof(Cl8Out,umax)+4);
 } // namespace vcl2
 static_assert(vcl2::MASK40==dn::MASK&&vcl2::I1==dn::I1&&vcl2::I2==dn::I2&&vcl2::DAYMS==DAY);
 static_assert(vcl2::CL_GEN_ALIAS_BITS==dn::GEN_ALIAS_BITS&&vcl2::CL_ALIAS_BITS==dn::ALIAS_BITS&&vcl2::DENSE_USER_BIT==DENSE_USER&&sizeof(CSlot)==(1u<<vcl2::CSLOT_SHIFT));
+// >>>> cl8g.h (pasted verbatim from /home/claude/vert/cl8g.h; vert/run_cl8g_tests.sh checks that the two texts are equal)
+// ---- cl8g: eight click lines per call with OPAQUE click_id / user_id (GFAST.md package C; agent CL, 2026-11-21).
+// ---- /home/claude/vert/cl8g.h; tested as this exact text by cl8g_test.cpp (run_cl8g_tests.sh).
+// ---- Paste / include AFTER cl8_paste2.h (namespace vcl2 in main.cpp): it calls the proven version 2 pieces
+// ---- (vcl2::tod8k_v5, day4k_v5, epoch8k_v5, off8k_v5, ld16x8_v5 and their scalar twins) and vcl2::EvDates
+// ---- (make_dates_cl). AVX-512 F/BW/DQ/VL/CD, no gather instruction, zmm only. The hex pieces are P3's (ev8g.h).
+// A line is cut in three 64-byte windows: A at the line start (click_id up to its comma), B behind that comma
+// (user_id up to the second comma of the line), C behind the second comma (campaign_id, ts and the newline). So each
+// part may be up to 63 bytes (a quoted 33-byte ID is 35; campaign + ts are at most ~40), a line up to 191; cl8
+// version 2 wanted the whole line in 64. 224 readable bytes from every ls[i] (4096 zero bytes behind each file).
+// An ok row is a line click_line_v3 / on_click would turn into a record once its campaign is found: four well-formed
+// fields, click_id and user_id not empty, ts in one of the three fast forms and inside the click window. The caller
+// looks the campaign of (sc, lc) up (camp_find): not found = the line is dropped. A drop row is a line the line
+// code drops without a trace (an empty ID, or a ts the kernel decided that is outside the window). Any other row
+// goes to the line code. The IDs are never decoded: class + exact key per ID.
+namespace vclg{
+using vcl2::EvDates;
+static constexpr uint64_t CLS_SHORT=0,CLS_LONG=1,CLS_OTHER=2; // P1's GRec classes
+struct ClgConst{int64_t clickStart;uint64_t wlen;EvDates d;}; // d = vcl2::make_dates_cl(clickStart, window_end, window_start)
+struct alignas(64) Cl8gScan{uint64_t cA[8],qA[8],cB[8],qB[8],cC[8],qC[8],bB[8],bC[8];};
+struct alignas(64) Cl8gOut{
+ // all fields: ok rows only
+ uint64_t kcls[8];    // click_id: 0 = 'k' + 0..8 bytes of [0-9a-z]; 1 = 'k' + exactly 32 of [0-9a-f]; 2 = any other text (not empty)
+ uint64_t kkey[8];    // class 0: the bytes after the 'k' as a word (first byte lowest, zero padded); 1: the last 16 hex digits as a number; 2: pointer to the text (= ks)
+ uint64_t khi[8];     // class 1: the first 16 hex digits as a number; else 0
+ const char* ks[8];uint64_t kl[8]; // click_id text (quotes stripped) and its length (1..63)
+ uint64_t ucls[8];    // user_id: 0 = at most 11 bytes (any bytes); 1 = 'u' + exactly 32 of [0-9a-f]; 2 = any other text
+ uint64_t uk0[8],uk1[8]; // class 0: KeyTable::pack of the text (k0 = bytes 0..7, k1 = bytes 8..10 | (length + 1) << 24); else 0
+ uint64_t ulo[8],uhi[8]; // class 1: as kkey / khi; else 0
+ const char* us[8];uint64_t ul[8]; // user_id text (quotes stripped) and its length (1..63)
+ uint64_t ckh[8];     // (ts - clickStart) << 16; the caller ORs (uint16_t)campaign number
+ const char* sc[8];uint64_t lc[8]; // campaign_id content (quotes stripped)
+ uint8_t ok;          // bit i: every field above is exact for row i
+ uint8_t drop;        // bit i: the line code drops the line without doing anything; never together with ok
+};
+// ---------------- scalar twin: the same decisions, written row by row ----------------
+static inline uint64_t hex16_ref(const char* s,bool& good){uint64_t v=0;for(int i=0;i<16;++i){const unsigned ch=(unsigned char)s[i];unsigned d;
+  if(ch>='0'&&ch<='9')d=ch-'0';else if(ch>='a'&&ch<='f')d=ch-'a'+10;else{good=false;d=0;}v=(v<<4)|d;}return v;}
+static inline void cl8g_ref(const char* const* ls,const char* const* nx,const ClgConst& c,Cl8gOut& o){
+ using namespace vcl2;
+ unsigned okm=0,drm=0;
+ for(int i=0;i<8;++i){
+  o.kcls[i]=o.kkey[i]=o.khi[i]=o.kl[i]=o.ucls[i]=o.uk0[i]=o.uk1[i]=o.ulo[i]=o.uhi[i]=o.ul[i]=o.ckh[i]=o.lc[i]=0;o.ks[i]=o.us[i]=o.sc[i]=ls[i];
+  const char* const p=ls[i];const char* const nl=nx[i]-1;
+  uint64_t cA,qA;masks_ref(p,cA,qA);
+  if(!cA)continue;                                              // no comma in window A
+  const unsigned c0=tz_ref(cA);const uint64_t mA=cA^(cA-1),enA=cA&~blsr_ref(cA);
+  const uint64_t qa=qA&mA,sqA=qa&1,opA=(sqA+~enA)&enA,errA=opA^((qa&~1ull)<<1);
+  const char* const bB=p+c0+1;
+  uint64_t cB,qB;masks_ref(bB,cB,qB);
+  if(!cB)continue;                                              // no comma in window B
+  const unsigned e1=tz_ref(cB);const uint64_t mB=cB^(cB-1),enB=cB&~blsr_ref(cB);
+  const uint64_t qb=qB&mB,sqB=qb&1,opB=(sqB+~enB)&enB,errB=opB^((qb&~1ull)<<1);
+  const char* const bC=bB+e1+1;
+  uint64_t cC,qC;masks_ref(bC,cC,qC);
+  const uint64_t L=(uint64_t)(nl-bC);
+  if(L>>6)continue;                                             // newline not inside window C (or before it)
+  const uint64_t nbit=1ull<<L,keep=nbit-1;
+  const uint64_t d=cC&keep,qc=qC&keep;
+  const uint64_t st=(d<<1)|1,en=d|nbit;
+  const uint64_t sq=qc&st,op=(sq+~en)&en,err=op^((qc&~st)<<1);
+  if((errA|errB|err|(uint64_t)(__builtin_popcountll(d)^1))!=0)continue; // not four well-formed fields: the line code passes it on
+  const unsigned z0=(unsigned)(qA&1),l0=c0-2*z0;
+  const unsigned z1=(unsigned)(qB&1),l1=e1-2*z1;
+  const unsigned d0=tz_ref(d),z2=(unsigned)(qc&1),l2=d0-2*z2;
+  const unsigned z3=(unsigned)((qc>>(d0+1))&1),o3=d0+1+z3,l3=(unsigned)L-o3-z3;
+  const char* const s0=p+z0;const char* const s1=bB+z1;const char* const s3=bC+o3;
+  if(l0==0||l1==0){drm|=1u<<i;continue;}                        // dropped before anything is decoded
+  // ts: the three fast forms of ts_v3; anything else is left to the line code
+  int64_t ts;
+  if(l3==13){uint64_t v;if(!epoch_ref(ld8_ref(s3),ld8_ref(s3+5),v))continue;ts=(int64_t)v;}
+  else if(l3==20||l3==25){
+   const uint64_t t0=ld8_ref(s3),t1=ld8_ref(s3+8),t2=ld8_ref(s3+12);
+   uint64_t tods,days;
+   if(!tod_ref(t1,t2,tods)||!day4_ref(t0,t1,c.d,days))continue;
+   ts=(int64_t)(days+tods);
+   if(l3==20){if(byte_of(t2,7)!='Z')continue;}
+   else{int64_t delta;if(!off_ref(t2,ld8_ref(s3+17),delta))continue;ts+=delta;}
+  }else continue;
+  const uint64_t trel=(uint64_t)ts-(uint64_t)c.clickStart;
+  if(trel>=c.wlen){drm|=1u<<i;continue;}                        // outside the click window: dropped
+  okm|=1u<<i;
+  o.ckh[i]=trel<<16;o.sc[i]=bC+z2;o.lc[i]=l2;
+  // the two IDs, by a plain reading of the text
+  o.ks[i]=s0;o.kl[i]=l0;o.us[i]=s1;o.ul[i]=l1;
+  {uint64_t cls=CLS_OTHER,key=(uint64_t)s0,hi=0;
+   if(s0[0]=='k'&&l0<=9){bool g=true;uint64_t w=0;for(unsigned j=1;j<l0;++j){const unsigned ch=(unsigned char)s0[j];if(!((ch>='0'&&ch<='9')||(ch>='a'&&ch<='z')))g=false;w|=(uint64_t)ch<<(8*(j-1));}
+    if(g){cls=CLS_SHORT;key=w;}}
+   else if(s0[0]=='k'&&l0==33){bool g=true;const uint64_t h=hex16_ref(s0+1,g),lo=hex16_ref(s0+17,g);if(g){cls=CLS_LONG;key=lo;hi=h;}}
+   o.kcls[i]=cls;o.kkey[i]=key;o.khi[i]=hi;}
+  {uint64_t cls=CLS_OTHER,k0=0,k1=0,lo=0,hi=0;
+   if(l1<=11){cls=CLS_SHORT;for(unsigned j=0;j<l1&&j<8;++j)k0|=(uint64_t)(unsigned char)s1[j]<<(8*j);for(unsigned j=8;j<l1;++j)k1|=(uint64_t)(unsigned char)s1[j]<<(8*(j-8));k1|=(uint64_t)(l1+1)<<24;}
+   else if(s1[0]=='u'&&l1==33){bool g=true;const uint64_t h=hex16_ref(s1+1,g),l=hex16_ref(s1+17,g);if(g){cls=CLS_LONG;lo=l;hi=h;}}
+   o.ucls[i]=cls;o.uk0[i]=k0;o.uk1[i]=k1;o.ulo[i]=lo;o.uhi[i]=hi;}
+ }
+ o.ok=(uint8_t)okm;o.drop=(uint8_t)drm;
+}
+// ---------------- the scan: three windows per row, and where the next line starts ----------------
+// s: the comma and quote masks of the three windows and the window starts bB (one past the first comma of A; p + 65
+// if A has none) and bC (one past the first comma of B; bB + 65 if B has none). nx[i] = one past the first '\n' of
+// window C. Result: bit i set = nx[i] is NOT certain to be the line's end (a '\n' at or before the comma that ends
+// window A's or window B's part, one of those commas missing, or no '\n' in window C): the caller finds that row's
+// newline itself (memchr from ls[i]). A clear bit: nx[i] - 1 is the first '\n' at or after ls[i].
+#define VCLG_ROW(i) {const char* const p=ls[i]; \
+  const __m512i x=_mm512_loadu_si512((const void*)p); \
+  const uint64_t ca=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc)),na=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vn)); \
+  s.cA[i]=ca;s.qA[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq)); \
+  const uint64_t e0=_tzcnt_u64(ca);const char* const bb=p+e0+1; \
+  const __m512i y=_mm512_loadu_si512((const void*)bb); \
+  const uint64_t cb=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc)),nb=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vn)); \
+  s.cB[i]=cb;s.qB[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));s.bB[i]=(uint64_t)bb; \
+  const uint64_t e1=_tzcnt_u64(cb);const char* const bc=bb+e1+1; \
+  const __m512i z=_mm512_loadu_si512((const void*)bc); \
+  s.cC[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(z,vc));s.qC[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(z,vq));s.bC[i]=(uint64_t)bc; \
+  const uint64_t nc=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(z,vn)),e3=_tzcnt_u64(nc); \
+  nx[i]=bc+e3+1; \
+  const uint64_t bad_=(na&(ca^(ca-1)))|(nb&(cb^(cb-1)))|((e0|e1|e3)>>6); /* (ca == 0: ca ^ (ca - 1) is all ones, and e0 is 64 anyway) */ \
+  unc|=(unsigned)(bad_!=0)<<i;__asm__("":"+r"(unc));}
+VERT_T5 static inline unsigned cscang8_v5(const char* const* ls,const char** nx,Cl8gScan& s){
+ const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"'),vn=_mm512_set1_epi8('\n');
+ unsigned unc=0;
+ VCLG_ROW(0) VCLG_ROW(1) VCLG_ROW(2) VCLG_ROW(3) VCLG_ROW(4) VCLG_ROW(5) VCLG_ROW(6) VCLG_ROW(7)
+ return unc;
+}
+#undef VCLG_ROW
+// ---------------- vector pieces for the IDs (the text of vertg::hex8k_v5 / hex32k_v5, ev8g.h) ----------------
+// Eight ASCII hex digits per lane (first digit in the lowest byte) -> their value; bad collects a non-zero byte for
+// every character that is not 0-9 a-f.
+VERT_T5 static inline __attribute__((always_inline)) __m512i hex8k_v5(__m512i w,__m512i& bad){
+ const __m512i d=_mm512_sub_epi8(w,_mm512_set1_epi8('0')),a=_mm512_sub_epi8(w,_mm512_set1_epi8('a'));
+ bad=_mm512_or_si512(bad,_mm512_min_epu8(_mm512_subs_epu8(d,_mm512_set1_epi8(9)),_mm512_subs_epu8(a,_mm512_set1_epi8(5))));
+ const __m512i nib=_mm512_mask_add_epi8(d,_mm512_cmpgt_epi8_mask(w,_mm512_set1_epi8(0x40)),a,_mm512_set1_epi8(10));
+ const __m512i by=_mm512_maddubs_epi16(nib,_mm512_set1_epi16(0x0110));          // two digits -> one byte value per 16-bit word
+ const __m512i dw=_mm512_madd_epi16(by,_mm512_set1_epi32(0x00010100));           // two of those -> 16 bits per 32-bit word
+ return _mm512_or_si512(_mm512_slli_epi64(_mm512_and_si512(dw,_mm512_set1_epi64(0xFFFF)),16),_mm512_srli_epi64(dw,32));
+}
+// 32 hex digits in W0..W3 (text bytes 1..8, 9..16, 17..24, 25..32) -> hi / lo; good = every character is a hex digit.
+VERT_T5 static inline __attribute__((always_inline)) __mmask8 hex32k_v5(__m512i W0,__m512i W1,__m512i W2,__m512i W3,__m512i& hi,__m512i& lo){
+ __m512i bad=_mm512_setzero_si512();
+ const __m512i v0=hex8k_v5(W0,bad),v1=hex8k_v5(W1,bad),v2=hex8k_v5(W2,bad),v3=hex8k_v5(W3,bad);
+ hi=_mm512_or_si512(_mm512_slli_epi64(v0,32),v1);lo=_mm512_or_si512(_mm512_slli_epi64(v2,32),v3);
+ return _mm512_testn_epi64_mask(bad,bad);
+}
+// ---------------- the decode ----------------
+VERT_T5 static inline void cdecg8_v5(const char* const* ls,const char* const* nx,const Cl8gScan& s,const ClgConst& c,Cl8gOut& o){
+ using namespace vcl2;
+ #define VG_C(x) _mm512_set1_epi64((long long)(x))
+ #define VG_TZ(x,xm) _mm512_sub_epi64(c63,_mm512_lzcnt_epi64(_mm512_xor_si512(x,xm))) /* tzcnt(x) given xm = x-1 (63 for x == 0) */
+ #define VG_ERR(q,st,en,sq,op) const __m512i sq=_mm512_and_si512(q,st),op=_mm512_and_si512(_mm512_add_epi64(_mm512_sub_epi64(sq,en),ones),en)
+ const __m512i one=VG_C(1),ones=VG_C(-1),c63=VG_C(63),c64=VG_C(64);
+ const __m512i P=_mm512_loadu_si512((const void*)ls),NL=_mm512_add_epi64(_mm512_loadu_si512((const void*)nx),ones);
+ const __m512i BB=_mm512_load_si512((const void*)s.bB),BC=_mm512_load_si512((const void*)s.bC);
+ const __m512i CA=_mm512_load_si512((const void*)s.cA),QA=_mm512_load_si512((const void*)s.qA),CB=_mm512_load_si512((const void*)s.cB),QB=_mm512_load_si512((const void*)s.qB);
+ const __m512i CC=_mm512_load_si512((const void*)s.cC),QC=_mm512_load_si512((const void*)s.qC);
+ // window A: the click_id
+ const __m512i tA=_mm512_add_epi64(CA,ones),c0=_mm512_sub_epi64(_mm512_sub_epi64(BB,P),one),mA=_mm512_xor_si512(CA,tA),enA=_mm512_andnot_si512(_mm512_and_si512(CA,tA),CA);
+ const __m512i qa=_mm512_and_si512(QA,mA);
+ VG_ERR(qa,one,enA,sqA,opA);
+ const __m512i errA=_mm512_xor_si512(opA,_mm512_slli_epi64(_mm512_andnot_si512(one,qa),1));
+ // window B: the user_id
+ const __m512i tB=_mm512_add_epi64(CB,ones),e1=_mm512_sub_epi64(_mm512_sub_epi64(BC,BB),one),mB=_mm512_xor_si512(CB,tB),enB=_mm512_andnot_si512(_mm512_and_si512(CB,tB),CB);
+ const __m512i qb=_mm512_and_si512(QB,mB);
+ VG_ERR(qb,one,enB,sqB,opB);
+ const __m512i errB=_mm512_xor_si512(opB,_mm512_slli_epi64(_mm512_andnot_si512(one,qb),1));
+ // window C: campaign_id, ts, newline
+ const __m512i L=_mm512_sub_epi64(NL,BC),nbit=_mm512_sllv_epi64(one,_mm512_and_si512(L,c63)),keep=_mm512_add_epi64(nbit,ones);
+ const __m512i d=_mm512_and_si512(CC,keep),qc=_mm512_and_si512(QC,keep);
+ const __m512i st=_mm512_or_si512(_mm512_slli_epi64(d,1),one),en=_mm512_or_si512(d,nbit);
+ VG_ERR(qc,st,en,sq,op);
+ const __m512i errC=_mm512_xor_si512(op,_mm512_slli_epi64(_mm512_andnot_si512(st,qc),1));
+ const __m512i u0=_mm512_add_epi64(d,ones),d0=VG_TZ(d,u0),dR=_mm512_and_si512(d,u0);
+ const __m512i err=_mm512_or_si512(_mm512_ternarylogic_epi64(errA,errB,errC,0xFE),dR);  // a quote error, or a second comma before the newline
+ __mmask8 sok=_mm512_testn_epi64_mask(err,err);
+ sok=_mm512_mask_test_epi64_mask(sok,d,d);                                       // a comma in window C before the newline
+ sok=_mm512_mask_test_epi64_mask(sok,CA,CA);                                     // a comma in window A
+ sok=_mm512_mask_test_epi64_mask(sok,CB,CB);                                     // a comma in window B
+ sok=_mm512_mask_cmplt_epu64_mask(sok,L,c64);                                    // the newline inside window C
+ const __m512i z0=_mm512_and_si512(QA,one),l0=_mm512_sub_epi64(c0,_mm512_add_epi64(z0,z0));
+ const __m512i z1=_mm512_and_si512(QB,one),l1=_mm512_sub_epi64(e1,_mm512_add_epi64(z1,z1));
+ const __m512i z2=_mm512_and_si512(qc,one),l2=_mm512_sub_epi64(d0,_mm512_add_epi64(z2,z2));
+ const __m512i a3=_mm512_add_epi64(d0,one),z3=_mm512_and_si512(_mm512_srlv_epi64(qc,a3),one),o3=_mm512_add_epi64(a3,z3),l3=_mm512_sub_epi64(_mm512_sub_epi64(L,o3),z3);
+ const __mmask8 nz=_mm512_mask_test_epi64_mask(_mm512_mask_test_epi64_mask(sok,l0,l0),l1,l1); // well-formed, click_id and user_id not empty
+ const __mmask8 dropE=_kandn_mask8(nz,sok);                                      // well-formed with an empty ID
+ // ---- operands: the field addresses go through memory into general registers, 16-byte loads, no gather ----
+ // Every address is at most line start + 65 + 65 + 66 (bB, bC and o3 are bounded whatever the masks hold), so every
+ // load stays inside the 224 readable bytes.
+ const __m512i S0=_mm512_add_epi64(P,z0),S1=_mm512_add_epi64(BB,z1),S2=_mm512_add_epi64(BC,z2),S3=_mm512_add_epi64(BC,o3);
+ alignas(64) uint64_t AD[24];
+ _mm512_store_si512((void*)AD,S0);_mm512_store_si512((void*)(AD+8),S1);_mm512_store_si512((void*)(AD+16),S3);
+ const uint64_t* ad=AD;__asm__("":"+r"(ad)::"memory");
+ __m512i K0,K1,K2,K3,K4,Kx,U0,U1,U2,U3,U4,Ux,ts0,tsh,ts2,tsx;
+ ld16x8_v5(ad,0,K0,K1);          // click_id bytes 0..15
+ ld16x8_v5(ad,9,K2,K3);          // 9..24
+ ld16x8_v5(ad,25,K4,Kx);         // 25..40
+ ld16x8_v5(ad+8,0,U0,U1);        // user_id bytes 0..15
+ ld16x8_v5(ad+8,9,U2,U3);
+ ld16x8_v5(ad+8,25,U4,Ux);
+ ld16x8_v5(ad+16,0,ts0,tsh);     // ts bytes 0..15
+ ld16x8_v5(ad+16,12,ts2,tsx);    // ts bytes 12..27
+ (void)Kx;(void)Ux;
+ const __m512i lowbyte=VG_C(0xFF),c8=VG_C(8),c33=VG_C(33);
+ // ---- click_id: class, key ----
+ __m512i kcls,kkey,khi;
+ {const __m512i W=_mm512_or_si512(_mm512_srli_epi64(K0,8),_mm512_slli_epi64(K1,56));       // text bytes 1..8
+  const __mmask8 let=_mm512_cmpeq_epi64_mask(_mm512_and_si512(K0,lowbyte),VG_C('k'));
+  const __m512i n=_mm512_sub_epi64(l0,one);                                                 // bytes after the letter (l0 >= 1 in an ok row)
+  const __m512i keepb=_mm512_srlv_epi64(ones,_mm512_sub_epi64(c64,_mm512_slli_epi64(n,3))); // n == 0 or n > 8: the shift count is 64 or more and gives 0 (n > 8 is not short anyway)
+  const __m512i w=_mm512_and_si512(W,keepb);
+  const __m512i x=_mm512_or_si512(w,_mm512_andnot_si512(keepb,_mm512_set1_epi8('0')));
+  const __m512i dd=_mm512_sub_epi8(x,_mm512_set1_epi8('0')),aa=_mm512_sub_epi8(x,_mm512_set1_epi8('a'));
+  const __m512i bad=_mm512_min_epu8(_mm512_subs_epu8(dd,_mm512_set1_epi8(9)),_mm512_subs_epu8(aa,_mm512_set1_epi8(25)));
+  const __mmask8 sh=_mm512_mask_testn_epi64_mask(_mm512_mask_cmple_epu64_mask(let,n,c8),bad,bad);
+  __m512i hi,lo;const __mmask8 lg=_kand_mask8(_mm512_mask_cmpeq_epi64_mask(let,l0,c33),hex32k_v5(W,K2,K3,K4,hi,lo));
+  kcls=_mm512_mask_mov_epi64(_mm512_mask_mov_epi64(VG_C(CLS_OTHER),lg,one),sh,_mm512_setzero_si512());
+  kkey=_mm512_mask_mov_epi64(_mm512_mask_mov_epi64(S0,lg,lo),sh,w);
+  khi=_mm512_maskz_mov_epi64(lg,hi);}
+ // ---- user_id: class, KeyTable words, long value ----
+ __m512i ucls,uk0,uk1,ulo,uhi;
+ {const __m512i W=_mm512_or_si512(_mm512_srli_epi64(U0,8),_mm512_slli_epi64(U1,56));
+  const __mmask8 let=_mm512_cmpeq_epi64_mask(_mm512_and_si512(U0,lowbyte),VG_C('u'));
+  const __mmask8 pk=_mm512_cmple_epu64_mask(l1,VG_C(11));
+  const __m512i n0=_mm512_min_epu64(l1,c8),n1=_mm512_sub_epi64(l1,n0);                      // text bytes in k0 / in k1
+  const __m512i k0=_mm512_and_si512(U0,_mm512_srlv_epi64(ones,_mm512_sub_epi64(c64,_mm512_slli_epi64(n0,3))));
+  const __m512i k1=_mm512_or_si512(_mm512_and_si512(U1,_mm512_srlv_epi64(ones,_mm512_sub_epi64(c64,_mm512_slli_epi64(n1,3)))),_mm512_slli_epi64(_mm512_add_epi64(l1,one),24));
+  __m512i hi,lo;const __mmask8 lg=_kand_mask8(_mm512_mask_cmpeq_epi64_mask(let,l1,c33),hex32k_v5(W,U2,U3,U4,hi,lo));
+  ucls=_mm512_mask_mov_epi64(_mm512_mask_mov_epi64(VG_C(CLS_OTHER),lg,one),pk,_mm512_setzero_si512());
+  uk0=_mm512_maskz_mov_epi64(pk,k0);uk1=_mm512_maskz_mov_epi64(pk,k1);ulo=_mm512_maskz_mov_epi64(lg,lo);uhi=_mm512_maskz_mov_epi64(lg,hi);}
+ // ---- ts: 20 (Z), 13 (digits), 25 (offset): the text of cl8 version 2 ----
+ const __m512i cZ=VG_C('Z');
+ const __mmask8 is13=_mm512_cmpeq_epi64_mask(l3,VG_C(13));
+ const __m512i ts1=_mm512_mask_or_epi64(tsh,is13,_mm512_srli_epi64(ts0,40),_mm512_slli_epi64(tsh,24)); // bytes 8..15, for 13 digits bytes 5..12
+ const __m512i ts3=_mm512_or_si512(_mm512_srli_epi64(ts2,40),_mm512_slli_epi64(tsx,24));               // bytes 17..24
+ __mmask8 oks,hits,okoff,okep;
+ const __m512i days=day4k_v5(ts0,ts1,c.d,hits);
+ const __m512i tods=tod8k_v5(ts1,ts2,oks);
+ const __mmask8 dt=_kand_mask8(oks,hits);                                        // valid time of day and known date
+ const __m512i ep=epoch8k_v5(ts0,ts1,okep);
+ const __m512i base=_mm512_mask_mov_epi64(_mm512_add_epi64(days,tods),is13,ep);
+ const __mmask8 t13=_kand_mask8(is13,okep);
+ const __m512i b19=_mm512_srli_epi64(ts2,56);
+ const __mmask8 tokA=_kor_mask8(t13,_mm512_mask_cmpeq_epi64_mask(_mm512_mask_cmpeq_epi64_mask(dt,l3,VG_C(20)),b19,cZ)); // 13 digits, or 20 bytes ending in 'Z'
+ const __m512i off=off8k_v5(ts3,okoff);
+ const __mmask8 o25=_kand_mask8(dt,_mm512_mask_cmpeq_epi64_mask(okoff,l3,VG_C(25)));                                    // 25 bytes with a valid offset
+ const __mmask8 p25=_mm512_mask_cmpeq_epi64_mask(o25,b19,VG_C('+'));
+ __m512i ts=_mm512_mask_sub_epi64(base,p25,base,off);
+ const __mmask8 m25=_mm512_mask_cmpeq_epi64_mask(o25,b19,VG_C('-'));
+ ts=_mm512_mask_add_epi64(ts,m25,ts,off);
+ // ts decided by the kernel: 13 digits, or (valid time and known date) and (Z form, or offset form with a valid offset)
+ const __mmask8 tsk=_kand_mask8(nz,_kor_mask8(tokA,_kor_mask8(p25,m25)));
+ const __m512i trel=_mm512_sub_epi64(ts,VG_C(c.clickStart));
+ const __mmask8 ok=_mm512_mask_cmplt_epu64_mask(tsk,trel,VG_C(c.wlen));
+ const __mmask8 drop=_kor_mask8(dropE,_kandn_mask8(ok,tsk));                     // an empty ID, or ts outside the window
+ _mm512_store_si512((void*)o.kcls,kcls);_mm512_store_si512((void*)o.kkey,kkey);_mm512_store_si512((void*)o.khi,khi);
+ _mm512_store_si512((void*)o.ks,S0);_mm512_store_si512((void*)o.kl,l0);
+ _mm512_store_si512((void*)o.ucls,ucls);_mm512_store_si512((void*)o.uk0,uk0);_mm512_store_si512((void*)o.uk1,uk1);
+ _mm512_store_si512((void*)o.ulo,ulo);_mm512_store_si512((void*)o.uhi,uhi);
+ _mm512_store_si512((void*)o.us,S1);_mm512_store_si512((void*)o.ul,l1);
+ _mm512_store_si512((void*)o.ckh,_mm512_slli_epi64(trel,16));
+ _mm512_store_si512((void*)o.sc,S2);_mm512_store_si512((void*)o.lc,l2);
+ o.ok=(uint8_t)_cvtmask8_u32(ok);o.drop=(uint8_t)_cvtmask8_u32(drop);
+ #undef VG_C
+ #undef VG_TZ
+ #undef VG_ERR
+}
+// One call for a group whose line ends are known (tests; the lane loop calls cscang8_v5 one group ahead).
+VERT_T5 static inline void cl8g_v5(const char* const* ls,const char* const* nx,const ClgConst& c,Cl8gOut& o){
+ Cl8gScan s;const char* nn[8];(void)cscang8_v5(ls,nn,s);cdecg8_v5(ls,nx,s,c,o);
+}
+} // namespace vclg
+// <<<< cl8g.h
 // ---- lanes, clicks: the scan stage of cl8 (versions 1 and 2 share it) that also yields where the next line of each
 // ---- row starts. /home/claude/vert/lane_cl_paste.h; tested as this exact text by lanes/lane_test.cpp
 // ---- (Cl8Scan == vcl2::cscan8_v5 byte for byte; nx == memchr). Paste after cl8_paste2.h. Decode: unchanged vcl2::cdec8_v5.
@@ -5857,19 +6209,27 @@ struct Batch{ // 2 IDs per line, in line order: IDs 2i and 2i+1 are one line
  uint32_t kind[2*LB];          // k1 == 0: KeyTable::Long::kind
  uint32_t j[2*LB];             // home slot
  uint32_t id[2*LB];            // the IDs' numbers (set by the links stage)
+ uint8_t lq[2*LB];             // which IDs have a long key (nlong of them)
  int n=0,nlong=0;              // IDs in the batch; long keys among them
  uint64_t fast=0,slow=0,longs=0; // totals: lines cut by the fill itself, lines through link_split, long keys
 };
+// A key that does not pack (over 11 bytes), out of line: one ID in eight.
+static inline __attribute__((always_inline)) void put_long_body(Batch& B,int q,const char* s,size_t n,const KeyTable::Slot* slots,size_t mask){
+ KeyTable::Long l;const uint64_t h=KeyTable::long_key(string_view(s,n),l);const uint32_t j=(uint32_t)(h&mask);
+ B.a[q]=l.a;B.b[q]=l.b;B.h[q]=h;B.s[q]=s;B.len[q]=(uint32_t)n;B.k1[q]=0;B.kind[q]=l.kind;B.j[q]=j;__builtin_prefetch(&slots[j],0,1);
+ B.lq[B.nlong++]=(uint8_t)q;++B.longs;
+}
+static __attribute__((noinline)) void put_long(Batch& B,int q,const char* s,size_t n,const KeyTable::Slot* slots,size_t mask){put_long_body(B,q,s,n,slots,mask);}
 static inline __attribute__((always_inline)) void put(Batch& B,int q,const char* s,size_t n,const KeyTable::Slot* slots,size_t mask){
  uint64_t k0;uint32_t k1;
  if(__builtin_expect(KeyTable::pack(string_view(s,n),k0,k1),1)){
   const uint32_t j=(uint32_t)(KeyTable::hash_packed(k0,k1)&mask);
   B.a[q]=k0;B.k1[q]=k1;B.j[q]=j;__builtin_prefetch(&slots[j],1,1);return;
  }
- KeyTable::Long l;const uint64_t h=KeyTable::long_key(string_view(s,n),l);const uint32_t j=(uint32_t)(h&mask);
- B.a[q]=l.a;B.b[q]=l.b;B.h[q]=h;B.s[q]=s;B.len[q]=(uint32_t)n;B.k1[q]=0;B.kind[q]=l.kind;B.j[q]=j;__builtin_prefetch(&slots[j],0,1);++B.nlong;++B.longs;
+ put_long(B,q,s,n,slots,mask);
 }
-static inline __attribute__((always_inline)) const char* line_split(Batch& B,const char* p,const char* end,const KeyTable::Slot* slots,size_t mask){
+// A line through link_split (out of line: the fills' own cut takes nearly every line).
+static __attribute__((noinline)) const char* line_split(Batch& B,const char* p,const char* end,const KeyTable::Slot* slots,size_t mask){
  string_view f[2];const char* next;
  if(link_split(p,end,f,next)){put(B,B.n,f[0].data(),f[0].size(),slots,mask);put(B,B.n+1,f[1].data(),f[1].size(),slots,mask);B.n+=2;++B.slow;}
  return next;
@@ -5906,40 +6266,190 @@ static const char* fill_base(Batch& B,const char* p,const char* lim,const char* 
  return p;
 }
 #define SS_LKG5 __attribute__((target("avx2,bmi,bmi2,popcnt,lzcnt,avx512f,avx512bw,avx512vl")))
+// KeyTable::pack for a text of 1..11 bytes, without the table of masks (BMI2); same k0 / k1.
+SS_LKG5 static inline __attribute__((always_inline)) void put5(Batch& B,int q,const char* s,unsigned n,const KeyTable::Slot* slots,size_t mask){
+ uint64_t lo;uint32_t hi;memcpy(&lo,s,8);memcpy(&hi,s+8,4);
+ const uint64_t k0=_bzhi_u64(lo,8*n);                          // n >= 8: all 64 bits
+ const uint32_t k1=_bzhi_u32(hi,8*(n>8?n-8:0))|((n+1)<<24);   // n <= 8: no byte of the second word
+ const uint32_t j=(uint32_t)(KeyTable::hash_packed(k0,k1)&mask);
+ B.a[q]=k0;B.k1[q]=k1;B.j[q]=j;__builtin_prefetch(&slots[j],1,1);
+}
+// put_long for fill_v5: the same text built with VEX encodings (a call from 512-bit code into SSE2 code would pay for
+// the dirty upper halves on every instruction).
+SS_LKG5 static __attribute__((noinline)) void put_long5(Batch& B,int q,const char* s,size_t n,const KeyTable::Slot* slots,size_t mask){put_long_body(B,q,s,n,slots,mask);}
+alignas(64) static char FILL_C[3][64]; // 64 x '\n', ',', '"' (filled once; read from memory so that no register has to hold them across the calls)
 SS_LKG5 static const char* fill_v5(Batch& B,const char* p,const char* lim,const char* end,const KeyTable::Slot* slots,size_t mask){
- const __m512i vnl=_mm512_set1_epi8('\n'),vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"');
+ int n=B.n;uint64_t fast=0;
  do{
   if(__builtin_expect(end-p>=64,1)){
    const __m512i x=_mm512_loadu_si512((const void*)p);
-   const uint64_t mn=_mm512_cmpeq_epi8_mask(x,vnl);
+   const uint64_t mn=_mm512_cmpeq_epi8_mask(x,_mm512_load_si512((const void*)FILL_C[0]));
    if(__builtin_expect(mn!=0,1)){
     const unsigned L=(unsigned)_tzcnt_u64(mn); // the line's length, at most 63
-    const uint64_t keep=_bzhi_u64(~0ull,L);
-    const uint64_t mc=_mm512_cmpeq_epi8_mask(x,vc)&keep,mq=_mm512_cmpeq_epi8_mask(x,vq)&keep;
+    const uint64_t mc=_bzhi_u64(_mm512_cmpeq_epi8_mask(x,_mm512_load_si512((const void*)FILL_C[1])),L);
+    const uint64_t mq=_bzhi_u64(_mm512_cmpeq_epi8_mask(x,_mm512_load_si512((const void*)FILL_C[2])),L);
     if(__builtin_expect(mc!=0&&(mc&(mc-1))==0,1)){
      const unsigned P=(unsigned)_tzcnt_u64(mc); // the one comma; P < L
-     const uint64_t qa=mq&1u,qb=(mq>>(P+1))&1u;
-     // Quotes allowed: first and last byte of a field that begins with one.
-     const uint64_t want=qa|(qa<<((P-1)&63))|(qb<<(P+1))|(qb<<((L-1)&63));
-     const int na=(int)P-2*(int)qa,nb=(int)L-(int)P-1-2*(int)qb;
-     if(__builtin_expect(mq==want&&na>=1&&nb>=1,1)){
-      put(B,B.n,p+qa,(size_t)na,slots,mask);put(B,B.n+1,p+P+1+qb,(size_t)nb,slots,mask);
-      B.n+=2;++B.fast;p+=L+1;
+     unsigned na=P,nb=L-P-1;const char* sa=p;const char* sb=p+P+1;
+     if(__builtin_expect(mq!=0,0)){
+      // Quotes allowed: first and last byte of a field that begins with one.
+      const uint64_t qa=mq&1u,qb=(mq>>(P+1))&1u;
+      const uint64_t want=qa|(qa<<((P-1)&63))|(qb<<(P+1))|(qb<<((L-1)&63));
+      if(mq!=want)goto general;
+      na-=2*(unsigned)qa;nb-=2*(unsigned)qb;sa+=qa;sb+=qb; // (a field that is one quote wraps to a huge length: refused below)
+     }
+     if(__builtin_expect(na-1<63&&nb-1<63,1)){
+      if(__builtin_expect(na<=11,1))put5(B,n,sa,na,slots,mask);else put_long5(B,n,sa,na,slots,mask);
+      if(__builtin_expect(nb<=11,1))put5(B,n+1,sb,nb,slots,mask);else put_long5(B,n+1,sb,nb,slots,mask);
+      n+=2;++fast;p+=L+1;
       continue;
      }
     }
    }
   }
-  p=line_split(B,p,end,slots,mask);
- }while(B.n<2*LB&&p<lim);
+  general:
+  B.n=n;p=line_split(B,p,end,slots,mask);n=B.n;
+ }while(n<2*LB&&p<lim);
+ B.n=n;B.fast+=fast;
  return p;
 }
 static inline bool has_v5(){
- static const bool h=__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("lzcnt")&&__builtin_cpu_supports("popcnt");
+ static const bool h=[]{memset(FILL_C[0],'\n',64);memset(FILL_C[1],',',64);memset(FILL_C[2],'"',64);
+  return __builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("lzcnt")&&__builtin_cpu_supports("popcnt");}();
  return h;
 }
 } // namespace lkg
 // ==== end of lkg ====
+// ---- cl8g: the click loop of the GENERAL route (opaque IDs, GFAST.md package C): lanes as above, kernel vclg::cl8g ----
+// Per turn: group N is scanned (three windows per row; a row whose line end is not certain goes through lane_fix),
+// group D decoded and the ID table slot of each of its users asked for, group F finished: campaign lookup, the user's
+// number (the slot is in cache by now; a new user is added exactly as the line code adds it, and only for a row that
+// has its campaign), the record appended to its click bucket. A row that is neither ok nor drop goes through
+// click_line_v3<false> at that point (clicks need no line order: copies of a click are identical); its pending user
+// is resolved at once, so no record of this loop is ever appended to a bucket that a waiting pointer looks into.
+// SS_CLG=0: the loop with the line index (click_line_v3 for every line), as before. SS_CLG=check: every ok / drop
+// row against the portable reading (clg_check_row). SS_CLG=ref: the scalar twin of the kernel (no AVX-512 needed).
+static unsigned optClg=1; // 0 off, 1 on, 2 check, 3 scalar twin, 4 scalar twin + check
+struct alignas(64) ClgAsk{uint64_t h[8];}; // per ok row: KeyTable::hash_packed of the user words, or long_key's hash (the slot is h & mask)
+static constexpr uint64_t CLG_LONGK=(uint64_t)(0x100u|(unsigned)'u')*0x9E3779B97F4A7C15ull; // KeyTable::long_key: kind * constant
+static inline __attribute__((always_inline)) void clg_ask(const vclg::Cl8gOut& o,unsigned rows,ClgAsk& a,const KeyTable& tab){
+ for(unsigned r=o.ok&rows;r;r&=r-1){const unsigned i=(unsigned)__builtin_ctz(r);
+  const uint64_t cls=o.ucls[i];
+  const uint64_t hp=KeyTable::hash_packed(o.uk0[i],(uint32_t)o.uk1[i]),hl=mix64(o.ulo[i]^mix64(o.uhi[i]^CLG_LONGK));
+  uint64_t h=cls?hl:hp;
+  if(__builtin_expect(cls==vclg::CLS_OTHER,0)){KeyTable::Long key;h=KeyTable::long_key(string_view(o.us[i],(size_t)o.ul[i]),key);}
+  a.h[i]=h;__builtin_prefetch(&tab.slots[h&tab.mask],0,1);}
+}
+// The user number of ok row i (asked for by clg_ask a turn ago).
+static inline __attribute__((always_inline)) uint32_t clg_user(const vclg::Cl8gOut& o,unsigned i,const ClgAsk& a,KeyTable& tab,ThreadState& tl){
+ const auto R_=memory_order_relaxed;
+ const uint64_t h=a.h[i];const size_t j=h&tab.mask;uint32_t g;
+ if(__builtin_expect(o.ucls[i]==vclg::CLS_SHORT,1)){
+  const uint64_t k0=o.uk0[i];const uint32_t k1=(uint32_t)o.uk1[i];KeyTable::Slot& e=tab.slots[j];
+  if(__builtin_expect(e.k1.load(memory_order_acquire)==k1&&e.k0.load(R_)==k0,1))return e.v.load(R_);
+  g=tab.find_or_add_packed(k0,k1,j,string_view(o.us[i],(size_t)o.ul[i]));
+ }else{
+  const string_view u(o.us[i],(size_t)o.ul[i]);KeyTable::Long key;
+  if(o.ucls[i]==vclg::CLS_LONG){key.a=o.ulo[i];key.b=o.uhi[i];key.kind=0x100u|(unsigned)'u';}else KeyTable::long_key(u,key);
+  g=tab.find_or_add_long_key(key,h,u);
+ }
+ return g!=KeyTable::NONE?g:(LOCAL_USER|tl.users.intern(string_view(o.us[i],(size_t)o.ul[i])));
+}
+// SS_CLG=check: row i of a group against the portable reading of its line (scan_line + take_fields and the text of
+// on_click). ok: the same four fields, time, campaign and user number; drop: on_click makes no click of the line.
+[[gnu::noinline]] static void clg_check_row(const vclg::Cl8gOut& o,unsigned i,const char* p,const char* next,const char* end,bool isOk,bool found,uint32_t ci,uint32_t user,const KeyTable& tab,const KeyTable& camps,int64_t clickStart){
+ const char* comma[4];int nc,nq;const char* le;string_view f[4];
+ const char* const nx=scan_line(p,end,comma,4,nc,nq,le);
+ const bool gen=take_fields(p,le,comma,nc,nq,4,f);
+ int64_t ts=0;uint32_t cg=KeyTable::NONE;
+ const bool click=gen&&nx==next&&!f[0].empty()&&!f[1].empty()&&parse_ts_fast(f[3],ts)&&ts>=clickStart&&ts<window_end;
+ const char* why=nullptr;
+ if(nx!=next)why="line end";
+ else if(!isOk){if(click)why="a dropped line is a click";}
+ else if(!click)why="an ok row is not a click";
+ else{
+  cg=camps.find(f[2]);
+  if(f[0].data()!=o.ks[i]||f[0].size()!=o.kl[i])why="click_id text";
+  else if(f[1].data()!=o.us[i]||f[1].size()!=o.ul[i])why="user_id text";
+  else if(f[2].data()!=o.sc[i]||f[2].size()!=o.lc[i])why="campaign text";
+  else if(o.ckh[i]!=(uint64_t)(ts-clickStart)<<16)why="time";
+  else if(found!=(cg!=KeyTable::NONE)||(found&&ci!=cg))why="campaign number";
+  else if(found&&!(user&LOCAL_USER)&&tab.find(f[1])!=user)why="user number";
+  else{ // the ID classes and words, by a plain reading
+   const string_view id=f[0],us=f[1];
+   const auto low=[](string_view t,char top){for(char ch:t)if(!((ch>='0'&&ch<='9')||(ch>='a'&&ch<=top)))return false;return true;};
+   uint64_t cls=2,key=(uint64_t)(uintptr_t)id.data(),hi=0;
+   if(id[0]=='k'&&id.size()<=9&&low(id.substr(1),'z')){cls=0;key=0;memcpy(&key,id.data()+1,id.size()-1);}
+   else if(id[0]=='k'&&id.size()==33&&low(id.substr(1),'f')){cls=1;hi=strtoull(string(id.substr(1,16)).c_str(),nullptr,16);key=strtoull(string(id.substr(17,16)).c_str(),nullptr,16);}
+   if(o.kcls[i]!=cls||o.kkey[i]!=key||o.khi[i]!=hi)why="click_id class or key";
+   uint64_t uc=2,k0=0,lo=0,uh=0;uint32_t k1=0;
+   if(KeyTable::pack(us,k0,k1))uc=0;
+   else if(us[0]=='u'&&us.size()==33&&low(us.substr(1),'f')){uc=1;uh=strtoull(string(us.substr(1,16)).c_str(),nullptr,16);lo=strtoull(string(us.substr(17,16)).c_str(),nullptr,16);}
+   if(o.ucls[i]!=uc||o.uk0[i]!=k0||o.uk1[i]!=k1||o.ulo[i]!=lo||o.uhi[i]!=uh)why="user_id class or key";
+  }
+ }
+ if(!why)return;
+ fprintf(stderr,"ERROR SS_CLG=check: %s: %.*s\n",why,(int)min<ptrdiff_t>(le-p,200),p);_exit(1);
+}
+// One ok row of group F.
+#define SS_CLG_ROW(O_,K_,i_) {uint32_t ci_=0;const bool f_=camp_find(lp.cf,lp.camps,O_.sc[i_],(size_t)O_.lc[i_],ci_);uint32_t g_=0; \
+   if(__builtin_expect(f_,1)){g_=clg_user(O_,i_,K_,tab,tl); \
+    CRec r_;r_.id=O_.ks[i_];r_.idlen=(uint32_t)O_.kl[i_];r_.h=hkey_v3(r_.id,r_.idlen);r_.key=O_.ckh[i_]|(uint16_t)ci_;r_.user=g_; \
+    Bucket<CRec>& vec_=lp.buckets[(size_t)(((r_.h>>40)*PC)>>24)]; \
+    if(__builtin_expect(vec_.full(),0))vec_.reserve(max<size_t>(16,2*vec_.capacity())); \
+    vec_.append(r_);} \
+   if(__builtin_expect(chk_,0))clg_check_row(O_,i_,L_[i_],X_[i_],end,true,f_,ci_,g_,tab,camps,clickStart);}
+#define SS_CLG_FINISH(O,K,LS,NX,M,MASKS) {const auto& O_=(O);const auto& K_=(K);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned m_=(M); \
+  const unsigned ok_=O_.ok&m_; \
+  if(__builtin_expect(ok_==0xFFu,1)){rows+=8;SS_CLG_ROW(O_,K_,0) SS_CLG_ROW(O_,K_,1) SS_CLG_ROW(O_,K_,2) SS_CLG_ROW(O_,K_,3) SS_CLG_ROW(O_,K_,4) SS_CLG_ROW(O_,K_,5) SS_CLG_ROW(O_,K_,6) SS_CLG_ROW(O_,K_,7)} \
+  else{rows+=(unsigned)__builtin_popcount(m_); \
+   for(unsigned r_=m_;r_;r_&=r_-1){const unsigned i_=(unsigned)__builtin_ctz(r_); \
+    if((ok_>>i_)&1)SS_CLG_ROW(O_,K_,i_) \
+    else if((O_.drop>>i_)&1){if(__builtin_expect(chk_,0))clg_check_row(O_,i_,L_[i_],X_[i_],end,false,false,0,0,tab,camps,clickStart);} \
+    else{const char* const q_=L_[i_];++slow;click_line_v3<false>(q_,MASKS(q_),nullptr,lp,pend,pp,dmax,send,ring,rpos,general);resolve_users(pend,pp,tab,tl);pp=pend;}}} }
+#define SS_CLICK_LOOP_CLG(NAME,TARGET,MASKS,LSCAN,LIVE,DEC) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ if(p>=lim)return; \
+ const char* const end=base+len;const bool chk_=optClg==2||optClg==4; \
+ const ClLoop lp(tl,tab,camps,PC,end,clickStart); \
+ PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CRing* const ring=nullptr;unsigned rpos=0;uint64_t rows=0,slow=0,shortG=0,fixed=0; \
+ const vclg::ClgConst cc{clickStart,lp.wlen,vcl2::make_dates_cl(clickStart,window_end,window_start)}; \
+ vclg::Cl8gOut out[2];vclg::Cl8gScan sc[2];ClgAsk ask[2]; \
+ alignas(64) const char* A[4][8];alignas(64) const char* le[8];const char* tail=nullptr; \
+ {const char* cut_[9];lane_cut(p,lim,end,cut_);for(unsigned i_=0;i_<8;++i_){A[0][i_]=cut_[i_];le[i_]=cut_[i_+1];}} \
+ const char* const* lD=A[0];const char* const* xD=A[0];const char* const* lF=A[0];const char* const* xF=A[0]; \
+ unsigned g=0,nD=0,nF=0;vclg::Cl8gScan* sN=&sc[0];vclg::Cl8gScan* sD=&sc[1];vclg::Cl8gOut* oD=&out[0];vclg::Cl8gOut* oF=&out[1];ClgAsk* kD=&ask[0];ClgAsk* kF=&ask[1];bool more=true; \
+ do{ \
+  unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
+  if(more){ \
+   const unsigned live_=LIVE(lN,le); \
+   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF1(xN)} \
+   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail,fixed); \
+    for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
+   else more=false; \
+  } \
+  if(nD){DEC(lD,xD,*sD,cc,*oD);clg_ask(*oD,nD,*kD,tab);} \
+  if(nF)SS_CLG_FINISH(*oF,*kF,lF,xF,nF,MASKS) \
+  lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=nN;++g; \
+  {vclg::Cl8gScan* const t_=sN;sN=sD;sD=t_;vclg::Cl8gOut* const u_=oD;oD=oF;oF=u_;ClgAsk* const v_=kD;kD=kF;kF=v_;} \
+ }while(more||nD||nF); \
+ if(tail)line_general<4>(tail,end,general); /* the last line has no newline */ \
+ tl.clgRows+=rows;tl.clgSlow+=slow;tl.laneShort+=shortG;tl.laneFixC+=fixed; \
+}
+// The avx2 instance is the stand-in without AVX-512 (scalar twin; callgrind, ASan): the same scan rule from win_masks_avx2.
+SS_V3 [[gnu::noinline]] static unsigned lane_scan_clg_avx2(const char* const* ls,const char** nx,vclg::Cl8gScan&){
+ unsigned unc=0;
+ for(unsigned i=0;i<8;++i){const char* const p=ls[i];const WinMasks a=win_masks_avx2(p);
+  const uint64_t e0=_tzcnt_u64(a.c);const char* const bb=p+e0+1;const WinMasks b=win_masks_avx2(bb);
+  const uint64_t e1=_tzcnt_u64(b.c);const char* const bc=bb+e1+1;const WinMasks c=win_masks_avx2(bc);
+  const uint64_t e3=_tzcnt_u64(c.n);nx[i]=bc+e3+1;
+  if(((a.n&_blsmsk_u64(a.c))|(b.n&_blsmsk_u64(b.c))|((e0|e1|e3)>>6))!=0)unc|=1u<<i;}
+ return unc;
+}
+[[gnu::noinline]] static void clg_dec_ref(const char* const* ls,const char* const* nx,const vclg::Cl8gScan&,const vclg::ClgConst& c,vclg::Cl8gOut& o){vclg::cl8g_ref(ls,nx,c,o);}
+SS_CLICK_LOOP_CLG(clicks_avx2_cg,SS_V3,win_masks_avx2,lane_scan_clg_avx2,lane_live_scalar,clg_dec_ref)
+SS_CLICK_LOOP_CLG(clicks_avx512z_cg,SS_V5,win_masks_avx512z,vclg::cscang8_v5,lane_live_avx512,vclg::cdecg8_v5)
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  // With SS_STATS=1 every TIME line is followed by a CPU line: processor time (all threads, user+system) of that stage.
@@ -6432,7 +6942,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // lkSlot[id]: where the value of an ID added by the link loop lives - table slot + 1, or 0x80000000 | index of its
  // long entry (0: added some other way, or out of range; FLATTEN then looks the key up).
  struct LkUF{atomic<uint32_t> p,b;};static_assert(sizeof(LkUF)==8);
- LkUF* const uf=lkGen?(LkUF*)map_huge(((size_t)maxIds+1)*sizeof(LkUF)):nullptr;
+ LkUF* const uf=lkGen?(LkUF*)map_huge(((size_t)maxIds+33)*sizeof(LkUF)):nullptr;
  uint32_t* const lkSlot=lkGen?(uint32_t*)map_huge(((size_t)maxIds+1)*sizeof(uint32_t)):nullptr;
  const auto uf_root=[uf](uint32_t u)__attribute__((always_inline))->uint32_t{
   for(;;){
@@ -6466,6 +6976,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    lkg::Batch ring[RN];
    KeyTable::Slot* const slots=tab.slots;PName* const names=tab.newNames;const size_t tmask=tab.mask;
    LkUF* const ufp=uf;uint32_t* const note=lkSlot;
+   const size_t noteLim=getenv("SS_TEST_LKNOTE")?0:0x7FFFFFFFu; // test switch: no notes, so FLATTEN looks every key up (its path for a note out of range)
    KeyTable::IdBlock blk;
    // A number for a new ID, from this thread's block (cannot run out: the table holds every ID the link lines can name).
    const auto new_id=[&]()__attribute__((always_inline))->uint32_t{
@@ -6487,7 +6998,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       uint32_t expect=0;
       if(!e.k1.compare_exchange_strong(expect,KeyTable::BUSY,memory_order_acquire))continue;
       const uint32_t id=blk.next++;
-      names[id].set_packed(k0,k1);note[id]=j<0x7FFFFFFFu?(uint32_t)j+1:0;
+      names[id].set_packed(k0,k1);note[id]=j<noteLim?(uint32_t)j+1:0;
       e.k0.store(k0,R);e.v.store(tab.idBase+id,R);e.k1.store(k1,memory_order_release);
       return tab.idBase+id;
      }
@@ -6510,7 +7021,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       const uint32_t id=blk.next++;
       const size_t li=tab.longs.n.fetch_add(1,R); // below longs.room: at most idLimit IDs are added in this mode
       names[id].set(string_view(B.s[q],B.len[q]));key.v=tab.idBase+id;tab.longs.d[li]=key;
-      note[id]=li<0x7FFFFFFFu?0x80000000u|(uint32_t)li:0;
+      note[id]=li<noteLim?0x80000000u|(uint32_t)li:0;
       e.k0.store(h,R);e.v.store((uint32_t)li,R);e.k1.store(KeyTable::LONGK,memory_order_release);
       return tab.idBase+id;
      }
@@ -6534,7 +7045,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      if(more)p=fill(B,p,lim,end,slots,tmask);
      else if(++idle>4)break;}
     {const lkg::Batch& B=ring[(t+RN-1)%RN];
-     if(B.nlong)for(int q=0;q<B.n;++q)if(!B.k1[q]){const KeyTable::Slot& e=slots[B.j[q]];if(e.k1.load(memory_order_acquire)==KeyTable::LONGK)__builtin_prefetch(&tab.longs.d[e.v.load(memory_order_relaxed)],0,1);}}
+     for(int i=0;i<B.nlong;++i){const KeyTable::Slot& e=slots[B.j[B.lq[i]]];if(e.k1.load(memory_order_acquire)==KeyTable::LONGK)__builtin_prefetch(&tab.longs.d[e.v.load(memory_order_relaxed)],0,1);}}
     {lkg::Batch& B=ring[(t+RN-2)%RN];const int n=B.n;
      for(int q=0;q<n;++q){
       const uint32_t id=__builtin_expect(B.k1[q]!=0,1)?id_packed(B.a[q],B.k1[q],B.j[q]):id_long(B,q);
@@ -6697,9 +7208,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // A root's own name is no longer needed once every member has been compared, and no other person reads it.
    #pragma omp barrier
    #pragma omp for schedule(static)
-   for(uint32_t i=0;i<nlinked;++i){
-    if(i+16<nlinked&&!uf[i+16].p.load(memory_order_relaxed)){const uint32_t bn=uf[i+16].b.load(memory_order_relaxed);if(bn)__builtin_prefetch(&names[bn-1],0,1);}
-    if(!uf[i].p.load(memory_order_relaxed)){const uint32_t bi=uf[i].b.load(memory_order_relaxed);if(bi)names[i]=names[bi-1];}
+   for(uint32_t i=0;i<nlinked;++i){ // (b is only ever set in a root's entry; the array has 32 spare entries for the look ahead)
+    const uint32_t bn=uf[i+16].b.load(memory_order_relaxed);if(bn)__builtin_prefetch(&names[bn-1],0,1);
+    const uint32_t bi=uf[i].b.load(memory_order_relaxed);if(bi)names[i]=names[bi-1];
    }
   }
   if(unnoted.load())for(auto& l:tab.longs)if(l.v<nlinked)l.v=uf_root(l.v); // (a value that is a root already stays)
@@ -6774,6 +7285,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool evLead2=getenv("SS_EVLEAD")&&string_view(getenv("SS_EVLEAD"))=="2";
  const bool clLead2=getenv("SS_CLLEAD")&&string_view(getenv("SS_CLLEAD"))=="2";
  if(const char* v=getenv("SS_PF")){const string_view w(v);optPfw=w=="w"?1:w=="t1"?2:w=="none"?3:0;}
+ // SS_CLWIN=1: click lines of 64 bytes or more go to the general handler (as before GFAST); check: see click_long_check.
+ if(const char* v=getenv("SS_CLWIN")){const string_view w(v);optClickWin2=w=="1"?0:w=="check"?2:1;}
  #define SS_LEAD_CALL(two_,fn_,args_) {if(two_)fn_<2>args_;else fn_<1>args_;}
  // SS_EV8=3: the ev8 loop runs kernel version 3 (gathers, date memo) instead of version 4. Same output.
  const bool ev8V3=getenv("SS_EV8")&&string_view(getenv("SS_EV8"))=="3";
@@ -6801,7 +7314,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  gevCheck=gevW=="check"||gevW=="checkref";
  const bool gevUse=(gevRef||gevVec)&&!dparse.events&&!dparse.users;
  const bool cl8Auto=hasE8&&dparse.clicks&&!dparse.bucket&&!getenv("SS_CLICKS")&&!getenv("SS_DENSE_AHEAD")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
- cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
+ // The click loop of the general route (opaque IDs: no dense click records, no dense users) is the lane loop with
+ // kernel cl8g (SS_CLICK_LOOP_CLG) on a CPU with the kernel's extensions; SS_CLG=0, any SS_CLICKS or SS_LINES value,
+ // SS_LANES=0|e or SS_ISA=avx2|sse2 keep the loop with the line index. SS_CLG=ref|refcheck: the scalar twin on any CPU with AVX2.
+ if(const char* v=getenv("SS_CLG")){const string_view w(v);optClg=w=="0"?0:w=="check"?2:w=="ref"?3:w=="refcheck"?4:1;}
+ const bool clgRef=optClg>=3&&isaUse!=ISA_SSE2&&!dparse.clicks&&!dparse.users;
+ const bool clgUse=clgRef||(optClg&&hasE8&&!dparse.clicks&&!dparse.users&&!getenv("SS_CLICKS")&&!getenv("SS_LINES")&&lanesC&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2));
+ cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")<<(clgUse?(clgRef?" clicks: cl8g kernel (scalar twin) in lanes":" clicks: cl8g kernel in lanes"):"")<<(clgUse&&(optClg==2||optClg==4)?" (check)":"")
   <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":lanes?" events: ev8 kernel v4 in lanes":" events: ev8 kernel v4"):"")<<(cl8Auto?(cl8V1?" clicks: cl8 kernel v1":lanesC?" clicks: cl8 kernel v2 in lanes":" clicks: cl8 kernel v2"):"")<<(gevUse?(gevRef?" general events: ev8g scalar twin in lanes":" general events: ev8g kernel in lanes"):"")<<(gevUse&&gevCheck?" (checked)":"")<<(evLead2?" evlead 2":"")<<(clLead2?" cllead 2":"")<<(optPfw==1?" pf w":optPfw==2?" pf t1":optPfw==3?" pf none":"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
@@ -6947,6 +7466,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const bool drec=ck.click?dparse.clicks:dparse.events;
    const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
    const bool cl8Use=(dparse.cl8&&(isaUse==ISA_AVX2||hasE8))||(cl8Auto&&isaUse!=ISA_AVX2); // as ev8Use
+   if(ck.click&&!drec&&clgUse){if(clgRef)clicks_avx2_cg(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);else clicks_avx512z_cg(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);continue;} // the general route's click loop
    if(ck.click&&drec&&cl8Auto&&isaUse==ISA_AVX2){if(cl8V1)SS_LEAD_CALL(clLead2,clicks_avx512z_c8v1,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) else if(lanesC)clicks_avx512z_c8l(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); else SS_LEAD_CALL(clLead2,clicks_avx512z_c8,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) continue;} // the default on an AVX-512 CPU
    if(!ck.click&&!drec&&gevUse){if(gevRef)events_avx2_g8l(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);else events_avx512z_g8l(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);continue;} // general route, events
    if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){if(ev8V3)SS_LEAD_CALL(evLead2,events_avx512z_e8v3,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) else if(lanes)events_avx512z_e8l(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); else SS_LEAD_CALL(evLead2,events_avx512z_e8,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) continue;} // the default on an AVX-512 CPU
@@ -7092,6 +7612,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const uint32_t totalIds=tab.end_parallel();
  __mark("RESOLVE");
  if(campCheck)cerr<<"STATS campaign lookups checked against the KeyTable: "<<campTable.checked<<"\n";
+ if(getenv("SS_STATS")){uint64_t cr=0,cs=0,lf=0;for(int t=0;t<T;++t){cr+=tls[t].clgRows;cs+=tls[t].clgSlow;lf+=tls[t].laneFixC;}
+  if(cr)cerr<<"STATS cl8g click loop: lines "<<cr<<" through click_line_v3 "<<cs<<", line ends looked up "<<lf<<"\n";}
+ if(getenv("SS_STATS")){uint64_t w2=0,cg=0;for(int t=0;t<T;++t){w2+=tls[t].clWin2;cg+=tls[t].clGeneral;}
+  cerr<<"STATS click line code: three-window lines "<<w2<<", lines left to the general handler "<<cg<<(optClickWin2==2?" (SS_CLWIN=check)":optClickWin2==0?" (SS_CLWIN=1)":"")<<"\n";}
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
   cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";
   uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
