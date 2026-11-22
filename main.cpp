@@ -3846,7 +3846,7 @@ static inline vert4::EvConst ev8_const4(uint64_t ke,uint64_t limE,int64_t wstart
   else if(lp.strm8)estream_put8_v5(*lp.es,lp.bsh,O_);else estream_put8_rows(*lp.es,lp.bsh,O_);}
 // Stream mode, at the time the direct commit asks for its slots (a group ahead of the append): with thousands of
 // buckets the fill lines and states of a thread no longer fit its share of the second-level cache, so the eight
-// rows' lines are asked for here (lp.spf: SS_SPF, default on from 3,000 buckets).
+// rows' lines are asked for here (lp.spf: SS_SPF, default on from 1,000 buckets).
 #define SS_EV8_SPF(O_,M) {for(unsigned x_=(M);x_;x_&=x_-1){const size_t b_=(size_t)(O_.ve[__builtin_ctz(x_)]>>lp.bsh);__builtin_prefetch(lp.es->fill+b_*StreamStore<ERec>::RPL,1,3);__builtin_prefetch(lp.es->bs+b_,1,3);}}
 #define SS_EV8_FINISH(O,LS,NX,N,SLOW) {auto& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
   const unsigned ok_=O_.ok&((1u<<n_)-1);rows+=n_; \
@@ -5486,9 +5486,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   dparse.bsh=min(dparse.bwin,16u);
   while(dparse.bsh<16&&(dense.limE>>dparse.bsh)>=(uint64_t(1)<<20))++dparse.bsh;
   dparse.bwin=max(dparse.bwin,dparse.bsh);
-  // SS_SPF=0|1: the ev8 loops ask for a row's fill line and bucket state a group ahead (default: from 3,000 buckets,
-  // where a thread's lines and states are over 240 KB; not measured on the scoring machine).
-  dparse.spf=(dense.limE>>dparse.bsh)>=3000;if(const char* b=getenv("SS_SPF"))dparse.spf=b[0]=='1';}
+  // SS_SPF=0|1: the ev8 loops ask for a row's fill line and bucket state a group ahead (default: from 1,000 buckets,
+  // where a thread's lines and states are over 80 KB. CPU of the parse stage, one thread, this box: dev at 1,183 /
+  // 4,730 / 9,460 buckets 43.5 -> 42.6, 47.0 -> 43.9, 50.6 -> 46.4 ms; big20 at 1,221 buckets 1058 -> 1008 ms.
+  // Not measured on the scoring machine.)
+  dparse.spf=(dense.limE>>dparse.bsh)>=1000;if(const char* b=getenv("SS_SPF"))dparse.spf=b[0]=='1';}
  // Event lines with raw users use the two-phase loop (SS_EVENT_LOOP_2P) unless SS_DENSE_AHEAD is given: then the
  // loop with the ring of that length (0 = write at the end of the line) runs, for comparison.
  dparse.twoPhase=dparse.raw&&!getenv("SS_DENSE_AHEAD");
