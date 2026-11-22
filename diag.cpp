@@ -481,8 +481,7 @@ int main(){
    const char l0=sub[0]=='e'?'e':sub[0]=='c'?'k':'u';
    b+=replicate(fs::path(data)/sub,huge/sub,BIG,PARTS,l0,'u',botMode);
    fs::create_directories(big/sub);
-   if(gV5)b+=replicate(fs::path(data)/sub,big/sub,BIG,1,l0,'u',false); // v5: its own files (line-interleaved copies 0..BIG-1)
-   else if(botMode&&!gBots.empty())b+=replicate(fs::path(data)/sub,big/sub,BIG,1,l0,'u',true); // its own files: the bots' ranges depend on the number of copies
+   if(botMode&&!gBots.empty())b+=replicate(fs::path(data)/sub,big/sub,BIG,1,l0,'u',true); // its own files: the bots' ranges depend on the number of copies
    else for(auto& f:fs::directory_iterator(huge/sub)){const string n=f.path().filename().string();if(n.size()>6&&n.compare(n.size()-6,6,"-0.csv")==0)fs::create_symlink(f.path(),big/sub/n);}
   }
   for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
@@ -510,7 +509,8 @@ int main(){
  #define ND {"SS_NODENSE","1"}
  for(int r=0;r<3;++r){
   add("Bs",1,{N8,ST});add("B",1,{N8});
-  if(r<2){add("n4",1,{{"NCPU","4"}});add("n16",1,{{"NCPU","16"}});add("p4",1,{N8,{"SS_PERSONBUCKET","4096"}});add("p64",1,{N8,{"SS_PERSONBUCKET","65536"}});add("uw",1,{N8,{"SS_UNMAP","workers"}});add("po",1,{N8,PO});}
+  if(r<2){add("n4",1,{{"NCPU","4"}});add("uw",1,{N8,{"SS_UNMAP","workers"}});}
+  if(r<1){add("n16",1,{{"NCPU","16"}});add("p4",1,{N8,{"SS_PERSONBUCKET","4096"}});add("p64",1,{N8,{"SS_PERSONBUCKET","65536"}});add("po",1,{N8,PO});}
  }
  const size_t nSmall=vars.size();
  // final-sized set
