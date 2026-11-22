@@ -259,11 +259,16 @@ static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int p
     char name[64];snprintf(name,sizeof name,"part-%05zu-%d.csv",j,part);
     FILE* f=fopen((dst/name).c_str(),"wb");if(!f)continue;
     fwrite(in.data(),1,hdr,f);uint64_t wrote=hdr;
-    for(int r0=0;r0<reps;++r0){
+    // The copies are interleaved line by line, each starting at another place of the source file: neighbouring
+    // rows then hit counters all over the range, as rows of real data do (copy after copy would keep ~37k rows
+    // in a row inside one copy's 1/60 of the slot array).
+    vector<size_t> ls;{size_t p=hdr;while(p<in.size()){ls.push_back(p);size_t e=in.find('\n',p);if(e==string::npos)break;p=e+1;}}
+    const size_t nl=ls.size();out.clear();
+    for(size_t t=0;t<nl;++t)for(int r0=0;r0<reps;++r0){
      const uint64_t rep=(uint64_t)part*reps+r0;
-     out.clear();const char tag=(char)('A'+rep%26),tag2=(char)('a'+rep/26);
-     size_t p=hdr;
-     while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
+     const char tag=(char)('A'+rep%26),tag2=(char)('a'+rep/26);
+     size_t p=ls[(t+(size_t)r0*(nl/(size_t)reps))%nl];
+     {size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
       size_t q=p;
       // the line's user (second field; in link files both fields are users): is it a bot of this replica?
       const BotMap* bot=nullptr;
@@ -294,10 +299,11 @@ static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int p
        q=c+1;
       }
       if(q<=e)out.append(in,q,e-q);
-      out.push_back('\n');p=e+1;
+      out.push_back('\n');
      }
-     fwrite(out.data(),1,out.size(),f);wrote+=out.size();
+     if(out.size()>(4u<<20)){fwrite(out.data(),1,out.size(),f);wrote+=out.size();out.clear();}
     }
+    fwrite(out.data(),1,out.size(),f);wrote+=out.size();out.clear();
     fclose(f);bytes+=wrote;
    }
  }});
@@ -445,13 +451,13 @@ int main(){
  #define UB {"SS_UNMAP","bg"}
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  for(int r=0;r<4;++r){
-  add("B",1,{N8});add("c62",1,{N8},"core-b");add("c65",1,{N8},"core-d");add("cpf",1,{N8},"core-l");
+  add("B",1,{N8});add("ck",1,{N8},"core-k");add("c65",1,{N8},"core-d");add("cpf",1,{N8},"core-l");add("c66",1,{N8},"core-m");
   add("uw",1,{N8,{"SS_UNMAP","workers"}});add("nl",1,{N8,{"SS_LANES","0"}});
-  if(r<3){add("Bs",1,{N8,ST});}
+  if(r<3){add("Bs",1,{N8,ST});add("ms",1,{N8,ST},"core-m");}
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("H65",1,{N8},"core-d",true);add("Hpf",1,{N8},"core-l",true);
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hk",1,{N8},"core-k",true);add("H65",1,{N8},"core-d",true);add("Hpf",1,{N8},"core-l",true);add("H66",1,{N8},"core-m",true);
   if(r<2)add("HBs",1,{N8,ST},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
@@ -532,10 +538,10 @@ int main(){
   auto mk=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wMKP";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one));}return o+"~"+to_string(med(grp,"w"))+" ";};
   {char t[64];snprintf(t,sizeof t," | syncfs after replica %.1fs",syncSec);eqText+=t;}
   {char t[96];snprintf(t,sizeof t," | BOT REPLICA: %zu bots hold %.1f%% of rows",gBots.size(),100.0*gBotRows/1072000.0);eqText+=t;}
-  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c64","B")+mm("c62","c62")+mm("c65(+B4 last)","c65")+mm("c64+C4 prefetch","cpf")+mm("c64 unmap by workers","uw")+mm("c64 no lanes","nl");
-  a+="| small stages MKLDYWE "+fmt("c64","Bs","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","Bs","pqxa");
+  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c64","B")+mm("c64+K links","ck")+mm("c65(+B4 last)","c65")+mm("c64+C4 prefetch","cpf")+mm("c64 unmap by workers","uw")+mm("c64 no lanes","nl")+mm("c66=all","c66");
+  a+="| small stages MKLDYWE "+fmt("c64","Bs","MKLDYWE")+fmt("c66","ms","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","Bs","pqxa");
   {const RunResult* r=get("Bs#0");if(r)a+="| handed over: "+r->hand+" | DENSE threads c64:"+squeeze(r->dth)+" ";}
-  c+="60M min~median w/P/R/X/A: "+mm("c64","HB")+mm("c62","H62")+mm("c65","H65")+mm("c64+C4 prefetch","Hpf")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","HBs","pqxa");
+  c+="60M min~median w/P/R/X/A: "+mm("c64","HB")+mm("c64+K","Hk")+mm("c65","H65")+mm("c64+C4 prefetch","Hpf")+mm("c66=all","H66")+fmt("link stages c64","HB","L")+fmt("c66","H66","L")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","HBs","pqxa");
   {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c64 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;

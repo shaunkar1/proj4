@@ -178,7 +178,12 @@ static vector<fs::path> csv_files(const fs::path& dir){
  vector<fs::path> out;
  if(!fs::is_directory(dir))throw runtime_error("Missing input folder: "+dir.string());
  for(auto& f:fs::directory_iterator(dir))if(f.is_regular_file()&&f.path().extension()==".csv")out.push_back(f.path());
- sort(out.begin(),out.end());return out;
+ // All entries are dir/name with the same dir, so comparing the whole strings orders them exactly as comparing the
+ // paths does (which walks both paths element by element on every comparison). SS_PATHSORT=path: the path comparison.
+ static const bool pathSort=getenv("SS_PATHSORT")&&string_view(getenv("SS_PATHSORT"))=="path";
+ if(pathSort)sort(out.begin(),out.end());
+ else sort(out.begin(),out.end(),[](const fs::path& a,const fs::path& b){return a.native()<b.native();});
+ return out;
 }
 // Every input file stays mapped until exit: IDs are kept as views into the maps.
 struct Mapped{const char* base=nullptr;size_t len=0;};
@@ -244,20 +249,49 @@ static vector<Mapped> map_files(const vector<fs::path>& paths,FileGroup& g){
  if(base==MAP_FAILED)throw runtime_error("Cannot reserve address space for the input files");
  if(optFileAlign)base=(void*)(((uintptr_t)base+HUGE2M-1)&~(uintptr_t)(HUGE2M-1)); // the unused edges stay reserved, without pages
  g.base=(char*)base;g.len=total;size_t off=0;
- static const bool willNeed=!getenv("SS_NOWILLNEED"); // measuring switch
- for(size_t i=0;i<paths.size();++i){
-  if(!lens[i])continue;
-  int fd=open(paths[i].c_str(),O_RDONLY);
-  if(fd<0)throw runtime_error("Cannot open "+paths[i].string());
-  void* got=mmap(g.base+off,lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
-  close(fd);
-  if(got==MAP_FAILED)throw runtime_error("Cannot map "+paths[i].string());
-  if(willNeed)madvise(got,lens[i],MADV_WILLNEED);
-  if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
-  if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
-  out[i]={g.base+off,lens[i]};
-  off+=slot_of(lens[i]);g.ends.push_back(off);
+ // MADV_WILLNEED walks the page cache of the whole file (measured: ~15 us per 11 MB file with everything cached,
+ // more than half of the MAP stage). By default a background thread per folder makes those calls, so read-ahead of
+ // files that are not cached still starts at once while this thread goes on. SS_WILLNEED=inline: this thread makes
+ // them, file by file, as before. SS_NOWILLNEED=1: no such calls at all.
+ static const int willNeed=getenv("SS_NOWILLNEED")?0:(getenv("SS_WILLNEED")&&string_view(getenv("SS_WILLNEED"))=="inline")?1:2;
+ vector<pair<void*,size_t>> later;
+ // Where each file goes is fixed first, so the files can be opened and mapped by several threads at once (the calls
+ // of one file take ~8 us and a run has a few hundred files): SS_MAPTHREADS=n, n = 2..16 threads for folders of 16
+ // files or more. Default 1 (this thread alone, as before): not measurable on the loaded two-core dev box.
+ static const int mapThreads=[]{const char* v=getenv("SS_MAPTHREADS");const int x=v?atoi(v):1;return x<1?1:x>16?16:x;}();
+ vector<size_t> offs(paths.size(),0);
+ for(size_t i=0;i<paths.size();++i){if(!lens[i])continue;offs[i]=off;off+=slot_of(lens[i]);g.ends.push_back(off);}
+ atomic<size_t> nextFile{0},badOpen{SIZE_MAX},badMap{SIZE_MAX};
+ const auto note_min=[](atomic<size_t>& a,size_t i){size_t c=a.load();while(i<c&&!a.compare_exchange_weak(c,i)){}};
+ const auto map_some=[&]{
+  for(;;){
+   const size_t i=nextFile.fetch_add(1,memory_order_relaxed);if(i>=paths.size())break;
+   if(!lens[i])continue;
+   int fd=open(paths[i].c_str(),O_RDONLY);
+   if(fd<0){note_min(badOpen,i);continue;}
+   void* got=mmap(g.base+offs[i],lens[i],PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
+   close(fd);
+   if(got==MAP_FAILED){note_min(badMap,i);continue;}
+   if(willNeed==1)madvise(got,lens[i],MADV_WILLNEED);
+   if(optFileAlign==2)madvise(got,lens[i],MADV_HUGEPAGE);
+   if(optFileAdvise)madvise(got,lens[i],optFileAdvise==1?MADV_RANDOM:MADV_SEQUENTIAL);
+   out[i]={g.base+offs[i],lens[i]};
+  }
+ };
+ {
+  vector<thread> helpers;
+  if(paths.size()>=16)for(int t=1;t<mapThreads;++t)helpers.emplace_back(map_some);
+  map_some();
+  for(thread& h:helpers)h.join();
  }
+ // The first file that failed, in the order of the list, is the one reported (open before map, as one thread would).
+ {const size_t bo=badOpen.load(),bm=badMap.load();
+  if(bo!=SIZE_MAX&&bo<bm)throw runtime_error("Cannot open "+paths[bo].string());
+  if(bm!=SIZE_MAX)throw runtime_error("Cannot map "+paths[bm].string());}
+ if(willNeed==2)for(size_t i=0;i<paths.size();++i)if(lens[i])later.push_back({(void*)out[i].base,lens[i]});
+ // Advice only: it cannot change what is read. (A call that came after its file was unmapped would fail or hint
+ // at whatever is mapped there by then; the calls are done long before anything is unmapped.)
+ if(!later.empty())thread([list=move(later)]{for(const auto& [p,n]:list)madvise(p,n,MADV_WILLNEED);}).detach();
  return out;
 }
 // Cuts a group into about `parts` pieces of similar size at file boundaries (for unmapping in parallel).
@@ -386,6 +420,12 @@ static string hexstr(string_view s){static constexpr char h[]="0123456789ABCDEF"
 // Switches for measuring on the target machine; all default to the fast setting.
 // Measured on the scoring machine: huge pages help, bulk pre-faulting and the side-thread unmap do not.
 static bool optHuge=true,optPrefault=false,optAsyncFree=false;
+// SS_STATS: per-thread clocks of the reader stages (see the "STATS dense threads" line). optThrStats is set once, before any thread works.
+static bool optThrStats=false;
+static thread_local double tlGrowWall=0;static thread_local uint32_t tlGrowCalls=0;
+static inline double now_s(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;}
+static inline double thr_cpu_s(){timespec t;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return (double)t.tv_sec+1e-9*(double)t.tv_nsec;}
+struct alignas(128) ThrStat{double in=0,cIn=0,first=-1,cFirst=0,last=0,cLast=0,out=0,cOut=0,wWall=0,wMax=0,wCpu=0,oWall=0,gWall=0,endWall=0;uint32_t wCalls=0,gCalls=0;};
 // A fresh anonymous mapping of at least `bytes`: zero-filled, touched lazily, 2 MB aligned and (unless
 // SS_NOHUGE) advised for huge pages, so first touches cost one fault per 2 MB. The whole mapping
 // (for munmap) is reported through rawBase/rawLen when asked for.
@@ -408,8 +448,11 @@ struct HugePool{
  __attribute__((noinline,cold)) void grow(size_t bytes){
   const size_t huge=size_t(2)<<20;
   const size_t want=(max(bytes,cur?next:first)+huge-1)&~(huge-1);
+  const double t0=optThrStats?now_s():0;
   cur=(char*)map_huge(want);lim=cur+want;
+  if(optThrStats){tlGrowWall+=now_s()-t0;++tlGrowCalls;}
  }
+ void ensure(size_t bytes){if((size_t)(lim-cur)<bytes)grow(bytes);} // room for `bytes` without another mapping
  void* take(size_t bytes){
   bytes=(bytes+63)&~size_t(63);
   if((size_t)(lim-cur)<bytes)grow(bytes);
@@ -837,6 +880,8 @@ struct alignas(64) ThreadState{
  uint64_t slotWaits=0; // eslotWaits of this thread
  uint64_t cl8Rows=0,cl8Slow=0; // cl8 click loop: lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
+ uint64_t laneFixE=0,laneFixC=0; // lane loops: line ends of event / click rows looked up with memchr (SS_STATS)
+ uint64_t laneShort=0; // lane loops: groups with fewer than eight lanes at work (SS_STATS)
  uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
  string dumpRows; // SS_DENSE_DUMP only
@@ -948,18 +993,39 @@ struct Thrift{
  void open_elem(){stack.push_back(last);last=0;}
  void close(){o.push_back(0);last=stack.back();stack.pop_back();}
 };
+// Output switches for measuring (both off by default; the files' bytes are the same either way):
+//  SS_OUTOPEN=early  both output folders, every thread's user_daily part file and the campaign_daily file are
+//                    created (and their first four bytes written) by a helper thread while the input is parsed;
+//                    a worker takes its open file at its first row group. Files of threads that
+//                    never write a row are removed again after the last stage.
+//  SS_OUTWRITE=end   a file's row groups are kept in memory (one copy) and written by one writev when the file
+//                    is closed, instead of one writev per row group in the middle of the index loop.
+static bool optOutEarly=false,optOutEnd=false;
 struct PqFile{
  struct Chunk{int64_t offset,size,nvalues;};
  struct Group{int64_t rows,bytes;vector<Chunk> cols;};
  int fd=-1;int64_t pos=0,rows=0;vector<PqCol> cols;vector<Group> groups;string buf;
+ bool defer=false;vector<string> held; // SS_OUTWRITE=end: everything not yet written
  bool is_open()const{return fd>=0;}
+ void writev_all(vector<struct iovec>& iov){
+  size_t k=0;
+  while(k<iov.size()){
+   ssize_t w=::writev(fd,iov.data()+k,(int)min<size_t>(iov.size()-k,64));
+   if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}
+   size_t left=(size_t)w;
+   while(k<iov.size()&&left>=iov[k].iov_len){left-=iov[k].iov_len;++k;}
+   if(left){iov[k].iov_base=(char*)iov[k].iov_base+left;iov[k].iov_len-=left;}
+  }
+ }
+ void adopt(int f,vector<PqCol> c){cols=std::move(c);fd=f;defer=optOutEnd;pos=4;} // f: a fresh file open for writing that holds "PAR1" already
  void write_all(const char* p,size_t n){
+  if(defer){held.emplace_back(p,n);return;}
   while(n){ssize_t w=::write(fd,p,n);if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}p+=w;n-=(size_t)w;}
  }
  void open(const fs::path& path,vector<PqCol> c){
   cols=std::move(c);fd=::open(path.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
   if(fd<0)throw runtime_error("Cannot create "+path.string());
-  write_all("PAR1",4);pos=4;
+  defer=optOutEnd;write_all("PAR1",4);pos=4;
  }
  // bodies[i] is the finished page body of column i: optional definition levels, then PLAIN values.
  // The bodies are written from where they are (writev); only the small page headers are built here.
@@ -982,14 +1048,8 @@ struct PqFile{
    iov.push_back({(void*)(buf.data()+hoff[i]),hoff[i+1]-hoff[i]});
    if(!bodies[i].empty())iov.push_back({(void*)bodies[i].data(),bodies[i].size()});
   }
-  size_t k=0;
-  while(k<iov.size()){
-   ssize_t w=::writev(fd,iov.data()+k,(int)min<size_t>(iov.size()-k,64));
-   if(w<0){if(errno==EINTR)continue;throw runtime_error("Parquet write failed");}
-   size_t left=(size_t)w;
-   while(k<iov.size()&&left>=iov[k].iov_len){left-=iov[k].iov_len;++k;}
-   if(left){iov[k].iov_base=(char*)iov[k].iov_base+left;iov[k].iov_len-=left;}
-  }
+  if(defer){size_t tot=0;for(const auto& v:iov)tot+=v.iov_len;string keep;keep.reserve(tot);for(const auto& v:iov)keep.append((const char*)v.iov_base,v.iov_len);held.push_back(std::move(keep));}
+  else writev_all(iov);
   pos=at;rows+=nrows;groups.push_back(std::move(g));
  }
  void close(){
@@ -1024,6 +1084,8 @@ struct PqFile{
   buf.push_back(0);
   put_le32(buf,(uint32_t)buf.size());buf.append("PAR1",4);
   write_all(buf.data(),buf.size());
+  if(defer){defer=false;vector<struct iovec> iov;iov.reserve(held.size());for(const string& h:held)if(!h.empty())iov.push_back({(void*)h.data(),h.size()});
+   writev_all(iov);held.clear();held.shrink_to_fit();}
   if(::close(fd)!=0)throw runtime_error("Parquet close failed");
   fd=-1;
  }
@@ -1516,6 +1578,275 @@ SS_V3I bool parse36x2_v3(const char* sa,unsigned na,const char* sb,unsigned nb,u
  return (bool)_mm_testz_si128(bad,bad);
 }
 static inline __attribute__((always_inline)) bool parse36x2_ok(uint64_t y,unsigned m){return y-MIN36[m]<=SPAN36[m];}
+// ==== lk8: the link kernel (text of vert/lk8.h, agent K) ====
+// lk8.h - the link kernel: eight link lines per call, one per lane (agent K, 2026-11-21). Text to paste into main.cpp.
+//
+// A link line is `user_id_a,user_id_b`. The links stage (DENSE.md, stage 2) calls a line SIMPLE if both IDs are dense
+// user IDs (canonical 'u' + base 36, user index below limI) with aliases 0-7 of the same user index. lk8 finds the
+// simple lines; every other line is refused and stays with the line code of main.cpp (link_split + link_dense), unchanged.
+//
+// CONTRACT  lk8_v5(lp, klim, c, o) / lk8_ref (the scalar twin: same contract, plain code, same outputs bit for bit)
+//   lp[0..7]    line starts, one per lane. lp[i] must be a true line start with at least 96 readable bytes.
+//   klim[0..7]  a lane with lp[i] >= klim[i] is dead: nothing is reported for it and lp[i] stays (it is still read).
+//   c           ku = the user key (dense.ku), limU = min(limI, 2^31) << 9 (a counter below it has an index below limI).
+//   o.ok        bit i: lane i is live and its line is a simple line as link_split + link_dense see it: exactly two fields,
+//               each `u` + 1-8 canonical base-36 digits below 2^40 (bare, or the whole field wrapped in quotes), both user
+//               indexes below limI and equal, both aliases 0-7. Then o.idx[i] = the index, o.aa[i] / o.ab[i] = the two
+//               aliases, and lp[i] has been moved to the start of the next line (the byte after the line's newline).
+//   o.un        the ok lanes with aa != ab (the lines that are a union).
+//   o.rec[i]    for a union lane: idx << 5 | pair number of the two aliases, lk_pair(lo, hi) = hi*(hi-1)/2 + lo (0..27;
+//               LK_PAIR_LO / LK_PAIR_HI turn it back). It fits 32 bits when idx < 2^27. Unspecified for other lanes.
+//   o.bk[i]     for a union lane: (idx >> LK_BLOCK_BITS) & c.bmask, the bucket of the index; c.btrash for every other lane.
+//   o.slow      bit i: lane i is live and the line was refused: lp[i] is unchanged, the caller's line code decides
+//               everything about the line, including where the next one starts.
+//   o.idx[i]    0 for every lane that is not ok (so it can be used as a prefetch address without a test).
+//   o.mx[0..7]  running maximum of the indexes of ok lines, per lane; the caller zeroes it before the first call.
+// Why accept => same fields as link_split: P = first comma and L = first newline of the 64 bytes at lp[i]. Field a is
+// bytes [0,P), field b is bytes (P,L). Every byte of both is checked: an optional opening quote, the letter, N digits
+// (N = field length - 1 - 2*quoted), and for a quoted field the closing quote as its last byte. So the line has one
+// comma, quotes only around whole fields, both fields non-empty, and L <= 23: link_split's two-compare path returns
+// these two fields and next = lp[i]+L+1. (A newline before the comma, a missing comma, a second comma, a quote in
+// the wrong place, an empty field, \r, upper case: some checked byte is not a base-36 digit, or a length is out of range.)
+// Reads: 64 bytes at lp[i], 16 bytes at lp[i]+P+1 with P <= 64, i.e. below lp[i]+82. No read before lp[i].
+// CPU: AVX-512 F+BW+DQ+VL+CD, BMI1 (lk_has512). No gather instructions. Real calls, not always_inline.
+#ifndef LK8_H
+#define LK8_H
+namespace vlk{
+#define VLK_T5 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512cd,avx2,bmi,bmi2,lzcnt,popcnt")))
+static constexpr uint64_t MASK40=(1ull<<40)-1;
+static constexpr uint64_t M1=0x9E3779B97F4Bull&MASK40,M2=0xD6E8FEB86659ull&MASK40;
+static constexpr uint64_t inv40(uint64_t a){uint64_t x=a;for(int i=0;i<6;++i)x*=2-a*x;return x&MASK40;}
+static constexpr uint64_t I1=inv40(M1),I2=inv40(M2);
+static constexpr unsigned LK_GEN_ALIAS_BITS=9,LK_ALIAS_BITS=3; // main.cpp: dn::GEN_ALIAS_BITS, dn::ALIAS_BITS
+static constexpr unsigned LK_BLOCK_BITS=12; // 4096 user indexes (16 KB of component words) per block; blocks go to buckets in turn
+struct LkConst{uint64_t ku,limU,bmask,btrash;}; // bmask = buckets - 1 (a power of two), btrash = the bucket number for lanes without a union
+static inline LkConst lk_const(uint64_t ku,uint64_t limI,uint64_t buckets){
+ return {ku,(limI<(1ull<<(40-LK_GEN_ALIAS_BITS))?limI:(1ull<<(40-LK_GEN_ALIAS_BITS)))<<LK_GEN_ALIAS_BITS,buckets-1,buckets};
+}
+static constexpr uint64_t lk_pair(uint64_t lo,uint64_t hi){return hi*(hi-1)/2+lo;}
+static constexpr uint8_t LK_PAIR_LO[28]={0, 0,1, 0,1,2, 0,1,2,3, 0,1,2,3,4, 0,1,2,3,4,5, 0,1,2,3,4,5,6};
+static constexpr uint8_t LK_PAIR_HI[28]={1, 2,2, 3,3,3, 4,4,4,4, 5,5,5,5,5, 6,6,6,6,6,6, 7,7,7,7,7,7,7};
+struct alignas(64) LkOut{uint64_t idx[8],aa[8],ab[8],mx[8],rec[8],bk[8];uint8_t ok,un,slow;};
+static inline bool lk_has512(){
+ static const bool h=__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512dq")&&__builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx512cd")&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("lzcnt")&&__builtin_cpu_supports("popcnt");
+ return h;
+}
+// ---- the scalar twin (the definition; also what runs under SS_LINKS=ref and in valgrind) ----
+// One field of f bytes at s (16 readable): true if it is `u` + canonical base 36 below 2^40, bare or quoted; ctr = its counter.
+static inline bool lk_field_ref(const unsigned char* s,uint64_t f,uint64_t key,uint64_t& ctr){
+ if(f<2||f>11)return false;
+ const unsigned z=s[0]=='"';
+ if(z&&(f<4||s[f-1]!='"'))return false;
+ if(s[z]!='u')return false;
+ const uint64_t n=f-1-2*z; // digits
+ if(n<1||n>8)return false;
+ const unsigned char* d=s+z+1;
+ if(d[0]=='0'&&n>1)return false;
+ uint64_t v=0;
+ for(uint64_t i=0;i<n;++i){unsigned x=(unsigned)d[i]-(unsigned)'0';if(x>9){x=(unsigned)d[i]-(unsigned)'a';if(x>25)return false;x+=10;}v=v*36+x;}
+ if(v>MASK40)return false;
+ uint64_t m=(v*I2)&MASK40;m^=(m>>17)^(m>>34);
+ ctr=((m^key)*I1)&MASK40;return true;
+}
+static inline void lk8_ref(const char** lp,const char* const* klim,const LkConst& c,LkOut& o){
+ unsigned ok=0,un=0,slow=0;
+ for(int i=0;i<8;++i){
+  o.idx[i]=0;o.aa[i]=0;o.ab[i]=0;o.rec[i]=0;o.bk[i]=c.btrash;
+  const unsigned char* p=(const unsigned char*)lp[i];
+  if((const char*)p>=klim[i])continue;
+  uint64_t P=64,L=64;
+  for(uint64_t k=0;k<64;++k)if(p[k]==','){P=k;break;}
+  for(uint64_t k=0;k<64;++k)if(p[k]=='\n'){L=k;break;}
+  uint64_t ca=0,cb=0;
+  const bool good=P<L&&lk_field_ref(p,P,c.ku,ca)&&lk_field_ref(p+P+1,L-P-1,c.ku,cb)&&ca<c.limU&&cb<c.limU
+   &&(ca>>LK_GEN_ALIAS_BITS)==(cb>>LK_GEN_ALIAS_BITS)&&(ca&((1u<<LK_GEN_ALIAS_BITS)-1))<(1u<<LK_ALIAS_BITS)&&(cb&((1u<<LK_GEN_ALIAS_BITS)-1))<(1u<<LK_ALIAS_BITS);
+  if(!good){slow|=1u<<i;continue;}
+  ok|=1u<<i;
+  o.idx[i]=ca>>LK_GEN_ALIAS_BITS;o.aa[i]=ca&((1u<<LK_ALIAS_BITS)-1);o.ab[i]=cb&((1u<<LK_ALIAS_BITS)-1);
+  if(o.aa[i]!=o.ab[i]){un|=1u<<i;
+   const uint64_t lo=o.aa[i]<o.ab[i]?o.aa[i]:o.ab[i],hi=o.aa[i]<o.ab[i]?o.ab[i]:o.aa[i];
+   o.rec[i]=o.idx[i]<<5|lk_pair(lo,hi);o.bk[i]=(o.idx[i]>>LK_BLOCK_BITS)&c.bmask;}
+  if(o.idx[i]>o.mx[i])o.mx[i]=o.idx[i];
+  lp[i]=(const char*)p+L+1;
+ }
+ o.ok=(uint8_t)ok;o.un=(uint8_t)un;o.slow=(uint8_t)slow;
+}
+// ---- the AVX-512 kernel ----
+// constants, one 8-byte entry each, broadcast from memory (read through a pointer the compiler cannot see through, so
+// that it does not rebuild them in registers on every use)
+static const uint64_t LKK[]={
+ /*0*/ 64,
+ /*1*/ 0x3030303030303030ull,           // eight '0'
+ /*2*/ 0x3030303030303030ull,           // '0' per byte
+ /*3*/ 0x6161616161616161ull,           // 'a' per byte
+ /*4*/ 0x0909090909090909ull,
+ /*5*/ 0x1919191919191919ull,           // 25
+ /*6*/ 0xA9A9A9A9A9A9A9A9ull,           // 10-'a'
+ /*7*/ 0x0124012401240124ull,           // bytes 36,1
+ /*8*/ 0x0001051000010510ull,           // words 1296,1
+ /*9*/ 1679616ull,                      // 36^4
+ /*10*/ MASK40,
+ /*11*/ I2,
+ /*12*/ I1,
+ /*13*/ 0xFFull,
+ /*14*/ 0xFFFFull,
+ /*15*/ 0x75ull,                        // 'u'
+ /*16*/ 0x7522ull,                      // '"' then 'u'
+ /*17*/ 0x22ull,                        // '"'
+ /*18*/ 8,
+ /*19*/ 16,
+ /*20*/ 1,
+ /*21*/ 3,
+ /*22*/ ~7ull,                          // counter bits that must agree: everything above the low three alias bits
+ /*23*/ (uint64_t)(((1u<<LK_GEN_ALIAS_BITS)-1)&~((1u<<LK_ALIAS_BITS)-1)), // alias bits that must be zero (alias < 8)
+ /*24*/ 7,
+};
+alignas(64) static const uint64_t LKV[]={
+ /*0*/ 78364164096ull,0,36,1296,46656,1679616,60466176,2176782336ull, // MIN36[n] by the low three bits of n
+ /*8*/ 0,2,4,6,8,10,12,14,
+ /*16*/ 1,3,5,7,9,11,13,15,
+ /*24*/ 0,0,1,3,6,10,15,21,                                           // hi*(hi-1)/2
+};
+static inline __attribute__((always_inline)) const uint64_t* lkk_ptr(){const uint64_t* p=LKK;__asm__("":"+r"(p));return p;}
+static inline __attribute__((always_inline)) const uint64_t* lkv_ptr(){const uint64_t* p=LKV;__asm__("":"+r"(p));return p;}
+#define VLK_K(i) _mm512_set1_epi64((long long)K[i])
+// One field per lane: lo / hi = its first 16 bytes, F = its length. Returns the counter; ok = `u` + canonical base 36
+// below 2^40 (bare or quoted) with a counter below limU.
+VLK_T5 static inline __attribute__((always_inline)) __m512i lk_field_v5(__m512i lo,__m512i hi,__m512i F,const uint64_t* K,const uint64_t* V,const LkConst& c,__mmask8& okOut){
+ const __m512i c64=VLK_K(0),c8=VLK_K(18),ff=VLK_K(13);
+ const __mmask8 kq=_mm512_cmpeq_epi64_mask(_mm512_and_si512(lo,VLK_K(14)),VLK_K(16)); // starts with `"u`
+ const __mmask8 kb=_mm512_cmpeq_epi64_mask(_mm512_and_si512(lo,ff),VLK_K(15));        // starts with `u`
+ const __m512i s=_mm512_mask_mov_epi64(c8,kq,VLK_K(19));                               // bits to the first digit
+ const __m512i W=_mm512_or_si512(_mm512_srlv_epi64(lo,s),_mm512_sllv_epi64(hi,_mm512_sub_epi64(c64,s))); // the 8 bytes from the first digit
+ const __m512i N=_mm512_sub_epi64(F,_mm512_mask_mov_epi64(VLK_K(20),kq,VLK_K(21)));   // digits = F - 1 - 2*quoted
+ // closing quote of a quoted field: byte F-1 of the sixteen (a shift count of 64 or more gives zero)
+ const __m512i t=_mm512_sub_epi64(_mm512_slli_epi64(F,3),c8);
+ const __m512i cq=_mm512_or_si512(_mm512_srlv_epi64(lo,t),_mm512_srlv_epi64(hi,_mm512_sub_epi64(t,c64)));
+ const __mmask8 kc=_mm512_mask_cmpeq_epi64_mask(kq,_mm512_and_si512(cq,ff),VLK_K(17));
+ const __mmask8 shape=_kor_mask8(kb,kc);
+ // the digits: moved so that the last one is the top byte, '0' below the first; n = 0 gives val = 0 < MIN36[8] (the entry
+ // n & 7 == 0 picks), n >= 9 or negative gives x = 0, and a zero byte is not a digit
+ const __m512i n8=_mm512_slli_epi64(N,3);
+ const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(W,_mm512_sub_epi64(c64,n8)),_mm512_srlv_epi64(VLK_K(1),n8));
+ const __m512i tt=_mm512_sub_epi8(x,VLK_K(2)),u=_mm512_sub_epi8(x,VLK_K(3));
+ const __m512i bad=_mm512_min_epu8(_mm512_subs_epu8(tt,VLK_K(4)),_mm512_subs_epu8(u,VLK_K(5)));
+ const __m512i d=_mm512_min_epu8(tt,_mm512_add_epi8(x,VLK_K(6)));
+ const __m512i p2=_mm512_maddubs_epi16(d,VLK_K(7));
+ const __m512i p4=_mm512_madd_epi16(p2,VLK_K(8));
+ const __m512i val=_mm512_add_epi64(_mm512_mul_epu32(p4,VLK_K(9)),_mm512_srli_epi64(p4,32));
+ const __m512i min36=_mm512_permutexvar_epi64(N,_mm512_load_si512((const void*)V));
+ const __m512i mask=VLK_K(10);
+ __mmask8 ok=_mm512_mask_testn_epi64_mask(shape,bad,bad);
+ ok=_mm512_mask_cmpge_epu64_mask(ok,val,min36);
+ ok=_mm512_mask_cmple_epu64_mask(ok,val,mask);
+ __m512i m=_mm512_and_si512(_mm512_mullo_epi64(val,VLK_K(11)),mask);
+ m=_mm512_ternarylogic_epi64(m,_mm512_srli_epi64(m,17),_mm512_srli_epi64(m,34),0x96);
+ m=_mm512_xor_si512(m,_mm512_set1_epi64((long long)c.ku));
+ const __m512i ctr=_mm512_and_si512(_mm512_mullo_epi64(m,VLK_K(12)),mask);
+ okOut=_mm512_mask_cmplt_epu64_mask(ok,ctr,_mm512_set1_epi64((long long)c.limU));
+ return ctr;
+}
+VLK_T5 [[gnu::noinline]] static void lk8_v5(const char** lp,const char* const* klim,const LkConst& c,LkOut& o){
+ const uint64_t* const K=lkk_ptr();const uint64_t* const V=lkv_ptr();
+ alignas(64) uint64_t PL[16]; // P of the eight lanes, then L
+ alignas(64) uint64_t AB[32]; // the first 16 bytes of field a of each lane, then of field b
+ const __m512i vnl=_mm512_set1_epi8('\n'),vc=_mm512_set1_epi8(',');
+ for(int i=0;i<8;++i){
+  const char* const p=lp[i];
+  const __m512i x=_mm512_loadu_si512((const void*)p);
+  const uint64_t L=_tzcnt_u64(_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vnl))),P=_tzcnt_u64(_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc)));
+  PL[i]=P;PL[8+i]=L;
+  _mm_store_si128((__m128i*)(AB+2*i),_mm512_castsi512_si128(x));
+  _mm_store_si128((__m128i*)(AB+16+2*i),_mm_loadu_si128((const __m128i*)(p+P+1)));
+ }
+ const uint64_t* pl=PL;const uint64_t* ab=AB;__asm__("":"+r"(pl),"+r"(ab)::"memory"); // the vector part reads what the loop stored
+ const __m512i Pv=_mm512_load_si512((const void*)pl),Lv=_mm512_load_si512((const void*)(pl+8));
+ const __m512i ie=_mm512_load_si512((const void*)(V+8)),io=_mm512_load_si512((const void*)(V+16));
+ const __m512i Z0=_mm512_load_si512((const void*)ab),Z1=_mm512_load_si512((const void*)(ab+8));
+ const __m512i Z2=_mm512_load_si512((const void*)(ab+16)),Z3=_mm512_load_si512((const void*)(ab+24));
+ const __m512i Alo=_mm512_permutex2var_epi64(Z0,ie,Z1),Ahi=_mm512_permutex2var_epi64(Z0,io,Z1);
+ const __m512i Blo=_mm512_permutex2var_epi64(Z2,ie,Z3),Bhi=_mm512_permutex2var_epi64(Z2,io,Z3);
+ const __m512i one=VLK_K(20);
+ __mmask8 oka,okb;
+ const __m512i ca=lk_field_v5(Alo,Ahi,Pv,K,V,c,oka);
+ const __m512i cb=lk_field_v5(Blo,Bhi,_mm512_sub_epi64(_mm512_sub_epi64(Lv,Pv),one),K,V,c,okb);
+ const __m512i LP=_mm512_loadu_si512((const void*)lp);
+ __mmask8 ok=_mm512_mask_cmplt_epu64_mask(_kand_mask8(oka,okb),LP,_mm512_loadu_si512((const void*)klim));
+ const __mmask8 live=_mm512_cmplt_epu64_mask(LP,_mm512_loadu_si512((const void*)klim));
+ ok=_mm512_mask_testn_epi64_mask(ok,_mm512_xor_si512(ca,cb),VLK_K(22)); // same index (and then alias b < 8 if alias a is)
+ ok=_mm512_mask_testn_epi64_mask(ok,ca,VLK_K(23));                       // alias a < 8
+ const __m512i idx=_mm512_maskz_srli_epi64(ok,ca,LK_GEN_ALIAS_BITS);
+ const __m512i a7=VLK_K(24),aa=_mm512_and_si512(ca,a7),ab7=_mm512_and_si512(cb,a7);
+ _mm512_store_si512((void*)o.idx,idx);
+ _mm512_store_si512((void*)o.aa,aa);
+ _mm512_store_si512((void*)o.ab,ab7);
+ _mm512_store_si512((void*)o.mx,_mm512_max_epu64(_mm512_load_si512((const void*)o.mx),idx));
+ _mm512_mask_storeu_epi64((void*)lp,ok,_mm512_add_epi64(_mm512_add_epi64(LP,Lv),one));
+ const __mmask8 un=_mm512_mask_cmpneq_epi64_mask(ok,aa,ab7);
+ const __m512i tri=_mm512_permutexvar_epi64(_mm512_max_epu64(aa,ab7),_mm512_load_si512((const void*)(V+24)));
+ _mm512_store_si512((void*)o.rec,_mm512_or_si512(_mm512_slli_epi64(idx,5),_mm512_add_epi64(tri,_mm512_min_epu64(aa,ab7))));
+ _mm512_store_si512((void*)o.bk,_mm512_mask_and_epi64(_mm512_set1_epi64((long long)c.btrash),un,_mm512_srli_epi64(idx,LK_BLOCK_BITS),_mm512_set1_epi64((long long)c.bmask)));
+ o.ok=(uint8_t)_cvtmask8_u32(ok);
+ o.un=(uint8_t)_cvtmask8_u32(un);
+ o.slow=(uint8_t)_cvtmask8_u32(_kandn_mask8(ok,live));
+}
+#undef VLK_K
+// ---- the unions of one bucket (second step) ----
+// comp = the alias words (main.cpp: denseComp; see comp_union there for the format: three bits per alias = alias XOR the
+// smallest alias of its group). Each record (LkOut::rec) is one union. The caller is the only thread that changes the
+// words these records name while the call runs.
+static constexpr uint32_t LK_IDENT=0xFAC688u; // main.cpp: COMP_IDENT
+static inline __attribute__((always_inline)) void lk_union1(uint32_t* comp,uint32_t rec){ // the arithmetic of comp_union, plain load and store
+ const uint32_t a=LK_PAIR_LO[rec&31],b=LK_PAIR_HI[rec&31];uint32_t& c=comp[rec>>5];
+ const uint32_t w=c^LK_IDENT,ra=(w>>(3*a))&7,rb=(w>>(3*b))&7;
+ if(ra==rb)return;
+ const uint32_t lo=ra<rb?ra:rb,hi=ra<rb?rb:ra,F=0x249249u,x=w^(hi*F),eq=~(x|(x>>1)|(x>>2))&F;
+ c=(w^((hi^lo)*eq))^LK_IDENT;
+}
+static inline void lk_union_ref(uint32_t* comp,const uint32_t* b,const uint32_t* e){for(;b<e;++b)lk_union1(comp,*b);}
+alignas(64) static const uint32_t LKU[]={
+ /*0*/  0,0,3,0,3,6,0,3,6,9,0,3,6,9,12,0,   3,6,9,12,15,0,3,6,9,12,15,18,0,0,0,0,                 // 3 * LK_PAIR_LO[t]
+ /*32*/ 3,6,6,9,9,9,12,12,12,12,15,15,15,15,15,18,   18,18,18,18,18,21,21,21,21,21,21,21,0,0,0,0, // 3 * LK_PAIR_HI[t]
+ /*64*/ 0,0x249249u,2*0x249249u,3*0x249249u,4*0x249249u,5*0x249249u,6*0x249249u,7*0x249249u,0,0,0,0,0,0,0,0, // root * F
+};
+// Sixteen records per turn: the sixteen words are read one by one (no gather instruction), changed together and written
+// back one by one. Two records of one turn that name the same index would not see each other's result, so a turn with
+// a repeated index (vpconflictd) is done one record at a time, like the last n mod 16 records. A record whose two
+// aliases are already in one group writes its word back unchanged.
+VLK_T5 [[gnu::noinline]] static void lk_union_v5(uint32_t* comp,const uint32_t* b,const uint32_t* e){
+ const uint32_t* U=LKU;__asm__("":"+r"(U));
+ const __m512i salo=_mm512_load_si512((const void*)U),sahi=_mm512_load_si512((const void*)(U+16));
+ const __m512i sblo=_mm512_load_si512((const void*)(U+32)),sbhi=_mm512_load_si512((const void*)(U+48));
+ const __m512i hf=_mm512_load_si512((const void*)(U+64));
+ const __m512i ident=_mm512_set1_epi32((int)LK_IDENT),F=_mm512_set1_epi32(0x249249),c31=_mm512_set1_epi32(31),c7=_mm512_set1_epi32(7);
+ for(;e-b>=16;b+=16){
+  const __m512i R=_mm512_loadu_si512((const void*)b),idx=_mm512_srli_epi32(R,5);
+  const __m512i cf=_mm512_conflict_epi32(idx);
+  if(__builtin_expect(_mm512_test_epi32_mask(cf,cf)!=0,0)){for(int i=0;i<16;++i)lk_union1(comp,b[i]);continue;}
+  alignas(64) uint32_t IX[16],W[16];
+  _mm512_store_si512((void*)IX,idx);
+  {const uint32_t* ix=IX;__asm__("":"+r"(ix)::"memory");
+   for(int i=0;i<16;++i){uint32_t v=comp[ix[i]];__asm__("":"+r"(v));W[i]=v;}} // (the empty asm keeps these loads scalar)
+  const uint32_t* wp=W;__asm__("":"+r"(wp)::"memory");
+  const __m512i w=_mm512_xor_si512(_mm512_load_si512((const void*)wp),ident);
+  const __m512i t=_mm512_and_si512(R,c31);
+  const __m512i ra=_mm512_and_si512(_mm512_srlv_epi32(w,_mm512_permutex2var_epi32(salo,t,sahi)),c7);
+  const __m512i rb=_mm512_and_si512(_mm512_srlv_epi32(w,_mm512_permutex2var_epi32(sblo,t,sbhi)),c7);
+  const __m512i lo=_mm512_min_epu32(ra,rb),hi=_mm512_max_epu32(ra,rb);
+  const __m512i x=_mm512_xor_si512(w,_mm512_permutexvar_epi32(hi,hf));
+  const __m512i eq=_mm512_and_si512(_mm512_ternarylogic_epi32(x,_mm512_srli_epi32(x,1),_mm512_srli_epi32(x,2),0x01),F); // fields equal to hi
+  const __m512i w2=_mm512_xor_si512(w,_mm512_mullo_epi32(eq,_mm512_xor_si512(hi,lo)));
+  alignas(64) uint32_t O[16];
+  _mm512_store_si512((void*)O,_mm512_xor_si512(w2,ident));
+  {const uint32_t* ix=IX;const uint32_t* op=O;__asm__("":"+r"(ix),"+r"(op)::"memory");
+   for(int i=0;i<16;++i){uint32_t v=op[i];__asm__("":"+r"(v));comp[ix[i]]=v;}}
+ }
+ for(;b<e;++b)lk_union1(comp,*b);
+}
+} // namespace vlk
+#endif
+static_assert(vlk::MASK40==dn::MASK&&vlk::I1==dn::I1&&vlk::I2==dn::I2&&vlk::LK_GEN_ALIAS_BITS==dn::GEN_ALIAS_BITS&&vlk::LK_ALIAS_BITS==dn::ALIAS_BITS&&vlk::LK_IDENT==COMP_IDENT);
+// ==== end of lk8 ====
 // ---- Links stage helpers ----
 // The two IDs of a link line as dense user IDs: da / db say whether each is one (canonical 'u' + base 36,
 // user index below the limit; any alias), ia / ib and aa / ab are their user indexes and aliases.
@@ -1908,18 +2239,19 @@ struct RawCtx{
 // keys), std::sort does it. tmp: room for m keys; cnt: room for CLICK_SORT_BUCKETS + 1 counters.
 static constexpr unsigned CLICK_SORT_BITS=13;static constexpr size_t CLICK_SORT_BUCKETS=size_t(1)<<CLICK_SORT_BITS;
 static const uint32_t clickSortMax=[]{const char* v=getenv("SS_TEST_SORTMAX");return v?(uint32_t)strtoul(v,nullptr,10):16u;}(); // tests: 0 = always std::sort, 1 = on any shared bucket
-[[gnu::noinline]] static void click_key_sort(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){
+// (TS: where the time starts in a key: 32 for "time << 32 | position", 28 for "time << 28 | position << 16 | campaign".)
+template<unsigned TS> static inline __attribute__((always_inline)) void click_key_sort_t(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){
  uint64_t mn=a[0],mx=a[0];
  for(size_t i=1;i<m;++i){mn=min(mn,a[i]);mx=max(mx,a[i]);}
- const uint64_t t0=mn>>32,range=(mx>>32)-t0;
+ const uint64_t t0=mn>>TS,range=(mx>>TS)-t0;
  const unsigned lb=min<unsigned>((unsigned)bit_width(m-1)+1,CLICK_SORT_BITS),rb=(unsigned)bit_width(range),sh=rb>lb?rb-lb:0;
  const size_t B=(size_t)(range>>sh)+1; // buckets in use, at most 1 << lb
  memset(cnt,0,(B+1)*sizeof(uint32_t));
  uint32_t most=0;
- for(size_t i=0;i<m;++i){const uint32_t c=++cnt[(((a[i]>>32)-t0)>>sh)+1];most=max(most,c);}
+ for(size_t i=0;i<m;++i){const uint32_t c=++cnt[(((a[i]>>TS)-t0)>>sh)+1];most=max(most,c);}
  if(__builtin_expect(most>clickSortMax,0)){sort(a,a+m);return;}
  for(size_t b=1;b<B;++b)cnt[b]+=cnt[b-1]; // cnt[b]: where bucket b starts
- for(size_t i=0;i<m;++i){const uint64_t k=a[i];tmp[cnt[((k>>32)-t0)>>sh]++]=k;}
+ for(size_t i=0;i<m;++i){const uint64_t k=a[i];tmp[cnt[((k>>TS)-t0)>>sh]++]=k;}
  a[0]=tmp[0];
  for(size_t i=1;i<m;++i){ // keys only move inside their bucket
   const uint64_t k=tmp[i];size_t j=i;
@@ -1927,6 +2259,8 @@ static const uint32_t clickSortMax=[]{const char* v=getenv("SS_TEST_SORTMAX");re
   a[j]=k;
  }
 }
+[[gnu::noinline]] static void click_key_sort(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){click_key_sort_t<32>(a,m,tmp,cnt);}
+[[gnu::noinline]] static void click_key_sort28(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){click_key_sort_t<28>(a,m,tmp,cnt);}
 // Where one thread puts the session lists of the runs it reads (blocks of its pool) and a run's purchases.
 struct SessArena{uint64_t* cur=nullptr;uint64_t* end=nullptr;vector<uint64_t> pur;};
 // The event sweep of the counters [lo,hi) of an event slot array (stride 1 << evShift bytes, layout ESmall
@@ -1969,18 +2303,21 @@ static inline __attribute__((always_inline)) uint64_t sweep_event_runs(const cha
   for(;;){
    const size_t lim=min(stop,c+cap-2);
    const char* p=(const char*)&ev_at(j);const char* const pe=(const char*)&ev_at(lim);const char* lastp=p;
+   static constexpr uint32_t ALIAS_BIT[8]={1,2,4,8,16,32,64,128}; // (a table: one instruction instead of three for 1 << al)
+   uint64_t* out=blk+ns; // the next free entry (a moving pointer: blk and ns need no register in the loop)
    for(;p<pe;p+=stride){
     const ESmall& r=*(const ESmall*)(const void*)p;const uint64_t k=r.k;
     if(k<PR_KBIAS)continue;
     const uint32_t al=code_of(r)^code; // the alias if the row is this index's
     if(al>7)break;
-    mask|=1u<<al;
+    mask|=ALIAS_BIT[al];
     const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
     disorder|=step; // its top bit: a row before its predecessor
-    blk[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
-    if(__builtin_expect((k&EV_PURCHASE)!=0,0))ar.pur.push_back(((uint64_t)(ns-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
+    *out=(ts<<24)|n;out+=step>(uint64_t)GAP;last=ts;
+    if(__builtin_expect((k&EV_PURCHASE)!=0,0))ar.pur.push_back(((uint64_t)(out-blk-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
     ++n;lastp=p;
    }
+   ns=(size_t)(out-blk);
    j=(size_t)(p-(const char*)&ev_at(0))>>evShift;
    if(n)lastSlot=(size_t)(lastp-(const char*)&ev_at(0))>>evShift;
    if(p<pe)goto run_done; // a valid slot of somebody else
@@ -3256,6 +3593,39 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
 } // namespace vert4
 static_assert(vert4::ESLOT_INVALID_K==ESLOT_INVALID&&vert4::EV_PURCHASE_BIT==EV_PURCHASE&&vert4::RAW_USER==DENSE_USER_RAW&&sizeof(ESlot)==32);
 static_assert(vert4::MASK40==dn::MASK&&vert4::I1==dn::I1&&vert4::I2==dn::I2&&vert4::EV_TS_SHIFT==EV_TS&&vert4::DAYMS==DAY);
+// ---- lanes, events: the scan stage of ev8 version 4 that also yields where the next line of each row starts, so
+// ---- that eight "lanes" can walk eight pieces of a chunk without a line index. /home/claude/vert/lane_ev_paste.h;
+// ---- tested as this exact text by lanes/lane_test.cpp (Ev8Scan == vert4::scan8t_v5<1> byte for byte; nx == memchr).
+// ---- Paste after ev8_paste4.h (it uses vert4::Ev8Scan and VERT_T5). The decode is the unchanged vert4::dec8_v5.
+namespace vlane{
+// s: exactly what vert4::scan8t_v5<1>(ls, s) stores. Result 0: every nx[i] is one past the first '\n' at or after
+// ls[i] (the rule of the line index: every '\n' ends a line, quoted or not). Result not 0 (0xFF): no nx[i] may be
+// used and the caller finds the eight newlines itself (memchr from ls[i]). The result is 0 only if, for all eight
+// rows, window 1 (ls[i] .. +63) holds no '\n', its third comma exists (so window 2 starts at b <= ls[i]+64 and
+// [ls[i], b) lies inside window 1) and window 2 (b .. b+63) holds a '\n': then the first '\n' of window 2 is the first
+// one of the line. Reads the bytes scan8t_v5 reads (64 at ls[i], 64 at b <= ls[i]+65), nothing else.
+// e2 = tzcnt of "commas after the second" (64: no third comma), e3 = tzcnt of window 2's newlines (64: none): bit 6
+// of the OR of all of them says that some row lacks one of the two; kx collects the newlines of the first windows.
+#define VLANE_EV_ROW(i) {const char* const p=ls[i]; \
+  const __m512i x=_mm512_loadu_si512((const void*)p); \
+  const uint64_t cm=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc)); \
+  s.c1[i]=cm;s.q1[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq)); \
+  _mm_storeu_si128((__m128i*)&s.h[2*(i)],_mm512_castsi512_si128(x)); \
+  kx=_kor_mask64(kx,_mm512_cmpeq_epi8_mask(x,vn)); \
+  const uint64_t e2=_tzcnt_u64(_blsr_u64(_blsr_u64(cm))); \
+  const char* const b=p+e2+1; /* one past the third comma (p+65 if there is none) */ \
+  const __m512i y=_mm512_loadu_si512((const void*)b); \
+  s.c2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc));s.q2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));s.b[i]=(uint64_t)b; \
+  const uint64_t e3=_tzcnt_u64(_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vn))); \
+  nx[i]=b+e3+1;acc|=e2|e3;__asm__("":"+r"(acc));} /* (the empty asm keeps the OR here: otherwise the compiler holds all sixteen counts in registers to the end) */
+VERT_T5 static inline unsigned lscan8_v5(const char* const* ls,const char** nx,vert4::Ev8Scan& s){
+ const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"'),vn=_mm512_set1_epi8('\n');
+ __mmask64 kx=_cvtu64_mask64(0);uint64_t acc=0;
+ VLANE_EV_ROW(0) VLANE_EV_ROW(1) VLANE_EV_ROW(2) VLANE_EV_ROW(3) VLANE_EV_ROW(4) VLANE_EV_ROW(5) VLANE_EV_ROW(6) VLANE_EV_ROW(7)
+ return ((acc>>6)|(uint64_t)(_cvtmask64_u64(kx)!=0))!=0?0xFFu:0u;
+}
+#undef VLANE_EV_ROW
+} // namespace vlane
 // The scalar kernel in the two-step shape of the vector one (nothing to scan), as a call of its own: the avx2
 // loop, a test stand-in only (also what callgrind and the sanitizer runs see).
 static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
@@ -3294,6 +3664,13 @@ static inline vert4::EvConst ev8_const4(uint64_t ke,uint64_t limE,int64_t wstart
 // always the scan of exactly its lines.
 static constexpr size_t EV8_BLOCK=4096; // bytes indexed at a time
 #define SS_EV8_PF(O_,i_) __builtin_prefetch(&SS_EV8_SLOT(O_,i_),1,3);
+// SS_PF picks the instruction of the slot requests of the ev8 and cl8 loops, for measuring on the scoring machine:
+// default PREFETCHT0 (what __builtin_prefetch(p,1,3) gives without the prfchw target); w = PREFETCHW (line asked
+// for in exclusive state; opt-in, no CPU test: every x86-64 CPU with AVX-512 has it); t1 = PREFETCHT1 (into the
+// second-level cache only); none = no request at all. Same output for all.
+static unsigned optPfw=0; // 0 default, 1 w, 2 t1, 3 none
+#define SS_PFW_ASM(p_) {if(pfw_==1)__asm__ volatile("prefetchw %0"::"m"(*(const char*)(p_)));else if(pfw_==2)__asm__ volatile("prefetcht1 %0"::"m"(*(const char*)(p_)));}
+#define SS_EV8_PFW(O_,i_) SS_PFW_ASM(&SS_EV8_SLOT(O_,i_))
 // NAME_slow: a row the kernel did not decide goes through the line code, kept out of the loop so that the loop
 // stays small (`have` = the kernel's counter, or NOPRE = no claim: then the line's ID is decoded here).
 #define SS_EVENT_LOOP_EV8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC,VNS,ECONST) \
@@ -3304,23 +3681,23 @@ template<class GEN> TARGET [[gnu::noinline]] static void NAME##_slow(const char*
  const WinMasks w1=MASKS(q);const char* const bb=event_window2(q,w1.c); \
  event_line_v3<true,true>(q,bb,w1,MASKS(bb),nl,pre,lp,pend,pp,dmax,send,(ERing*)nullptr,rpos,general); \
 } \
-template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+template<unsigned LEAD,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  const char* const end=base+len; \
  const EvLoop lp(tl,tab,products,PE,end);uint32_t dmax=0;uint32_t send=0; \
  const char* ls[EV8_BLOCK+64+64];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
- const VNS::EvConst ec=ECONST(lp); \
- VNS::Ev8Out out[2];VNS::Ev8Scan sc[2];const char* tls[8];const char* tnx[8]; \
- const char* const* lN=ls;const char* const* xN=ls;const char* const* lD=ls;const char* const* xD=ls;const char* const* lF=ls;const char* const* xF=ls; /* lines and next lines of N, D, F */ \
- unsigned nD=0,nF=0;VNS::Ev8Scan* sN=&sc[0];VNS::Ev8Scan* sD=&sc[1];VNS::Ev8Out* oD=&out[0];VNS::Ev8Out* oF=&out[1];bool more=true; /* rows of D and F; N's and D's scan; D's and F's results */ \
+ const VNS::EvConst ec=ECONST(lp);const unsigned pfw_=optPfw; \
+ VNS::Ev8Out out[3];VNS::Ev8Scan sc[2];const char* tls[8];const char* tnx[8]; \
+ const char* const* lN=ls;const char* const* xN=ls;const char* const* lD=ls;const char* const* xD=ls;const char* const* lW=ls;const char* const* xW=ls;const char* const* lF=ls;const char* const* xF=ls; /* lines and next lines of N, D, W, F */ \
+ unsigned nD=0,nW=0,nF=0;VNS::Ev8Scan* sN=&sc[0];VNS::Ev8Scan* sD=&sc[1];VNS::Ev8Out* oD=&out[0];VNS::Ev8Out* oW=&out[2];VNS::Ev8Out* oF=&out[1];bool more=true; /* rows of D, W and F; N's and D's scan; D's, W's and F's results. W (LEAD 2 only): a decoded group that waits one more turn */ \
  __m256i vmx=_mm256_setzero_si256();bool fastAny=false;uint64_t rows=0; \
- while(more||nD||nF){ \
+ while(more||nD||nW||nF){ \
   unsigned n=0; \
   if(more){ \
    if(pos+8>m){ /* fewer than eight whole lines known: what is still needed moves to the front and the index goes on */ \
-    const size_t s_=pos-(nD?8:0)-(nF?8:0); \
+    const size_t s_=pos-(nD?8:0)-(nW?8:0)-(nF?8:0); \
     if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_; \
-     if(nD){lD-=s_;xD-=s_;} if(nF){lF-=s_;xF-=s_;}} \
+     if(nD){lD-=s_;xD-=s_;} if(nW){lW-=s_;xW-=s_;} if(nF){lF-=s_;xF-=s_;}} \
     while(m-pos<8&&scan<end&&ls[m]<lim){ \
      const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
      const char** w_=ls+m; /* the first newline of a window is stored without a branch (no newline: a value past the last entry, never read); a second one is rare */ \
@@ -3341,12 +3718,16 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
   if(nD){ \
    VNS::Ev8Out& o_=*oD; \
    DEC(lD,xD,*sD,ec,o_); \
-   if(__builtin_expect((nD==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
+   if(__builtin_expect(pfw_,0)){for(unsigned x_=o_.idok&((1u<<nD)-1);x_;x_&=x_-1)SS_EV8_PFW(o_,__builtin_ctz(x_))} \
+   else if(__builtin_expect((nD==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
    else for(unsigned x_=o_.idok&((1u<<nD)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
   } \
   if(nF)SS_EV8_FINISH(*oF,lF,xF,nF,NAME##_slow) \
-  lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=n; /* D becomes F, N becomes D */ \
-  {VNS::Ev8Scan* const t_=sN;sN=sD;sD=t_;VNS::Ev8Out* const u_=oD;oD=oF;oF=u_;} \
+  if(LEAD==2){lF=lW;xF=xW;nF=nW;lW=lD;xW=xD;nW=nD;lD=lN;xD=xN;nD=n; /* W becomes F, D becomes W, N becomes D */ \
+   VNS::Ev8Out* const u_=oF;oF=oW;oW=oD;oD=u_;} \
+  else{lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=n; /* D becomes F, N becomes D */ \
+   VNS::Ev8Out* const u_=oD;oD=oF;oF=u_;} \
+  {VNS::Ev8Scan* const t_=sN;sN=sD;sD=t_;} \
  } \
  if(pos==m&&ls[m]<lim)line_general<7>(ls[m],end,general); /* the last line has no newline */ \
  if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
@@ -3359,6 +3740,116 @@ SS_EVENT_LOOP_EV8(events_avx512y_e8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert
 SS_EVENT_LOOP_EV8(events_avx2_e8v3,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_scan_none,ev8_dec_ref,vert,SS_EV8_CONST3)
 SS_EVENT_LOOP_EV8(events_avx512z_e8v3,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::scan8_v5,vert::dec8_v5,vert,SS_EV8_CONST3)
 SS_EVENT_LOOP_EV8(events_avx512y_e8v3,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert::scan8_v5,vert::dec8_v5,vert,SS_EV8_CONST3)
+// ---- lanes: the ev8 loop without a line index (SS_LANES=0 keeps the loop above) ----
+// The lines of a chunk are cut into eight pieces at line starts (lane_cut: seven memchr calls) and lane i walks piece
+// i: the start of its next line is one past the newline of its current one, and that newline is found by the scan
+// stage on the bytes it loads anyway (vlane::lscan8_v5 = the text of vert4::scan8t_v5<1> + two newline compares).
+// A line end the scan cannot give for certain (line shorter than 64 bytes, no third comma in the first 64 bytes,
+// newline beyond the second window) is searched with memchr from the line start (lane_fix), so the kernel is always
+// handed a true (line start, next line start) pair, as from the index: "the first '\n' at or after the start ends the
+// line", quoted or not. It then accepts or refuses the row exactly as in the loop above.
+// Group g: line starts A[g&3], next starts A[(g+1)&3] = the line starts of group g+1. A lane that has reached the end
+// of its piece stays where it is and its rows are masked (the masks nN / nD / nF name the rows that are lines of this
+// chunk); the kernel still reads the bytes there (inside the file or its zero padding: at most `end`) but nothing of
+// such a row is used. The last line of a file without a newline goes to line_general after the loop, as above.
+// Rows are finished in lane order, not file order: nothing in the dense-record loops depends on the order (slots keep
+// the smallest ingest_ts, send / dmax are maxima, the line code has no state across lines but the date memo).
+// Every full group asks for the cache lines lanePf and lanePf2 bytes ahead of each lane's next line (SS_LANES_PF=n,
+// SS_LANES_PF2=n; 0 = that one off). Without them the lanes lose to the index loops: eight streams per thread are not
+// covered by the hardware prefetchers, and a miss in a lane's scan load holds up the whole group, where the index
+// pass ran through 4 KB at a time with many loads under way (parse-only CPU time of one thread on 3.2M events + 0.8M
+// clicks, this box: index loops 178 ms, lanes without prefetch 233, one prefetch 512 or 1024 ahead 151, two 138).
+// Two per lane because an event line (77 bytes) is more than one cache line per group.
+// Click lines (about 48 bytes) are less than a cache line per group: the click loop asks for the first one only.
+// The first lanePf bytes of each lane of a chunk are asked for when the chunk is cut (lane_cut).
+static unsigned lanePf=1024,lanePf2=1088;
+#define SS_LANE_PF1(X_) if(__builtin_expect(lanePf!=0,1)){const unsigned d_=lanePf;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+d_,0,3);}
+#define SS_LANE_PF(X_) if(__builtin_expect(lanePf!=0,1)){const unsigned d_=lanePf;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+d_,0,3); \
+  if(lanePf2){const unsigned e_=lanePf2;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+e_,0,3);}}
+static inline void lane_cut(const char* p,const char* lim,const char* end,const char** c){
+ const size_t step=(size_t)(lim-p)/8;c[0]=p;c[8]=lim;
+ for(unsigned i=1;i<8;++i){
+  const char* const t=p+step*i; // the first line start at or after t is one past the first newline at or after t-1 (p-1 is a newline)
+  const char* const nl=(const char*)memchr(t-1,'\n',(size_t)(end-(t-1)));
+  c[i]=nl&&nl+1<lim?nl+1:lim;}
+ if(const unsigned d=lanePf)for(unsigned i=0;i<8;++i)if(c[i]<c[i+1])for(unsigned o=0;o<d;o+=64)__builtin_prefetch(c[i]+o,0,3);
+}
+// Rows whose line end the scan did not give (bits of unc): x[i] = one past the first newline from l[i]. A line
+// without one (the last line of the file): returned as a bit, `tail` = the line, the lane goes to the end.
+[[gnu::noinline]] static unsigned lane_fix(const char* const* l,const char** x,unsigned unc,const char* end,const char*& tail,uint64_t& looked){
+ unsigned gone=0;looked+=(unsigned)__builtin_popcount(unc);
+ for(;unc;unc&=unc-1){const unsigned i=(unsigned)__builtin_ctz(unc);
+  const char* const nl=(const char*)memchr(l[i],'\n',(size_t)(end-l[i]));
+  if(nl)x[i]=nl+1;else{tail=l[i];x[i]=end;gone|=1u<<i;}}
+ return gone;
+}
+// Which lanes still have a line (position below the end of the piece).
+static inline unsigned lane_live_scalar(const char* const* l,const char* const* e){unsigned m=0;for(unsigned i=0;i<8;++i)m|=(unsigned)(l[i]<e[i])<<i;return m;}
+// (The mask goes through a 16-bit mask move and an explicit AND: g++ 12 otherwise stores the 8-bit mask as one byte
+// and reads the slot back as 32 bits.)
+SS_V5I unsigned lane_live_avx512(const char* const* l,const char* const* e){
+ const __mmask16 k=(__mmask16)_mm512_cmplt_epu64_mask(_mm512_load_si512((const void*)l),_mm512_load_si512((const void*)e));
+ return (unsigned)_cvtmask16_u32(k)&0xFFu;}
+// The lane scans of the avx2 instances (test stand-ins as the scalar kernels are): the same rule from win_masks_avx2.
+SS_V3 [[gnu::noinline]] static unsigned lane_scan_ev_avx2(const char* const* ls,const char** nx,vert4::Ev8Scan&){
+ unsigned unc=0;
+ for(unsigned i=0;i<8;++i){const char* const p=ls[i];const WinMasks w1=win_masks_avx2(p);const uint64_t t=_blsr_u64(_blsr_u64(w1.c));
+  const char* const b=p+_tzcnt_u64(t)+1;const WinMasks w2=win_masks_avx2(b);nx[i]=b+_tzcnt_u64(w2.n)+1;
+  if(w1.n!=0||t==0||w2.n==0)unc|=1u<<i;}
+ return unc;
+}
+// Finishing the rows M (a mask) of a group; otherwise SS_EV8_FINISH.
+#define SS_EV8L_FINISH(O,LS,NX,M,SLOW) {auto& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned m_=(M); \
+  const unsigned ok_=O_.ok&m_; \
+  for(unsigned p_=O_.pur&ok_;p_;p_&=p_-1){const unsigned i_=(unsigned)__builtin_ctz(p_); \
+   const uint32_t ci_=products.find(string_view(O_.s5[i_],(size_t)O_.l5[i_]));O_.uct[i_]|=(uint64_t)(ci_==KeyTable::NONE?0u:(unsigned)(uint16_t)ci_)<<32;} \
+  if(__builtin_expect(ok_==0xFFu,1)){rows+=8; \
+   vmx=_mm256_max_epu32(vmx,_mm256_max_epu32(_mm256_load_si256((const __m256i*)&O_.ve[0]),_mm256_load_si256((const __m256i*)&O_.ve[4])));fastAny=true; \
+   SS_EV8_COMMIT(O_,0) SS_EV8_COMMIT(O_,1) SS_EV8_COMMIT(O_,2) SS_EV8_COMMIT(O_,3) SS_EV8_COMMIT(O_,4) SS_EV8_COMMIT(O_,5) SS_EV8_COMMIT(O_,6) SS_EV8_COMMIT(O_,7) \
+  }else{rows+=(unsigned)__builtin_popcount(m_); \
+   for(unsigned r_=m_;r_;r_&=r_-1){const unsigned i_=(unsigned)__builtin_ctz(r_); \
+    if((ok_>>i_)&1){send=max(send,(uint32_t)O_.ve[i_]+1);SS_EV8_COMMIT(O_,i_)} \
+    else SLOW(L_[i_],X_[i_]-1,((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:NOPRE,lp,dmax,send,general);}} }
+#define SS_EVENT_LOOP_EV8L(NAME,TARGET,LSCAN,LIVE,DEC,VNS,ECONST,SLOW) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ if(p>=lim)return; \
+ const char* const end=base+len; \
+ const EvLoop lp(tl,tab,products,PE,end);uint32_t dmax=0;uint32_t send=0; \
+ const VNS::EvConst ec=ECONST(lp); \
+ VNS::Ev8Out out[2];VNS::Ev8Scan sc[2]; \
+ alignas(64) const char* A[4][8];alignas(64) const char* le[8];const char* tail=nullptr; \
+ {const char* cut_[9];lane_cut(p,lim,end,cut_);for(unsigned i_=0;i_<8;++i_){A[0][i_]=cut_[i_];le[i_]=cut_[i_+1];}} \
+ const char* const* lD=A[0];const char* const* xD=A[0];const char* const* lF=A[0];const char* const* xF=A[0]; /* lines and next lines of D, F */ \
+ unsigned g=0,nD=0,nF=0;VNS::Ev8Scan* sN=&sc[0];VNS::Ev8Scan* sD=&sc[1];VNS::Ev8Out* oD=&out[0];VNS::Ev8Out* oF=&out[1];bool more=true; /* row masks of D and F; N's and D's scan; D's and F's results */ \
+ __m256i vmx=_mm256_setzero_si256();bool fastAny=false;uint64_t rows=0,shortG=0,fixed=0; \
+ do{ \
+  unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
+  if(more){ \
+   const unsigned live_=LIVE(lN,le); \
+   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF(xN)} \
+   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail,fixed); \
+    for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
+   else more=false; \
+  } \
+  if(nD){ \
+   VNS::Ev8Out& o_=*oD; \
+   DEC(lD,xD,*sD,ec,o_); \
+   if(__builtin_expect((nD==0xFFu)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&nD;x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
+  } \
+  if(nF)SS_EV8L_FINISH(*oF,lF,xF,nF,SLOW) \
+  lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=nN;++g; /* D becomes F, N becomes D */ \
+  {VNS::Ev8Scan* const t_=sN;sN=sD;sD=t_;VNS::Ev8Out* const u_=oD;oD=oF;oF=u_;} \
+ }while(more||nD||nF); \
+ if(tail)line_general<7>(tail,end,general); /* the last line has no newline */ \
+ if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send);tl.ev8Rows+=rows;tl.laneShort+=shortG;tl.laneFixE+=fixed; \
+}
+// _e8l = the lane form of _e8 (kernel version 4 only). The avx2 instance is the test stand-in (scalar kernel).
+SS_EVENT_LOOP_EV8L(events_avx2_e8l,SS_V3,lane_scan_ev_avx2,lane_live_scalar,ev8_dec_ref4,vert4,SS_EV8_CONST4,events_avx2_e8_slow)
+SS_EVENT_LOOP_EV8L(events_avx512z_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,vert4::dec8_v5,vert4,SS_EV8_CONST4,events_avx512z_e8_slow)
+SS_EVENT_LOOP_EV8L(events_avx512y_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,vert4::dec8_v5,vert4,SS_EV8_CONST4,events_avx512y_e8_slow)
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
@@ -4391,6 +4882,26 @@ static_assert(offsetof(Cl8Out,kend)==offsetof(Cl8Out,umax)+4);
 } // namespace vcl2
 static_assert(vcl2::MASK40==dn::MASK&&vcl2::I1==dn::I1&&vcl2::I2==dn::I2&&vcl2::DAYMS==DAY);
 static_assert(vcl2::CL_GEN_ALIAS_BITS==dn::GEN_ALIAS_BITS&&vcl2::CL_ALIAS_BITS==dn::ALIAS_BITS&&vcl2::DENSE_USER_BIT==DENSE_USER&&sizeof(CSlot)==(1u<<vcl2::CSLOT_SHIFT));
+// ---- lanes, clicks: the scan stage of cl8 (versions 1 and 2 share it) that also yields where the next line of each
+// ---- row starts. /home/claude/vert/lane_cl_paste.h; tested as this exact text by lanes/lane_test.cpp
+// ---- (Cl8Scan == vcl2::cscan8_v5 byte for byte; nx == memchr). Paste after cl8_paste2.h. Decode: unchanged vcl2::cdec8_v5.
+namespace vlane{
+// s: exactly what vcl2::cscan8_v5(ls, s) stores. Result 0: every nx[i] is one past the first '\n' at or after ls[i].
+// Result not 0 (0xFF; some row has no '\n' in the 64 bytes at ls[i]): no nx[i] may be used, the caller finds the
+// eight newlines itself. (acc: OR of the eight tzcnt results, 64 = no newline.)
+#define VLANE_CL_ROW(i) {const char* const p=ls[i]; \
+  const __m512i x=_mm512_loadu_si512((const void*)p); \
+  s.c[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));s.q[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq)); \
+  const uint64_t e=_tzcnt_u64(_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vn))); \
+  nx[i]=p+e+1;acc|=e;__asm__("":"+r"(acc));}
+VERT_T5 static inline unsigned clscan8_v5(const char* const* ls,const char** nx,vcl2::Cl8Scan& s){
+ const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"'),vn=_mm512_set1_epi8('\n');
+ uint64_t acc=0;
+ VLANE_CL_ROW(0) VLANE_CL_ROW(1) VLANE_CL_ROW(2) VLANE_CL_ROW(3) VLANE_CL_ROW(4) VLANE_CL_ROW(5) VLANE_CL_ROW(6) VLANE_CL_ROW(7)
+ return (acc>>6)!=0?0xFFu:0u;
+}
+#undef VLANE_CL_ROW
+} // namespace vlane
 static inline void cl8_scan_none(const char* const*,vcl::Cl8Scan&){}
 [[gnu::noinline]] static void cl8_dec_ref(const char* const* ls,const char* const* nx,const vcl::Cl8Scan&,const vcl::ClConst& c,vcl::Cl8Out& o){vcl::cl8_ref(ls,nx,c,o);}
 static inline void cl8_scan_none2(const char* const*,vcl2::Cl8Scan&){}
@@ -4417,28 +4928,29 @@ static inline vcl2::ClConst cl8_const2(uint64_t kc,uint64_t limC,uint64_t ku,uin
   if(__builtin_expect(found_==ok_,1)){dmax=max(dmax,O_.umax);send=max(send,O_.kend);} \
   else for(unsigned x_=found_;x_;x_&=x_-1){const unsigned i_=(unsigned)__builtin_ctz(x_);dmax=max(dmax,(uint32_t)O_.user[i_]);send=max(send,(uint32_t)O_.kcn[i_]+1);} }
 #define SS_CL8_PF(O_,i_) __builtin_prefetch(&SS_CL8_SLOT(O_,i_),1,3);
+#define SS_CL8_PFW(O_,i_) SS_PFW_ASM(&SS_CL8_SLOT(O_,i_))
 // The line index and the three groups under way (N scanned, D decoded and its slots asked for, F finished) are those
 // of SS_EVENT_LOOP_EV8; see there. A short last group is filled up with the pointer behind its last line (a row with
 // nx == ls is never ok, drop or idok; the row masks cut it off as well).
 #define SS_CLICK_LOOP_CL8(NAME,TARGET,MASKS,NLMASK,SCAN,DEC,VNS,CCONST) \
-template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
+template<unsigned LEAD,class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
- const char* const end=base+len; \
+ const char* const end=base+len;const unsigned pfw_=optPfw; \
  ClLoop lp_(tl,tab,camps,PC,end,clickStart);lp_.ahead=0;const ClLoop& lp=lp_; /* no ring: a slow row writes its slot at the end of its line, a group after the kernel asked for it */ \
  PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CRing* const ring=nullptr;unsigned rpos=0;uint64_t rows=0,slow=0; \
  const char* ls[EV8_BLOCK+64+64];size_t pos=0,m=0;ls[0]=p;const char* scan=p; \
  const VNS::ClConst cc=CCONST(lp); \
- VNS::Cl8Out out[2];VNS::Cl8Scan sc[2];const char* tls[9]; \
- const char* const* gl[3]={ls,ls,ls};unsigned gn[3]={0,0,0}; /* lines (the next line of row i is [i+1]) and number of rows of N, D, F */ \
- unsigned iN=0,iD=1,iF=2,sN=0,oD=0;bool more=true; /* sc[sN]: N's scan, sc[sN^1]: D's; out[oD]: D's results, out[oD^1]: F's */ \
- while(more||gn[iD]||gn[iF]){ \
+ VNS::Cl8Out out[4];VNS::Cl8Scan sc[2];const char* tls[9]; \
+ const char* const* gl[4]={ls,ls,ls,ls};unsigned gn[4]={0,0,0,0}; /* group g lives in slot g&3: its lines (the next line of row i is [i+1]), its number of rows, its results */ \
+ unsigned t_=0,live=0;bool more=true; /* turn t_: group t_ is formed and scanned (N, sc[t_&1]), group t_-1 decoded and its slots asked for (D), group t_-1-LEAD finished (F); live = groups formed and not finished */ \
+ while(more||live){ \
+  const unsigned iN=t_&3,iD=(t_-1)&3,iF=(t_-1-LEAD)&3,sN=t_&1; \
   unsigned n=0; \
   if(more){ \
    if(pos+8>m){ /* fewer than eight whole lines known: what is still needed moves to the front and the index goes on */ \
-    const size_t s_=pos-(gn[iD]?8:0)-(gn[iF]?8:0); \
+    size_t s_=pos;for(unsigned j_=1;j_<=LEAD+1;++j_)s_-=gn[(t_-j_)&3]?8:0; /* the groups under way keep their eight starts each right before ls[pos] */ \
     if(s_){for(size_t i_=0;i_<=m-s_;i_+=4)_mm256_storeu_si256((__m256i*)(ls+i_),_mm256_loadu_si256((const __m256i*)(ls+s_+i_)));pos-=s_;m-=s_; \
-     if(gn[iD]){gl[iD]-=s_;} \
-     if(gn[iF]){gl[iF]-=s_;}} \
+     for(unsigned j_=1;j_<=LEAD+1;++j_)if(gn[(t_-j_)&3])gl[(t_-j_)&3]-=s_;} \
     while(m-pos<8&&scan<end&&ls[m]<lim){ \
      const char* const stop=(size_t)(end-scan)>EV8_BLOCK?scan+EV8_BLOCK:end; \
      const char** w_=ls+m; /* the first two newlines of a window are stored without a branch (click lines are shorter than a window: one or two per window; a missing one stores a value past the last entry, never read); a third one is rare */ \
@@ -4456,15 +4968,16 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
    pos+=n;rows+=n; \
    if(n)SCAN(gl[iN],sc[sN]); \
   } \
-  gn[iN]=n; \
+  gn[iN]=n;live+=(n!=0); \
   if(gn[iD]){ \
-   VNS::Cl8Out& o_=out[oD];const unsigned nd_=gn[iD]; \
+   VNS::Cl8Out& o_=out[iD];const unsigned nd_=gn[iD]; \
    DEC(gl[iD],gl[iD]+1,sc[sN^1],cc,o_); \
-   if(__builtin_expect((nd_==8)&(o_.idok==0xFFu),1)){SS_CL8_PF(o_,0) SS_CL8_PF(o_,1) SS_CL8_PF(o_,2) SS_CL8_PF(o_,3) SS_CL8_PF(o_,4) SS_CL8_PF(o_,5) SS_CL8_PF(o_,6) SS_CL8_PF(o_,7)} \
+   if(__builtin_expect(pfw_,0)){for(unsigned x_=o_.idok&((1u<<nd_)-1);x_;x_&=x_-1)SS_CL8_PFW(o_,__builtin_ctz(x_))} \
+   else if(__builtin_expect((nd_==8)&(o_.idok==0xFFu),1)){SS_CL8_PF(o_,0) SS_CL8_PF(o_,1) SS_CL8_PF(o_,2) SS_CL8_PF(o_,3) SS_CL8_PF(o_,4) SS_CL8_PF(o_,5) SS_CL8_PF(o_,6) SS_CL8_PF(o_,7)} \
    else for(unsigned x_=o_.idok&((1u<<nd_)-1);x_;x_&=x_-1)SS_CL8_PF(o_,__builtin_ctz(x_)) \
   } \
-  if(gn[iF])SS_CL8_FINISH(out[oD^1],gl[iF],gl[iF]+1,gn[iF],MASKS) \
-  {const unsigned t_=iF;iF=iD;iD=iN;iN=t_;sN^=1;oD^=1;} \
+  if(gn[iF]){SS_CL8_FINISH(out[iF],gl[iF],gl[iF]+1,gn[iF],MASKS) --live;} \
+  ++t_; \
  } \
  if(pos==m&&ls[m]<lim)line_general<4>(ls[m],end,general); /* the last line has no newline */ \
  tl.denseMax=max(tl.denseMax,dmax);tl.clEnd=max(tl.clEnd,send);tl.cl8Rows+=rows;tl.cl8Slow+=slow; \
@@ -4476,6 +4989,63 @@ SS_CLICK_LOOP_CL8(clicks_avx512y_c8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vcl2
 SS_CLICK_LOOP_CL8(clicks_avx2_c8v1,SS_V3,win_masks_avx2,nl_mask_avx2,cl8_scan_none,cl8_dec_ref,vcl,SS_CL8_CONST1)
 SS_CLICK_LOOP_CL8(clicks_avx512z_c8v1,SS_V5,win_masks_avx512z,nl_mask_avx512z,vcl::cscan8_v5,vcl::cdec8_v5,vcl,SS_CL8_CONST1)
 SS_CLICK_LOOP_CL8(clicks_avx512y_c8v1,SS_V5,win_masks_avx512y,nl_mask_avx512y,vcl::cscan8_v5,vcl::cdec8_v5,vcl,SS_CL8_CONST1)
+// ---- lanes: the cl8 click loop without a line index (see "lanes" at the ev8 loop; SS_LANES=0 keeps the loop above) ----
+// The lane scan is vlane::clscan8_v5 (the text of cscan8_v5 + one newline compare on the window it loads): a click
+// line of up to 63 bytes has its newline there, a longer one goes through memchr (lane_fix). The group maxima are
+// used only if every row the kernel calls ok is a row of this chunk and was committed.
+SS_V3 [[gnu::noinline]] static unsigned lane_scan_cl_avx2(const char* const* ls,const char** nx,vcl2::Cl8Scan&){
+ unsigned unc=0;
+ for(unsigned i=0;i<8;++i){const char* const p=ls[i];const uint64_t n=nl_mask_avx2(p);nx[i]=p+_tzcnt_u64(n)+1;if(n==0)unc|=1u<<i;}
+ return unc;
+}
+#define SS_CL8L_FINISH(O,LS,NX,M,MASKS) {const auto& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned m_=(M); \
+  const unsigned ok_=O_.ok&m_;unsigned found_=0; \
+  if(__builtin_expect(ok_==0xFFu,1)){rows+=8;SS_CL8_ROW(O_,0) SS_CL8_ROW(O_,1) SS_CL8_ROW(O_,2) SS_CL8_ROW(O_,3) SS_CL8_ROW(O_,4) SS_CL8_ROW(O_,5) SS_CL8_ROW(O_,6) SS_CL8_ROW(O_,7)} \
+  else{rows+=(unsigned)__builtin_popcount(m_); \
+   for(unsigned r_=m_;r_;r_&=r_-1){const unsigned i_=(unsigned)__builtin_ctz(r_); \
+    if((ok_>>i_)&1)SS_CL8_ROW(O_,i_) \
+    else if(!((O_.drop>>i_)&1)){const char* const q_=L_[i_];++slow;click_line_v3<true>(q_,MASKS(q_),X_[i_]-1,lp,pend,pp,dmax,send,ring,rpos,general);}}} \
+  if(__builtin_expect(found_==(unsigned)O_.ok,1)){dmax=max(dmax,O_.umax);send=max(send,O_.kend);} \
+  else for(unsigned x_=found_;x_;x_&=x_-1){const unsigned i_=(unsigned)__builtin_ctz(x_);dmax=max(dmax,(uint32_t)O_.user[i_]);send=max(send,(uint32_t)O_.kcn[i_]+1);} }
+#define SS_CLICK_LOOP_CL8L(NAME,TARGET,MASKS,LSCAN,LIVE,DEC,VNS,CCONST) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ if(p>=lim)return; \
+ const char* const end=base+len; \
+ ClLoop lp_(tl,tab,camps,PC,end,clickStart);lp_.ahead=0;const ClLoop& lp=lp_; /* no ring: a slow row writes its slot at the end of its line, a group after the kernel asked for it */ \
+ PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CRing* const ring=nullptr;unsigned rpos=0;uint64_t rows=0,slow=0,shortG=0,fixed=0; \
+ const VNS::ClConst cc=CCONST(lp); \
+ VNS::Cl8Out out[2];VNS::Cl8Scan sc[2]; \
+ alignas(64) const char* A[4][8];alignas(64) const char* le[8];const char* tail=nullptr; \
+ {const char* cut_[9];lane_cut(p,lim,end,cut_);for(unsigned i_=0;i_<8;++i_){A[0][i_]=cut_[i_];le[i_]=cut_[i_+1];}} \
+ const char* const* lD=A[0];const char* const* xD=A[0];const char* const* lF=A[0];const char* const* xF=A[0]; \
+ unsigned g=0,nD=0,nF=0;VNS::Cl8Scan* sN=&sc[0];VNS::Cl8Scan* sD=&sc[1];VNS::Cl8Out* oD=&out[0];VNS::Cl8Out* oF=&out[1];bool more=true; \
+ do{ \
+  unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
+  if(more){ \
+   const unsigned live_=LIVE(lN,le); \
+   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF1(xN)} \
+   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail,fixed); \
+    for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
+   else more=false; \
+  } \
+  if(nD){ \
+   VNS::Cl8Out& o_=*oD; \
+   DEC(lD,xD,*sD,cc,o_); \
+   if(__builtin_expect((nD==0xFFu)&(o_.idok==0xFFu),1)){SS_CL8_PF(o_,0) SS_CL8_PF(o_,1) SS_CL8_PF(o_,2) SS_CL8_PF(o_,3) SS_CL8_PF(o_,4) SS_CL8_PF(o_,5) SS_CL8_PF(o_,6) SS_CL8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&nD;x_;x_&=x_-1)SS_CL8_PF(o_,__builtin_ctz(x_)) \
+  } \
+  if(nF)SS_CL8L_FINISH(*oF,lF,xF,nF,MASKS) \
+  lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=nN;++g; \
+  {VNS::Cl8Scan* const t_=sN;sN=sD;sD=t_;VNS::Cl8Out* const u_=oD;oD=oF;oF=u_;} \
+ }while(more||nD||nF); \
+ if(tail)line_general<4>(tail,end,general); /* the last line has no newline */ \
+ tl.denseMax=max(tl.denseMax,dmax);tl.clEnd=max(tl.clEnd,send);tl.cl8Rows+=rows;tl.cl8Slow+=slow;tl.laneShort+=shortG;tl.laneFixC+=fixed; \
+}
+// _c8l = the lane form of _c8 (kernel version 2 only). The avx2 instance is the test stand-in (scalar kernel).
+SS_CLICK_LOOP_CL8L(clicks_avx2_c8l,SS_V3,win_masks_avx2,lane_scan_cl_avx2,lane_live_scalar,cl8_dec_ref2,vcl2,SS_CL8_CONST2)
+SS_CLICK_LOOP_CL8L(clicks_avx512z_c8l,SS_V5,win_masks_avx512z,vlane::clscan8_v5,lane_live_avx512,vcl2::cdec8_v5,vcl2,SS_CL8_CONST2)
+SS_CLICK_LOOP_CL8L(clicks_avx512y_c8l,SS_V5,win_masks_avx512y,vlane::clscan8_v5,lane_live_avx512,vcl2::cdec8_v5,vcl2,SS_CL8_CONST2)
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  // With SS_STATS=1 every TIME line is followed by a CPU line: processor time (all threads, user+system) of that stage.
@@ -4484,23 +5054,66 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  double __cpu0=__cpu_now();
  // ... and by a SYS line (system CPU of the whole process in that stage, seconds) and a FLT line (minor page faults).
  // SYS/FLT EXITPREP at the very end cover what runs after the last mark.
- auto __ru_now=[](double& sys,long& flt){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;};
- double __sys0=0;long __flt0=0;if(__cpuLines)__ru_now(__sys0,__flt0);
- auto __sysflt=[&](const char* label){double s;long f;__ru_now(s,f);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\n";__sys0=s;__flt0=f;};
+ // ... and a CSW line: context switches of the whole process in the stage, voluntary (a thread went to sleep: futex,
+ // lock or I/O wait) and involuntary (a thread was taken off its processor).
+ auto __ru_now=[](double& sys,long& flt,long& vol,long& invol){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;vol=r.ru_nvcsw;invol=r.ru_nivcsw;};
+ double __sys0=0;long __flt0=0,__vol0=0,__inv0=0;if(__cpuLines)__ru_now(__sys0,__flt0,__vol0,__inv0);
+ auto __sysflt=[&](const char* label){double s;long f,v,iv;__ru_now(s,f,v,iv);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\nCSW "<<label<<" "<<v-__vol0<<" "<<iv-__inv0<<"\n";__sys0=s;__flt0=f;__vol0=v;__inv0=iv;};
  auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
+ // SS_FINE=1: FINE lines, the time since the start of run() at points inside the stages (the split of the serial
+ // work before the parse stage, the side thread, the campaign file). Measuring only.
+ static const bool fineLines=getenv("SS_FINE")!=nullptr;
+ static const auto fineT0=chrono::steady_clock::now();
+ const auto __fine=[](const char* label){if(fineLines)fprintf(stderr,"FINE %s %.6f\n",label,chrono::duration<double>(chrono::steady_clock::now()-fineT0).count());};
  optHuge=!getenv("SS_NOHUGE");optPrefault=getenv("SS_PREFAULT")!=nullptr;optAsyncFree=getenv("SS_ASYNCFREE")!=nullptr;
  if(const char* v=getenv("SS_FILEALIGN")){const string_view w(v);optFileAlign=w=="2m"?1:w=="2m+huge"?2:0;}
+ if(const char* v=getenv("SS_OUTOPEN"))optOutEarly=string_view(v)=="early";
+ if(const char* v=getenv("SS_OUTWRITE"))optOutEnd=string_view(v)=="end";
  if(const char* v=getenv("SS_FILEADVISE")){const string_view w(v);optFileAdvise=w=="random"?1:w=="seq"?2:0;}
  if(const char* v=getenv("SS_POPULATE")){const string_view w(v);optPopulate=w=="ahead"?1:w=="all"?2:w.substr(0,2)=="bg"?3:0;
   if(optPopulate==3&&w.size()>2){const int n=atoi(v+2);if(n>=1&&n<=64)optPopulateBg=n;}}
  if(__cpuLines)cerr<<"STATS kernel switches: SS_FILEALIGN="<<(optFileAlign==2?"2m+huge":optFileAlign?"2m":"off")<<" SS_POPULATE="<<(optPopulate==1?"ahead":optPopulate==2?"all":optPopulate==3?"bg"+to_string(optPopulateBg):string("off"))
-  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<!getenv("SS_NOWILLNEED")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
+  <<" SS_FILEADVISE="<<(optFileAdvise==1?"random":optFileAdvise==2?"seq":"off")<<" SS_OUTOPEN="<<(optOutEarly?"early":"off")<<" SS_OUTWRITE="<<(optOutEnd?"end":"off")<<" huge="<<optHuge<<" prefault="<<optPrefault<<" asyncfree="<<optAsyncFree<<" willneed="<<(getenv("SS_NOWILLNEED")?"off":(getenv("SS_WILLNEED")&&string_view(getenv("SS_WILLNEED"))=="inline")?"inline":"bg")<<" earlyunmap="<<!getenv("SS_NOEARLYUNMAP")<<"\n";
  auto manifest=read_all(data/"manifest.json");
  if(!parse_ts(json_string(manifest,"window_start"),window_start)||!parse_ts(json_string(manifest,"window_end"),window_end)||window_end<=window_start)throw runtime_error("Bad manifest");
  ingestBase=(int64_t)((uint64_t)window_start-(1ull<<38));
  int nday=(int)((window_end-window_start+DAY-1)/DAY);
  if(nday<=0||nday>1000)throw runtime_error("Unreasonable window length");
+ // ---- Products and campaigns: two small files that depend on nothing else. They are read by a side thread
+ // while this one maps the inputs and the link stages run (about 9 million instructions that used to sit, on one
+ // thread, in front of the parse stage). The tables are only used after the join below, where a failure of the
+ // side thread is thrown again. SS_CATALOG=inline: read them on this thread at that place, as before.
+ FastMap<uint16_t> categories;vector<string> catnames;
+ KeyTable products(1<<17); // product_id -> category number
+ vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
+ uint16_t organic=0;
+ const auto load_catalog=[&]{
+ cat_id("unknown",categories,catnames);
+ // Categories repeat: a small memo of the last category texts seen saves most of the string-map lookups.
+ struct CatMemo{const char* p;uint32_t n;uint16_t id;};
+ CatMemo catMemo[64]={};
+ read_pairs(data/"products.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean products.csv");
+  const string_view c=f[1];
+  uint64_t w;memcpy(&w,c.data(),8);w&=LOW_BYTES[min<size_t>(c.size(),8)]; // mapped input: reading past the end is safe
+  CatMemo& e=catMemo[((w^c.size())*0x9e3779b97f4a7c15ULL)>>58];
+  uint16_t id;
+  if(e.p&&e.n==c.size()&&memcmp(e.p,c.data(),c.size())==0)id=e.id;
+  else{id=cat_id(c,categories,catnames);e.p=c.data();e.n=(uint32_t)c.size();e.id=id;}
+  products.intern(f[0],id);
+ });
+ read_pairs(data/"campaigns.csv",[&](const string_view* f,bool ok){
+  if(!ok)throw runtime_error("Malformed clean campaigns.csv");
+  if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
+  const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
+ organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
+ };
+ const bool catalogBg=getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="thread"; // default inline: on the scoring machine the side thread made KEYS wait 13-18 ms (diagnostic 17)
+ exception_ptr catalogErr;thread catalogThread;
+ struct Joiner{thread& t;~Joiner(){if(t.joinable())t.join();}} catalogJoiner{catalogThread}; // an exception on the way must not meet a running thread
+ if(catalogBg)catalogThread=thread([&]{try{load_catalog();}catch(...){catalogErr=current_exception();}__fine("catalog-read-end");});
+ __fine("start");
  // The scorer may limit CPU by quota rather than by affinity, so trust NCPU when it is set.
  int T=max(1,omp_get_max_threads());
  if(const char* n=getenv("NCPU")){int v=atoi(n);if(v>=1&&v<=1024)T=v;}
@@ -4516,10 +5129,20 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(size_t from=0;from<m.len;from+=CH)chunks.push_back({m.base,m.len,from,from+CH,click});}
  };
  add_files(data/"events",false,eventBytes,eventFiles);
+ __fine("map-events");
  add_files(data/"clicks",true,clickBytes,clickFiles);
+ __fine("map-clicks");
  // Lines per byte, measured on the start of the largest event file, sizes the bucket buffers tightly.
  uint64_t estEvents=eventBytes/70;
- if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);const uint64_t nl=(uint64_t)count_newlines(sampleBase,n);
+ // (The count is a plain sum over the bytes, so it is taken in pieces by all threads: the same number as one
+ // pass, which costs this thread the first touch and a scan of 4 MB. SS_SAMPLE=serial: one pass, as before.)
+ if(sampleLen>4096){const size_t n=min<size_t>(sampleLen,size_t(4)<<20);uint64_t nl=0;
+  static constexpr size_t SAMPLE_PIECE=size_t(256)<<10;
+  if(T==1||n<=SAMPLE_PIECE||(getenv("SS_SAMPLE")&&string_view(getenv("SS_SAMPLE"))=="serial"))nl=(uint64_t)count_newlines(sampleBase,n);
+  else{
+   #pragma omp parallel for num_threads(T) schedule(static,1) reduction(+:nl)
+   for(size_t at=0;at<n;at+=SAMPLE_PIECE)nl+=(uint64_t)count_newlines(sampleBase+at,min(SAMPLE_PIECE,n-at));
+  }
   if(nl>16)estEvents=(uint64_t)((double)eventBytes*(double)nl/(double)n)+1;}
  const uint64_t estClicks=clickBytes/36;
  // SS_POPULATE=all|bg: the input's pages are entered into the page tables by madvise calls, a chunk at a time.
@@ -4530,6 +5153,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(size_t c=0;c<chunks.size();++c)populate_chunk(c);
  }
  __mark("MAP");
+ struct EarlyOut{vector<int> fd;int campFd=-1;bool dirs=false;atomic<bool> done{false};};
+ shared_ptr<EarlyOut> earlyOut;
+ if(optOutEarly){earlyOut=make_shared<EarlyOut>();earlyOut->fd.assign((size_t)T,-1);
+  thread([eo=earlyOut,dir=output/"user_daily",cdir=output/"campaign_daily",T]{
+   std::error_code ec,ec2;fs::create_directories(dir,ec);fs::create_directories(cdir,ec2);eo->dirs=!ec&&!ec2;
+   {int f=::open((cdir/"part-00000.parquet").c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);if(f>=0&&::write(f,"PAR1",4)!=4){::close(f);f=-1;}eo->campFd=f;}
+   for(int t=0;t<T;++t){char name[32];snprintf(name,sizeof name,"part-%05d.parquet",t);int f=::open((dir/name).c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
+    if(f>=0&&::write(f,"PAR1",4)!=4){::close(f);f=-1;} // the file's first four bytes go out here too; on any failure the worker creates the file itself
+    eo->fd[(size_t)t]=f;}
+   eo->done.store(true,memory_order_release);}).detach();}
  if(optPopulate==3)for(int i=0;i<optPopulateBg;++i)thread([&chunks,populate_chunk]{ // chunks outlives the threads' work: they stop before PARSE ends and the process leaves through _exit
   for(;;){if(populateStop.load(memory_order_relaxed))break;const size_t c=populateNext.fetch_add(1,memory_order_relaxed);if(c>=chunks.size())break;populate_chunk(c);}}).detach();
  // ---- Dense IDs: find the generator's keys from the first lines of one event file and one click file. ----
@@ -4546,6 +5179,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   };
   const vector<uint64_t> es=sample(sampleBase,sampleLen,0,'e'),us=sample(sampleBase,sampleLen,1,'u');
   vector<uint64_t> cs;for(const Chunk& c:chunks)if(c.click&&c.from==0){cs=sample(c.base,c.len,0,'k');if(cs.size()>=12)break;}
+  __fine("key-samples");
   dn::Info d;
   d.limE=min<uint64_t>(estEvents+estEvents/8+4096,uint64_t(1)<<31);
   d.limC=min<uint64_t>(estClicks+estClicks/8+4096,uint64_t(1)<<31);
@@ -4586,10 +5220,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __mark("KEYS");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0,linkBytes=0,linkFileCount=0;
+ // SS_LINKS: how the first pass over the link files finds the simple lines (dense users only; see the pass).
+ //   (unset)  eight lanes + the AVX-512 kernel vlk::lk8_v5 where the CPU has it (not under SS_ISA=sse2); else as "old"
+ //   old      one line after the other through link_split + link_dense
+ //   ref      eight lanes + the kernel's scalar twin vlk::lk8_ref (any CPU; for tests and instruction counts)
+ //   check / refcheck  as the default / as ref, and every line the kernel takes is compared with what link_split +
+ //            link_dense say about it (abort on a difference); counts under SS_STATS
+ //   cas      as the default, but every union is applied at once with comp_union (compare-and-swap), one kernel call
+ //            behind its prefetch, instead of going through the bucket lists
+ const char* const lkMode=getenv("SS_LINKS");const string_view lkm(lkMode?lkMode:"");
+ const bool lkRef=lkm=="ref"||lkm=="refcheck",lkCheck=lkm=="check"||lkm=="refcheck",lkCas=lkm=="cas";
+ const bool lkWanted=lkm!="old"&&(lkRef||(vlk::lk_has512()&&(lkMode||!(getenv("SS_ISA")&&string_view(getenv("SS_ISA"))=="sse2"))));
+ // Link files are handed out in pieces of 256 KB when the lane loop runs them (2 MB otherwise, as before): a piece is
+ // about 12,000 lines, cheap enough now that the threads' shares of a small link folder should be even (20M events:
+ // 18 MB of links = 13 pieces of 2 MB for 8 threads, or 72 of 256 KB). SS_LINKCH=bytes sets the size (measuring).
+ size_t linkCH=lkWanted?(size_t(256)<<10):CH;
+ if(const char* v=getenv("SS_LINKCH")){const unsigned long long x=strtoull(v,nullptr,10);if(x>=64&&x<=(1ull<<30))linkCH=(size_t)x;}
  for(const Mapped& m:map_files(csv_files(data/"links"),linkFiles)){if(!m.len)continue;
   ++linkLines; // a last line without '\n'
   linkBytes+=m.len;++linkFileCount;
-  for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+  for(size_t from=0;from<m.len;from+=linkCH)linkChunks.push_back({m.base,m.len,from,from+linkCH,false});}
+ __fine("map-links");
  static const bool idBlocks=!getenv("SS_NOIDBLOCKS"); // measuring switch: per-thread ID blocks in the links stage
  // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
  // If a dataset has more, the extra ones take the thread-private fallback path (slower, still exact).
@@ -4637,13 +5288,32 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // A complex index keeps the general route for all its IDs, so the simple lines already applied to its
  // word have to reach the table too: they are replayed from the word afterwards (same groups).
  struct LinkGen{const char* a;const char* b;uint32_t la,lb;};
- struct alignas(64) LinkOut{vector<LinkGen> gen;vector<uint32_t> cplx;uint32_t maxIdx=0;};
+ static constexpr int LKR_MAX=64;static constexpr size_t LKB=size_t(1)<<16,LKG=1024; // most buckets; records per block of a bucket's list; kernel calls between two looks at the room left
+ struct alignas(64) LinkOut{vector<LinkGen> gen;vector<uint32_t> cplx;uint32_t maxIdx=0;uint64_t nk=0,nslow=0,ntail=0,missed=0;double cpu=0,cpu2=0; // cpu2: of the second step; nk..: lane loop counts, cpu: thread seconds in the pass (SS_STATS)
+  // Lane loop: the unions of the simple lines wait here as records (vlk::LkOut::rec), one list per bucket of user
+  // indexes; bp = where the next record of a bucket goes (bp[buckets] is the place for lanes without a union).
+  uint32_t* bp[LKR_MAX+1]={};uint32_t* bcap[LKR_MAX+1]={};uint32_t* bstart[LKR_MAX]={};vector<pair<uint32_t*,uint32_t*>> blocks[LKR_MAX];uint32_t trash[16];};
  vector<LinkOut> lout(denseUsers?T:0);
  {
   bool v3=__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("popcnt")&&__builtin_cpu_supports("lzcnt");
   if(const char* isa=getenv("SS_ISA"))if(string_view(isa)=="sse2")v3=false;
   void (*const link_dense)(const char*,size_t,const char*,size_t,LinkDense&)=v3?link_dense_v3:link_dense_base;
-  #pragma omp parallel for num_threads(T) schedule(dynamic,1) reduction(+:linkLines)
+  // SS_LINKS (read where the link files are cut into pieces) decides how the simple lines are found.
+  // The unions of the lane loop (default): a simple line with two different aliases becomes a 32-bit record in a list
+  // of its thread, one list per bucket; a bucket is every lkR-th block of 4096 user indexes. When all chunks are done
+  // each bucket is applied by one thread (vlk::lk_union_v5, sixteen records per turn; lk_union_ref under ref): no word
+  // is changed by two threads, so no lock prefix, and a bucket's words are an lkR-th of the array. The result is the same word whatever the order: a word is "the
+  // smallest alias of each alias's group", which the set of unions decides. (Unions from the line code - refused
+  // lines, file tails - still go through comp_union at once; all of that is over before the buckets are applied.)
+  const bool lkOn=denseUsers&&lkWanted;
+  void (*const lk8)(const char**,const char* const*,const vlk::LkConst&,vlk::LkOut&)=lkRef?vlk::lk8_ref:vlk::lk8_v5;
+  int lkR=32;while(lkR<T&&lkR<LKR_MAX)lkR*=2;
+  static constexpr array<uint8_t,256> POP8=[]{array<uint8_t,256> a{};for(unsigned m=0;m<256;++m){unsigned n=0;for(unsigned j=0;j<8;++j)n+=(m>>j)&1;a[m]=(uint8_t)n;}return a;}();
+  const vlk::LkConst lkc=vlk::lk_const(dense.ku,dense.limI,(uint64_t)lkR);
+  static const bool lkStats=getenv("SS_STATS")!=nullptr;
+  #pragma omp parallel num_threads(T)
+  {
+  #pragma omp for schedule(dynamic,1) reduction(+:linkLines)
   for(size_t c=0;c<linkChunks.size();++c){const Chunk& ck=linkChunks[c];
    if(!denseUsers){linkLines+=count_newlines(ck.base+ck.from,min(ck.to,ck.len)-ck.from);continue;}
    if(ck.from>=ck.len)continue;
@@ -4652,29 +5322,142 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(!nl)continue;
    const char* const lim=ck.base+min(ck.to,ck.len);
    LinkOut& out=lout[omp_get_thread_num()];
+   struct CpuNote{LinkOut& o;double t0;~CpuNote(){if(lkStats)o.cpu+=thr_cpu_s()-t0;}} cpuNote{out,lkStats?thr_cpu_s():0.0};
    // Simple lines wait in a small batch so that their index's word is in the cache when it is changed.
    static constexpr int SB=8;
    struct Simple{uint32_t idx,aa,ab;} sb[SB];int ns=0;uint32_t maxIdx=out.maxIdx;
    const auto apply=[&]{for(int i=0;i<ns;++i)comp_union(sb[i].idx,sb[i].aa,sb[i].ab);ns=0;};
-   for(const char* p=nl+1;p<lim;){
+   // The line code: everything about the line that starts at p; returns where the next line starts.
+   const auto one_line=[&](const char* p)__attribute__((always_inline))->const char*{
     string_view f[2];const char* next;
     const bool ok=link_split(p,end,f,next);
-    p=next;
-    if(!ok)continue;
+    if(!ok)return next;
     LinkDense r;link_dense(f[0].data(),f[0].size(),f[1].data(),f[1].size(),r);
     if(r.da&&r.db&&r.ia==r.ib&&r.aa<8&&r.ab<8){
      maxIdx=max(maxIdx,(uint32_t)r.ia);
      if(r.aa!=r.ab){__builtin_prefetch(&denseComp[r.ia],1,1);sb[ns++]={(uint32_t)r.ia,r.aa,r.ab};if(ns==SB)apply();}
-     continue;
+     return next;
     }
     // Whoever turns an index's bit on notes the index for the replay (so each index is noted once).
     if(r.da&&!dense_set_complex(r.ia))out.cplx.push_back((uint32_t)r.ia);
     if(r.db&&!dense_set_complex(r.ib))out.cplx.push_back((uint32_t)r.ib);
     out.gen.push_back({f[0].data(),f[1].data(),(uint32_t)f[0].size(),(uint32_t)f[1].size()});
+    return next;
+   };
+   if(!lkOn||ck.len<512){
+    for(const char* p=nl+1;p<lim;)p=one_line(p);
+    apply();out.maxIdx=maxIdx;
+    continue;
    }
-   apply();out.maxIdx=maxIdx;
+   // Eight lanes (SS_LINKS): the chunk's lines are cut into eight runs at line starts and each lane walks its own run,
+   // one line per lane and kernel call. vlk::lk8 takes the simple lines (see its contract); a line it refuses, and the
+   // last lines of a file (the kernel reads up to 96 bytes from a line start), go through one_line. The lines and what
+   // is done for each are those of the loop above; only the order differs, and nothing here depends on the order
+   // (a union is commutative; the lists are per thread and already depend on which thread gets which chunk).
+   const char* s[9];s[0]=nl+1;s[8]=lim;
+   {const size_t span=s[0]<lim?(size_t)(lim-s[0]):0;
+    for(int j=1;j<8;++j){const char* const t=s[0]+span*(size_t)j/8; // t-1 >= nl: the byte before a lane start is a newline
+     const char* const q=(const char*)memchr(t-1,'\n',(size_t)(end-(t-1)));
+     s[j]=q&&q+1<lim?q+1:lim;}}
+   const char* const kend=end-160; // a live lane has 160 readable bytes, so a lane that has just ended still has 96
+   const char* kp[8];const char* klim[8];const char* tail[8];
+   for(int j=0;j<8;++j){klim[j]=min(s[j+1],kend);
+    if(s[j]<klim[j]){kp[j]=s[j];tail[j]=nullptr;}else{kp[j]=klim[j]=ck.base;tail[j]=s[j];}} // a lane that never runs reads the chunk's first bytes
+   vlk::LkOut ob[2];memset(ob[0].mx,0,sizeof ob[0].mx);memset(ob[1].mx,0,sizeof ob[1].mx);
+   vlk::LkOut* prev=nullptr;int cur=0;uint64_t nk=0,nslow=0;
+   // Memory for records: its own mapping, small pages on purpose (a list is touched a few pages at a time; a huge page
+   // under each of the 32 lists of a thread would be 2 MB of zeroing for a few kilobytes of records).
+   const auto rec_block=[](size_t records)->uint32_t*{
+    const size_t bytes=records*sizeof(uint32_t);
+    void* const m=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+    if(m==MAP_FAILED){cerr<<"ERROR out of memory\n";_exit(1);}
+    madvise(m,bytes,MADV_NOHUGEPAGE);
+    return (uint32_t*)m;};
+   // Every LKG kernel calls: a bucket whose block could run full within the next LKG calls (8 records each at most)
+   // gets a new block. The first blocks of a thread are one allocation, touched only as far as records are written.
+   const auto refill=[&]()__attribute__((noinline,cold))->size_t{
+    if(!out.bp[lkR]){uint32_t* const slab=rec_block((size_t)lkR*LKB);
+     for(int r=0;r<lkR;++r){out.bstart[r]=out.bp[r]=slab+(size_t)r*LKB;out.bcap[r]=out.bp[r]+LKB;}
+     out.bp[lkR]=out.trash;}
+    for(int r=0;r<lkR;++r)if((size_t)(out.bcap[r]-out.bp[r])<8*LKG){
+     out.blocks[r].push_back({out.bstart[r],out.bp[r]});
+     uint32_t* const nb=rec_block(LKB);
+     out.bstart[r]=out.bp[r]=nb;out.bcap[r]=nb+LKB;}
+    return LKG;};
+   size_t room=0;
+   const auto unions=[&](const vlk::LkOut& o)__attribute__((always_inline)){
+    for(unsigned i=0;i<8;++i)if((o.un>>i)&1)comp_union(o.idx[i],(uint32_t)o.aa[i],(uint32_t)o.ab[i]);};
+   for(;;){
+    vlk::LkOut& o=ob[cur];
+    const char* was[8];if(__builtin_expect(lkCheck,0))memcpy(was,kp,sizeof was);
+    lk8(kp,klim,lkc,o);
+    if(!(o.ok|o.slow))break; // no lane is live any more: this call did nothing
+    if(lkCas)for(int i=0;i<8;++i)__builtin_prefetch(&denseComp[o.idx[i]],1,1);
+    if(__builtin_expect(lkCheck,0)){
+     // Test mode: every line the kernel took is put through the line code's own functions and compared.
+     for(int i=0;i<8;++i){
+      const bool kok=(o.ok>>i)&1,ksl=(o.slow>>i)&1;
+      if(!kok&&!ksl){if(kp[i]!=was[i]||o.idx[i]){cerr<<"LINKCHECK FAIL dead lane changed\n";abort();}continue;}
+      string_view f[2];const char* next;LinkDense r{};
+      const bool ok=link_split(was[i],end,f,next);
+      if(ok)link_dense(f[0].data(),f[0].size(),f[1].data(),f[1].size(),r);
+      const bool simple=ok&&r.da&&r.db&&r.ia==r.ib&&r.aa<8&&r.ab<8;
+      if(kok==ksl||(kok&&(!simple||r.ia!=o.idx[i]||r.aa!=o.aa[i]||r.ab!=o.ab[i]||next!=kp[i]||(((o.un>>i)&1)!=(r.aa!=r.ab))))||(!kok&&(kp[i]!=was[i]||o.idx[i]||((o.un>>i)&1)))){
+       cerr<<"LINKCHECK FAIL line '"<<string_view(was[i],(size_t)min<ptrdiff_t>(next-was[i],60))<<"' kernel ok "<<kok<<" slow "<<ksl<<" idx "<<o.idx[i]<<" aa "<<o.aa[i]<<" ab "<<o.ab[i]<<" line code simple "<<simple<<" idx "<<r.ia<<" aa "<<r.aa<<" ab "<<r.ab<<"\n";abort();}
+      if(ksl&&simple)++out.missed;
+      const bool kun=(o.un>>i)&1;
+      if(o.bk[i]!=(kun?((o.idx[i]>>vlk::LK_BLOCK_BITS)&lkc.bmask):lkc.btrash)||(kun&&(o.rec[i]>>32||o.rec[i]>>5!=o.idx[i]||vlk::LK_PAIR_LO[o.rec[i]&31]!=min(o.aa[i],o.ab[i])||vlk::LK_PAIR_HI[o.rec[i]&31]!=max(o.aa[i],o.ab[i])))){
+       cerr<<"LINKCHECK FAIL record "<<o.rec[i]<<" bucket "<<o.bk[i]<<" idx "<<o.idx[i]<<" aa "<<o.aa[i]<<" ab "<<o.ab[i]<<"\n";abort();}
+     }
+    }
+    nk+=POP8[o.ok];
+    if(__builtin_expect(o.slow,0)){
+     for(unsigned m=o.slow;m;m&=m-1){const int i=__builtin_ctz(m);++nslow;
+      const char* const next=one_line(kp[i]);
+      if(next<klim[i])kp[i]=next;else{tail[i]=next;kp[i]=klim[i]=ck.base;}} // the lane ends here: its pointer may be too close to the file's end to be read
+    }
+    if(lkCas){if(prev)unions(*prev);prev=&o;cur^=1;}
+    else{
+     if(__builtin_expect(room==0,0))room=refill();
+     --room;
+     uint32_t** const bp=out.bp;
+     for(int i=0;i<8;++i){const uint64_t r=o.bk[i];uint32_t* const q=bp[r];*q=(uint32_t)o.rec[i];bp[r]=q+1;} // a lane without a union writes to the spare place
+     bp[lkR]=out.trash;
+    }
+   }
+   if(prev)unions(*prev);
+   for(int j=0;j<8;++j){
+    maxIdx=max(maxIdx,(uint32_t)max(ob[0].mx[j],ob[1].mx[j]));
+    for(const char* p=tail[j]?tail[j]:kp[j];p<s[j+1];++out.ntail)p=one_line(p);
+   }
+   apply();out.maxIdx=maxIdx;out.nk+=nk;out.nslow+=nslow;
+  }
+  // Second step of the lane loop: every bucket's records, from all threads' lists, applied by one thread.
+  if(lkOn&&!lkCas){
+   #pragma omp for schedule(dynamic,1) nowait
+   for(int r=0;r<lkR;++r){
+    const double t0=lkStats?thr_cpu_s():0.0;
+    uint32_t* const words=(uint32_t*)denseComp; // plain loads and stores: this thread alone changes bucket r's words now
+    const auto run_block=[&](const uint32_t* b,const uint32_t* e){if(lkRef)vlk::lk_union_ref(words,b,e);else vlk::lk_union_v5(words,b,e);};
+    for(LinkOut& o:lout){
+     for(const auto& bl:o.blocks[r])run_block(bl.first,bl.second);
+     if(o.bstart[r])run_block(o.bstart[r],o.bp[r]);
+    }
+    if(lkStats)lout[omp_get_thread_num()].cpu2+=thr_cpu_s()-t0;
+   }
+  }
   }
  }
+ __fine("link-pass");
+ // Test only, SS_LINKS_DUMP=file: what the first pass left behind - every non-zero alias word, every complex index and the
+ // number of lines kept for the ID table - as text (compared between SS_LINKS=old and the lane loop).
+ if(const char* v=getenv("SS_LINKS_DUMP"))if(denseUsers){ofstream o(v,ios::binary);
+  uint64_t gen=0;uint32_t mx=0;for(const LinkOut& l:lout){gen+=l.gen.size();mx=max(mx,l.maxIdx);}
+  o<<"gen "<<gen<<" maxIdx "<<mx<<"\n";
+  for(uint64_t i=0;i<dense.limI;++i){const uint32_t w=denseComp[i].load(memory_order_relaxed);if(w)o<<"w "<<i<<' '<<w<<'\n';if(dense_complex(i))o<<"c "<<i<<'\n';}}
+ if(getenv("SS_STATS")&&denseUsers){uint64_t nk=0,nslow=0,ntail=0,missed=0;for(const LinkOut& o:lout){nk+=o.nk;nslow+=o.nslow;ntail+=o.ntail;missed+=o.missed;}
+  double cpu=0,cpu2=0;for(const LinkOut& o:lout){cpu+=o.cpu;cpu2+=o.cpu2;}
+  cerr<<"STATS links: kernel lines "<<nk<<" refused "<<nslow<<" (simple among them, check modes only: "<<missed<<") file tails "<<ntail<<" thread cpu ms "<<cpu*1e3<<" + bucket unions "<<cpu2*1e3<<"\n";}
  // The pairs to replay: for every complex index, each alias that the simple lines put into a group
  // with a smaller one. (Indexes the test switch marked complex were never noted; they are looked up here.)
  struct Replay{uint32_t idx;uint8_t a,b;};
@@ -4842,28 +5625,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  __mark("FLATTEN");
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked-idHoles<<"\n";
- FastMap<uint16_t> categories;vector<string> catnames;
- cat_id("unknown",categories,catnames);
- KeyTable products(1<<17); // product_id -> category number
- // Categories repeat: a small memo of the last category texts seen saves most of the string-map lookups.
- struct CatMemo{const char* p;uint32_t n;uint16_t id;};
- CatMemo catMemo[64]={};
- read_pairs(data/"products.csv",[&](const string_view* f,bool ok){
-  if(!ok)throw runtime_error("Malformed clean products.csv");
-  const string_view c=f[1];
-  uint64_t w;memcpy(&w,c.data(),8);w&=LOW_BYTES[min<size_t>(c.size(),8)]; // mapped input: reading past the end is safe
-  CatMemo& e=catMemo[((w^c.size())*0x9e3779b97f4a7c15ULL)>>58];
-  uint16_t id;
-  if(e.p&&e.n==c.size()&&memcmp(e.p,c.data(),c.size())==0)id=e.id;
-  else{id=cat_id(c,categories,catnames);e.p=c.data();e.n=(uint32_t)c.size();e.id=id;}
-  products.intern(f[0],id);
- });
- vector<Camp> campaigns;KeyTable camps(1<<13); // campaign_id -> campaign number
- read_pairs(data/"campaigns.csv",[&](const string_view* f,bool ok){
-  if(!ok)throw runtime_error("Malformed clean campaigns.csv");
-  if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
-  const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
- uint16_t organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
+ __fine("catalog-join");
+ if(catalogBg){catalogThread.join();if(catalogErr)rethrow_exception(catalogErr);}else load_catalog();
+ __fine("catalog-ready");
 
  // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
  const size_t PE=pow2_parts(eventBytes/70),PC=pow2_parts(clickBytes/40);
@@ -4888,6 +5652,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // SS_ISA the event files then use the avx512z masks (the kernel uses 512-bit registers anyway) while the click
  // files stay on the avx2 loop; with SS_ISA=avx512z|avx512y everything follows that choice. Any SS_LINES value
  // switches the default off (SS_LINES=ev8 asks for the loop explicitly, also on avx2 with the scalar kernel).
+ // SS_EVLEAD=2 / SS_CLLEAD=2: the ev8 / cl8 loop keeps one more group under way (a decoded group waits a turn before
+ // it is finished), so a slot is asked for 16 to 24 lines before its store instead of 8 to 16. SS_PF=w|t1|none: see optPfw.
+ // All three are for measuring on the scoring machine; same output.
+ const bool evLead2=getenv("SS_EVLEAD")&&string_view(getenv("SS_EVLEAD"))=="2";
+ const bool clLead2=getenv("SS_CLLEAD")&&string_view(getenv("SS_CLLEAD"))=="2";
+ if(const char* v=getenv("SS_PF")){const string_view w(v);optPfw=w=="w"?1:w=="t1"?2:w=="none"?3:0;}
+ #define SS_LEAD_CALL(two_,fn_,args_) {if(two_)fn_<2>args_;else fn_<1>args_;}
  // SS_EV8=3: the ev8 loop runs kernel version 3 (gathers, date memo) instead of version 4. Same output.
  const bool ev8V3=getenv("SS_EV8")&&string_view(getenv("SS_EV8"))=="3";
  const bool ev8Auto=hasE8&&dparse.twoPhase&&!getenv("SS_LINES")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
@@ -4896,9 +5667,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // SS_ISA=avx2 or SS_DENSE_AHEAD (which asks for the ring of the old loop) keeps the click loop with the line index.
  // SS_CL8=1: the cl8 loop runs kernel version 1 (gathers, date memo) instead of version 2. Same output.
  const bool cl8V1=getenv("SS_CL8")&&string_view(getenv("SS_CL8"))=="1";
+ // Lanes (SS_EVENT_LOOP_EV8L): wherever the ev8 loop runs kernel version 4, eight lanes walk eight pieces of a chunk and
+ // there is no line index; the same for the cl8 loop with kernel version 2 (SS_CLICK_LOOP_CL8L). SS_LANES=0: the loops
+ // with the index; SS_LANES=e / c: lanes for event / click files only. Same output. SS_LANES_PF=n / SS_LANES_PF2=n: see lanePf.
+ const char* const lanesEnv=getenv("SS_LANES"); // 0 = neither, e = events only, c = clicks only
+ if(const char* v=getenv("SS_LANES_PF")){const long long x=atoll(v);lanePf=x>0&&x<=(1<<20)?(unsigned)x:0;}
+ if(const char* v=getenv("SS_LANES_PF2")){const long long x=atoll(v);lanePf2=x>0&&x<=(1<<20)?(unsigned)x:0;}
+ const bool lanes=!(lanesEnv&&(string_view(lanesEnv)=="0"||string_view(lanesEnv)=="c")),lanesC=!(lanesEnv&&(string_view(lanesEnv)=="0"||string_view(lanesEnv)=="e"));
  const bool cl8Auto=hasE8&&dparse.clicks&&!dparse.bucket&&!getenv("SS_CLICKS")&&!getenv("SS_DENSE_AHEAD")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
-  <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":" events: ev8 kernel v4"):"")<<(cl8Auto?(cl8V1?" clicks: cl8 kernel v1":" clicks: cl8 kernel v2"):"")<<"\n";
+  <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":lanes?" events: ev8 kernel v4 in lanes":" events: ev8 kernel v4"):"")<<(cl8Auto?(cl8V1?" clicks: cl8 kernel v1":lanesC?" clicks: cl8 kernel v2 in lanes":" clicks: cl8 kernel v2"):"")<<(evLead2?" evlead 2":"")<<(clLead2?" cllead 2":"")<<(optPfw==1?" pf w":optPfw==2?" pf t1":optPfw==3?" pf none":"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -4934,6 +5712,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const size_t usedE=DE?min<size_t>(DE,(size_t)((spanE-1)>>dparse.shE)+1):0,usedC=DC?min<size_t>(DC,(size_t)((spanC-1)>>dparse.shC)+1):0;
  if(getenv("SS_STATS")&&(DE||DC))cerr<<"STATS dense buckets events "<<DE<<" (span "<<spanE<<", "<<usedE<<" x "<<rdFull<<" records) clicks "<<DC<<" (span "<<spanC<<", "<<usedC<<" x "<<rdcFull<<" records)\n";
  if(T>65535)throw runtime_error("Too many threads"); // ESlot::thread
+ __fine("parse-region");
  #pragma omp parallel num_threads(T)
  {
   ThreadState& tl=tls[omp_get_thread_num()];
@@ -5028,16 +5807,18 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const bool drec=ck.click?dparse.clicks:dparse.events;
    const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
    const bool cl8Use=(dparse.cl8&&(isaUse==ISA_AVX2||hasE8))||(cl8Auto&&isaUse!=ISA_AVX2); // as ev8Use
-   if(ck.click&&drec&&cl8Auto&&isaUse==ISA_AVX2){if(cl8V1)clicks_avx512z_c8v1(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);else clicks_avx512z_c8(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);continue;} // the default on an AVX-512 CPU
-   if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){if(ev8V3)events_avx512z_e8v3(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);else events_avx512z_e8(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event);continue;} // the default on an AVX-512 CPU
+   if(ck.click&&drec&&cl8Auto&&isaUse==ISA_AVX2){if(cl8V1)SS_LEAD_CALL(clLead2,clicks_avx512z_c8v1,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) else if(lanesC)clicks_avx512z_c8l(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); else SS_LEAD_CALL(clLead2,clicks_avx512z_c8,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) continue;} // the default on an AVX-512 CPU
+   if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){if(ev8V3)SS_LEAD_CALL(evLead2,events_avx512z_e8v3,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) else if(lanes)events_avx512z_e8l(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); else SS_LEAD_CALL(evLead2,events_avx512z_e8,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) continue;} // the default on an AVX-512 CPU
    #define SS_RUN_LOOPS(ISA) \
-    if(ck.click){if(drec&&cl8Use&&cl8V1)clicks_##ISA##_c8v1(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
-     else if(drec&&cl8Use)clicks_##ISA##_c8(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
+    if(ck.click){if(drec&&cl8Use&&cl8V1)SS_LEAD_CALL(clLead2,clicks_##ISA##_c8v1,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) \
+     else if(drec&&cl8Use&&lanesC)clicks_##ISA##_c8l(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
+     else if(drec&&cl8Use)SS_LEAD_CALL(clLead2,clicks_##ISA##_c8,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) \
      else if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else clicks_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);} \
-    else{if(drec&&ev8Use&&ev8V3)events_##ISA##_e8v3(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
-     else if(drec&&ev8Use)events_##ISA##_e8(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+    else{if(drec&&ev8Use&&ev8V3)SS_LEAD_CALL(evLead2,events_##ISA##_e8v3,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) \
+     else if(drec&&ev8Use&&lanes)events_##ISA##_e8l(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
+     else if(drec&&ev8Use)SS_LEAD_CALL(evLead2,events_##ISA##_e8,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) \
      else if(drec&&dparse.batch)events_##ISA##_bt(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(drec&&dparse.twoPhase)events_##ISA##_2p(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(drec)events_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
@@ -5128,7 +5909,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
   if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";
   uint64_t er=0,es=0;for(int t=0;t<T;++t){er+=tls[t].ev8Rows;es+=tls[t].ev8Slow;}
-  if(er)cerr<<"STATS ev8 loop: rows "<<er<<" left to the line code "<<es<<"\n";}
+  if(er)cerr<<"STATS ev8 loop: rows "<<er<<" left to the line code "<<es<<"\n";
+  uint64_t lsg=0,lfe=0,lfc=0;for(int t=0;t<T;++t){lsg+=tls[t].laneShort;lfe+=tls[t].laneFixE;lfc+=tls[t].laneFixC;}
+  if(lsg|lfe|lfc)cerr<<"STATS lanes: groups with fewer than eight lanes at work "<<lsg<<", line ends looked up with memchr: event rows "<<lfe<<" click rows "<<lfc<<"\n";}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
  if(dumpDir){
   // Test only (fuzz/dense_check.py): rows-T.txt = what the general handlers saw (raw texts, written above),
@@ -5635,9 +6418,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   __mark("DENSE1");
  }
  const size_t idxEnd=slots&&denseUsers?(size_t)denseMaxIdx.load()+1:0;
+ optThrStats=stats;
+ const double thrS0=stats?now_s():0; // start of the DENSE stage's serial lead-in
+ double thrR0=0,thrA0=0,thrSingle=0; // parallel region start; AGGREGATE start; serial part at the end of DENSE
+ vector<ThrStat> dstat(stats?T:0),astat(stats?T:0);
+ // One line per stage, all times in ms. min/max/sum are over the threads.
+ const auto thr_line=[&](const char* name,const vector<ThrStat>& v,double t0,double serialPre,double serialEnd){
+  double fMin=1e9,fMax=0,lMin=1e9,lMax=0,wMin=1e9,wMax=0,wSum=0,cLoop=0,wr=0,wrMax=0,wrCpu=0,op=0,gr=0,tMin=1e9,tMax=0,cAll=0,en=0;unsigned wc=0,gc=0,idle=0;
+  for(const ThrStat& x:v){
+   if(x.first<0){++idle;cAll+=x.cOut-x.cIn;wr+=x.wWall;wrCpu+=x.wCpu;wc+=x.wCalls;op+=x.oWall;gr+=x.gWall;gc+=x.gCalls;en+=x.endWall;continue;}
+   const double f=x.first-t0,l=x.last-t0,w=x.last-x.first,tl=x.out-x.last;
+   fMin=min(fMin,f);fMax=max(fMax,f);lMin=min(lMin,l);lMax=max(lMax,l);wMin=min(wMin,w);wMax=max(wMax,w);wSum+=w;cLoop+=x.cLast-x.cFirst;
+   wr+=x.wWall;wrMax=max(wrMax,x.wMax);wrCpu+=x.wCpu;wc+=x.wCalls;op+=x.oWall;gr+=x.gWall;gc+=x.gCalls;tMin=min(tMin,tl);tMax=max(tMax,tl);cAll+=x.cOut-x.cIn;en+=x.endWall;
+  }
+  if(idle==v.size())fMin=lMin=wMin=tMin=0;
+  char b[640];snprintf(b,sizeof b,"STATS %s threads: n %zu noloop %u serial_pre %.2f first_start %.2f %.2f last_end %.2f %.2f loop_wall %.2f %.2f %.2f loop_cpu %.2f write_wall %.2f write_max %.2f write_cpu %.2f write_calls %u open_wall %.2f grow_wall %.2f grow_calls %u tail_wall %.2f %.2f end_wall %.2f serial_end %.2f thread_cpu %.2f\n",
+   name,v.size(),idle,serialPre*1e3,fMin*1e3,fMax*1e3,lMin*1e3,lMax*1e3,wMin*1e3,wMax*1e3,wSum*1e3,cLoop*1e3,wr*1e3,wrMax*1e3,wrCpu*1e3,wc,op*1e3,gr*1e3,gc,tMin*1e3,tMax*1e3,en*1e3,serialEnd*1e3,cAll*1e3);
+  cerr<<b;};
  uint64_t deferLoE=UINT64_MAX,deferHiE=0,deferLoC=UINT64_MAX,deferHiC=0; // counter ranges holding the rows of deferred indexes
  // ---- Per person bucket: order, sessionize, attribute. Each thread writes its own Parquet file. ----
- fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");
+ if(earlyOut)while(!earlyOut->done.load(memory_order_acquire))this_thread::yield(); // SS_OUTOPEN=early: long done in practice
+ if(!(earlyOut&&earlyOut->dirs)){fs::create_directories(output/"user_daily");fs::create_directories(output/"campaign_daily");}
  const bool debugCsv=getenv("SS_DEBUG_CSV")!=nullptr; // unit tests read these hex rows from SCRATCH_DIR
  const size_t ncamp=campaigns.size();
  const int64_t firstday=divfloor(window_start,DAY);
@@ -5687,6 +6488,55 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  static const size_t SMALL_BUCKET=[]{const char* v=getenv("SS_SMALLBUCKET");const long x=v?atol(v):4096;return (size_t)(x<0?0:x);}();
  if(personSess)cerr<<"test: every person through sessionize_person\n";
  uint64_t num_sessions=0;
+ // campaign_daily: the totals of all threads added up, one row per campaign and day with a session or an assist,
+ // one file. By default one worker does this as soon as every thread has left the last sessionizing loop, while
+ // the others flush and close their user_daily files and hand memory back (it used to follow the parallel
+ // region on one thread: the WRITE stage). SS_CAMPWRITE=end: after the region, as before. Same bytes either way.
+ static const bool campEarly=!(getenv("SS_CAMPWRITE")&&string_view(getenv("SS_CAMPWRITE"))=="end");
+ string campCsv; // SS_DEBUG_CSV rows
+ vector<Totals> campTotals(ncamp*(size_t)ndays);
+ const auto merge_totals=[&](size_t lo,size_t hi){ // cells [lo,hi) of every thread's totals added into campTotals
+  for(const Totals* tt:threadTotals)if(tt)for(size_t i=lo;i<hi;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
+  for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=lo;i<hi;++i)campTotals[i].assists+=ta[i];
+ };
+ static constexpr size_t MERGE_BLOCK=4096;
+ const auto write_campaigns=[&]{
+  if(!campEarly)merge_totals(0,ncells); // otherwise all threads have added the totals up, a block of cells each
+  string& csv=campCsv;
+  const auto open_camp=[&](PqFile& f){f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
+   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});};
+  if(campEarly){
+   // The same column bodies as below, written through pointers into buffers with room for a row of every cell
+   // (a length-prefixed text is its 32-bit little-endian length and its bytes; the numbers are little-endian as stored).
+   size_t idBytes=0,chBytes=0;for(size_t ci=0;ci<ncamp;++ci){idBytes+=4+campaigns[ci].id.size();chBytes+=4+campaigns[ci].channel.size();}
+   const auto cidBuf=make_unique_for_overwrite<char[]>(idBytes*(size_t)ndays+1),chanBuf=make_unique_for_overwrite<char[]>(chBytes*(size_t)ndays+1);
+   const auto dayBuf=make_unique_for_overwrite<int32_t[]>(ncells+1);
+   const auto sBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),pBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),rBuf=make_unique_for_overwrite<int64_t[]>(ncells+1),aBuf=make_unique_for_overwrite<int64_t[]>(ncells+1);
+   char* pc=cidBuf.get();char* ph=chanBuf.get();size_t n=0;
+   for(size_t ci=0;ci<ncamp;++ci){
+    const string& id=campaigns[ci].id;const string& ch=campaigns[ci].channel;const uint32_t il=(uint32_t)id.size(),cl=(uint32_t)ch.size();
+    for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
+     memcpy(pc,&il,4);memcpy(pc+4,id.data(),il);pc+=4+il;memcpy(ph,&cl,4);memcpy(ph+4,ch.data(),cl);ph+=4+cl;
+     dayBuf[n]=(int32_t)(firstday+d);sBuf[n]=(int64_t)t.sessions;pBuf[n]=(int64_t)t.purchasing_sessions;rBuf[n]=(int64_t)t.revenue;aBuf[n]=(int64_t)t.assists;++n;
+     if(debugCsv){csv+=hexstr(id);csv+=',';csv+=hexstr(ch);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
+    }
+   }
+   PqFile f;open_camp(f);
+   if(n)f.row_group((int64_t)n,{string_view(cidBuf.get(),(size_t)(pc-cidBuf.get())),string_view(chanBuf.get(),(size_t)(ph-chanBuf.get())),string_view((const char*)dayBuf.get(),n*sizeof(int32_t)),
+    string_view((const char*)sBuf.get(),n*sizeof(int64_t)),string_view((const char*)pBuf.get(),n*sizeof(int64_t)),string_view((const char*)rBuf.get(),n*sizeof(int64_t)),string_view((const char*)aBuf.get(),n*sizeof(int64_t))});
+   f.close();
+   return;
+  }
+  string cid,chan;vector<int32_t> days;vector<int64_t> s,p,r,a;
+  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
+   put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
+   s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
+   if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
+  }
+  PqFile f;open_camp(f);
+  if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
+  f.close();
+ };
  // Input files nobody reads any more are unmapped by the worker threads, a few large pieces each,
  // instead of leaving every page of them to process exit, which tears mappings down on one thread.
  vector<pair<char*,size_t>> unmapFirst,unmapLast;
@@ -5703,9 +6553,37 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(evBase&&evEnd)slot_pieces(evBase,(size_t)denseEvEnd.load()<<evShift);
   if(denseCl&&clEnd)slot_pieces((const char*)denseCl,(size_t)denseClEnd.load()*sizeof(CSlot));
  }
+ // SS_UNMAP (measuring switch; default: the workers unmap, the event files before the index loop, the rest
+ // after the last loop):
+ //   bg       one helper thread unmaps both lists in 16 MB steps while the workers compute (the event files
+ //            from the start of this stage, the rest from the end of the last loop; what is left at the end
+ //            goes with the process). No worker waits in munmap, and a worker's mmap waits for one step at most.
+ //   bgfirst  the helper takes the event files only; the rest as today.
+ //   late     the workers unmap everything after the last loop, nothing before the index loop.
+ vector<pair<char*,size_t>> unmapLastBg;
+ {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=(w=="bg"||w.empty())?1:w=="bgfirst"?2:w=="late"?3:0; // default bg (scoring machine: DENSE -3 ms, AGGREGATE -4 ms at 20M; -10 and -13 at 60M); SS_UNMAP=workers = the workers unmap
+  const auto unmap_bg=[](vector<pair<char*,size_t>> v){if(v.empty())return;
+   thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();};
+  // SS_POOLPRE=1 (measuring switch): every thread's pool gets its next region here, before any unmapping starts,
+  // so the workers' first takes of this stage need no mmap while other threads hold the mapping lock in munmap.
+  const bool poolPre=getenv("SS_POOLPRE")!=nullptr;
+  if(poolPre)for(int t=0;t<T;++t)surv[t].pool.ensure(size_t(8)<<20);
+  if(stats)cerr<<"STATS pools: SS_POOLPRE="<<poolPre<<"\n";
+  if(mode==3){unmapLast.insert(unmapLast.end(),unmapFirst.begin(),unmapFirst.end());unmapFirst.clear();}
+  if(mode==1||mode==2){unmap_bg(std::move(unmapFirst));unmapFirst.clear();}
+  if(mode==1)unmapLastBg.swap(unmapLast);
+  if(stats)cerr<<"STATS unmap: SS_UNMAP="<<(mode==1?"bg":mode==2?"bgfirst":mode==3?"late":"workers")<<" first "<<unmapFirst.size()<<" last "<<unmapLast.size()<<" helper-last "<<unmapLastBg.size()<<"\n";
+ }
+ if(stats)thrR0=now_s();
  #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9])
  {
   const int tid=omp_get_thread_num();
+  ThrStat thrNone;ThrStat* cur=stats?&dstat[tid]:&thrNone; // the stage this thread is in
+  double grow0=tlGrowWall;uint32_t growN0=tlGrowCalls;
+  if(stats){cur->in=now_s();cur->cIn=thr_cpu_s();}
+  const auto thr_chunk_in=[&]{if(__builtin_expect(stats,0)&&cur->first<0){cur->first=cur->last=now_s();cur->cFirst=cur->cLast=thr_cpu_s();}};
+  const auto thr_chunk_out=[&]{if(__builtin_expect(stats,0)){cur->last=now_s();cur->cLast=thr_cpu_s();}};
+  const auto thr_stage_out=[&]{cur->out=now_s();cur->cOut=thr_cpu_s();cur->gWall=tlGrowWall-grow0;cur->gCalls=tlGrowCalls-growN0;grow0=tlGrowWall;growN0=tlGrowCalls;};
   #pragma omp for schedule(static,1) nowait
   for(size_t i=0;i<unmapFirst.size();++i)munmap(unmapFirst[i].first,unmapFirst[i].second);
   // Per-thread campaign totals, laid out [day][campaign].
@@ -5716,7 +6594,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   vector<uint32_t> freq(ncamp),positions(ncamp);vector<uint16_t> active(ncamp+1);size_t nact=0; // active: one free place after a full list (see the fast lane's large click sets)
   vector<uint64_t> catsum(catnames.size());vector<uint16_t> touched;
   PqFile file;
-  auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);file.open(output/"user_daily"/name,userCols);};
+  auto open_file=[&]{char name[32];snprintf(name,sizeof name,"part-%05d.parquet",tid);
+   const int efd=earlyOut&&(size_t)tid<earlyOut->fd.size()?earlyOut->fd[(size_t)tid]:-1; // each worker touches only its own entry
+   if(efd>=0){earlyOut->fd[(size_t)tid]=-1;file.adopt(efd,userCols);}
+   else file.open(output/"user_daily"/name,userCols);};
   // Row buffers. A person adds at most ndays rows and the buffers are flushed between persons,
   // so the fixed-width columns never need a capacity check.
   static constexpr size_t FLUSH=50000;
@@ -5736,11 +6617,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    catbody.clear();
    string head;put_varint(head,(groups<<1)|1);
    put_le32(catbody,(uint32_t)(head.size()+groups));catbody+=head;catbody.append((const char*)catbits,groups);catbody+=catv;
+   const double w0=stats?now_s():0,c0=stats?thr_cpu_s():0;
    if(!file.is_open())open_file();
+   const double w1=stats?now_s():0;
    file.row_group((int64_t)n,{string_view(uidp,uidLen),string_view((const char*)dayp,n*4),
     narrow?string_view((const char*)sess32p,n*4):string_view((const char*)sessp,n*8),
     narrow?string_view((const char*)evs32p,n*4):string_view((const char*)evsp,n*8),
     string_view((const char*)revp,n*8),catbody});
+   if(stats){const double w2=now_s();cur->oWall+=w1-w0;cur->wWall+=w2-w1;cur->wMax=max(cur->wMax,w2-w1);cur->wCpu+=thr_cpu_s()-c0;++cur->wCalls;}
    memset(catbits,0,groups);catv.clear();uidLen=0;nrows=0;
   };
   Scratch<Ev> bufA,bufB;Scratch<Click> bufC,bufD;
@@ -5784,7 +6668,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   };
   // The rows of one person in one go (the fast lane; its names are always of the fixed kind).
   struct RowOut{uint64_t rev,best;int day;uint32_t sess,evs;uint16_t top;};
-  auto put_rows=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&catv,&dbg,&catnames,dayp,revp,sess32p,evs32p,sessp,evsp,catbits,narrow,debugCsv,firstday,tid]
+  // (SS_ROWS=old: one loop that does everything for a row, as before.)
+  auto put_rows_old=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&catv,&dbg,&catnames,dayp,revp,sess32p,evs32p,sessp,evsp,catbits,narrow,debugCsv,firstday,tid]
    (const NameRef& nm,const RowOut* R,size_t k){
    const size_t room=k*((size_t)nm.L+4)+64;
    if(uidCap-uidLen<room)grow_uid(room);
@@ -5800,6 +6685,37 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     }
    }
    uidLen=(size_t)(o-uidp);nrows=r;
+  };
+  // The parts of a person's rows that few rows have: a top category (rows with a purchase), the test output.
+  auto put_rows_rare=[&catv,&dbg,&catnames,catbits,debugCsv,firstday,tid](const NameRef& nm,const RowOut* R,size_t k,size_t r) __attribute__((noinline)) {
+   for(size_t i=0;i<k;++i,++r){const RowOut& x=R[i];
+    if(x.best!=0){catbits[r>>3]|=(uint8_t)(1u<<(r&7));put_bytes(catv,catnames[x.top]);}
+    if(debugCsv){string& t=dbg[tid];
+     t+=hexstr(string_view(nm.p,nm.L));t+=',';t+=to_string(firstday+x.day);t+=',';t+=to_string(x.sess);t+=',';t+=to_string(x.evs);t+=',';t+=to_string(x.rev);t+=',';
+     t+=x.best==0?string("NULL"):hexstr(catnames[x.top]);t+='\n';
+    }
+   }
+  };
+  // The fixed-width columns and the name of every row in a loop that calls nothing and reads only locals
+  // (the byte stores of the name could be stores to anything, so captured pointers would be read again for
+  // every row); the rest in put_rows_rare, for persons that have any of it.
+  auto put_rows=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&put_rows_rare,dayp,revp,sess32p,evs32p,sessp,evsp,narrow,debugCsv,firstday]
+   (const NameRef& nm,const RowOut* R,size_t k) __attribute__((always_inline)) {
+   const uint32_t L=nm.L;const size_t room=k*((size_t)L+4)+64;
+   if(__builtin_expect(uidCap-uidLen<room,0))grow_uid(room);
+   const size_t r0=nrows;char* o=uidp+uidLen;
+   const __m128i name=_mm_loadu_si128((const __m128i*)(const void*)nm.p);
+   const int32_t day0=(int32_t)firstday;uint64_t anyBest=0;
+   if(narrow){int32_t* const dp=dayp+r0;int64_t* const rp=revp+r0;int32_t* const sp=sess32p+r0;int32_t* const ep=evs32p+r0;
+    for(size_t i=0;i<k;++i){const RowOut& x=R[i];
+     memcpy(o,&L,4);_mm_storeu_si128((__m128i*)(void*)(o+4),name);o+=4+L;
+     dp[i]=day0+(int32_t)x.day;rp[i]=(int64_t)x.rev;sp[i]=(int32_t)x.sess;ep[i]=(int32_t)x.evs;anyBest|=x.best;}}
+   else{int32_t* const dp=dayp+r0;int64_t* const rp=revp+r0;int64_t* const sp=sessp+r0;int64_t* const ep=evsp+r0;
+    for(size_t i=0;i<k;++i){const RowOut& x=R[i];
+     memcpy(o,&L,4);_mm_storeu_si128((__m128i*)(void*)(o+4),name);o+=4+L;
+     dp[i]=day0+(int32_t)x.day;rp[i]=(int64_t)x.rev;sp[i]=(int64_t)x.sess;ep[i]=(int64_t)x.evs;anyBest|=x.best;}}
+   uidLen=(size_t)(o-uidp);nrows=r0+k;
+   if(__builtin_expect(anyBest!=0||debugCsv,0))put_rows_rare(nm,R,k,r0);
   };
   // All rows and campaign totals of one person. E[0..ne): the person's events in time order (ne > 0; the
   // order of events with the same time does not matter). cb..ce: the person's clicks in click_before order.
@@ -5871,18 +6787,43 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
    // One index's sessions (start time; number of its rows before the session) and purchases
    // (session<<40 | category<<24 | price), written by the walk over its event slots.
-   Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;fastC2.pool=&pool;
+   Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2,clickKeys3;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;clickKeys3.pool=&pool;fastC2.pool=&pool;
    uint32_t* const sortCnt=(uint32_t*)pool.take((CLICK_SORT_BUCKETS+1)*sizeof(uint32_t)); // click_key_sort's counters
    vector<uint8_t> lastOfV(ncamp+1,0xFF);uint8_t* const lastOf=lastOfV.data(); // small click sets: last position of a campaign
+   // Small click sets, set-up in four loops over the clicks instead of seven (SS_SMALLSET=old: the old set-up):
+   // times and campaigns out of the clicks; ranks; every click straight to its place (clicks of one moment
+   // show in the sum of the ranks and take the old way through keys and ID texts); for every place the
+   // place of the campaign's click before it (lastG: "set's number << 8 | place" per campaign, so that
+   // nothing has to be cleared after a set). A session then finds the first click of every campaign in
+   // its window by one compare of those places with the window's first place.
+   static const bool rowsOld=[]{const char* v=getenv("SS_ROWS");return v&&!strcmp(v,"old");}(); // the fast lane's row writer as it was
+   static const bool smallOld=[]{const char* v=getenv("SS_SMALLSET");return v&&!strcmp(v,"old");}();
+   vector<uint32_t> lastGV(ncamp+1,0);uint32_t* const lastG=lastGV.data();uint32_t smallGen=0;
+   alignas(16) static constexpr auto PLACE16=[]{array<array<int8_t,16>,17> a{};for(int v=0;v<17;++v)for(int i=0;i<16;++i)a[(size_t)v][(size_t)i]=(int8_t)v;return a;}();
    // The 32-bit click arithmetic below counts times from the window start (clicks: -7 days and up), so
    // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
    const bool smallClicksOk=(uint64_t)(window_end-window_start)<0x7fffffffull&&!getenv("SS_TEST_NOSMALLCLICKS");
    uint32_t* const fr=freq.data();uint32_t* const pos=positions.data();uint16_t* const act=active.data();
+   // Large click sets: assists are counted per row, not per session. since[c] is the number of the first
+   // session of the current row that campaign c was in the window for (set when its first click comes
+   // into the window and when a row begins); when its last click leaves the window, and when the row is
+   // closed, the sessions since then are added in one step. No list of active campaigns is kept: a row
+   // is closed by a walk over the clicks in the window, which leaves since[c] at the closing session, so
+   // a second click of a campaign adds nothing. The window runs over 8-byte keys "time << 28 | position
+   // << 16 | campaign", which are also what is sorted (up to 4096 clicks; the position is only looked at
+   // for clicks of one moment, to order them by their ID texts): the clicks are not copied in order.
+   // SS_LARGEASSIST=old: keys with positions, clicks copied out in order, the
+   // active list, one ++ per session and active campaign.
+   static const bool largeOld=[]{const char* v=getenv("SS_LARGEASSIST");return v&&!strcmp(v,"old");}();
+   static const size_t largeMax=[]{const char* v=getenv("SS_TEST_LARGEMAX");const long x=v?atol(v):4096;return (size_t)(x<1?1:x>4096?4096:x);}(); // tests: sets beyond this take the path of sets beyond 4096 clicks
+   static const bool assistLoop=[]{const char* v=getenv("SS_SMALLASSIST");return v&&!strcmp(v,"loop");}(); // small sets: the row's counters added by a loop over the clicks (old) instead of eight at a time
+   vector<uint32_t> sinceV(ncamp+1,0);uint32_t* const since=sinceV.data();
    vector<RowOut> rowsOut((size_t)ndays+2);
    const atomic<uint32_t>* const comp=denseComp;const uint32_t dBase=denseBase;
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
    for(size_t i0=0;i0<idxEnd;i0+=ICH){
     const size_t i1=min(idxEnd,i0+ICH);
+    thr_chunk_in();
     for(size_t ix=i0;ix<i1;++ix){
      DInfo& f=info[ix];
      const uint32_t ec=f.ec.load(memory_order_relaxed),cc=f.cc.load(memory_order_relaxed);
@@ -5982,9 +6923,52 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       // is that of the last one, and the assists are counted in one byte per click (bumped only for the
       // first click of its campaign inside the window) and added to the totals when the row is done.
       // A larger set takes the sliding window over the sorted clicks, as the general lane does.
-      enum{NONE,SMALL,LARGE} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:LARGE;
+      enum{NONE,SMALL,LARGE,LARGEOLD} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:(largeOld||wideWindow)?LARGEOLD:LARGE; // (LARGE keeps times in 36 bits)
       alignas(16) int32_t cts[16];uint16_t ccamp[16],credit[17];uint16_t dupMask[17];size_t nvec=0;uint64_t cntLo=0,cntHi=0;
-      if(mode==SMALL){
+      alignas(16) int8_t prevPlace[16]; // of the campaign's click before this one, or -1
+      if(mode==SMALL&&!smallOld){
+       alignas(16) int32_t tm[16];alignas(16) uint8_t rnk[16];uint16_t cmp[16];
+       const __m128i far=_mm_set1_epi32(INT32_MAX); // later than every click: times from the window start stay below it
+       _mm_store_si128((__m128i*)tm,far);_mm_store_si128((__m128i*)(tm+4),far);_mm_store_si128((__m128i*)(tm+8),far);_mm_store_si128((__m128i*)(tm+12),far);
+       {const FClick* const q=C;const size_t mm=m;
+        for(size_t i=0;i<mm;++i){const uint64_t k=q[i].key;tm[i]=(int32_t)((int64_t)(k>>16)-WEEK);cmp[i]=(uint16_t)k;}}
+       const __m128i T0=_mm_load_si128((const __m128i*)tm),T1=_mm_load_si128((const __m128i*)(tm+4)),T2=_mm_load_si128((const __m128i*)(tm+8)),T3=_mm_load_si128((const __m128i*)(tm+12));
+       __m128i acc=_mm_setzero_si128();
+       for(size_t j=0;j<m;++j){const __m128i b=_mm_set1_epi32(tm[j]); // one byte per place: all ones where that click is later than click j
+        acc=_mm_sub_epi8(acc,_mm_packs_epi16(_mm_packs_epi32(_mm_cmpgt_epi32(T0,b),_mm_cmpgt_epi32(T1,b)),_mm_packs_epi32(_mm_cmpgt_epi32(T2,b),_mm_cmpgt_epi32(T3,b))));}
+       _mm_store_si128((__m128i*)rnk,acc);
+       // The rank of a click is the number of clicks before it in time. All moments different: the ranks are
+       // 0..m-1. Two clicks of one moment share a rank and a later one is missing, so the sum is smaller
+       // (the places without a click have rank m each).
+       const __m128i sad=_mm_sad_epu8(acc,_mm_setzero_si128());
+       const uint32_t rankSum=(uint32_t)_mm_cvtsi128_si32(sad)+(uint32_t)_mm_extract_epi16(sad,4);
+       _mm_store_si128((__m128i*)cts,far);_mm_store_si128((__m128i*)(cts+4),far);_mm_store_si128((__m128i*)(cts+8),far);_mm_store_si128((__m128i*)(cts+12),far);
+       memset(ccamp,0,sizeof ccamp); // (count_assists reads all sixteen places)
+       if(__builtin_expect(rankSum==(uint32_t)(m*(m-1)/2+(16-m)*m),1)){
+        const size_t mm=m;
+        for(size_t i=0;i<mm;++i){const unsigned r=rnk[i];const uint16_t c=cmp[i];cts[r]=tm[i];ccamp[r]=c;credit[r+1]=c;}
+       }
+       else{
+        // Clicks of one moment: by position first, then the larger ID text first, so that the last one has the smallest.
+        uint64_t keys[16];uint8_t taken[16];memset(taken,0,16);
+        for(size_t i=0;i<m;++i){const unsigned r=rnk[i];keys[r+taken[r]++]=((C[i].key>>16)<<32)|i;}
+        for(size_t i=1;i<m;++i)if((keys[i]>>32)==(keys[i-1]>>32)){
+         const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)key),dense.kc));};
+         const uint64_t key=keys[i];size_t j=i;
+         while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
+         keys[j]=key;
+        }
+        for(size_t i=0;i<m;++i){const uint16_t c=(uint16_t)C[(uint32_t)keys[i]].key;cts[i]=(int32_t)((int64_t)(keys[i]>>32)-WEEK);ccamp[i]=c;credit[i+1]=c;}
+       }
+       credit[0]=organic; // read when no click is in the window
+       if(__builtin_expect(++smallGen==(1u<<24),0)){memset(lastG,0,(ncamp+1)*sizeof(uint32_t));smallGen=1;} // (set numbers used up: start again)
+       {const uint32_t tag=smallGen<<8;const size_t mm=m;
+        #pragma GCC unroll 1
+        for(size_t i=0;i<mm;++i){const uint16_t c=ccamp[i];const uint32_t x=lastG[c]^tag,none=0u-(uint32_t)(x>255u); // x: the place, if the entry is of this set
+         lastG[c]=tag|(uint32_t)i;prevPlace[i]=(int8_t)(x|none);}}
+       nvec=(m+3)/4;
+      }
+      else if(mode==SMALL){
        uint64_t keys[16];
        // In time order, clicks of one moment by position, without a data-dependent branch: the place of a
        // click is the number of clicks with an earlier time (counted for all sixteen places at once, one
@@ -6007,6 +6991,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        bool dup=false;uint16_t nextMask[16];
        for(size_t i=0;i<16;++i){cts[i]=INT32_MAX;nextMask[i]=0;}
+       memset(ccamp,0,sizeof ccamp); // (count_assists reads all sixteen places)
        for(size_t i=0;i<m;++i){const FClick& x=C[(uint32_t)keys[i]];const uint16_t c=(uint16_t)x.key;
         cts[i]=(int32_t)((int64_t)(keys[i]>>32)-WEEK);ccamp[i]=c;credit[i+1]=c; // times from the window start, like session times
         const uint8_t p=lastOf[c];if(p!=0xFF){nextMask[p]|=(uint16_t)(1u<<i);dup=true;}
@@ -6018,13 +7003,34 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        else memset(dupMask,0,sizeof dupMask);
        nvec=(m+3)/4;
       }
-      else if(mode==LARGE&&m>1){
+      const uint64_t* LK=nullptr; // large sets: the clicks' keys "time << 28 | position << 16 | campaign", in order
+      if(mode==LARGE){
+       uint64_t* const K=clickKeys3.get(m+1);LK=K;
+       uint64_t all=0;
+       if(m<=largeMax){const FClick* q=C;const FClick* const qe=q+m;uint64_t* o=K;uint64_t at=0;
+        for(;q<qe;++q,++o,at+=0x10000u){const uint64_t k=q->key;all|=k;*o=((k>>16)<<28)|at|(uint16_t)k;__asm__("");}} // (the empty statement keeps the loop scalar)
+       if(__builtin_expect(m>largeMax||(all>>48)!=0,0)){if(all>>48)mode=LARGEOLD;goto large_by_text;} // too many for a 12-bit position: the old order, keys made below (a time beyond 32 bits cannot be in a window this short, but would not fit the key)
+       if(m>1){
+        click_key_sort28(K,m,clickKeys2.get(m),sortCnt);
+        // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
+        uint64_t prev=K[0]>>28;
+        for(size_t i=1;i<m;++i){const uint64_t t=K[i]>>28;const bool same=t==prev;prev=t;
+         if(__builtin_expect(same,0)){
+          const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)(key>>16)&0xFFFu),dense.kc));};
+          const uint64_t key=K[i];size_t j=i;
+          while(j>0&&(K[j-1]>>28)==t&&text_order(K[j-1])<text_order(key)){K[j]=K[j-1];--j;}
+          K[j]=key;
+         }}
+       }
+      }
+      else if(mode==LARGEOLD&&m>1){
+       large_by_text:;
        // Order by time through 8-byte keys (time, position), which sort faster than the clicks
        // themselves; clicks of one moment are then put in text order, and the clicks are copied out
        // in the final order.
        uint64_t* const keys=clickKeys.get(m);
        const bool wide=(C[0].key>>16)>>32!=0||(uint64_t)(window_end-clickStart)>>32!=0; // times that do not fit 32 bits: sort the clicks themselves
-       if(wide||m>4096){
+       if(wide||m>4096||(mode==LARGE&&m>largeMax)){
         if(direct){FClick* const G=fastC.get(m+1);for(size_t i=0;i<m;++i){G[i]=C[i];G[i].present=(uint32_t)(cf+i);}C=G;direct=false;} // sorted in a copy that carries the counters
         const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
          return ta!=tb?ta<tb:order36(dn::value_of(a.present,kc))>order36(dn::value_of(b.present,kc));};
@@ -6043,35 +7049,55 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         for(size_t i=0;i<m;++i)S[i]=C[(uint32_t)keys[i]];
         C=S;
        }
+       if(mode==LARGE){uint64_t* const K=clickKeys3.get(m+1);for(size_t i=0;i<m;++i)K[i]=((C[i].key&~0xFFFFull)<<12)|(C[i].key&0xFFFFu);LK=K;} // (more than 4096 clicks)
       }
       char tmp[16];const NameRef nm=person_name(person,tmp);
       const FClick *add=C,*expire=C,*const ce=C+m;size_t na=0;
+      const uint64_t *add8=LK,*exp8=LK,*const ce8=LK+(mode==LARGE?m:0);
       int currentday=-1;uint64_t dsess=0,drev=0;uint32_t rowStart=0;size_t pi=0;
       RowOut* const R=rowsOut.data();size_t nr=0;
-      const auto close_row=[&](uint32_t evs){ // the finished row with its top category; written out after the person's last session
+      const auto close_row=[&](uint32_t evs) __attribute__((always_inline)) { // the finished row with its top category; written out after the person's last session
        RowOut& o=R[nr++];o.day=currentday;o.sess=(uint32_t)dsess;o.evs=evs;o.rev=drev;o.best=0;o.top=0;
        if(__builtin_expect(!touched.empty(),0)){
         uint16_t top=0;uint64_t best=0;
         for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
         touched.clear();o.best=best;o.top=top;
        }};
-      const auto count_assists=[&](int day){ // the row's byte counters into the totals
+      const auto count_assists=[&](int day) __attribute__((always_inline)) { // the row's byte counters into the totals
        if(!(cntLo|cntHi))return;
        uint64_t* const arow=assists+(size_t)day*ncamp;
-       for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));
+       if(assistLoop){for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));}
+       else{ // eight at a time without a loop: the places after the last click hold campaign 0 and a zero count
+        const uint64_t lo=cntLo;
+        arow[ccamp[0]]+=(uint8_t)lo;arow[ccamp[1]]+=(uint8_t)(lo>>8);arow[ccamp[2]]+=(uint8_t)(lo>>16);arow[ccamp[3]]+=(uint8_t)(lo>>24);
+        arow[ccamp[4]]+=(uint8_t)(lo>>32);arow[ccamp[5]]+=(uint8_t)(lo>>40);arow[ccamp[6]]+=(uint8_t)(lo>>48);arow[ccamp[7]]+=(uint8_t)(lo>>56);
+        if(const uint64_t hi=cntHi){
+         arow[ccamp[8]]+=(uint8_t)hi;arow[ccamp[9]]+=(uint8_t)(hi>>8);arow[ccamp[10]]+=(uint8_t)(hi>>16);arow[ccamp[11]]+=(uint8_t)(hi>>24);
+         arow[ccamp[12]]+=(uint8_t)(hi>>32);arow[ccamp[13]]+=(uint8_t)(hi>>40);arow[ccamp[14]]+=(uint8_t)(hi>>48);arow[ccamp[15]]+=(uint8_t)(hi>>56);}
+       }
        cntLo=0;cntHi=0;};
+      // Large sets: the sessions [since, sn) of the row of `day` for every campaign in the window.
+      const auto flush_window=[&](int day,uint32_t sn) __attribute__((always_inline)) {
+       uint64_t* const arow=assists+(size_t)day*ncamp;
+       for(const uint64_t* q=exp8;q<add8;++q){const uint16_t c=(uint16_t)*q;arow[c]+=sn-since[c];since[c]=sn;}};
+      // The sessions, in one copy of the loop per kind of click set (M is a constant in each).
+      uint64_t dayEnd=0;Totals* totRow=tot;uint64_t* assistRow=assists; // the row's day ends before dayEnd; its totals
+      const auto run_sessions=[&](const int M) __attribute__((always_inline)) {
       for(size_t sn=0;sn<ns;++sn){
-       const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);const int d=(int)((ts+dayOff)/(uint64_t)DAY);
-       if(d!=currentday){
+       const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);
+       if(ts>=dayEnd){ // the sessions come in time order, so a session is in a new day when it is past the end of the row's day
+        const int d=(int)((ts+dayOff)/(uint64_t)DAY);
         if(currentday>=0){
-         if(mode==SMALL)count_assists(currentday);
+         if(M==SMALL)count_assists(currentday);
+         else if(M==LARGE)flush_window(currentday,(uint32_t)sn);
          close_row(ord-rowStart);dsess=0;drev=0;
         }
-        currentday=d;rowStart=ord;
+        currentday=d;rowStart=ord;dayEnd=(uint64_t)(d+1)*(uint64_t)DAY-dayOff;
+        totRow=tot+(size_t)d*ncamp;assistRow=assists+(size_t)d*ncamp;
        }
        ++dsess;
        uint16_t credited=organic;
-       if(mode==SMALL){
+       if(M==SMALL){
         // In the window: start - seven days <= click time <= start.
         const __m128i vlo=_mm_set1_epi32((int)((int64_t)ts-WEEK)),vhi=_mm_set1_epi32((int)ts);
         uint32_t out=0;
@@ -6079,10 +7105,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
          out|=(uint32_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(_mm_cmplt_epi32(x,vlo),_mm_cmpgt_epi32(x,vhi))))<<(4*v);}
         const uint32_t in=~out&((1u<<(4*nvec))-1);
         credited=credit[31-__builtin_clz((in<<1)|1u)]; // the last click in the window, or entry 0
-        const uint32_t firsts=in&~(uint32_t)dupMask[__builtin_ctz(in|0x10000u)]; // bit 16: nothing in the window
+        const unsigned wfirst=(unsigned)__builtin_ctz(in|0x10000u); // the window's first place; 16: nothing in the window
+        const uint32_t firsts=smallOld?in&~(uint32_t)dupMask[wfirst]
+         :in&(uint32_t)_mm_movemask_epi8(_mm_cmpgt_epi8(_mm_load_si128((const __m128i*)(const void*)PLACE16[wfirst].data()),_mm_load_si128((const __m128i*)prevPlace))); // no click of its campaign before it in the window
         cntLo+=SPREAD8[firsts&255];cntHi+=SPREAD8[(firsts>>8)&255];
        }
-       else if(mode==LARGE){
+       else if(M==LARGE){
+        const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<28,expLim=ts<<28;const uint32_t s32=(uint32_t)sn;
+        uint64_t* const arow=assistRow;
+        // (masks, not ?: - first / last click of a campaign in the window is as good as random)
+        while(add8<ce8&&*add8<addLim){
+         const uint16_t c=(uint16_t)*add8;const uint32_t f=fr[c],s=since[c];uint32_t first=0u-(uint32_t)(f==0);
+         __asm__("":"+r"(first)); // (hidden from the compiler, which otherwise turns the mask back into a branch)
+         fr[c]=f+1;since[c]=s^((s^s32)&first);++add8;}
+        while(exp8<add8&&*exp8<expLim){
+         const uint16_t c=(uint16_t)*exp8;const uint32_t f=fr[c]-1;
+         fr[c]=f;arow[c]+=(s32-since[c])&(0u-(uint32_t)(f==0));++exp8;} // (a campaign that came and went with this session: nothing)
+        if(add8>exp8)credited=(uint16_t)add8[-1];
+       }
+       else if(M==LARGEOLD){
         const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
         // Whether a click is the first (last) of its campaign in the window is as good as random, so the
         // list of active campaigns is kept without a branch on it: a write that must not happen goes to the
@@ -6096,11 +7137,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
          const uint16_t back=act[na];const uint32_t at=(uint32_t)na^(((uint32_t)na^pos[c])&(0u-gone)),pb=pos[back];
          act[at]=back;pos[back]=pb^((pb^at)&(0u-gone));++expire;}
         if(add>expire)credited=(uint16_t)add[-1].key;
-        uint64_t* const arow=assists+(size_t)d*ncamp;
+        uint64_t* const arow=assistRow;
         #pragma GCC unroll 4
         for(size_t q=0;q<na;++q)++arow[act[q]];
        }
-       Totals* const cur=&tot[(size_t)d*ncamp+credited];cur->sessions++;
+       Totals* const cur=totRow+credited;cur->sessions++;
        if((pur[pi]>>40)==sn){ // the list ends with an all-ones entry, which is no session's
         cur->purchasing_sessions++;
         do{const uint64_t price=pur[pi]&EV_PRICE;const uint16_t cat=(uint16_t)(pur[pi]>>24);
@@ -6110,9 +7151,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         }while((pur[++pi]>>40)==sn);
        }
       }
-      if(mode==SMALL)count_assists(currentday);
+      if(M==SMALL)count_assists(currentday);
+      else if(M==LARGE){flush_window(currentday,(uint32_t)ns);for(const uint64_t* q=exp8;q<add8;++q)fr[(uint16_t)*q]=0;}
+      };
+      switch(mode){case NONE:run_sessions(NONE);break;case SMALL:run_sessions(SMALL);break;case LARGE:run_sessions(LARGE);break;default:run_sessions(LARGEOLD);}
       close_row((uint32_t)n-rowStart);
-      put_rows(nm,R,nr);
+      if(__builtin_expect(rowsOld,0))put_rows_old(nm,R,nr);else put_rows(nm,R,nr);
       for(size_t q=0;q<na;++q)fr[act[q]]=0;
       num_sessions+=ns;
       if(nrows>=FLUSH)flush_rows();
@@ -6125,6 +7169,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        if(sl.present&&d<8){hand_click(myCl,pool,txt,sl.key,dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|(d^((stored>>(3*d))&7))),(uint32_t)c);++rdHandCl;}}
      }
     }
+    thr_chunk_out();
    }
    // ---- DENSE stage, part 3: the rows of the deferred indexes, in one sweep. ----
    #pragma omp for schedule(dynamic,1) nowait
@@ -6141,18 +7186,26 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      if(sl.present&&(u&DENSE_USER)){const uint32_t d=u&~DENSE_USER;
       if(info[d>>dn::ALIAS_BITS].state.load(memory_order_relaxed)==DSTATE_DEFER){hand_click(myCl,pool,txt,sl.key,dBase+(d^((comp[d>>3].load(memory_order_relaxed)>>(3*(d&7)))&7)),(uint32_t)c);++rdHandCl;}}}
    }
+   if(stats){ // every thread closes its DENSE record before one of them prints the line
+    thr_stage_out();
+    #pragma omp barrier
+   }
    // The general lists are complete now: size the buffers of the rest of this stage by them.
    #pragma omp single
    {
+    const double thrSg0=stats?now_s():0;
     if(slots){
      maxEvPerson=0;maxClPerson=0;
      for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
       maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
      size_pools();
+     if(stats){thrSingle=now_s()-thrSg0;thr_line("dense",dstat,thrR0,thrR0-thrS0,thrSingle);}
      __mark("DENSE");
     }
+    if(stats)thrA0=now_s();
    }
   }
+  if(stats){cur=&astat[tid];cur->in=now_s();cur->cIn=thr_cpu_s();} // from here on: the AGGREGATE stage
   bufA.reserve(maxEvPerson);bufB.reserve(maxEvPerson);bufC.reserve(maxClPerson);bufD.reserve(maxClPerson);
   if(cellPass)cellBuf.reserve(maxEvPerson+2);
   Cell* const cells=cellBuf.p;
@@ -6161,6 +7214,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t nE=0,nC=0;
    for(int t=0;t<T;++t){nE+=surv[t].ev[up].size();nC+=surv[t].cl[up].size();}
    if(!nE)continue;
+   thr_chunk_in();thr_chunk_out();
    const uint32_t base=up<nA?(uint32_t)(up<<shA):denseBase+(uint32_t)((up-nA)<<shB),W=up<nA?WA:WB;
    if(SMALL_BUCKET&&nE<=max<size_t>(SMALL_BUCKET,W/2)){
     // Few rows for the bucket's width: sort them by person and time and go person by person, so the
@@ -6370,17 +7424,31 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     nact=0;
     if(nrows>=FLUSH)flush_rows();
    }
+   thr_chunk_out();
   }
+  // The loop above ended with a barrier: every thread's totals are final. (A failed write ends the run from
+  // inside the region, as a failed write of a user_daily file does.)
+  // The totals are added up by all threads (each cell by one thread), then one of them builds and writes the file.
+  #pragma omp for schedule(static)
+  for(size_t b=0;b<(campEarly?(ncells+MERGE_BLOCK-1)/MERGE_BLOCK:0);++b)merge_totals(b*MERGE_BLOCK,min(ncells,(b+1)*MERGE_BLOCK));
+  #pragma omp single nowait
+  {if(campEarly){__fine("campaign-begin");write_campaigns();__fine("campaign-end");}}
+  const double thrE0=stats?now_s():0;
   // Every row is in the output buffers now (names are copied there): nothing points into an input file.
-  #pragma omp for schedule(static,1) nowait
+  #pragma omp for schedule(dynamic,1) nowait // whoever is free takes a piece: the thread with the campaign file comes late
   for(size_t i=0;i<unmapLast.size();++i)munmap(unmapLast[i].first,unmapLast[i].second);
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
   if(file.is_open())file.close();
+  if(stats){thr_stage_out();cur->endWall=cur->out-thrE0;}
  }
- vector<Totals> campTotals(ncamp*(size_t)ndays);
- for(const Totals* tt:threadTotals)if(tt)for(size_t i=0;i<ncells;++i){campTotals[i].sessions+=tt[i].sessions;campTotals[i].purchasing_sessions+=tt[i].purchasing_sessions;campTotals[i].revenue+=tt[i].revenue;}
- for(const uint64_t* ta:threadAssists)if(ta)for(size_t i=0;i<ncells;++i)campTotals[i].assists+=ta[i];
+ if(!unmapLastBg.empty())thread([v=std::move(unmapLastBg)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach(); // SS_UNMAP=bg
+ if(stats)thr_line("aggregate",astat,thrA0?thrA0:thrR0,0,0);
+ if(earlyOut)for(size_t t=0;t<earlyOut->fd.size();++t)if(earlyOut->fd[t]>=0){ // a file no worker wrote to: it must not stay behind empty
+  ::close(earlyOut->fd[t]);earlyOut->fd[t]=-1;char name[32];snprintf(name,sizeof name,"part-%05d.parquet",(int)t);::unlink((output/"user_daily"/name).c_str());}
+ __fine("region-end");
+ if(!campEarly)write_campaigns();
+ if(earlyOut&&earlyOut->campFd>=0){::close(earlyOut->campFd);earlyOut->campFd=-1;} // SS_OUTOPEN=early: the campaign file is written by write_campaigns() through its own descriptor
 __mark("AGGREGATE");
  if(slots&&stats){
   fprintf(stderr,"STATS dense reader: slots %llu events %llu clicks, fast lane %llu indexes %llu events %llu clicks, handed over %llu events %llu clicks, deferred indexes %llu\n",
@@ -6390,17 +7458,7 @@ __mark("AGGREGATE");
   fprintf(stderr,"STATS person buckets: %zu of 2^%u table persons, %zu of 2^%u dense persons\n",nA,shA,UPn-nA,shB);
  }
  {
-  string cid,chan,csv;vector<int32_t> days;vector<int64_t> s,p,r,a;
-  for(size_t ci=0;ci<ncamp;++ci)for(int d=0;d<ndays;++d){const auto& t=campTotals[(size_t)d*ncamp+ci];if(t.sessions==0&&t.assists==0)continue;
-   put_bytes(cid,campaigns[ci].id);put_bytes(chan,campaigns[ci].channel);days.push_back((int32_t)(firstday+d));
-   s.push_back((int64_t)t.sessions);p.push_back((int64_t)t.purchasing_sessions);r.push_back((int64_t)t.revenue);a.push_back((int64_t)t.assists);
-   if(debugCsv){csv+=hexstr(campaigns[ci].id);csv+=',';csv+=hexstr(campaigns[ci].channel);csv+=',';csv+=to_string(firstday+d);csv+=',';csv+=to_string(t.sessions);csv+=',';csv+=to_string(t.purchasing_sessions);csv+=',';csv+=to_string(t.revenue);csv+=',';csv+=to_string(t.assists);csv+='\n';}
-  }
-  PqFile f;
-  f.open(output/"campaign_daily"/"part-00000.parquet",{{"campaign_id",PQ_BYTES,false,CONV_UTF8},{"channel",PQ_BYTES,false,CONV_UTF8},{"day",PQ_INT32,false,CONV_DATE},
-   {"sessions",PQ_INT64,false,CONV_NONE},{"purchasing_sessions",PQ_INT64,false,CONV_NONE},{"revenue_cents",PQ_INT64,false,CONV_NONE},{"assisted_sessions",PQ_INT64,false,CONV_NONE}});
-  if(!days.empty())f.row_group((int64_t)days.size(),{cid,chan,raw(days),raw(s),raw(p),raw(r),raw(a)});
-  f.close();
+  const string& csv=campCsv;
   if(debugCsv){
    fs::create_directories(scratch);
    ofstream uout(scratch/"user_rows.csv",ios::binary|ios::trunc),cout(scratch/"campaign_rows.csv",ios::binary|ios::trunc);

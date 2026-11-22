@@ -3,14 +3,15 @@
 FROM --platform=linux/amd64 debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY main.cpp main62.cpp mainB4.cpp mainL.cpp diag.cpp vert_bench_1file.cpp ./
+COPY main.cpp mainK.cpp mainM.cpp mainB4.cpp mainL.cpp diag.cpp vert_bench_1file.cpp ./
 RUN mkdir -p /vb && (g++ -std=c++20 -O3 -march=x86-64 -pthread -static -o /vb/vert_bench vert_bench_1file.cpp || echo "vert_bench did not build")
-RUN g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /shopping-core main.cpp && g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /core-b main62.cpp && g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /core-l mainL.cpp && g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /core-d mainB4.cpp && g++ -std=c++20 -O2 -pthread -o /diag diag.cpp
+RUN g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /shopping-core main.cpp && g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /core-k mainK.cpp && g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /core-m mainM.cpp && g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /core-l mainL.cpp && g++ -std=c++20 -O3 -DNDEBUG -march=x86-64 -flto -fopenmp -static -o /core-d mainB4.cpp && g++ -std=c++20 -O2 -pthread -o /diag diag.cpp
 
 FROM --platform=linux/amd64 debian:bookworm-slim
 COPY --from=build /shopping-core /app/shopping-core
 COPY --from=build /diag /app/diag
-COPY --from=build /core-b /app/core-b
+COPY --from=build /core-k /app/core-k
+COPY --from=build /core-m /app/core-m
 COPY --from=build /core-d /app/core-d
 COPY --from=build /core-l /app/core-l
 COPY --from=build /vb /app/vb
