@@ -7960,8 +7960,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   Scratch<uint32_t> slotBuf,emitBuf;vector<size_t> off(T+1);
   slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);if(!evStream)emitBuf.reserve(maxEvBucket);
   Scratch<uint64_t> lostBuf;lostBuf.pool=&pool;if(evStream)lostBuf.reserve(maxEvBucket/64+2);
-  struct Cand{const PRec* r;int t;};
-  Scratch<uint64_t> cellBuf;cellBuf.pool=&pool;Scratch<Cand> candBuf;candBuf.pool=&pool;
+  Scratch<uint64_t> cellBuf;cellBuf.pool=&pool;Scratch<const PRec*> candBuf;candBuf.pool=&pool;
+  vector<const PRec*> segB(T),segE(T); // the bucket's records, thread by thread
   if(prefilter){cellBuf.reserve(maxEvBucket*cellsPer/32+2);candBuf.reserve(maxEvBucket+1);}
   StreamStore<Ev>& sev=surv[tid].sev;
   if(evStream)sev.init(UPn,12,(size_t)(parsedEvents*sizeof(Ev)/(uint64_t)T*9/8));
@@ -7984,19 +7984,24 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(n>=0x7fffffffu){fprintf(stderr,"ERROR event ID bucket too large\n");_exit(1);}
    if(prefilter){
     // One valid record that has won (or has no copy) -> its person's bucket.
-    Ev* const fl=sev.fill;const auto* const fs=sev.bs;
-    const auto emit=[&](const PRec* const r,const int t) __attribute__((always_inline)) {
+    Ev* const fl=sev.fill;auto* const fs=sev.bs;
+    // (t < 0: the record's thread is looked up when it is needed, i.e. for a user of a thread's fallback table.
+    // The put is StreamStore::put written out on local copies of the store's pointers.)
+    const auto emit=[&](const PRec* const r,int t) __attribute__((always_inline)) {
       uint64_t w;memcpy(&w,(const void*)&r->user,8);
       size_t bkt;
       if(__builtin_expect(((uint32_t)w&(LOCAL_USER|DENSE_USER))!=0,0)){
+       if(t<0){t=0;while(!(r>=segB[t]&&r<segE[t]))++t;}
        const uint32_t ru=(uint32_t)w,pn=person_of(ru,t);
        w=(w&~0xffffffffull)|pn;
        bkt=(ru&DENSE_USER)?bnA+((pn-bBase)>>bshB):pn>>bshA;
       }
       else bkt=(uint32_t)w>>bshA;
-      Ev e;e.k=r->k-PR_KBIAS;memcpy((void*)&e.person,&w,8);
-      sev.put(bkt,e);
+      auto& st=fs[bkt];const uint32_t nn=st.n;st.n=nn+1;const unsigned pos=nn&3;
+      Ev* const d=fl+bkt*4+pos;d->k=r->k-PR_KBIAS;memcpy((void*)&d->person,&w,8);
+      if(pos==3)sev.send_line(bkt,st);
     };
+    for(int t=0;t<T;++t){const size_t m=bucket_size(tls[t].eb,p);segB[t]=m?tls[t].eb[p].data():nullptr;segE[t]=segB[t]+m;}
     // Pass 1: two bits per cell, "a record" and "a second record". The cell comes from the low 25 hash bits, which
     // every copy of an ID shares, so all copies of an ID meet in one cell.
     const uint64_t C=min<uint64_t>((uint64_t)n*cellsPer+32,uint64_t(1)<<31);const size_t words=(size_t)((C+31)/32);
@@ -8011,19 +8016,21 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      }
     }
     // Pass 2: alone in its cell = no copy in the bucket: passed on. The others are the candidates.
-    Cand* const cand=candBuf.get(n+1);size_t nc=0;
+    const PRec** const cand=candBuf.get(n+1);size_t nc=0;
     for(int t=0;t<T;++t){
-     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
-     const PRec* const r0=tls[t].eb[p].data();
-     for(size_t i=0;i<m;++i){
-      const PRec* const r=r0+i;
-      {const size_t ab=(size_t)(r0[i+8<m?i+8:i].user>>bshA); // the fill line of a record a little ahead (a wrong guess is harmless)
-       __builtin_prefetch((const char*)fl+ab*64,1,3);__builtin_prefetch((const char*)fs+ab*sizeof(*fs),1,3);}
-      const uint64_t c=((r->ih&PR_HMASK)*C)>>PR_HBITS;
-      const uint64_t again=(bm[c>>5]>>(2*((unsigned)c&31)+1))&1;
-      cand[nc].r=r;cand[nc].t=t;nc+=again;
-      if(!again&&r->k)emit(r,t);
-     }
+     const size_t m=(size_t)(segE[t]-segB[t]);if(!m)continue;
+     const PRec* const r0=segB[t];
+     const auto row=[&](const size_t i) __attribute__((always_inline)) {
+       const PRec* const r=r0+i;
+       const uint64_t c=((r->ih&PR_HMASK)*C)>>PR_HBITS;
+       if((bm[c>>5]>>(2*((unsigned)c&31)+1))&1){cand[nc++]=r;return;}
+       if(r->k)emit(r,t);
+     };
+     size_t i=0;
+     // (the fill line of a record a little ahead is asked for; a wrong guess for the few rows whose user is not a
+     // table number is harmless: a prefetch never faults)
+     for(;i+8<m;++i){__builtin_prefetch((const char*)fl+(size_t)(r0[i+8].user>>bshA)*64,1,3);row(i);}
+     for(;i<m;++i)row(i);
     }
     stEvCand+=nc;size_t dups=0;
     // The candidates through the exact table, in the order of the records (threads, then append order): slot = tag |
@@ -8036,7 +8043,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
      uint32_t waitC[DEDUP_WAIT];unsigned wn=0;
      const auto oneC=[&](const uint32_t ci,const bool mayWait) __attribute__((always_inline)) {
-       const PRec* const r=cand[ci].r;
+       const PRec* const r=cand[ci];
        const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
        const uint32_t tg=((uint32_t)r->hx&tagMask)<<ib;
        size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
@@ -8050,7 +8057,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        if(((any&(0u-any))&mz)!=0)j+=(unsigned)__builtin_ctz(mz);
        else for(uint32_t e;(e=S[j])!=0;){
         if((e^tg)<=imask){ // same tag: compare the IDs themselves
-         const uint32_t oc=(e&imask)-1;const PRec& o=*cand[oc].r;
+         const uint32_t oc=(e&imask)-1;const PRec& o=*cand[oc];
          if(mayWait){ // the two texts lie in the input files: ask for them, come back later
           __builtin_prefetch(o.id);__builtin_prefetch(o.id+48);__builtin_prefetch(r->id);__builtin_prefetch(r->id+48);
           waitC[wn++]=ci;return;
@@ -8074,7 +8081,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(__builtin_expect(wn==DEDUP_WAIT,0)){for(unsigned q=0;q<DEDUP_WAIT;++q)oneC(waitC[q],false);wn=0;}
      }
      for(unsigned q=0;q<wn;++q)oneC(waitC[q],false);
-     for(size_t ci=0;ci<nc;++ci)if(!((lost[ci>>6]>>(ci&63))&1)&&cand[ci].r->k)emit(cand[ci].r,cand[ci].t);
+     for(size_t ci=0;ci<nc;++ci)if(!((lost[ci>>6]>>(ci&63))&1)&&cand[ci]->k)emit(cand[ci],-1);
     }
     for(int t=0;t<T;++t)if(p<tls[t].eb.size()){Bucket<PRec>& B=tls[t].eb[p];
      if(recycle)sev.give((char*)B.b,B.capacity()*sizeof(PRec)); // nobody reads these records again
@@ -8175,7 +8182,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(unsigned q=0;q<wn;++q)one(waitQ[q].r,waitQ[q].g1,waitQ[q].t,false);
    if(evStream){
     // Pass 2: every valid record that did not lose is an event of its person's bucket.
-    Ev* const fl=sev.fill;const auto* const fs=sev.bs;
+    Ev* const fl=sev.fill;auto* const fs=sev.bs;
     for(int t=0;t<T;++t){
      const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
      const PRec* const r0=tls[t].eb[p].data();const size_t g0=off[t];
