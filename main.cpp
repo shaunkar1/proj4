@@ -3760,7 +3760,10 @@ SS_EVENT_LOOP_EV8(events_avx512y_e8v3,SS_V5,win_masks_avx512y,nl_mask_avx512y,ve
 // pass ran through 4 KB at a time with many loads under way (parse-only CPU time of one thread on 3.2M events + 0.8M
 // clicks, this box: index loops 178 ms, lanes without prefetch 233, one prefetch 512 or 1024 ahead 151, two 138).
 // Two per lane because an event line (77 bytes) is more than one cache line per group.
+// Click lines (about 48 bytes) are less than a cache line per group: the click loop asks for the first one only.
+// The first lanePf bytes of each lane of a chunk are asked for when the chunk is cut (lane_cut).
 static unsigned lanePf=1024,lanePf2=1088;
+#define SS_LANE_PF1(X_) if(__builtin_expect(lanePf!=0,1)){const unsigned d_=lanePf;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+d_,0,3);}
 #define SS_LANE_PF(X_) if(__builtin_expect(lanePf!=0,1)){const unsigned d_=lanePf;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+d_,0,3); \
   if(lanePf2){const unsigned e_=lanePf2;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+e_,0,3);}}
 static inline void lane_cut(const char* p,const char* lim,const char* end,const char** c){
@@ -3769,6 +3772,7 @@ static inline void lane_cut(const char* p,const char* lim,const char* end,const 
   const char* const t=p+step*i; // the first line start at or after t is one past the first newline at or after t-1 (p-1 is a newline)
   const char* const nl=(const char*)memchr(t-1,'\n',(size_t)(end-(t-1)));
   c[i]=nl&&nl+1<lim?nl+1:lim;}
+ if(const unsigned d=lanePf)for(unsigned i=0;i<8;++i)if(c[i]<c[i+1])for(unsigned o=0;o<d;o+=64)__builtin_prefetch(c[i]+o,0,3);
 }
 // Rows whose line end the scan did not give (bits of unc): x[i] = one past the first newline from l[i]. A line
 // without one (the last line of the file): returned as a bit, `tail` = the line, the lane goes to the end.
@@ -5020,7 +5024,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
   unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
   if(more){ \
    const unsigned live_=LIVE(lN,le); \
-   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF(xN)} \
+   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF1(xN)} \
    else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail,fixed); \
     for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
    else more=false; \
