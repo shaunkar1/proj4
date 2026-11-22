@@ -6655,7 +6655,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  auto __ru_now=[](double& sys,long& flt,long& vol,long& invol){rusage r{};getrusage(RUSAGE_SELF,&r);sys=(double)r.ru_stime.tv_sec+1e-6*(double)r.ru_stime.tv_usec;flt=r.ru_minflt;vol=r.ru_nvcsw;invol=r.ru_nivcsw;};
  double __sys0=0;long __flt0=0,__vol0=0,__inv0=0;if(__cpuLines)__ru_now(__sys0,__flt0,__vol0,__inv0);
  auto __sysflt=[&](const char* label){double s;long f,v,iv;__ru_now(s,f,v,iv);cerr<<"SYS "<<label<<" "<<s-__sys0<<"\nFLT "<<label<<" "<<f-__flt0<<"\nCSW "<<label<<" "<<v-__vol0<<" "<<iv-__inv0<<"\n";__sys0=s;__flt0=f;__vol0=v;__inv0=iv;};
- auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";__time0=now;
+ double __probeSleep=0; // PROBE BUILD ONLY (-DSS_PROBE_STAGE="\"NAME\"" -DSS_PROBE_K=n): the run is lengthened by n times the wall time of one stage
+ auto __mark=[&](const char *label){auto now=chrono::steady_clock::now();cerr<<"TIME "<<label<<" "<<chrono::duration<double>(now-__time0).count()<<"\n";
+#ifdef SS_PROBE_STAGE
+  if(string_view(label)==SS_PROBE_STAGE)__probeSleep+=SS_PROBE_K*chrono::duration<double>(now-__time0).count();
+#endif
+  __time0=now;
   if(__cpuLines){const double c=__cpu_now();cerr<<"CPU "<<label<<" "<<c-__cpu0<<"\n";__cpu0=c;__sysflt(label);}};
  // SS_FINE=1: FINE lines, the time since the start of run() at points inside the stages (the split of the serial
  // work before the parse stage, the side thread, the campaign file). Measuring only.
@@ -10080,6 +10085,10 @@ __mark("WRITE"); cerr<<"completed sessions: "<<num_sessions<<"\n";
  // Every output file is written and closed. Leave at once: unwinding would only hand gigabytes of
  // mappings back piece by piece before the kernel drops them anyway.
  if(__cpuLines)__sysflt("EXITPREP");
+#ifdef SS_PROBE_STAGE
+ cerr<<"PROBE sleeping "<<__probeSleep<<" s ("<<SS_PROBE_K<<" x stage "<<SS_PROBE_STAGE<<")\n";
+ this_thread::sleep_for(chrono::duration<double>(__probeSleep));
+#endif
  cerr.flush();fflush(nullptr);
  _exit(0);
 }
