@@ -507,17 +507,13 @@ int main(){
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  #define NL {"SS_LANES","0"}
  #define ND {"SS_NODENSE","1"}
- #define GS {"SS_GCOMMIT","stream"}
- #define AU {"SS_ABL","nouser"}
- #define AR {"SS_ABL","norec"}
- #define AK {"SS_ABL","nokern"}
- for(int r=0;r<3;++r){
-  add("Bs",1,{N8,ST});add("gs",1,{N8,ST,GS});add("au",1,{N8,ST,AU});add("ar",1,{N8,ST,AR});add("ak",1,{N8,ST,AK});add("sr",1,{N8,ST,GS,AR});add("su",1,{N8,ST,GS,AU});
+ for(int r=0;r<4;++r){
+  add("Bs",1,{N8,ST});add("vb",1,{N8,ST},"core-b");add("hb",1,{N8,ST},"core-h");add("vh",1,{N8,ST},"core-v");add("ob",1,{N8,ST},"core-o");
  }
  const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HBs",1,{N8,ST},"",true);add("Hgs",1,{N8,ST,GS},"",true);if(r<2){add("Hau",1,{N8,ST,AU},"",true);add("Har",1,{N8,ST,AR},"",true);add("Hak",1,{N8,ST,AK},"",true);}}
+ for(int r=0;r<3;++r){add("HBs",1,{N8,ST},"",true);add("Hvb",1,{N8,ST},"core-b",true);add("Hhb",1,{N8,ST},"core-h",true);add("Hvh",1,{N8,ST},"core-v",true);}
  if(quick){vars.clear();
   for(int r=0;r<4;++r){
    {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
@@ -620,12 +616,10 @@ int main(){
    char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE EV dbccecb | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
    const char* SK="MKLPDAWE";
    const char* SL="MLPDAE";
-   a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("gcommit-stream","gs");
-   a+="| 20M stages MAP/LINKS(all)/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("stream","gs",SL);
-   a+="| PARSE wall,cpu,sys ms: "+fmt("default","Bs","Ppy")+fmt("stream","gs","Ppy")+fmt("ABL-nouser","au","Ppy")+fmt("ABL-norec","ar","Ppy")+fmt("ABL-nokern","ak","Ppy")+fmt("stream+norec","sr","Ppy")+fmt("stream+nouser","su","Ppy");
-   a+="| cpu LINKREAD/PARSE/DEDUP/AGG "+fmt("default","Bs","lpda")+fmt("stream","gs","lpda")+"sys P/D/A "+fmt("","Bs","ybg")+fmt("stream","gs","ybg")+"faults P/D/A "+fmt("","Bs","jnm")+fmt("stream","gs","jnm");
-   {const RunResult* r=get("Bs#0");if(r)a+="| "+r->raw.substr(0,200);}
-   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("stream","Hgs")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("stream","Hgs",SL)+"PARSE wall,cpu,sys: "+fmt("default","HBs","Ppy")+fmt("stream","Hgs","Ppy")+fmt("nouser","Hau","Ppy")+fmt("norec","Har","Ppy")+fmt("nokern","Hak","Ppy")+"cpu L/P/D/A "+fmt("","HBs","lpda")+fmt("stream","Hgs","lpda")+allw("walls","HBs");
+   a=string(t)+"BUILD FLAGS, cand73. 20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("base(x86-64)","Bs")+mm("x86-64-v3","vb")+mm("branch-align","hb")+mm("v3+align","vh")+mm("O2","ob");
+   a+="| 20M stages MAP/LINKS/PARSE/DEDUP/AGG/exit: "+fmt("base","Bs",SL)+fmt("v3","vb",SL)+fmt("align","hb",SL)+fmt("v3+align","vh",SL)+fmt("O2","ob",SL);
+   a+="| cpu LINKREAD/PARSE/DEDUP/AGG "+fmt("base","Bs","lpda")+fmt("v3","vb","lpda")+fmt("align","hb","lpda")+fmt("v3+align","vh","lpda")+fmt("O2","ob","lpda")+allw("walls base","Bs")+allw("v3","vb")+allw("align","hb")+allw("v3+align","vh");
+   c="60M min~median w/P/R/X/A: "+mm("base","HBs")+mm("v3","Hvb")+mm("align","Hhb")+mm("v3+align","Hvh")+"stages MLPDAE "+fmt("base","HBs",SL)+fmt("v3","Hvb",SL)+fmt("align","Hhb",SL)+fmt("v3+align","Hvh",SL)+"cpu L/P/D/A "+fmt("base","HBs","lpda")+fmt("v3","Hvb","lpda")+fmt("align","Hhb","lpda")+fmt("v3+align","Hvh","lpda")+allw("walls","HBs");
   }
   if(quick){
    a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);
