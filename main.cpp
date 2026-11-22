@@ -5419,19 +5419,27 @@ struct Batch{ // 2 IDs per line, in line order: IDs 2i and 2i+1 are one line
  uint32_t kind[2*LB];          // k1 == 0: KeyTable::Long::kind
  uint32_t j[2*LB];             // home slot
  uint32_t id[2*LB];            // the IDs' numbers (set by the links stage)
+ uint8_t lq[2*LB];             // which IDs have a long key (nlong of them)
  int n=0,nlong=0;              // IDs in the batch; long keys among them
  uint64_t fast=0,slow=0,longs=0; // totals: lines cut by the fill itself, lines through link_split, long keys
 };
+// A key that does not pack (over 11 bytes), out of line: one ID in eight.
+static inline __attribute__((always_inline)) void put_long_body(Batch& B,int q,const char* s,size_t n,const KeyTable::Slot* slots,size_t mask){
+ KeyTable::Long l;const uint64_t h=KeyTable::long_key(string_view(s,n),l);const uint32_t j=(uint32_t)(h&mask);
+ B.a[q]=l.a;B.b[q]=l.b;B.h[q]=h;B.s[q]=s;B.len[q]=(uint32_t)n;B.k1[q]=0;B.kind[q]=l.kind;B.j[q]=j;__builtin_prefetch(&slots[j],0,1);
+ B.lq[B.nlong++]=(uint8_t)q;++B.longs;
+}
+static __attribute__((noinline)) void put_long(Batch& B,int q,const char* s,size_t n,const KeyTable::Slot* slots,size_t mask){put_long_body(B,q,s,n,slots,mask);}
 static inline __attribute__((always_inline)) void put(Batch& B,int q,const char* s,size_t n,const KeyTable::Slot* slots,size_t mask){
  uint64_t k0;uint32_t k1;
  if(__builtin_expect(KeyTable::pack(string_view(s,n),k0,k1),1)){
   const uint32_t j=(uint32_t)(KeyTable::hash_packed(k0,k1)&mask);
   B.a[q]=k0;B.k1[q]=k1;B.j[q]=j;__builtin_prefetch(&slots[j],1,1);return;
  }
- KeyTable::Long l;const uint64_t h=KeyTable::long_key(string_view(s,n),l);const uint32_t j=(uint32_t)(h&mask);
- B.a[q]=l.a;B.b[q]=l.b;B.h[q]=h;B.s[q]=s;B.len[q]=(uint32_t)n;B.k1[q]=0;B.kind[q]=l.kind;B.j[q]=j;__builtin_prefetch(&slots[j],0,1);++B.nlong;++B.longs;
+ put_long(B,q,s,n,slots,mask);
 }
-static inline __attribute__((always_inline)) const char* line_split(Batch& B,const char* p,const char* end,const KeyTable::Slot* slots,size_t mask){
+// A line through link_split (out of line: the fills' own cut takes nearly every line).
+static __attribute__((noinline)) const char* line_split(Batch& B,const char* p,const char* end,const KeyTable::Slot* slots,size_t mask){
  string_view f[2];const char* next;
  if(link_split(p,end,f,next)){put(B,B.n,f[0].data(),f[0].size(),slots,mask);put(B,B.n+1,f[1].data(),f[1].size(),slots,mask);B.n+=2;++B.slow;}
  return next;
@@ -5468,36 +5476,56 @@ static const char* fill_base(Batch& B,const char* p,const char* lim,const char* 
  return p;
 }
 #define SS_LKG5 __attribute__((target("avx2,bmi,bmi2,popcnt,lzcnt,avx512f,avx512bw,avx512vl")))
+// KeyTable::pack for a text of 1..11 bytes, without the table of masks (BMI2); same k0 / k1.
+SS_LKG5 static inline __attribute__((always_inline)) void put5(Batch& B,int q,const char* s,unsigned n,const KeyTable::Slot* slots,size_t mask){
+ uint64_t lo;uint32_t hi;memcpy(&lo,s,8);memcpy(&hi,s+8,4);
+ const uint64_t k0=_bzhi_u64(lo,8*n);                          // n >= 8: all 64 bits
+ const uint32_t k1=_bzhi_u32(hi,8*(n>8?n-8:0))|((n+1)<<24);   // n <= 8: no byte of the second word
+ const uint32_t j=(uint32_t)(KeyTable::hash_packed(k0,k1)&mask);
+ B.a[q]=k0;B.k1[q]=k1;B.j[q]=j;__builtin_prefetch(&slots[j],1,1);
+}
+// put_long for fill_v5: the same text built with VEX encodings (a call from 512-bit code into SSE2 code would pay for
+// the dirty upper halves on every instruction).
+SS_LKG5 static __attribute__((noinline)) void put_long5(Batch& B,int q,const char* s,size_t n,const KeyTable::Slot* slots,size_t mask){put_long_body(B,q,s,n,slots,mask);}
+alignas(64) static char FILL_C[3][64]; // 64 x '\n', ',', '"' (filled once; read from memory so that no register has to hold them across the calls)
 SS_LKG5 static const char* fill_v5(Batch& B,const char* p,const char* lim,const char* end,const KeyTable::Slot* slots,size_t mask){
- const __m512i vnl=_mm512_set1_epi8('\n'),vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"');
+ int n=B.n;uint64_t fast=0;
  do{
   if(__builtin_expect(end-p>=64,1)){
    const __m512i x=_mm512_loadu_si512((const void*)p);
-   const uint64_t mn=_mm512_cmpeq_epi8_mask(x,vnl);
+   const uint64_t mn=_mm512_cmpeq_epi8_mask(x,_mm512_load_si512((const void*)FILL_C[0]));
    if(__builtin_expect(mn!=0,1)){
     const unsigned L=(unsigned)_tzcnt_u64(mn); // the line's length, at most 63
-    const uint64_t keep=_bzhi_u64(~0ull,L);
-    const uint64_t mc=_mm512_cmpeq_epi8_mask(x,vc)&keep,mq=_mm512_cmpeq_epi8_mask(x,vq)&keep;
+    const uint64_t mc=_bzhi_u64(_mm512_cmpeq_epi8_mask(x,_mm512_load_si512((const void*)FILL_C[1])),L);
+    const uint64_t mq=_bzhi_u64(_mm512_cmpeq_epi8_mask(x,_mm512_load_si512((const void*)FILL_C[2])),L);
     if(__builtin_expect(mc!=0&&(mc&(mc-1))==0,1)){
      const unsigned P=(unsigned)_tzcnt_u64(mc); // the one comma; P < L
-     const uint64_t qa=mq&1u,qb=(mq>>(P+1))&1u;
-     // Quotes allowed: first and last byte of a field that begins with one.
-     const uint64_t want=qa|(qa<<((P-1)&63))|(qb<<(P+1))|(qb<<((L-1)&63));
-     const int na=(int)P-2*(int)qa,nb=(int)L-(int)P-1-2*(int)qb;
-     if(__builtin_expect(mq==want&&na>=1&&nb>=1,1)){
-      put(B,B.n,p+qa,(size_t)na,slots,mask);put(B,B.n+1,p+P+1+qb,(size_t)nb,slots,mask);
-      B.n+=2;++B.fast;p+=L+1;
+     unsigned na=P,nb=L-P-1;const char* sa=p;const char* sb=p+P+1;
+     if(__builtin_expect(mq!=0,0)){
+      // Quotes allowed: first and last byte of a field that begins with one.
+      const uint64_t qa=mq&1u,qb=(mq>>(P+1))&1u;
+      const uint64_t want=qa|(qa<<((P-1)&63))|(qb<<(P+1))|(qb<<((L-1)&63));
+      if(mq!=want)goto general;
+      na-=2*(unsigned)qa;nb-=2*(unsigned)qb;sa+=qa;sb+=qb; // (a field that is one quote wraps to a huge length: refused below)
+     }
+     if(__builtin_expect(na-1<63&&nb-1<63,1)){
+      if(__builtin_expect(na<=11,1))put5(B,n,sa,na,slots,mask);else put_long5(B,n,sa,na,slots,mask);
+      if(__builtin_expect(nb<=11,1))put5(B,n+1,sb,nb,slots,mask);else put_long5(B,n+1,sb,nb,slots,mask);
+      n+=2;++fast;p+=L+1;
       continue;
      }
     }
    }
   }
-  p=line_split(B,p,end,slots,mask);
- }while(B.n<2*LB&&p<lim);
+  general:
+  B.n=n;p=line_split(B,p,end,slots,mask);n=B.n;
+ }while(n<2*LB&&p<lim);
+ B.n=n;B.fast+=fast;
  return p;
 }
 static inline bool has_v5(){
- static const bool h=__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("lzcnt")&&__builtin_cpu_supports("popcnt");
+ static const bool h=[]{memset(FILL_C[0],'\n',64);memset(FILL_C[1],',',64);memset(FILL_C[2],'"',64);
+  return __builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("lzcnt")&&__builtin_cpu_supports("popcnt");}();
  return h;
 }
 } // namespace lkg
@@ -5994,7 +6022,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // lkSlot[id]: where the value of an ID added by the link loop lives - table slot + 1, or 0x80000000 | index of its
  // long entry (0: added some other way, or out of range; FLATTEN then looks the key up).
  struct LkUF{atomic<uint32_t> p,b;};static_assert(sizeof(LkUF)==8);
- LkUF* const uf=lkGen?(LkUF*)map_huge(((size_t)maxIds+1)*sizeof(LkUF)):nullptr;
+ LkUF* const uf=lkGen?(LkUF*)map_huge(((size_t)maxIds+33)*sizeof(LkUF)):nullptr;
  uint32_t* const lkSlot=lkGen?(uint32_t*)map_huge(((size_t)maxIds+1)*sizeof(uint32_t)):nullptr;
  const auto uf_root=[uf](uint32_t u)__attribute__((always_inline))->uint32_t{
   for(;;){
@@ -6028,6 +6056,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    lkg::Batch ring[RN];
    KeyTable::Slot* const slots=tab.slots;PName* const names=tab.newNames;const size_t tmask=tab.mask;
    LkUF* const ufp=uf;uint32_t* const note=lkSlot;
+   const size_t noteLim=getenv("SS_TEST_LKNOTE")?0:0x7FFFFFFFu; // test switch: no notes, so FLATTEN looks every key up (its path for a note out of range)
    KeyTable::IdBlock blk;
    // A number for a new ID, from this thread's block (cannot run out: the table holds every ID the link lines can name).
    const auto new_id=[&]()__attribute__((always_inline))->uint32_t{
@@ -6049,7 +6078,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       uint32_t expect=0;
       if(!e.k1.compare_exchange_strong(expect,KeyTable::BUSY,memory_order_acquire))continue;
       const uint32_t id=blk.next++;
-      names[id].set_packed(k0,k1);note[id]=j<0x7FFFFFFFu?(uint32_t)j+1:0;
+      names[id].set_packed(k0,k1);note[id]=j<noteLim?(uint32_t)j+1:0;
       e.k0.store(k0,R);e.v.store(tab.idBase+id,R);e.k1.store(k1,memory_order_release);
       return tab.idBase+id;
      }
@@ -6072,7 +6101,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       const uint32_t id=blk.next++;
       const size_t li=tab.longs.n.fetch_add(1,R); // below longs.room: at most idLimit IDs are added in this mode
       names[id].set(string_view(B.s[q],B.len[q]));key.v=tab.idBase+id;tab.longs.d[li]=key;
-      note[id]=li<0x7FFFFFFFu?0x80000000u|(uint32_t)li:0;
+      note[id]=li<noteLim?0x80000000u|(uint32_t)li:0;
       e.k0.store(h,R);e.v.store((uint32_t)li,R);e.k1.store(KeyTable::LONGK,memory_order_release);
       return tab.idBase+id;
      }
@@ -6096,7 +6125,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      if(more)p=fill(B,p,lim,end,slots,tmask);
      else if(++idle>4)break;}
     {const lkg::Batch& B=ring[(t+RN-1)%RN];
-     if(B.nlong)for(int q=0;q<B.n;++q)if(!B.k1[q]){const KeyTable::Slot& e=slots[B.j[q]];if(e.k1.load(memory_order_acquire)==KeyTable::LONGK)__builtin_prefetch(&tab.longs.d[e.v.load(memory_order_relaxed)],0,1);}}
+     for(int i=0;i<B.nlong;++i){const KeyTable::Slot& e=slots[B.j[B.lq[i]]];if(e.k1.load(memory_order_acquire)==KeyTable::LONGK)__builtin_prefetch(&tab.longs.d[e.v.load(memory_order_relaxed)],0,1);}}
     {lkg::Batch& B=ring[(t+RN-2)%RN];const int n=B.n;
      for(int q=0;q<n;++q){
       const uint32_t id=__builtin_expect(B.k1[q]!=0,1)?id_packed(B.a[q],B.k1[q],B.j[q]):id_long(B,q);
@@ -6259,9 +6288,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // A root's own name is no longer needed once every member has been compared, and no other person reads it.
    #pragma omp barrier
    #pragma omp for schedule(static)
-   for(uint32_t i=0;i<nlinked;++i){
-    if(i+16<nlinked&&!uf[i+16].p.load(memory_order_relaxed)){const uint32_t bn=uf[i+16].b.load(memory_order_relaxed);if(bn)__builtin_prefetch(&names[bn-1],0,1);}
-    if(!uf[i].p.load(memory_order_relaxed)){const uint32_t bi=uf[i].b.load(memory_order_relaxed);if(bi)names[i]=names[bi-1];}
+   for(uint32_t i=0;i<nlinked;++i){ // (b is only ever set in a root's entry; the array has 32 spare entries for the look ahead)
+    const uint32_t bn=uf[i+16].b.load(memory_order_relaxed);if(bn)__builtin_prefetch(&names[bn-1],0,1);
+    const uint32_t bi=uf[i].b.load(memory_order_relaxed);if(bi)names[i]=names[bi-1];
    }
   }
   if(unnoted.load())for(auto& l:tab.longs)if(l.v<nlinked)l.v=uf_root(l.v); // (a value that is a root already stays)
