@@ -508,14 +508,16 @@ int main(){
  #define NL {"SS_LANES","0"}
  #define ND {"SS_NODENSE","1"}
  #define GS {"SS_GCOMMIT","stream"}
+ #define BP {"SS_BIGPERSON","0"}
+ #define AO {"SS_AGGORDER","index"}
  for(int r=0;r<3;++r){
-  add("Bs",1,{N8,ST});add("p0",1,{N8,ST,{"SS_PREFILTER","0"}});add("el",1,{N8,ST,{"SS_EMIT","list"},{"SS_CLEMIT","list"}});add("rc",1,{N8,ST,{"SS_RECYCLE","0"}});
-  add("gs",1,{N8,ST,GS});add("e2",1,{N8,ST,{"SS_EBUCKETS","2048"}});add("e4",1,{N8,ST,{"SS_EBUCKETS","4096"}});add("g2",1,{N8,ST,GS,{"SS_GBITS","11"}});add("g4",1,{N8,ST,GS,{"SS_GBITS","12"}});
+  add("Bs",1,{N8,ST});add("bp",1,{N8,ST,BP});add("ao",1,{N8,ST,AO});add("bo",1,{N8,ST,BP,AO});add("lp",1,{N8,ST,{"SS_GEV_LONGPF","0"}});
+  add("gs",1,{N8,ST,GS});add("ue",1,{N8,ST,{"SS_UNMAP","end"}});add("p8",1,{N8,ST,{"SS_PERSONBUCKET","8192"}});add("gb",1,{N8,ST,GS,BP,AO});
  }
  const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HBs",1,{N8,ST},"",true);add("Hgs",1,{N8,ST,GS},"",true);add("He4",1,{N8,ST,{"SS_EBUCKETS","4096"}},"",true);add("He8",1,{N8,ST,{"SS_EBUCKETS","8192"}},"",true);add("Hp0",1,{N8,ST,{"SS_PREFILTER","0"}},"",true);add("Hg3",1,{N8,ST,GS,{"SS_GBITS","13"}},"",true);}
+ for(int r=0;r<2;++r){add("HBs",1,{N8,ST},"",true);add("Hbp",1,{N8,ST,BP},"",true);add("Hao",1,{N8,ST,AO},"",true);add("Hgs",1,{N8,ST,GS},"",true);add("Hue",1,{N8,ST,{"SS_UNMAP","end"}},"",true);add("Hlp",1,{N8,ST,{"SS_GEV_LONGPF","0"}},"",true);add("Hgb",1,{N8,ST,GS,BP,AO},"",true);}
  if(quick){vars.clear();
   for(int r=0;r<4;++r){
    {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
@@ -553,17 +555,18 @@ int main(){
   fprintf(stderr,"DIAG %s\n",floorText.c_str());}
  // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
  string eqText="eq60 not run";
- if(!quick&&gKeys&&timeleft(40)){
+ if(!quick&&timeleft(45)){
   auto csvhash=[&](const char* name,uint64_t& rows,uint64_t& sum){rows=0;sum=0;const string pth=scratch+"/"+name;int fd=open(pth.c_str(),O_RDONLY);if(fd<0)return false;struct stat st;fstat(fd,&st);
    if(st.st_size){const char* b=(const char*)mmap(nullptr,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);uint64_t h=1469598103934665603ull;
     for(off_t k=0;k<st.st_size;++k){if(b[k]=='\n'){h^=h>>29;h*=0xBF58476D1CE4E5B9ull;h^=h>>32;sum+=h;++rows;h=1469598103934665603ull;}else{h^=(unsigned char)b[k];h*=1099511628211ull;}}
     munmap((void*)b,st.st_size);}
    close(fd);unlink(pth.c_str());return true;};
   uint64_t ur[3]={0,0,0},us_[3]={0,0,0},cr[3]={0,0,0},cs[3]={0,0,0};bool ok[3]={false,false,false};
-  for(int i=0;i<2;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
-   {const string o=od();pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,o,env,"");error_code ec;fs::remove_all(o,ec);}ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+  for(int i=0;i<3;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==2)env.push_back({"SS_GCOMMIT","stream"});
+   if(i==2&&!timeleft(12))break;
+   {const string o=od();pipeline(i==0?"Hc0":i==1?"Hc1":"Hc2",H,o,env,i==1?"core-b":"");error_code ec;fs::remove_all(o,ec);}ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c68 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
+  char t[240];snprintf(t,sizeof t,"EQ60 reference c69 rows u%llu c%llu: candidate default %s (u%llu c%llu), candidate stream %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0],!ok[2]?"not run":same(2)?"SAME":"DIFF",(unsigned long long)ur[2],(unsigned long long)cr[2]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
   if(!quick&&fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
@@ -618,10 +621,10 @@ int main(){
    char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
    const char* SK="MKLPDAWE";
    const char* SL="MLPDAE";
-   a=string(t)+"BE 1250057 (prefilter dedup). 20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("PREFILTER=0","p0")+mm("EMIT=list","el")+mm("RECYCLE=0","rc")+mm("GCOMMIT=stream","gs")+mm("EBUCKETS=2048","e2")+mm("EBUCKETS=4096","e4")+mm("stream+GBITS=11","g2")+mm("stream+GBITS=12","g4");
-   a+="| 20M stages MAP/LINKS/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("PREFILTER=0","p0",SL)+fmt("EMIT=list","el",SL)+fmt("RECYCLE=0","rc",SL)+fmt("stream","gs",SL)+fmt("EB2048","e2",SL)+fmt("EB4096","e4",SL)+fmt("s+GB11","g2",SL)+fmt("s+GB12","g4",SL);
-   a+="| cpu L/P/D/A "+fmt("default","Bs","lpda")+fmt("stream","gs","lpda")+"sys P/D/A "+fmt("default","Bs","ybg")+fmt("stream","gs","ybg")+"faults P/D/A "+fmt("default","Bs","jnm")+fmt("stream","gs","jnm");
-   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("stream","Hgs")+mm("EB4096","He4")+mm("EB8192","He8")+mm("PREFILTER=0","Hp0")+mm("stream+GBITS=13","Hg3")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("stream","Hgs",SL)+fmt("EB4096","He4",SL)+fmt("EB8192","He8",SL)+fmt("PREFILTER=0","Hp0",SL)+fmt("s+GB13","Hg3",SL)+"cpu L/P/D/A "+fmt("default","HBs","lpda")+fmt("stream","Hgs","lpda")+"sys P/D/A "+fmt("default","HBs","ybg")+fmt("stream","Hgs","ybg")+allw("walls","HBs");
+   a=string(t)+"cand77. "+eqText+" | 20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("BIGPERSON=0","bp")+mm("AGGORDER=index","ao")+mm("both","bo")+mm("GEV_LONGPF=0","lp")+mm("GCOMMIT=stream","gs")+mm("UNMAP=end","ue")+mm("PERSONBUCKET=8192","p8")+mm("stream+both","gb");
+   a+="| 20M stages MAP/LINKS/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("BIGPERSON=0","bp",SL)+fmt("AGGORDER=index","ao",SL)+fmt("both","bo",SL)+fmt("LONGPF=0","lp",SL)+fmt("stream","gs",SL)+fmt("UNMAP=end","ue",SL)+fmt("PB8192","p8",SL)+fmt("stream+both","gb",SL);
+   a+="| cpu L/P/D/A "+fmt("default","Bs","lpda")+fmt("both","bo","lpda")+fmt("LONGPF=0","lp","lpda")+"sys P/D/A "+fmt("default","Bs","ybg")+fmt("UNMAP=end","ue","ybg");
+   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("BIGPERSON=0","Hbp")+mm("AGGORDER=index","Hao")+mm("stream","Hgs")+mm("UNMAP=end","Hue")+mm("LONGPF=0","Hlp")+mm("stream+both","Hgb")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("BIGPERSON=0","Hbp",SL)+fmt("AGGORDER=index","Hao",SL)+fmt("stream","Hgs",SL)+fmt("UNMAP=end","Hue",SL)+fmt("LONGPF=0","Hlp",SL)+fmt("stream+both","Hgb",SL)+"cpu L/P/D/A "+fmt("default","HBs","lpda")+fmt("BIGPERSON=0","Hbp","lpda")+allw("walls","HBs");
   }
   if(quick){
    a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);

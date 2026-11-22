@@ -863,6 +863,18 @@ static_assert(offsetof(PRec,cat)==offsetof(PRec,user)+4&&offsetof(PRec,hx)==offs
 static constexpr uint64_t EV_PURCHASE=1ull<<24,EV_PRICE=EV_PURCHASE-1;
 static constexpr unsigned EV_TS=25;
 static_assert(PR_KBIAS==1ull<<EV_TS);
+// One cell (2^20 ms of event time) of one big person in the last stage: nmn = the largest ~k, so that all zeros
+// means "no event" (k is never 0), mx = the largest k, cnt = events, any = OR of the keys' low halves (purchase flag).
+struct BCell{uint64_t nmn,mx;uint32_t cnt,any;};
+static_assert(sizeof(BCell)==24);
+// Fault injection for the tests of the last stage's big-person path: a build with -DAGFAULT takes the number of
+// ONE deliberate bug from SS_AGFAULT (see the AGF(n) places); any other build has none of it.
+#ifdef AGFAULT
+static const int agFault=[]{const char* v=getenv("SS_AGFAULT");return v?atoi(v):0;}();
+#define AGF(n) (agFault==(n))
+#else
+#define AGF(n) false
+#endif
 // One surviving click, 24 bytes. key = (ts - (window_start - 7 days))<<16 | campaign.
 struct Click{uint64_t key;const char* id;uint32_t person;uint32_t idlen;};
 // ---- Clicks straight from the parser to the persons (GFAST.md "DIRECTION CHANGE AFTER SURVEY 2", item 1; SS_CLDIRECT) ----
@@ -1122,7 +1134,7 @@ struct alignas(64) ThreadState{
  uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
  uint64_t gevAblSum=0; // SS_ABL=norec
  uint64_t gevRows=0,gevSlow=0,gevChecked=0; // general event loop (ev8g kernel): rows, rows the kernel refused (line code), rows compared in check mode
- struct GCap{PRec prec;uint64_t cls,key,hi;int64_t ingest;bool has;};GCap* gcap=nullptr; // SS_GEV=check: the general handler stores its record here instead of committing it
+ struct GCap{PRec prec;uint64_t cls,key,hi,gh;int64_t ingest;bool has;};GCap* gcap=nullptr; /* gh: the stream hash of (cls, key, hi) as the scalar entry computes it */ // SS_GEV=check: the general handler stores its record here instead of committing it
  StreamStore<PClick> pcl;vector<PClick> pclLocal; // clDirect: this thread's valid clicks by person range; those of fallback-table users
  StreamStore<ERec> es; // SS_COMMIT=stream: this thread's dense event rows by bucket (counter >> dparse.bsh)
  StreamStore<GRec> gs;StreamStore<GRecL> gl; // SS_GCOMMIT=stream: this thread's general event rows by bucket (short / other IDs; long IDs)
@@ -1802,6 +1814,8 @@ static inline uint64_t gkey_classify(const char* s,size_t n,uint64_t& key,uint64
  }
  key=(uint64_t)(uintptr_t)s;return GCLS_OTHER;
 }
+// The stream hash of a classified event_id (s, n: its text, read for class 2 only).
+static inline uint64_t gkey_hash(uint64_t cls,uint64_t key,uint64_t hi,const char* s,size_t n){return cls==GCLS_SHORT?gkey_hash_short(key):cls==GCLS_LONG?gkey_hash_long(key,hi):hkey(string_view(s,n));}
 // One general event row into the calling thread's streams (h = the hash of its class, see GRec).
 static inline __attribute__((always_inline)) void gstream_put(ThreadState& tl,unsigned gbits,uint64_t cls,uint64_t key,uint64_t hi,uint64_t h,uint64_t k,uint32_t user,unsigned cat,int64_t ingest){
  const size_t b=(size_t)(h>>(64-gbits));
@@ -1811,7 +1825,7 @@ static inline __attribute__((always_inline)) void gstream_put(ThreadState& tl,un
 // The scalar entry: classify the text, hash, put.
 static inline void gcommit_row(ThreadState& tl,unsigned gbits,const char* s,size_t n,uint64_t k,uint32_t user,unsigned cat,int64_t ingest){
  uint64_t key,hi;const uint64_t cls=gkey_classify(s,n,key,hi);
- gstream_put(tl,gbits,cls,key,hi,cls==GCLS_SHORT?gkey_hash_short(key):cls==GCLS_LONG?gkey_hash_long(key,hi):hkey(string_view(s,n)),k,user,cat,ingest);
+ gstream_put(tl,gbits,cls,key,hi,gkey_hash(cls,key,hi,s,n),k,user,cat,ingest);
 }
 // SS_GCOMMIT=stream while nothing reads the streams directly: one thread's streams back into its PRec buckets, so
 // that the bucket dedup runs unchanged. The text of a class 0 / 1 ID is written out again ('e' + bytes + ',') into
@@ -4673,84 +4687,98 @@ SS_EVENT_LOOP_EV8L(events_avx512y_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,ve
 // a bucket) and compares the 32 bytes of the two records, the exact ingest_ts and the line end.
 // SS_ABL (TEST ONLY, WRONG OUTPUT: pricing on the scoring machine; the run stops after the PARSE mark): 1 nouser = no
 // user lookup and no slot request (every row user 0); 2 norec = the row is decoded and resolved but its record is not
-// stored (no bucket append / stream put, no fill-line request); 3 nokern = lane scan only: line starts found, nothing decoded.
+// stored (no bucket append / stream put, no fill-line request); 3 nokern = lane scan only: line starts found, nothing decoded; 4 stop = the full loop (for timing PARSE alone).
 static unsigned gevAbl=0;
+static bool gevLongPf=true;
+static bool gevCount=false;
 static bool gevCheck=false,gevLongText=false; // gevLongText (SS_GEV_LONG=text): canonical long users through their text (long_user), as before
-struct alignas(64) GevSide{uint64_t h[8];uint64_t hu[8];uint32_t j[8];}; // per row: hash of the event key; hash of a canonical long user; table slot of a packed user
-template<class GEN> [[gnu::noinline]] static void gev_check_row(const char* l,const char* nx,const PRec* prec,uint64_t cls,uint64_t key,uint64_t hi,uint64_t k,uint32_t user,unsigned cat,int64_t ingest,const EvLoop& lp,GEN&& general){
+struct alignas(64) GevSide{uint64_t h[8];uint64_t hu[8];uint32_t j[8];unsigned lm;}; // // lm: rows whose user is a canonical long ID (their slots were asked for) // per row: hash of the event key; hash of a canonical long user; table slot of a packed user
+template<class GEN> [[gnu::noinline]] static void gev_check_row(const char* l,const char* nx,const PRec* prec,const uint64_t* gh,uint64_t cls,uint64_t key,uint64_t hi,uint64_t k,uint32_t user,unsigned cat,int64_t ingest,const EvLoop& lp,GEN&& general){
  ThreadState& tl=lp.tl;
  const char* const nl=(const char*)memchr(l,'\n',(size_t)(lp.end-l));
  ThreadState::GCap cap;memset((void*)&cap,0,sizeof cap);tl.gcap=&cap;
  line_general<7>(l,lp.end,general);tl.gcap=nullptr;
  uint32_t cu;memcpy(&cu,(const void*)&cap.prec.user,4);
  if(nl&&nl+1==nx&&cap.has&&cap.cls==cls&&cap.key==key&&cap.hi==hi&&cap.prec.k==k&&cu==user&&cap.prec.cat==cat&&cap.ingest==ingest
-    &&(!prec||memcmp((const void*)&cap.prec,(const void*)prec,sizeof(PRec))==0)){++tl.gevChecked;return;}
+    &&(!prec||memcmp((const void*)&cap.prec,(const void*)prec,sizeof(PRec))==0)&&(!gh||*gh==cap.gh)){++tl.gevChecked;return;}
  const size_t n=nl?(size_t)(nl-l):(size_t)(lp.end-l);
- fprintf(stderr,"SS_GEV=check: row differs (line end %d, record %d, PRec %d): kernel class %llu key %llx hi %llx k %llu user %u cat %u ingest %lld | handler class %llu key %llx hi %llx k %llu user %u cat %u ingest %lld | line: %.*s\n",
-  (int)(nl&&nl+1==nx),(int)cap.has,(int)(!prec||memcmp((const void*)&cap.prec,(const void*)prec,sizeof(PRec))==0),(unsigned long long)cls,(unsigned long long)key,(unsigned long long)hi,(unsigned long long)k,user,cat,(long long)ingest,
+ fprintf(stderr,"SS_GEV=check: row differs (line end %d, record %d, PRec %d, stream hash %d): kernel class %llu key %llx hi %llx k %llu user %u cat %u ingest %lld | handler class %llu key %llx hi %llx k %llu user %u cat %u ingest %lld | line: %.*s\n",
+  (int)(nl&&nl+1==nx),(int)cap.has,(int)(!prec||memcmp((const void*)&cap.prec,(const void*)prec,sizeof(PRec))==0),(int)(!gh||*gh==cap.gh),(unsigned long long)cls,(unsigned long long)key,(unsigned long long)hi,(unsigned long long)k,user,cat,(long long)ingest,
   (unsigned long long)cap.cls,(unsigned long long)cap.key,(unsigned long long)cap.hi,(unsigned long long)cap.prec.k,cu,(unsigned)cap.prec.cat,(long long)cap.ingest,(int)min<size_t>(n,300),l);
  abort();
 }
+// The loop's switches as values (globals would be loaded again for every row: the row code stores through pointers).
+struct GevOpt{unsigned abl;bool check,count,longText,longPf;};
 // D: what F wants ready, for one ok row.
-SS_V3I void gev_ahead_row(const vertg::Ev8gOut& o,GevSide& s,const unsigned i,const EvLoop& lp){
+SS_V3I void gev_ahead_row(const vertg::Ev8gOut& o,GevSide& s,const unsigned i,const EvLoop& lp,const GevOpt G){
  if(lp.gstrm){ // the hash of the record's class; its bucket's fill line and state
   const uint64_t cls=o.ecls[i];
   const uint64_t h=__builtin_expect(cls==GCLS_SHORT,1)?gkey_hash_short(o.ekey[i]):cls==GCLS_LONG?gkey_hash_long(o.ekey[i],o.ehi[i]):hkey_v3(o.es[i],(size_t)o.el[i]);
   s.h[i]=h;
-  if(lp.gspf&&gevAbl!=2){const size_t b=(size_t)(h>>lp.gsh);
+  if(lp.gspf&&G.abl!=2){const size_t b=(size_t)(h>>lp.gsh);
    if(cls==GCLS_LONG){__builtin_prefetch(lp.gl->fill+b,1,3);__builtin_prefetch(lp.gl->bs+b,1,3);}
    else{__builtin_prefetch(lp.gs->fill+b*2,1,3);__builtin_prefetch(lp.gs->bs+b,1,3);}}
  }else s.h[i]=hkey_v3(o.es[i],(size_t)o.el[i]);
- if(o.kk[i]&&__builtin_expect(gevAbl!=1,1)){
-  if(__builtin_expect(o.ucls[i]==0,1)){const size_t j=KeyTable::hash_packed(o.uk0[i],(uint32_t)o.uk1[i])&lp.tmask;s.j[i]=(uint32_t)j;__builtin_prefetch(&lp.slots[j],0,1);}
-  else if(o.ucls[i]==1){const uint64_t hl=mix64(o.ulo[i]^mix64(o.uhi[i]^((uint64_t)(0x100u|(uint8_t)'u')*0x9E3779B97F4A7C15ull)));s.hu[i]=hl;__builtin_prefetch(&lp.slots[hl&lp.tmask],0,1);} // KeyTable::long_key's hash of 'u' + 32 hex
+ if(o.kk[i]&&__builtin_expect(G.abl!=1,1)){
+  if(__builtin_expect(o.ucls[i]==0,1)){const uint64_t k0=o.uk0[i];const uint32_t k1=(uint32_t)o.uk1[i];const uint64_t hh=KeyTable::hash_packed(k0,k1);const size_t j=hh&lp.tmask;s.j[i]=(uint32_t)j;
+   __builtin_prefetch(&lp.slots[j],0,1);}
+  else if(o.ucls[i]==1){const uint64_t hl=mix64(o.ulo[i]^mix64(o.uhi[i]^((uint64_t)(0x100u|(uint8_t)'u')*0x9E3779B97F4A7C15ull)));s.hu[i]=hl;s.lm|=1u<<i;__builtin_prefetch(&lp.slots[hl&lp.tmask],0,1);} // KeyTable::long_key's hash of 'u' + 32 hex
  }
 }
 // m = the rows of the group that are lines of this chunk. A whole group takes the loop without the row mask.
-SS_V3I void gev_ahead(const vertg::Ev8gOut& o,GevSide& s,const unsigned m,const EvLoop& lp){
- const unsigned live=m&o.ok;
- if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_ahead_row(o,s,i,lp);}
- else for(unsigned x=live;x;x&=x-1)gev_ahead_row(o,s,(unsigned)__builtin_ctz(x),lp);
+SS_V3I void gev_ahead(const vertg::Ev8gOut& o,GevSide& s,const unsigned m,const EvLoop& lp,const GevOpt G){
+ const unsigned live=m&o.ok;s.lm=0;
+ if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_ahead_row(o,s,i,lp,G);}
+ else for(unsigned x=live;x;x&=x-1)gev_ahead_row(o,s,(unsigned)__builtin_ctz(x),lp,G);
+}
+// Between D and F (a kernel call before F): a canonical long user's slot has arrived by now; it holds the index of the
+// key's entry in the table's long list, which is a second line of memory far away: ask for it (SS_GEV_LONGPF=0: do not).
+SS_V3I void gev_mid(const GevSide& s,const EvLoop& lp){
+ for(unsigned x=s.lm;x;x&=x-1){const unsigned i=(unsigned)__builtin_ctz(x);
+  const KeyTable::Slot& e=lp.slots[s.hu[i]&lp.tmask];
+  if(e.k1.load(memory_order_acquire)==KeyTable::LONGK)__builtin_prefetch(&lp.tab.longs.d[e.v.load(memory_order_relaxed)],0,3);}
 }
 // F: one ok row becomes a record.
-template<class GEN> SS_V3I void gev_finish_row(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned i,const EvLoop& lp,uint32_t* const pend,unsigned& cnt,GEN&& general){
+template<class GEN> SS_V3I void gev_finish_row(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned i,const EvLoop& lp,const GevOpt G,uint32_t* const pend,unsigned& cnt,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const auto R_=memory_order_relaxed;
  const uint64_t k=o.kk[i];uint32_t user=0;unsigned cat=0;
  if(k){
-  if(__builtin_expect(gevAbl==1,0)){} // SS_ABL=nouser
+  if(__builtin_expect(G.abl==1,0)){} // SS_ABL=nouser
   else if(__builtin_expect(o.ucls[i]==0,1)){
    const uint64_t k0=o.uk0[i];const uint32_t k1=(uint32_t)o.uk1[i];const size_t j=s.j[i];KeyTable::Slot& e=lp.slots[j];
    if(__builtin_expect(e.k1.load(memory_order_acquire)==k1&&e.k0.load(R_)==k0,1))user=e.v.load(R_);
    else{const string_view u(o.us[i],(size_t)o.ul[i]);user=tab.find_or_add_packed(k0,k1,j,u);if(user==KeyTable::NONE)user=LOCAL_USER|tl.users.intern(u);}
-  }else if(o.ucls[i]==1&&!gevLongText){ // 'u' + 32 hex: the table's key of that text is (kind, lo, hi), which the kernel has (KeyTable::long_key)
+  }else if(o.ucls[i]==1&&!G.longText){ // 'u' + 32 hex: the table's key of that text is (kind, lo, hi), which the kernel has (KeyTable::long_key)
    KeyTable::Long key;key.a=o.ulo[i];key.b=o.uhi[i];key.v=0;key.kind=0x100u|(uint8_t)'u';
    const string_view u(o.us[i],(size_t)o.ul[i]);user=tab.find_or_add_long_key(key,s.hu[i],u);if(user==KeyTable::NONE)user=LOCAL_USER|tl.users.intern(u);
   }else user=long_user(o.us[i],(size_t)o.ul[i],tab,tl);
   if((o.pur>>i)&1){const uint32_t ci=lp.products.find(string_view(o.s5[i],(size_t)o.l5[i]));cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;}
  }
  const int64_t ingest=(int64_t)o.ingest[i];const uint64_t h=s.h[i];
- if(__builtin_expect(gevAbl==2,0)){lp.tl.gevAblSum+=k^h^user^cat^(uint64_t)ingest;return;} // SS_ABL=norec: the values are used, nothing is stored
+ if(__builtin_expect(G.abl==2,0)){lp.tl.gevAblSum+=k^h^user^cat^(uint64_t)ingest;return;} // SS_ABL=norec: the values are used, nothing is stored
  if(lp.gstrm){
-  const uint64_t cls=o.ecls[i];
-  if(__builtin_expect(gevCheck,0))gev_check_row(L[i],X[i],nullptr,cls,o.ekey[i],o.ehi[i],k,user,cat,ingest,lp,general);
-  const size_t b=(size_t)(h>>lp.gsh);
-  if(__builtin_expect(cls==GCLS_LONG,0))lp.gl->put(b,GRecL{o.ekey[i],o.ehi[i],k,grec_uc(user,cat,cls),ingest,{0,0,0}});
-  else if(lp.gnote)lp.gs->put_noted(b,GRec{o.ekey[i],k,grec_uc(user,cat,cls),ingest},pend,cnt); // a full line leaves at the end of the group (no branch per row)
-  else lp.gs->put(b,GRec{o.ekey[i],k,grec_uc(user,cat,cls),ingest});
+  const uint64_t cls=o.ecls[i];const size_t b=(size_t)(h>>lp.gsh);
+  if(__builtin_expect(cls==GCLS_LONG,0)){const GRecL r{o.ekey[i],o.ehi[i],k,grec_uc(user,cat,cls),ingest,{0,0,0}};
+   if(__builtin_expect(G.check,0))gev_check_row(L[i],X[i],nullptr,&h,grec_cls(r),r.lo,r.hi,r.k,grec_user(r),grec_cat(r),r.ingest,lp,general); // the record as it is stored
+   lp.gl->put(b,r);
+  }else{const GRec r{o.ekey[i],k,grec_uc(user,cat,cls),ingest};
+   if(__builtin_expect(G.check,0))gev_check_row(L[i],X[i],nullptr,&h,grec_cls(r),r.key,0,r.k,grec_user(r),grec_cat(r),r.ingest,lp,general);
+   if(lp.gnote)lp.gs->put_noted(b,r,pend,cnt); // a full line leaves at the end of the group (no branch per row)
+   else lp.gs->put(b,r);}
   return;
  }
  const uint64_t code=ingest_code(ingest);
  if(__builtin_expect(code==INGEST_SIDE,0))tl.ingestSide.emplace_back(o.es[i],ingest); // out of the code's range: the exact value on the side, as the general handler does
  const PRec r=make_prec(o.es[i],h,code,k,cat,user);
- if(__builtin_expect(gevCheck,0))gev_check_row(L[i],X[i],&r,o.ecls[i],o.ekey[i],o.ehi[i],k,user,cat,ingest,lp,general);
+ if(__builtin_expect(G.check,0))gev_check_row(L[i],X[i],&r,nullptr,o.ecls[i],o.ekey[i],o.ehi[i],k,user,cat,ingest,lp,general);
  Bucket<PRec>& vec=lp.buckets[(size_t)(((h>>40)*lp.PE)>>24)];
  if(__builtin_expect(vec.full(),0))vec.reserve(max<size_t>(16,2*vec.capacity()));
  vec.append(r);
 }
-template<class GEN> SS_V3I void gev_finish(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned m,const EvLoop& lp,GEN&& general){
+template<class GEN> SS_V3I void gev_finish(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned m,const EvLoop& lp,const GevOpt G,GEN&& general){
  const unsigned live=m&o.ok;uint32_t pend[8];unsigned cnt=0;
- if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_finish_row(o,s,L,X,i,lp,pend,cnt,general);}
- else for(unsigned x=live;x;x&=x-1)gev_finish_row(o,s,L,X,(unsigned)__builtin_ctz(x),lp,pend,cnt,general);
+ if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_finish_row(o,s,L,X,i,lp,G,pend,cnt,general);}
+ else for(unsigned x=live;x;x&=x-1)gev_finish_row(o,s,L,X,(unsigned)__builtin_ctz(x),lp,G,pend,cnt,general);
  lp.gs->send_noted(pend,cnt); // (nothing noted unless lp.gnote; before any other use of the store: the slow rows, the next group)
 }
 // The stand-in instance (scalar twin): no scan stage, every line end through lane_fix (memchr).
@@ -4769,9 +4797,10 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  if(p>=lim)return; \
  const char* const end=base+len; \
+ const GevOpt G{gevAbl,gevCheck,gevCount,gevLongText,gevLongPf}; /* the switches, read once per chunk: locals for the row code */ \
  const EvLoop lp(tl,tab,products,PE,end); \
  const vert4::EvConst ec=ev8_const4(0,0,lp.wstart,lp.wlen,0); \
- vertg::Ev8gOut out[2];vertg::Ev8gScan sc[2];GevSide side[2]; \
+ vertg::Ev8gOut out[2];vertg::Ev8gScan sc[2];GevSide side[2];side[0].lm=side[1].lm=0; \
  alignas(64) const char* A[4][8];alignas(64) const char* le[8];const char* tail=nullptr; \
  {const char* cut_[9];lane_cut(p,lim,end,cut_);for(unsigned i_=0;i_<8;++i_){A[0][i_]=cut_[i_];le[i_]=cut_[i_+1];}} \
  const char* const* lD=A[0];const char* const* xD=A[0];const char* const* lF=A[0];const char* const* xF=A[0]; /* lines and next lines of D, F */ \
@@ -4779,6 +4808,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  uint64_t rows=0,shortG=0,fixed=0; \
  do{ \
   unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
+  if(nF&&G.longPf)gev_mid(*dF,lp); /* first thing: F's long users' slots were asked for a turn ago; their entries get the scan, the decode and gev_ahead of time (dF->lm is 0 unless the group went through gev_ahead) */ \
   if(more){ \
    const unsigned live_=LIVE(lN,le); \
    if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF(xN)} \
@@ -4786,9 +4816,9 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
     for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
    else more=false; \
   } \
-  if(nD&&__builtin_expect(gevAbl!=3,1)){DEC(lD,xD,*sD,ec,*oD);gev_ahead(*oD,*dD,nD,lp);} \
-  if(nF&&__builtin_expect(gevAbl==3,0)){rows+=(unsigned)__builtin_popcount(nF);} /* SS_ABL=nokern */ \
-  else if(nF){rows+=(unsigned)__builtin_popcount(nF);gev_finish(*oF,*dF,lF,xF,nF,lp,general); \
+  if(nD&&__builtin_expect(G.abl!=3,1)){DEC(lD,xD,*sD,ec,*oD);gev_ahead(*oD,*dD,nD,lp,G);} \
+  if(nF&&__builtin_expect(G.abl==3,0)){rows+=(unsigned)__builtin_popcount(nF);} /* SS_ABL=nokern */ \
+  else if(nF){rows+=(unsigned)__builtin_popcount(nF);gev_finish(*oF,*dF,lF,xF,nF,lp,G,general); \
    for(unsigned r_=nF&~(unsigned)oF->ok;__builtin_expect(r_!=0,0);r_&=r_-1)NAME##_slow(lF[__builtin_ctz(r_)],lp,general);} \
   lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=nN;++g; /* D becomes F, N becomes D */ \
   {vertg::Ev8gScan* const t_=sN;sN=sD;sD=t_;vertg::Ev8gOut* const u_=oD;oD=oF;oF=u_;GevSide* const v_=dD;dD=dF;dF=v_;} \
@@ -7488,7 +7518,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool gevVec=!gevRef&&hasE8&&gevW!="old"&&!getenv("SS_LINES")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  gevCheck=gevW=="check"||gevW=="checkref";
  gevLongText=getenv("SS_GEV_LONG")&&string_view(getenv("SS_GEV_LONG"))=="text";
- if(const char* v=getenv("SS_ABL")){const string_view w(v);gevAbl=w=="nouser"?1:w=="norec"?2:w=="nokern"?3:0;}
+ if(const char* v=getenv("SS_ABL")){const string_view w(v);gevAbl=w=="nouser"?1:w=="norec"?2:w=="nokern"?3:w=="stop"?4:0;} // stop: nothing left out, the run just ends after the PARSE mark
+ if(const char* v=getenv("SS_GEV_LONGPF"))gevLongPf=atoi(v)!=0;
+ gevCount=getenv("SS_STATS")!=nullptr;
  const bool gevUse=(gevRef||gevVec)&&!dparse.events&&!dparse.users;
  // SS_GCOMMIT=stream (needs the loop above for every event file): the rows go to GRec / GRecL streams of 2^gbits
  // buckets per thread instead of PRec buckets. gbits: the smallest with estimated rows / buckets <= 6,000, 6..12
@@ -7649,7 +7681,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     return;
    }
    uint64_t code=testSide?INGEST_SIDE:ingest_code(ingest);
-   if(__builtin_expect(tl.gcap!=nullptr,0)){ThreadState::GCap& c=*tl.gcap;c.prec=make_prec(f[0].data(),h,code,k,cat,user);c.cls=gkey_classify(f[0].data(),f[0].size(),c.key,c.hi);c.ingest=ingest;c.has=true;return;} // SS_GEV=check
+   if(__builtin_expect(tl.gcap!=nullptr,0)){ThreadState::GCap& c=*tl.gcap;c.prec=make_prec(f[0].data(),h,code,k,cat,user);c.cls=gkey_classify(f[0].data(),f[0].size(),c.key,c.hi);c.gh=gkey_hash(c.cls,c.key,c.hi,f[0].data(),f[0].size());c.ingest=ingest;c.has=true;return;} // SS_GEV=check
    if(dparse.gstream){gcommit_row(tl,dparse.gbits,f[0].data(),f[0].size(),k,user,cat,ingest);return;} // general route, SS_GCOMMIT=stream
    if(code==INGEST_SIDE)tl.ingestSide.emplace_back(f[0].data(),ingest); // rare: keep the exact value on the side
    PRec r=make_prec(f[0].data(),h,code,k,cat);r.user=user;
@@ -8627,6 +8659,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const auto order_buckets=[&]{
   upOrder.resize(UPn);for(size_t up=0;up<UPn;++up)upOrder[up]=(uint32_t)up;
   static const bool byIndex=[]{const char* v=getenv("SS_AGGORDER");return v&&!strcmp(v,"index");}();
+  if(stats){ // how even the person buckets are: events in buckets by size class (classes: up to 4096, 16k, 32k, 64k, 256k, more)
+   static const size_t lim[5]={4096,16384,32768,65536,262144};uint64_t nb[6]={0},ne[6]={0},mx=0,tot=0;
+   for(size_t up=0;up<UPn;++up){uint64_t x=0;for(int t=0;t<T;++t)x+=ev_count(t,up);if(!x)continue;
+    int c=0;while(c<5&&x>lim[c])++c;++nb[c];ne[c]+=x;mx=max(mx,x);tot+=x;}
+   fprintf(stderr,"STATS person bucket sizes: events %llu, largest bucket %llu; buckets/events by size <=4096: %llu/%llu <=16k: %llu/%llu <=32k: %llu/%llu <=64k: %llu/%llu <=256k: %llu/%llu more: %llu/%llu\n",
+    (unsigned long long)tot,(unsigned long long)mx,(unsigned long long)nb[0],(unsigned long long)ne[0],(unsigned long long)nb[1],(unsigned long long)ne[1],(unsigned long long)nb[2],(unsigned long long)ne[2],
+    (unsigned long long)nb[3],(unsigned long long)ne[3],(unsigned long long)nb[4],(unsigned long long)ne[4],(unsigned long long)nb[5],(unsigned long long)ne[5]);
+  }
   if(byIndex)return;
   vector<uint64_t> w(UPn);
   for(size_t up=0;up<UPn;++up){uint64_t x=0;for(int t=0;t<T;++t)x+=ev_count(t,up)+cl_count(t,up);w[up]=x;}
@@ -8849,6 +8889,23 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // is sorted and handled person by person instead of by the counting passes. SS_SMALLBUCKET=0 turns that off.
  static const size_t SMALL_BUCKET=[]{const char* v=getenv("SS_SMALLBUCKET");const long x=v?atol(v):4096;return (size_t)(x<0?0:x);}();
  if(personSess)cerr<<"test: every person through sessionize_person\n";
+ // BIG PERSONS. A person with at least BIGP events in its bucket (generated data: the five people with 1-2% of all
+ // events each; each of them makes its bucket 10-70 times the usual size) is not ordered at all: sessions only
+ // need, per cell, the earliest and the latest time, the number of events and the purchases (see the cell loop),
+ // so one pass over the bucket drops such a person's events into a table of its cells (24 bytes per cell, in L1/L2)
+ // and sessionize_cells walks the table. The bucket's other events are copied aside in the same pass and go
+ // through the counting passes as usual. The default threshold keeps the tables below 6 bytes per event of the
+ // bucket. SS_BIGPERSON=0: off (every person through the passes, as before); SS_BIGPERSON=n: threshold n exactly
+ // (tests: 1 = every person that has room in 64 MB of tables).
+ static const long bigPersonEnv=[]{const char* v=getenv("SS_BIGPERSON");return v?atol(v):-1L;}();
+ const size_t bigCellN=(size_t)((uint64_t)(window_end-window_start)>>CELL)+2; // k>>CSH = (ts - window_start + 1)>>CELL is below this
+ const size_t BIGP=bigPersonEnv==0?0:bigPersonEnv>0?(size_t)bigPersonEnv:max<size_t>(16384,4*bigCellN);
+ const size_t bigMax=bigPersonEnv>0?max<size_t>(1,(size_t(64)<<20)/(bigCellN*sizeof(BCell))):SIZE_MAX;
+ uint64_t agBigPersons=0,agBigEv=0;
+ // Test switch SS_TEST_CLICKCOPIES=n: every n-th click of a person bucket is there twice and every 3n-th three
+ // times when the last stage reads the bucket (copies of a click are identical, so the answer must not change).
+ static const size_t testCopies=[]{const char* v=getenv("SS_TEST_CLICKCOPIES");const long x=v?atol(v):0;return (size_t)(x<0?0:x);}();
+ if(testCopies)cerr<<"test: every "<<testCopies<<". click copied in the last stage\n";
  uint64_t num_sessions=0;
  // campaign_daily: the totals of all threads added up, one row per campaign and day with a session or an assist,
  // one file. By default one worker does this as soon as every thread has left the last sessionizing loop, while
@@ -8922,8 +8979,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  //            goes with the process). No worker waits in munmap, and a worker's mmap waits for one step at most.
  //   bgfirst  the helper takes the event files only; the rest as today.
  //   late     the workers unmap everything after the last loop, nothing before the index loop.
- vector<pair<char*,size_t>> unmapLastBg;
- {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=(w=="bg"||w.empty())?1:w=="bgfirst"?2:w=="late"?3:0; // default bg (scoring machine: DENSE -3 ms, AGGREGATE -4 ms at 20M; -10 and -13 at 60M); SS_UNMAP=workers = the workers unmap
+ //   end      nothing is unmapped while anybody computes: every worker, once its own output file is written
+ //            and closed, takes pieces of 32 MB of ALL input mappings until none is left. (With bg the helper
+ //            only starts when the last loop is over on v5 data - long names point into the event files - so
+ //            nearly all of the input, 5.7 GB of mapped files at 60M rows, is left to process exit, which tears
+ //            mappings down on one thread: the 9 / 27 ms of "exit" at 20M / 60M.) To be A/B-ed on the scoring
+ //            machine before it becomes the default: parallel munmap cost more CPU than exit in the workers mode.
+ vector<pair<char*,size_t>> unmapLastBg,unmapEnd;
+ {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=w=="end"?4:w=="bgfirst"?2:w=="late"?3:w=="workers"?0:1; // default bg (scoring machine: DENSE -3 ms, AGGREGATE -4 ms at 20M against workers; -10 and -13 at 60M); SS_UNMAP=workers = the workers unmap; SS_UNMAP=end is NOT measured there yet
   const auto unmap_bg=[](vector<pair<char*,size_t>> v){if(v.empty())return;
    thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();};
   // SS_POOLPRE=1 (measuring switch): every thread's pool gets its next region here, before any unmapping starts,
@@ -8934,7 +8997,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(mode==3){unmapLast.insert(unmapLast.end(),unmapFirst.begin(),unmapFirst.end());unmapFirst.clear();}
   if(mode==1||mode==2){unmap_bg(std::move(unmapFirst));unmapFirst.clear();}
   if(mode==1)unmapLastBg.swap(unmapLast);
-  if(stats)cerr<<"STATS unmap: SS_UNMAP="<<(mode==1?"bg":mode==2?"bgfirst":mode==3?"late":"workers")<<" first "<<unmapFirst.size()<<" last "<<unmapLast.size()<<" helper-last "<<unmapLastBg.size()<<"\n";
+  if(mode==4){
+   const size_t step=size_t(32)<<20;
+   for(const auto* l:{&unmapFirst,&unmapLast})for(const auto& r:*l)for(size_t at=0;at<r.second;at+=step)unmapEnd.push_back({r.first+at,min(step,r.second-at)});
+   unmapFirst.clear();unmapLast.clear();
+  }
+  if(stats)cerr<<"STATS unmap: SS_UNMAP="<<(mode==1?"bg":mode==2?"bgfirst":mode==3?"late":mode==4?"end":"workers")<<" first "<<unmapFirst.size()<<" last "<<unmapLast.size()<<" helper-last "<<unmapLastBg.size()<<" end "<<unmapEnd.size()<<"\n";
  }
  if(stats)thrR0=now_s();
  // Turns of the index loop. On generated data the user index is a rank: the first five indexes hold about 1.1%
@@ -8946,7 +9014,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   for(size_t i=0;i<idxEnd;){turnLo.push_back((uint32_t)i);const size_t step=turnsOld||i>=4096?ICH:i<64?1:i<512?16:64;i=min(idxEnd,i+step);}
   turnLo.push_back((uint32_t)idxEnd);}
  const size_t nTurns=turnLo.size()-1;
- #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9],rdMarkIdx,rdMarkPersons,rdMarkEv,rdMarkCl,rdMarkRows,rdMarkSorted,rdMarkPulled)
+ #pragma omp parallel num_threads(T) reduction(+:num_sessions,agBigPersons,agBigEv,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9],rdMarkIdx,rdMarkPersons,rdMarkEv,rdMarkCl,rdMarkRows,rdMarkSorted,rdMarkPulled)
  {
   const int tid=omp_get_thread_num();
   ThrStat thrNone;ThrStat* cur=stats?&dstat[tid]:&thrNone; // the stage this thread is in
@@ -9000,6 +9068,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   };
   Scratch<Ev> bufA,bufB;Scratch<Click> bufC,bufD;
   bufA.pool=bufB.pool=&pool;bufC.pool=bufD.pool=&pool;
+  // Big persons of the bucket at hand: bigIdx = their places in the bucket (ascending), bigOf[place] = index + 1 (0 for
+  // everybody else, all zero between buckets), their cell tables, their purchases, and the bucket's other events.
+  Scratch<Ev> bufR,bufP;Scratch<BCell> bigCells;bufR.pool=bufP.pool=&pool;bigCells.pool=&pool;
+  vector<uint32_t> bigOfV(BIGP?(size_t)Wmax+1:0),bigIdx;uint32_t* const bigOf=bigOfV.data();
   // One person's cells: earliest and latest key, the OR of the keys' low halves (purchase flag), and where the cell ends.
   struct Cell{uint64_t mn,mx;uint32_t anyLo,end;};
   static_assert(sizeof(Cell)==24&&offsetof(Cell,end)==offsetof(Cell,anyLo)+4);
@@ -9130,6 +9202,49 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     }
    }
    const uint64_t devs=ne-rowStart;
+   put_row(nm,currentday,dsess,devs,drev);
+   for(size_t q=0;q<na;++q)fr[act[q]]=0;
+   num_sessions+=nsess;
+   if(nrows>=FLUSH)flush_rows();
+  };
+  // All rows and campaign totals of one BIG person, from its cells instead of its events: Z[c] is cell c (cnt 0:
+  // no event there), P..Pend the person's purchases in key order. The rules and the order of work are those of the
+  // cell loop of the last stage: a cell is shorter than the session gap, so its events share a session, and
+  // whether a session starts at a cell depends only on the latest time before it and on its own earliest time.
+  auto sessionize_cells=[&put_row,&touched,&num_sessions,&nrows,&flush_rows,catsum=catsum.data(),dOff=dayOff,nCamp=ncamp,org=organic,totals=tot,assist=assists,
+   fr=freq.data(),pos=positions.data(),act=active.data()](const NameRef& nm,const BCell* Z,size_t nz,const Ev* P,const Ev* Pend,const Click* cb,const Click* ce){
+   size_t na=0;const Click *add=cb,*expire=cb;
+   int currentday=-1;uint64_t dsess=0,devs=0,drev=0,nsess=0,prevmax=0;
+   Totals* cur=nullptr;bool purchasing=false;
+   for(size_t c=0;c<nz;++c){
+    const BCell& z=Z[c];if(!z.cnt)continue;
+    const uint64_t tmin=(~z.nmn)>>EV_TS;
+    if(!cur||tmin-prevmax>(uint64_t)GAP-(AGF(1)?1:0)){
+     const int d=(int)((tmin+dOff)/(uint64_t)DAY);
+     if(d!=currentday){
+      if(currentday>=0){put_row(nm,currentday,dsess,devs,drev);dsess=0;if(!AGF(3))devs=0;drev=0;}
+      currentday=d;
+     }
+     ++dsess;++nsess;
+     const uint64_t addLim=(tmin+(uint64_t)WEEK+1)<<16,expLim=tmin<<16;
+     while(add<ce&&add->key<addLim){const uint16_t k=(uint16_t)add->key;if(fr[k]++==0){pos[k]=(uint32_t)na;act[na++]=k;}++add;}
+     while(expire<add&&expire->key<expLim){const uint16_t k=(uint16_t)expire->key;if(--fr[k]==0){const uint32_t at=pos[k];const uint16_t back=act[--na];act[at]=back;pos[back]=at;}++expire;}
+     uint16_t credited=org;
+     if(add>expire)credited=(uint16_t)add[-1].key;
+     cur=&totals[(size_t)d*nCamp+credited];cur->sessions++;purchasing=false;
+     uint64_t* const arow=assist+(size_t)d*nCamp;
+     for(size_t q=0;q<na;++q)++arow[act[q]];
+    }
+    prevmax=(AGF(2)?~z.nmn:z.mx)>>EV_TS;devs+=z.cnt;
+    if(z.any&EV_PURCHASE){
+     const uint64_t cellEnd=((uint64_t)c+(AGF(4)?2:1))<<CSH;
+     for(;P<Pend&&P->k<cellEnd;++P){const uint64_t price=P->k&EV_PRICE;const uint16_t cat=P->cat;
+      drev+=price;cur->revenue+=price;
+      if(!purchasing){purchasing=true;cur->purchasing_sessions++;}
+      if(catsum[cat]==0)touched.push_back(cat);
+      catsum[cat]+=price;}
+    }
+   }
    put_row(nm,currentday,dsess,devs,drev);
    for(size_t q=0;q<na;++q)fr[act[q]]=0;
    num_sessions+=nsess;
@@ -9802,6 +9917,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   #pragma omp for schedule(dynamic,1)
   for(size_t oi=0;oi<UPn;++oi){
    const size_t up=upOrder[oi];
+   if(__builtin_expect(testCopies!=0,0)){ // test: copies go to the end of this thread's own list of the bucket (nobody else reads it now)
+    vector<Click> extra;size_t k=0;
+    each_cl(up,[&](const char* s,const size_t m,const size_t st){
+     for(size_t i=0;i<m;++i)if(++k%testCopies==0){Click c;memcpy((void*)&c,s+i*st,sizeof c);extra.push_back(c);if(k%(3*testCopies)==0)extra.push_back(c);}});
+    for(const Click& c:extra)*surv[tid].cl[up].slot(pool)=c;
+   }
    size_t nE=0,nC=0;
    for(int t=0;t<T;++t){nE+=ev_count(t,up);nC+=cl_count(t,up);}
    if(!nE)continue;
@@ -9834,9 +9955,53 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // lists directly, so the events are never gathered separately.
    const unsigned sh0=tpass[0].sh;const uint32_t m0=tpass[0].mask;
    memset(th,0,((size_t)m0+2)*sizeof(uint32_t));memset(pp,0,((size_t)W+3)*sizeof(uint32_t));
-   each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
+   // A bucket several times the size a big person needs most likely holds one: only the persons are counted
+   // first (the cells are counted from R below, or from the lists if there is no big person after all).
+   const bool heavy=BIGP&&nE>=4*BIGP;
+   if(heavy)each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
+     #pragma GCC unroll 4
+     for(size_t i=0;i<m;++i)++pp[(s[i].person-base)+2];});
+   else each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
      #pragma GCC unroll 4
      for(size_t i=0;i<m;++i){++th[((s[i].k>>sh0)&m0)+1];++pp[(s[i].person-base)+2];}});
+   // Big persons (see BIGP): their events go into cell tables, the bucket's other nS events into R, and the
+   // counts are taken again from R. A big person keeps ONE unused place in the person order, so that its range
+   // is not empty: that is what keeps a person's clicks below.
+   size_t nBig=0,nS=nE,nBigPur=0;const Ev* R=nullptr;BCell* bigZ=nullptr;Ev* bigP=nullptr;
+   if(BIGP&&nE>=BIGP){
+    bigIdx.clear();
+    for(uint32_t i=0;i<W&&bigIdx.size()<bigMax;++i)if(pp[i+2]>=BIGP)bigIdx.push_back(i);
+    nBig=bigIdx.size();
+   }
+   if(nBig){
+    size_t bigEv=0;
+    for(size_t j=0;j<nBig;++j){bigOf[bigIdx[j]]=(uint32_t)j+1;bigEv+=pp[bigIdx[j]+2];}
+    agBigPersons+=nBig;agBigEv+=bigEv;
+    bigZ=bigCells.get(nBig*bigCellN);memset((void*)bigZ,0,nBig*bigCellN*sizeof(BCell));
+    bigP=bufP.get(bigEv);Ev* const Rw=bufR.get(nE-bigEv+1);Ev* rw=Rw;Ev* pw=bigP;
+    each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
+      for(size_t i=0;i<m;++i){const uint64_t k=s[i].k;const uint32_t bj=bigOf[s[i].person-base]; // a tombstone's place is W: never big
+       if(__builtin_expect(bj!=0,1)){
+        const uint64_t c=k>>CSH;
+        if(__builtin_expect(c>=bigCellN,0)){fprintf(stderr,"ERROR event time outside the window in the last stage\n");_exit(1);}
+        BCell* const z=bigZ+(size_t)(bj-1)*bigCellN+c;
+        const uint64_t nk=~k;
+        if(nk>z->nmn&&!(AGF(9)&&z->cnt>2))z->nmn=nk;
+        if(k>z->mx&&!(AGF(12)&&z->cnt>2))z->mx=k;
+        ++z->cnt;if(!AGF(5))z->any|=(uint32_t)k;
+        if(__builtin_expect((k&EV_PURCHASE)!=0,0))*pw++=s[i];
+       }else *rw++=s[i];}});
+    const size_t nr=(size_t)(rw-Rw);nBigPur=(size_t)(pw-bigP);
+    R=Rw;nS=nr;
+    memset(pp,0,((size_t)W+3)*sizeof(uint32_t));
+    if(!heavy)memset(th,0,((size_t)m0+2)*sizeof(uint32_t)); // (a heavy bucket has not counted its cells yet: th is all zero)
+    for(size_t i=0;i<nr;++i){++th[((Rw[i].k>>sh0)&m0)+1];++pp[(Rw[i].person-base)+2];}
+    for(size_t j=0;j<nBig;++j)pp[bigIdx[j]+2]=AGF(11)?0:1;
+   }else if(heavy){ // no big person after all: the cells are counted now
+    each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
+      #pragma GCC unroll 4
+      for(size_t i=0;i<m;++i)++th[((s[i].k>>sh0)&m0)+1];});
+   }
    for(uint32_t d=0;d<m0;++d)th[d+1]+=th[d];
    // pp[i+1] = where person i's events start; after the person pass pp[i]..pp[i+1] is person i's range.
    // nE counts tombstones too.
@@ -9845,8 +10010,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     pp[i+2]+=pp[i+1];
    }
    pp[W+2]+=pp[W+1]; // tombstones (person = base+W) are placed after everybody and never looked at
-   Ev* A=bufA.get(nE);Ev* B=bufB.get(nE);
-   each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
+   Ev* A=bufA.get(nS+nBig);Ev* B=bufB.get(nS+nBig);
+   if(R)for(size_t i=0;i<nS;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(R+i));_mm_storeu_si128((__m128i*)(A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++),e);}
+   else each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
      if(pfa)
      #pragma GCC unroll 4
      for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));Ev* const d=A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
@@ -9856,18 +10022,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(size_t q=1;q<tpass.size();++q){
     const unsigned sh=tpass[q].sh;const uint32_t mk=tpass[q].mask;
     memset(th,0,((size_t)mk+2)*sizeof(uint32_t));
-    for(size_t i=0;i<nE;++i)++th[((A[i].k>>sh)&mk)+1];
+    for(size_t i=0;i<nS;++i)++th[((A[i].k>>sh)&mk)+1];
     for(uint32_t d=0;d<mk;++d)th[d+1]+=th[d];
-    for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh)&mk]++),e);}
+    for(size_t i=0;i<nS;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh)&mk]++),e);}
     swap(A,B);
    }
    {uint32_t* const pq=pp+1;
     if(pfa)
     #pragma GCC unroll 4
-    for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));Ev* const d=B+pq[A[i].person-base]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
+    for(size_t i=0;i<nS;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));Ev* const d=B+pq[A[i].person-base]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
     else
     #pragma GCC unroll 4
-    for(size_t i=0;i<nE;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+pq[A[i].person-base]++),e);}}
+    for(size_t i=0;i<nS;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(A+i));_mm_storeu_si128((__m128i*)(B+pq[A[i].person-base]++),e);}}
+   if(!AGF(6))for(size_t j=0;j<nBig;++j)++pp[bigIdx[j]+1]; // a big person's unused place: its range is that one place (never read)
    const Ev* const E=B;
    // Clicks of people with events, grouped by person the same way.
    Click* C=nullptr;
@@ -9899,6 +10066,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    }
    for(uint32_t pi=0;pi<W;++pi){
     const size_t es=pp[pi],ee=pp[pi+1];if(es==ee)continue;
+    if(nBig&&bigOf[pi])continue; // a big person: after the loop
     const uint32_t person=base+pi;
     const Click *cb=nullptr,*ce=nullptr;
     if(nC){
@@ -10011,6 +10179,31 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     nact=0;
     if(nrows>=FLUSH)flush_rows();
    }
+   if(nBig){
+    // The big persons: purchases by person and time (bigIdx is ascending, so the persons come in that order),
+    // clicks finished as in the loop above, rows and totals from the cells.
+    if(nBigPur>1&&!AGF(8))sort(bigP,bigP+nBigPur,[](const Ev& a,const Ev& b){return a.person!=b.person?a.person<b.person:a.k<b.k;});
+    const Ev* P=bigP;const Ev* const Plast=bigP+nBigPur;
+    for(size_t j=0;j<nBig;++j){
+     const uint32_t pi=bigIdx[j],person=base+pi;
+     const Ev* P1=P;while(P1<Plast&&P1->person==person)++P1;
+     const Click *cb=nullptr,*ce=nullptr;
+     if(nC){
+      Click* c0=C+cp[pi];Click* c1=C+cp[pi+1];const size_t n=(size_t)(c1-c0);
+      if(n>1&&!AGF(10)){
+       if(n<=24)click_insertion_sort(c0,c1);
+       else for(Click* r0=c0;r0<c1;){
+        const uint64_t cellEnd=((r0->key>>CCSH)+1)<<CCSH;Click* r1=r0+1;while(r1<c1&&r1->key<cellEnd)++r1;
+        if(r1-r0>1){if(r1-r0<=24)click_insertion_sort(r0,r1);else sort(r0,r1,click_before);}
+        r0=r1;
+       }
+      }
+      cb=c0;ce=c1;
+     }
+     char tmp[16];sessionize_cells(person_name(person,tmp),bigZ+j*bigCellN,bigCellN,P,P1,cb,ce);
+     P=P1;if(!AGF(7))bigOf[pi]=0;
+    }
+   }
    thr_chunk_out();
   }
   // The loop above ended with a barrier: every thread's totals are final. (A failed write ends the run from
@@ -10027,6 +10220,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   flush_rows();
   if(tid==0&&!file.is_open())open_file(); // the folder always holds at least one file, even with no rows
   if(file.is_open())file.close();
+  // SS_UNMAP=end: this thread's output is on its way; the input mappings go now, on all threads at once.
+  #pragma omp for schedule(dynamic,1) nowait
+  for(size_t i=0;i<unmapEnd.size();++i)munmap(unmapEnd[i].first,unmapEnd[i].second);
   if(stats){thr_stage_out();cur->endWall=cur->out-thrE0;}
  }
  if(!unmapLastBg.empty())thread([v=std::move(unmapLastBg)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach(); // SS_UNMAP=bg
@@ -10046,6 +10242,7 @@ __mark("AGGREGATE");
    (unsigned long long)rdWhy[0],(unsigned long long)rdWhy[1],(unsigned long long)rdWhy[2],(unsigned long long)rdWhy[3],(unsigned long long)rdWhy[4],(unsigned long long)rdWhy[5],(unsigned long long)rdWhy[6],(unsigned long long)rdWhy[7],(unsigned long long)rdWhy[8]);
   fprintf(stderr,"STATS person buckets: %zu of 2^%u table persons, %zu of 2^%u dense persons\n",nA,shA,UPn-nA,shB);
  }
+ if(stats)fprintf(stderr,"STATS big persons: SS_BIGPERSON threshold %zu (0 = off), %llu persons %llu events through cell tables of %zu cells\n",BIGP,(unsigned long long)agBigPersons,(unsigned long long)agBigEv,bigCellN);
  {
   const string& csv=campCsv;
   if(debugCsv){
