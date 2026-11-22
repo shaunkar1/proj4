@@ -539,6 +539,9 @@ struct KeyTable{
    const size_t have=size();if(have)memcpy((void*)nd,(const void*)d,have*sizeof(Long));if(raw)munmap(raw,rawLen);d=nd;raw=r;rawLen=rl;room=want;}
   void push_back(const Long& l){const size_t i=size();if(i==room)reserve(max<size_t>(1024,room*2));d[i]=l;n.store(i+1,memory_order_relaxed);}
  };
+ // Rewrites the value of the long entries [from, to) (to <= longs.size()); disjoint ranges may run in different
+ // threads while nobody adds keys (the links stage sets every linked ID to its group's root this way).
+ template<class FN> void remap_long(size_t from,size_t to,FN&& fn){for(size_t i=from;i<to;++i)longs.d[i].v=fn(longs.d[i].v);}
  // Sixteen hex digits [0-9a-f] at p as a number (first digit highest); false if any byte is something else.
  __attribute__((always_inline)) static bool hex16(const char* p,uint64_t& v){
   const __m128i x=_mm_loadu_si128((const __m128i*)(const void*)p);
