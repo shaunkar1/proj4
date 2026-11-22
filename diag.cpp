@@ -142,7 +142,7 @@ static void put_bytes(string& o,string_view s){put_le32(o,(uint32_t)s.size());o.
 template<class V> static string_view raw(const V& v){return string_view((const char*)v.data(),v.size()*sizeof(v[0]));}
 
 static uint64_t gKe=0,gKu=0,gKc=0;static bool gKeys=false; // the generator's ID keys, read from the pipeline's STATS line
-struct RunResult{string dth,csw;string hand;string label;double wall=0,user=0,sys=0;long minflt=0,majflt=0,maxrssMB=0,nvcsw=0,nivcsw=0;int rc=0;map<string,double> t;uint64_t pc[4]={0,0,0,0};int perfErr=0;};
+struct RunResult{string dth,csw;string hand;string raw;string label;double wall=0,user=0,sys=0;long minflt=0,majflt=0,maxrssMB=0,nvcsw=0,nivcsw=0;int rc=0;map<string,double> t;uint64_t pc[4]={0,0,0,0};int perfErr=0;};
 static vector<RunResult> results;
 static int perf_open(pid_t pid,uint32_t type,uint64_t config){
  perf_event_attr a;memset(&a,0,sizeof a);a.size=sizeof a;a.type=type;a.config=config;a.inherit=1;a.exclude_kernel=0;a.exclude_hv=1;a.disabled=0;
@@ -175,6 +175,8 @@ static void run_child(const string& bin,vector<pair<string,string>> env,RunResul
   if(line.rfind("SYS ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["s"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1);}
   if(line.rfind("FLT ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["f"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1)/1e6;}
   if(line.rfind("SMAPS FilePmdMapped:",0)==0)r.t["pmd"]=atof(line.c_str()+20)/1e6;
+  for(const char* pre:{"dense:","STATS dense keys","STATS ev8 loop","STATS cl8","STATS dense reader","linked IDs","STATS event buckets","STATS click buckets","ERROR"})
+   if(line.rfind(pre,0)==0&&r.raw.size()<700){r.raw+=line.substr(0,150);r.raw+=" # ";}
   if(line.rfind("STATS dense threads:",0)==0)r.dth=line.substr(20);
   if(line.rfind("STATS dense reader:",0)==0){size_t a=line.find("handed over ");size_t b=line.find(", deferred");if(a!=string::npos&&b!=string::npos&&b>a)r.hand=line.substr(a+12,b-a-12);size_t c=line.find("slots ");if(c!=string::npos)r.hand+=" of "+line.substr(c+6,line.find(' ',c+6)-c-6);}
   if(line.rfind("CSW DENSE ",0)==0)r.csw=line.substr(10);
@@ -419,11 +421,18 @@ int main(){
  const int BIG=getenv("SS_DIAG_BIG")?atoi(getenv("SS_DIAG_BIG")):20;
  const int PARTS=getenv("SS_DIAG_PARTS")?atoi(getenv("SS_DIAG_PARTS")):3;
  const fs::path big=fs::path(scratch)/"big",huge=fs::path(scratch)/"huge";
- pipeline("keys",data,od(),{{"NCPU","8"},{"SS_STATS","1"}}); // the pipeline finds the generator's keys; its STATS line gives them to us
+ const bool quick=!(getenv("SS_DIAG_QUICK")&&atoi(getenv("SS_DIAG_QUICK"))==0); // this diagnostic: what does the new public set look like to the pipeline?
+ pipeline("keys",data,od(),{{"NCPU","8"},{"SS_STATS","1"}});
+ string sampleText;
+ for(const char* sub:{"events","clicks","links"}){vector<fs::path> fl;error_code ec;for(auto& f:fs::directory_iterator(fs::path(data)/sub,ec))fl.push_back(f.path());sort(fl.begin(),fl.end());
+  if(fl.empty())continue;ifstream g(fl[0],ios::binary);string buf(230,'\0');g.read(&buf[0],230);buf.resize((size_t)g.gcount());for(char& ch:buf)if(ch=='\n')ch='|';else if(ch=='"')ch='`';else if((unsigned char)ch<32||(unsigned char)ch>126)ch='?';
+  sampleText+=string(sub)+"("+to_string(fl.size())+" files): "+buf+" ## ";}
+ fprintf(stderr,"DIAG samples: %s\n",sampleText.c_str()); // the pipeline finds the generator's keys; its STATS line gives them to us
  if(gKeys){d_scan_max(fs::path(data)/"events",'e','u');d_scan_max(fs::path(data)/"clicks",'k','u');d_scan_max(fs::path(data)/"links",'u','u');
   gOffE=gMaxE.load()+1;gOffC=gMaxC.load()+1;gOffI=gMaxI.load()+1;}
  fprintf(stderr,"DIAG keys %d: counters per copy: events %llu clicks %llu user indexes %llu\n",(int)gKeys,(unsigned long long)gOffE,(unsigned long long)gOffC,(unsigned long long)gOffI);
  {double t=now();uint64_t b=0;
+  if(!quick){
   const bool botMode=gKeys&&!(getenv("SS_DIAG_BOTS")&&atoi(getenv("SS_DIAG_BOTS"))==0);
   if(botMode)d_find_bots(fs::path(data),0.005);
   for(const char* sub:{"events","clicks","links"}){
@@ -434,6 +443,7 @@ int main(){
    else for(auto& f:fs::directory_iterator(huge/sub)){const string n=f.path().filename().string();if(n.size()>6&&n.compare(n.size()-6,6,"-0.csv")==0)fs::create_symlink(f.path(),big/sub/n);}
   }
   for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
+  }
   gReplicaSec=now()-t;
   fprintf(stderr,"DIAG replica: %d x %d copies, %.1f MB written in %.2fs (elapsed %.1fs)\n",PARTS,BIG,b/1e6,now()-t,now()-T0);}
  // The public set as the scorer mounts it (/data) against a copy of it on the scratch mount: do file mappings behave the same?
@@ -464,6 +474,12 @@ int main(){
  add("Hwarm",1,{N8},"",true);
  for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H66",1,{N8},"core-b",true);add("Htold",1,{N8,{"SS_TURNS","old"}},"",true);
   if(r<2){add("HBs",1,{N8,ST},"",true);}}
+ if(quick){vars.clear();
+  for(int r=0;r<4;++r){
+   {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
+   {const string o=od();pipeline("nl#"+to_string(r),data,o,{N8,ST,{"SS_LANES","0"}});error_code ec;fs::remove_all(o,ec);}
+   {const string o=od();pipeline("ix#"+to_string(r),data,o,{N8,ST,{"SS_LANES","0"},{"SS_LINES","plain"}});error_code ec;fs::remove_all(o,ec);}
+  }}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  (void)nSmall;
  for(int r=0;r<6;++r){
@@ -477,7 +493,7 @@ int main(){
   else{const string o=od();pipeline(v.label,v.hugeSet?H:B,o,v.env,v.bin);error_code ec;fs::remove_all(o,ec);}}
  // Floors: 8 threads over every byte of the 20M replica's event and click files (page cache is warm by now).
  string floorText;
- if(timeleft(10)){
+ if(!quick&&timeleft(10)){
   vector<pair<string,off_t>> files;for(const char* sub:{"events","clicks"})for(auto& f:fs::directory_iterator(big/sub)){struct stat st;if(stat(f.path().c_str(),&st)==0)files.push_back({f.path().string(),st.st_size});}
   sort(files.begin(),files.end(),[](auto& x,auto& y){return x.second>y.second;});
   for(int mode=0;mode<3;++mode){double best=1e9;uint64_t tot=0;
@@ -495,7 +511,7 @@ int main(){
   fprintf(stderr,"DIAG %s\n",floorText.c_str());}
  // Same rows from the dense route and the general route on the final-sized set? (order-independent hash of the debug CSV rows)
  string eqText="eq60 not run";
- if(timeleft(40)){
+ if(!quick&&timeleft(40)){
   auto csvhash=[&](const char* name,uint64_t& rows,uint64_t& sum){rows=0;sum=0;const string pth=scratch+"/"+name;int fd=open(pth.c_str(),O_RDONLY);if(fd<0)return false;struct stat st;fstat(fd,&st);
    if(st.st_size){const char* b=(const char*)mmap(nullptr,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);uint64_t h=1469598103934665603ull;
     for(off_t k=0;k<st.st_size;++k){if(b[k]=='\n'){h^=h>>29;h*=0xBF58476D1CE4E5B9ull;h^=h>>32;sum+=h;++rows;h=1469598103934665603ull;}else{h^=(unsigned char)b[k];h*=1099511628211ull;}}
@@ -508,7 +524,7 @@ int main(){
   char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c68 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
-  if(fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
+  if(!quick&&fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
    fprintf(stderr,"DIAG bench: %s\n",benchText.c_str());}}
  // ---- the real output, then break it on purpose so this entry is rejected and the log is returned ----
  pipeline("final /data -> /output",data,outdir,{{"NCPU","8"}});
@@ -556,6 +572,12 @@ int main(){
   c+="60M min~median w/P/R/X/A: "+mm("c68","HB")+mm("c66","H66")+mm("c68 turns old","Htold")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("c68","HBs","pqxa");
   {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c68 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
+  if(quick){
+   a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);
+   {const RunResult* r=get("dv#0");if(r)a+=" || dv: "+r->hand;}
+   c="public set, c68, min~median w/P/R/X/A: "+mm("default","dv")+mm("NODENSE","nd")+mm("LANES=0","nl")+mm("plain","ix")+"MKLDYWE "+fmt("default","dv","MKLDYWE")+fmt("nodense","nd","MKLDYWE")+allw("walls default","dv");
+   {const RunResult* r=get("nd#0");if(r)c+=" || nodense: "+r->raw.substr(0,330);}
+  }
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}
   // row 1: every run, compact (the checker shows only about 2 KB in all, so this is usually cut)
