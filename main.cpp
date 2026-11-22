@@ -1090,7 +1090,6 @@ struct alignas(64) ThreadState{
  uint64_t laneShort=0; // lane loops: groups with fewer than eight lanes at work (SS_STATS)
  uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
  uint64_t gevAblSum=0; // SS_ABL=norec
- KeyTable::Slot* ufront=nullptr;uint32_t ufrontMask=0;uint64_t gevFrontHits=0,gevUsers=0; // front of the user table (see gevUBits); SS_STATS counts
  uint64_t gevRows=0,gevSlow=0,gevChecked=0; // general event loop (ev8g kernel): rows, rows the kernel refused (line code), rows compared in check mode
  struct GCap{PRec prec;uint64_t cls,key,hi,gh;int64_t ingest;bool has;};GCap* gcap=nullptr; /* gh: the stream hash of (cls, key, hi) as the scalar entry computes it */ // SS_GEV=check: the general handler stores its record here instead of committing it
  StreamStore<ERec> es; // SS_COMMIT=stream: this thread's dense event rows by bucket (counter >> dparse.bsh)
@@ -2402,13 +2401,12 @@ static inline bool chunk_lines(const char* base,size_t len,size_t from,size_t to
 // What an event loop keeps across lines (never changes during a chunk).
 struct EvLoop{ThreadState& tl;KeyTable& tab;const KeyTable& products;size_t PE;const char* end;DateMemo3* memo;int64_t wstart;uint64_t wlen,ibase;Bucket<PRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t ke,ku,limE;ESlot* ev;uint64_t tid48;bool bucket,raw;unsigned ahead,shE;uint32_t loMask;Bucket<DRec>* db; // dense route (dparse); tid48 = thread index << 48 (eslot_uct), 0 in stream mode (a record has the low counter bits there)
- KeyTable::Slot* front;uint32_t fmask; /* the thread's front of the user table (general event loop), or null */
  bool gstrm,gspf,gnote;unsigned gsh;StreamStore<GRec>* gs;StreamStore<GRecL>* gl; /* general route, SS_GCOMMIT=stream: rows go to gs / gl (bucket = hash >> gsh) */
  bool strm,strm8,spf;unsigned bsh;StreamStore<ERec>* es; // SS_COMMIT=stream: rows go to es (bucket = counter >> bsh), no event slot is written or asked for; strm8: whole kernel groups through estream_put8_v5
  EvLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& products_,size_t PE_,const char* end_):tl(tl_),tab(tab_),products(products_),PE(PE_),end(end_),memo(date_memo3()),
   wstart(window_start),wlen((uint64_t)(window_end-window_start)),ibase((uint64_t)ingestBase),buckets(tl_.eb.data()),slots(tab_.slots),tmask(tab_.mask),
   dUsers(dparse.users),ke(dense.ke),ku(dense.ku),limE(dense.limE),ev(denseEv),tid48(dparse.stream?0:(uint64_t)tl_.tid<<48),bucket(dparse.bucket),raw(dparse.raw),ahead(dparse.ahead),shE(dparse.shE),loMask((1u<<dparse.shE)-1),db(tl_.db.data()),
-  front(tl_.ufront),fmask(tl_.ufrontMask),gstrm(dparse.gstream),gspf(dparse.gstream&&dparse.gspf),gnote(dparse.gstream&&dparse.gnote),gsh(64-dparse.gbits),gs(&tl_.gs),gl(&tl_.gl),
+  gstrm(dparse.gstream),gspf(dparse.gstream&&dparse.gspf),gnote(dparse.gstream&&dparse.gnote),gsh(64-dparse.gbits),gs(&tl_.gs),gl(&tl_.gl),
   strm(dparse.stream),strm8(dparse.stream&&dparse.put8&&vlk::lk_has512()),spf(dparse.stream&&dparse.spf),bsh(dparse.bsh),es(&tl_.es){}
 };
 // A finished dense event row of a line loop: into its slot, or (stream mode) behind the stream of its bucket.
@@ -4636,15 +4634,9 @@ SS_EVENT_LOOP_EV8L(events_avx512y_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,ve
 // stored (no bucket append / stream put, no fill-line request); 3 nokern = lane scan only: line starts found, nothing decoded; 4 stop = the full loop (for timing PARSE alone).
 static unsigned gevAbl=0;
 static bool gevLongPf=true;
-// The thread's FRONT of the user table (SS_GEV_UCACHE=bits, 0 = none): 2^bits direct-mapped copies {k0, k1, number} of
-// packed user keys this thread resolved last. A row whose key is there never touches (or asks for) its slot of the
-// shared table, which is a line of far memory per row (measured on the scoring machine: 27-29 ns of thread time per
-// event row although the slot is asked for a group ahead). Exact: a key's number never changes during PARSE (the
-// table only ever adds keys; a LOCAL_USER number is the thread's own), and an entry is only trusted on a full key match
-// at the time it is read; an entry replaced between the request and the read sends the row through the table.
-static unsigned gevUBits=0;static bool gevCount=false; // default off: on real dev 2^12 entries answer a third of the lookups and PARSE of one thread is 10% SLOWER (61 -> 69 ms; the table is in cache there); for the scorer to price at 60M
+static bool gevCount=false;
 static bool gevCheck=false,gevLongText=false; // gevLongText (SS_GEV_LONG=text): canonical long users through their text (long_user), as before
-struct alignas(64) GevSide{uint64_t h[8];uint64_t hu[8];KeyTable::Slot* p[8];uint32_t j[8];uint32_t f[8];unsigned lm;}; // p, f: where a packed user is looked up first (table slot or the thread's front entry) and its front index; // lm: rows whose user is a canonical long ID (their slots were asked for) // per row: hash of the event key; hash of a canonical long user; table slot of a packed user
+struct alignas(64) GevSide{uint64_t h[8];uint64_t hu[8];uint32_t j[8];unsigned lm;}; // // lm: rows whose user is a canonical long ID (their slots were asked for) // per row: hash of the event key; hash of a canonical long user; table slot of a packed user
 template<class GEN> [[gnu::noinline]] static void gev_check_row(const char* l,const char* nx,const PRec* prec,const uint64_t* gh,uint64_t cls,uint64_t key,uint64_t hi,uint64_t k,uint32_t user,unsigned cat,int64_t ingest,const EvLoop& lp,GEN&& general){
  ThreadState& tl=lp.tl;
  const char* const nl=(const char*)memchr(l,'\n',(size_t)(lp.end-l));
@@ -4659,30 +4651,29 @@ template<class GEN> [[gnu::noinline]] static void gev_check_row(const char* l,co
   (unsigned long long)cap.cls,(unsigned long long)cap.key,(unsigned long long)cap.hi,(unsigned long long)cap.prec.k,cu,(unsigned)cap.prec.cat,(long long)cap.ingest,(int)min<size_t>(n,300),l);
  abort();
 }
+// The loop's switches as values (globals would be loaded again for every row: the row code stores through pointers).
+struct GevOpt{unsigned abl;bool check,count,longText,longPf;};
 // D: what F wants ready, for one ok row.
-SS_V3I void gev_ahead_row(const vertg::Ev8gOut& o,GevSide& s,const unsigned i,const EvLoop& lp){
+SS_V3I void gev_ahead_row(const vertg::Ev8gOut& o,GevSide& s,const unsigned i,const EvLoop& lp,const GevOpt G){
  if(lp.gstrm){ // the hash of the record's class; its bucket's fill line and state
   const uint64_t cls=o.ecls[i];
   const uint64_t h=__builtin_expect(cls==GCLS_SHORT,1)?gkey_hash_short(o.ekey[i]):cls==GCLS_LONG?gkey_hash_long(o.ekey[i],o.ehi[i]):hkey_v3(o.es[i],(size_t)o.el[i]);
   s.h[i]=h;
-  if(lp.gspf&&gevAbl!=2){const size_t b=(size_t)(h>>lp.gsh);
+  if(lp.gspf&&G.abl!=2){const size_t b=(size_t)(h>>lp.gsh);
    if(cls==GCLS_LONG){__builtin_prefetch(lp.gl->fill+b,1,3);__builtin_prefetch(lp.gl->bs+b,1,3);}
    else{__builtin_prefetch(lp.gs->fill+b*2,1,3);__builtin_prefetch(lp.gs->bs+b,1,3);}}
  }else s.h[i]=hkey_v3(o.es[i],(size_t)o.el[i]);
- if(o.kk[i]&&__builtin_expect(gevAbl!=1,1)){
+ if(o.kk[i]&&__builtin_expect(G.abl!=1,1)){
   if(__builtin_expect(o.ucls[i]==0,1)){const uint64_t k0=o.uk0[i];const uint32_t k1=(uint32_t)o.uk1[i];const uint64_t hh=KeyTable::hash_packed(k0,k1);const size_t j=hh&lp.tmask;s.j[i]=(uint32_t)j;
-   KeyTable::Slot* p=lp.slots+j;
-   if(lp.front){const uint32_t fi=(uint32_t)(hh>>40)&lp.fmask;KeyTable::Slot* const fe=lp.front+fi;s.f[i]=fi;
-    const bool hit=(fe->k1.load(memory_order_relaxed)==k1)&(fe->k0.load(memory_order_relaxed)==k0);p=hit?fe:p;} // a hit: the far slot is not even asked for
-   s.p[i]=p;__builtin_prefetch(p,0,1);}
+   __builtin_prefetch(&lp.slots[j],0,1);}
   else if(o.ucls[i]==1){const uint64_t hl=mix64(o.ulo[i]^mix64(o.uhi[i]^((uint64_t)(0x100u|(uint8_t)'u')*0x9E3779B97F4A7C15ull)));s.hu[i]=hl;s.lm|=1u<<i;__builtin_prefetch(&lp.slots[hl&lp.tmask],0,1);} // KeyTable::long_key's hash of 'u' + 32 hex
  }
 }
 // m = the rows of the group that are lines of this chunk. A whole group takes the loop without the row mask.
-SS_V3I void gev_ahead(const vertg::Ev8gOut& o,GevSide& s,const unsigned m,const EvLoop& lp){
+SS_V3I void gev_ahead(const vertg::Ev8gOut& o,GevSide& s,const unsigned m,const EvLoop& lp,const GevOpt G){
  const unsigned live=m&o.ok;s.lm=0;
- if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_ahead_row(o,s,i,lp);}
- else for(unsigned x=live;x;x&=x-1)gev_ahead_row(o,s,(unsigned)__builtin_ctz(x),lp);
+ if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_ahead_row(o,s,i,lp,G);}
+ else for(unsigned x=live;x;x&=x-1)gev_ahead_row(o,s,(unsigned)__builtin_ctz(x),lp,G);
 }
 // Between D and F (a kernel call before F): a canonical long user's slot has arrived by now; it holds the index of the
 // key's entry in the table's long list, which is a second line of memory far away: ask for it (SS_GEV_LONGPF=0: do not).
@@ -4692,32 +4683,30 @@ SS_V3I void gev_mid(const GevSide& s,const EvLoop& lp){
   if(e.k1.load(memory_order_acquire)==KeyTable::LONGK)__builtin_prefetch(&lp.tab.longs.d[e.v.load(memory_order_relaxed)],0,3);}
 }
 // F: one ok row becomes a record.
-template<class GEN> SS_V3I void gev_finish_row(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned i,const EvLoop& lp,uint32_t* const pend,unsigned& cnt,GEN&& general){
+template<class GEN> SS_V3I void gev_finish_row(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned i,const EvLoop& lp,const GevOpt G,uint32_t* const pend,unsigned& cnt,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const auto R_=memory_order_relaxed;
  const uint64_t k=o.kk[i];uint32_t user=0;unsigned cat=0;
  if(k){
-  if(__builtin_expect(gevAbl==1,0)){} // SS_ABL=nouser
+  if(__builtin_expect(G.abl==1,0)){} // SS_ABL=nouser
   else if(__builtin_expect(o.ucls[i]==0,1)){
-   const uint64_t k0=o.uk0[i];const uint32_t k1=(uint32_t)o.uk1[i];const size_t j=s.j[i];KeyTable::Slot& e=*s.p[i]; // the table's slot j, or the front entry that held the key a group ago
+   const uint64_t k0=o.uk0[i];const uint32_t k1=(uint32_t)o.uk1[i];const size_t j=s.j[i];KeyTable::Slot& e=lp.slots[j];
    if(__builtin_expect(e.k1.load(memory_order_acquire)==k1&&e.k0.load(R_)==k0,1))user=e.v.load(R_);
    else{const string_view u(o.us[i],(size_t)o.ul[i]);user=tab.find_or_add_packed(k0,k1,j,u);if(user==KeyTable::NONE)user=LOCAL_USER|tl.users.intern(u);}
-   if(lp.front){KeyTable::Slot& fe=lp.front[s.f[i]];fe.k0.store(k0,R_);fe.v.store(user,R_);fe.k1.store(k1,R_); // (a hit writes back what is there)
-    if(__builtin_expect(gevCount,0)){++tl.gevUsers;tl.gevFrontHits+=(uint64_t)(&e!=lp.slots+j);}}
-  }else if(o.ucls[i]==1&&!gevLongText){ // 'u' + 32 hex: the table's key of that text is (kind, lo, hi), which the kernel has (KeyTable::long_key)
+  }else if(o.ucls[i]==1&&!G.longText){ // 'u' + 32 hex: the table's key of that text is (kind, lo, hi), which the kernel has (KeyTable::long_key)
    KeyTable::Long key;key.a=o.ulo[i];key.b=o.uhi[i];key.v=0;key.kind=0x100u|(uint8_t)'u';
    const string_view u(o.us[i],(size_t)o.ul[i]);user=tab.find_or_add_long_key(key,s.hu[i],u);if(user==KeyTable::NONE)user=LOCAL_USER|tl.users.intern(u);
   }else user=long_user(o.us[i],(size_t)o.ul[i],tab,tl);
   if((o.pur>>i)&1){const uint32_t ci=lp.products.find(string_view(o.s5[i],(size_t)o.l5[i]));cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;}
  }
  const int64_t ingest=(int64_t)o.ingest[i];const uint64_t h=s.h[i];
- if(__builtin_expect(gevAbl==2,0)){lp.tl.gevAblSum+=k^h^user^cat^(uint64_t)ingest;return;} // SS_ABL=norec: the values are used, nothing is stored
+ if(__builtin_expect(G.abl==2,0)){lp.tl.gevAblSum+=k^h^user^cat^(uint64_t)ingest;return;} // SS_ABL=norec: the values are used, nothing is stored
  if(lp.gstrm){
   const uint64_t cls=o.ecls[i];const size_t b=(size_t)(h>>lp.gsh);
   if(__builtin_expect(cls==GCLS_LONG,0)){const GRecL r{o.ekey[i],o.ehi[i],k,grec_uc(user,cat,cls),ingest,{0,0,0}};
-   if(__builtin_expect(gevCheck,0))gev_check_row(L[i],X[i],nullptr,&h,grec_cls(r),r.lo,r.hi,r.k,grec_user(r),grec_cat(r),r.ingest,lp,general); // the record as it is stored
+   if(__builtin_expect(G.check,0))gev_check_row(L[i],X[i],nullptr,&h,grec_cls(r),r.lo,r.hi,r.k,grec_user(r),grec_cat(r),r.ingest,lp,general); // the record as it is stored
    lp.gl->put(b,r);
   }else{const GRec r{o.ekey[i],k,grec_uc(user,cat,cls),ingest};
-   if(__builtin_expect(gevCheck,0))gev_check_row(L[i],X[i],nullptr,&h,grec_cls(r),r.key,0,r.k,grec_user(r),grec_cat(r),r.ingest,lp,general);
+   if(__builtin_expect(G.check,0))gev_check_row(L[i],X[i],nullptr,&h,grec_cls(r),r.key,0,r.k,grec_user(r),grec_cat(r),r.ingest,lp,general);
    if(lp.gnote)lp.gs->put_noted(b,r,pend,cnt); // a full line leaves at the end of the group (no branch per row)
    else lp.gs->put(b,r);}
   return;
@@ -4725,15 +4714,15 @@ template<class GEN> SS_V3I void gev_finish_row(const vertg::Ev8gOut& o,const Gev
  const uint64_t code=ingest_code(ingest);
  if(__builtin_expect(code==INGEST_SIDE,0))tl.ingestSide.emplace_back(o.es[i],ingest); // out of the code's range: the exact value on the side, as the general handler does
  const PRec r=make_prec(o.es[i],h,code,k,cat,user);
- if(__builtin_expect(gevCheck,0))gev_check_row(L[i],X[i],&r,nullptr,o.ecls[i],o.ekey[i],o.ehi[i],k,user,cat,ingest,lp,general);
+ if(__builtin_expect(G.check,0))gev_check_row(L[i],X[i],&r,nullptr,o.ecls[i],o.ekey[i],o.ehi[i],k,user,cat,ingest,lp,general);
  Bucket<PRec>& vec=lp.buckets[(size_t)(((h>>40)*lp.PE)>>24)];
  if(__builtin_expect(vec.full(),0))vec.reserve(max<size_t>(16,2*vec.capacity()));
  vec.append(r);
 }
-template<class GEN> SS_V3I void gev_finish(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned m,const EvLoop& lp,GEN&& general){
+template<class GEN> SS_V3I void gev_finish(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned m,const EvLoop& lp,const GevOpt G,GEN&& general){
  const unsigned live=m&o.ok;uint32_t pend[8];unsigned cnt=0;
- if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_finish_row(o,s,L,X,i,lp,pend,cnt,general);}
- else for(unsigned x=live;x;x&=x-1)gev_finish_row(o,s,L,X,(unsigned)__builtin_ctz(x),lp,pend,cnt,general);
+ if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_finish_row(o,s,L,X,i,lp,G,pend,cnt,general);}
+ else for(unsigned x=live;x;x&=x-1)gev_finish_row(o,s,L,X,(unsigned)__builtin_ctz(x),lp,G,pend,cnt,general);
  lp.gs->send_noted(pend,cnt); // (nothing noted unless lp.gnote; before any other use of the store: the slow rows, the next group)
 }
 // The stand-in instance (scalar twin): no scan stage, every line end through lane_fix (memchr).
@@ -4752,7 +4741,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
  if(p>=lim)return; \
  const char* const end=base+len; \
- if(!tl.ufront&&gevUBits&&gevAbl!=1){const size_t n_=size_t(1)<<gevUBits;tl.ufront=(KeyTable::Slot*)aligned_alloc(64,n_*sizeof(KeyTable::Slot));memset((void*)tl.ufront,0,n_*sizeof(KeyTable::Slot));tl.ufrontMask=(uint32_t)(n_-1);} /* kept until the process ends */ \
+ const GevOpt G{gevAbl,gevCheck,gevCount,gevLongText,gevLongPf}; /* the switches, read once per chunk: locals for the row code */ \
  const EvLoop lp(tl,tab,products,PE,end); \
  const vert4::EvConst ec=ev8_const4(0,0,lp.wstart,lp.wlen,0); \
  vertg::Ev8gOut out[2];vertg::Ev8gScan sc[2];GevSide side[2];side[0].lm=side[1].lm=0; \
@@ -4763,7 +4752,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
  uint64_t rows=0,shortG=0,fixed=0; \
  do{ \
   unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
-  if(nF&&gevLongPf)gev_mid(*dF,lp); /* first thing: F's long users' slots were asked for a turn ago; their entries get the scan, the decode and gev_ahead of time (dF->lm is 0 unless the group went through gev_ahead) */ \
+  if(nF&&G.longPf)gev_mid(*dF,lp); /* first thing: F's long users' slots were asked for a turn ago; their entries get the scan, the decode and gev_ahead of time (dF->lm is 0 unless the group went through gev_ahead) */ \
   if(more){ \
    const unsigned live_=LIVE(lN,le); \
    if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF(xN)} \
@@ -4771,9 +4760,9 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
     for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
    else more=false; \
   } \
-  if(nD&&__builtin_expect(gevAbl!=3,1)){DEC(lD,xD,*sD,ec,*oD);gev_ahead(*oD,*dD,nD,lp);} \
-  if(nF&&__builtin_expect(gevAbl==3,0)){rows+=(unsigned)__builtin_popcount(nF);} /* SS_ABL=nokern */ \
-  else if(nF){rows+=(unsigned)__builtin_popcount(nF);gev_finish(*oF,*dF,lF,xF,nF,lp,general); \
+  if(nD&&__builtin_expect(G.abl!=3,1)){DEC(lD,xD,*sD,ec,*oD);gev_ahead(*oD,*dD,nD,lp,G);} \
+  if(nF&&__builtin_expect(G.abl==3,0)){rows+=(unsigned)__builtin_popcount(nF);} /* SS_ABL=nokern */ \
+  else if(nF){rows+=(unsigned)__builtin_popcount(nF);gev_finish(*oF,*dF,lF,xF,nF,lp,G,general); \
    for(unsigned r_=nF&~(unsigned)oF->ok;__builtin_expect(r_!=0,0);r_&=r_-1)NAME##_slow(lF[__builtin_ctz(r_)],lp,general);} \
   lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=nN;++g; /* D becomes F, N becomes D */ \
   {vertg::Ev8gScan* const t_=sN;sN=sD;sD=t_;vertg::Ev8gOut* const u_=oD;oD=oF;oF=u_;GevSide* const v_=dD;dD=dF;dF=v_;} \
@@ -7446,7 +7435,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  gevLongText=getenv("SS_GEV_LONG")&&string_view(getenv("SS_GEV_LONG"))=="text";
  if(const char* v=getenv("SS_ABL")){const string_view w(v);gevAbl=w=="nouser"?1:w=="norec"?2:w=="nokern"?3:w=="stop"?4:0;} // stop: nothing left out, the run just ends after the PARSE mark
  if(const char* v=getenv("SS_GEV_LONGPF"))gevLongPf=atoi(v)!=0;
- if(const char* v=getenv("SS_GEV_UCACHE")){const long long x=atoll(v);gevUBits=(unsigned)(x<0?0:x>20?20:x);}
  gevCount=getenv("SS_STATS")!=nullptr;
  const bool gevUse=(gevRef||gevVec)&&!dparse.events&&!dparse.users;
  // SS_GCOMMIT=stream (needs the loop above for every event file): the rows go to GRec / GRecL streams of 2^gbits
@@ -7788,9 +7776,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(lsg|lfe|lfc)cerr<<"STATS lanes: groups with fewer than eight lanes at work "<<lsg<<", line ends looked up with memchr: event rows "<<lfe<<" click rows "<<lfc<<"\n";}
  if(getenv("SS_STATS")){uint64_t gr=0,gs=0,gc=0,gf=0,gsh=0;for(int t=0;t<T;++t){gr+=tls[t].gevRows;gs+=tls[t].gevSlow;gc+=tls[t].gevChecked;if(!denseEv){gf+=tls[t].laneFixE;gsh+=tls[t].laneShort;}}
   if(gr){char pc[32];snprintf(pc,sizeof pc,"%.3f",100.0*(double)gs/(double)gr);
-   cerr<<"STATS gev loop: rows "<<gr<<" refused by the kernel (line code) "<<gs<<" = "<<pc<<"%, line ends looked up with memchr "<<gf<<", short groups "<<gsh<<", rows checked "<<gc<<"\n";
-   uint64_t fu=0,fh=0;for(int t=0;t<T;++t){fu+=tls[t].gevUsers;fh+=tls[t].gevFrontHits;}
-   if(fu){snprintf(pc,sizeof pc,"%.1f",100.0*(double)fh/(double)fu);cerr<<"STATS gev user front: "<<(size_t(1)<<gevUBits)<<" entries per thread, packed-user lookups "<<fu<<", answered by the front "<<fh<<" = "<<pc<<"%\n";}}}
+   cerr<<"STATS gev loop: rows "<<gr<<" refused by the kernel (line code) "<<gs<<" = "<<pc<<"%, line ends looked up with memchr "<<gf<<", short groups "<<gsh<<", rows checked "<<gc<<"\n";}}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
  if(dumpDir){
   // Test only (fuzz/dense_check.py): rows-T.txt = what the general handlers saw (raw texts, written above),
