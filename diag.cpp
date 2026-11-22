@@ -507,15 +507,15 @@ int main(){
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  #define NL {"SS_LANES","0"}
  #define ND {"SS_NODENSE","1"}
+ #define DW {"SS_DEDUPWAIT","0"}
+ #define AO {"SS_AGGORDER","index"}
  for(int r=0;r<3;++r){
-  add("Bs",1,{N8,ST});add("B",1,{N8});
-  if(r<2){add("n4",1,{{"NCPU","4"}});add("uw",1,{N8,{"SS_UNMAP","workers"}});}
-  if(r<1){add("n16",1,{{"NCPU","16"}});add("p4",1,{N8,{"SS_PERSONBUCKET","4096"}});add("p64",1,{N8,{"SS_PERSONBUCKET","65536"}});add("po",1,{N8,PO});}
+  add("Bs",1,{N8,ST});add("dw",1,{N8,ST,DW});add("ao",1,{N8,ST,AO});add("da",1,{N8,ST,DW,AO});
  }
  const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HBs",1,{N8,ST},"",true);add("HB",1,{N8},"",true);}
+ for(int r=0;r<2;++r){add("HBs",1,{N8,ST},"",true);add("Hdw",1,{N8,ST,DW},"",true);add("Hao",1,{N8,ST,AO},"",true);}
  if(quick){vars.clear();
   for(int r=0;r<4;++r){
    {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
@@ -589,7 +589,7 @@ int main(){
     double v;const string k=key;
     if(k=="w")v=r.wall;else if(k=="u")v=r.user;else if(k=="s")v=r.sys;else if(k=="f")v=r.minflt/1e3;else if(k=="r")v=r.maxrssMB/1e3;
     else if(k=="L"){v=0;for(auto& kv:r.t)if(kv.first.rfind("LINK",0)==0||kv.first=="FLATTEN")v+=kv.second;}
-    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="Y"?"DENSE1":k=="K"?"KEYS":k=="W"?"WRITE":k=="R"?"RESOLVE":k=="M"?"MAP":k=="E"?"zEXIT":k=="p"?"cPARSE":k=="q"?"cRESOLVE":k=="x"?"cDENSE":k=="a"?"cAGGREGATE":k=="i"?"sMAP":k=="y"?"sPARSE":k=="h"?"sRESOLVE":k=="z"?"sDENSE":k=="g"?"sAGGREGATE":k=="j"?"fPARSE":k=="k"?"fMAP":k=="e"?"pmd":key);v=it==r.t.end()?0:it->second;}
+    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="Y"?"DENSE1":k=="K"?"KEYS":k=="W"?"WRITE":k=="R"?"RESOLVE":k=="M"?"MAP":k=="E"?"zEXIT":k=="p"?"cPARSE":k=="q"?"cRESOLVE":k=="x"?"cDENSE":k=="a"?"cAGGREGATE":k=="i"?"sMAP":k=="y"?"sPARSE":k=="h"?"sRESOLVE":k=="z"?"sDENSE":k=="g"?"sAGGREGATE":k=="j"?"fPARSE":k=="k"?"fMAP":k=="e"?"pmd":k=="d"?"cDEDUP":k=="b"?"sDEDUP":k=="n"?"fDEDUP":k=="m"?"fAGGREGATE":k=="l"?"cLINKREAD":key);v=it==r.t.end()?0:it->second;}
     if(best<0||v<best)best=v;}
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
@@ -615,13 +615,11 @@ int main(){
   {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c68 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   if(!quick&&gV5){
-   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE c69 | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
+   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE c70 | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
    const char* SK="MKLPDAWE";
-   a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","B")+mm("personbucket4096","p4")+mm("personbucket65536","p64")+mm("unmap-workers","uw")+mm("4 threads","n4")+mm("16 threads","n16");
-   a+="| 20M stages MAP/KEYS/LINKS/PARSE/DEDUP/AGG/WRITE/exit: "+fmt("default","Bs",SK)+"cpu PARSE/AGG "+fmt("","Bs","pa")+"sys MAP/PARSE/AGG "+fmt("","Bs","iyg")+"user/sys total "+fmt("","Bs","us")+"parse-only "+fmt("","po","wPus");
-   {const RunResult* r=get("Bs#0");if(r)a+="| "+r->raw.substr(0,420);}
-   c="60M min~median w/P/R/X/A: "+mm("default","HB")+"stages MKLPDAWE "+fmt("","HBs",SK)+"cpu PARSE/AGG "+fmt("","HBs","pa")+"user/sys "+fmt("","HBs","us")+allw("walls","HB");
-   {const RunResult* r=get("HBs#0");if(r)c+="| "+r->raw.substr(0,420);}
+   a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("dedupwait0","dw")+mm("aggorder-index","ao")+mm("both-old","da");
+   a+="| 20M stages MKLPDAWE: "+fmt("default","Bs",SK)+fmt("dedupwait0","dw",SK)+fmt("aggorder-index","ao",SK)+fmt("both-old","da",SK)+"cpu PARSE/DEDUP/AGG "+fmt("","Bs","pda")+"sys P/D/A "+fmt("","Bs","ybg")+"faults P/D/A "+fmt("","Bs","jnm")+"user/sys "+fmt("","Bs","us");
+   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("dedupwait0","Hdw")+mm("aggorder-index","Hao")+"stages MKLPDAWE "+fmt("default","HBs",SK)+fmt("dedupwait0","Hdw",SK)+fmt("aggorder-index","Hao",SK)+"cpu P/D/A "+fmt("","HBs","pda")+"sys P/D/A "+fmt("","HBs","ybg")+"faults P/D/A "+fmt("","HBs","jnm")+allw("walls","HBs");
   }
   if(quick){
    a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);
