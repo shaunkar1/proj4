@@ -7706,7 +7706,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __mark("PARSE");
  if(gevAbl){uint64_t x=0;for(int t=0;t<T;++t)x+=tls[t].gevAblSum;cerr<<"SS_ABL="<<getenv("SS_ABL")<<": TEST RUN, WRONG OUTPUT, stopping after the parse stage ("<<x<<")\n";cerr.flush();_exit(0);}
  // The dedup stage reads the GRec / GRecL streams itself (prefilter + stream emit) unless told otherwise.
- const bool gDirect=dparse.gstream&&!dparse.events&&!dparse.clicks&&!denseUsers
+ const bool gDirect=dparse.gstream&&!dparse.events&&!dparse.clicks&&!denseUsers&&T<16384
   &&!(getenv("SS_GDEDUP")&&!strcmp(getenv("SS_GDEDUP"),"bridge"))&&!(getenv("SS_EMIT")&&!strcmp(getenv("SS_EMIT"),"list"))&&!(getenv("SS_PREFILTER")&&getenv("SS_PREFILTER")[0]=='0');
  if(dparse.gstream){
   if(getenv("SS_STATS")){const size_t nb=size_t(1)<<dparse.gbits;uint64_t ns=0,nl=0,big=0,chunks=0,bytes=0;
@@ -8122,10 +8122,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   Scratch<uint32_t> slotBuf,emitBuf;vector<size_t> off(T+1);
   slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);if(!evStream)emitBuf.reserve(maxEvBucket);
   Scratch<uint64_t> lostBuf;lostBuf.pool=&pool;if(evStream)lostBuf.reserve(maxEvBucket/64+2);
-  Scratch<uint64_t> cellBuf;cellBuf.pool=&pool;Scratch<const PRec*> candBuf;candBuf.pool=&pool;
+  Scratch<uint64_t> cellBuf;cellBuf.pool=&pool;Scratch<PRec> candBuf;candBuf.pool=&pool;Scratch<uint16_t> candTBuf;candTBuf.pool=&pool;
   vector<const PRec*> segB(T),segE(T); // the bucket's records, thread by thread
-  if(prefilter){cellBuf.reserve(maxEvBucket*cellsPer/32+2);candBuf.reserve(maxEvBucket+1);}
-  // A candidate of the stream reader: the record's fields side by side (uc also carries the thread, bits 56-63).
+  if(prefilter){cellBuf.reserve(maxEvBucket*cellsPer/32+2);candBuf.reserve(maxEvBucket+1);candTBuf.reserve(maxEvBucket+1);}
+  // SS_PF1=n (measuring switch): pass 1 asks for the records n bytes ahead (default 1024; 0 = off): the pass is the
+  // first reader of a bucket, one stretch per parser thread, and the hardware's stream detection starts again at
+  // every 4 KB of each stretch.
+  static const size_t pf1=[]{const char* v=getenv("SS_PF1");const long x=v?atol(v):1024;return (size_t)(x<0?0:x>65536?65536:x);}();
+  // A candidate of the stream reader: the record's fields side by side (uc also carries the thread, bits 50-63).
   struct GCand{uint64_t key,hi,k,uc;int64_t ingest;uint64_t h;};
   Scratch<GCand> gcandBuf;gcandBuf.pool=&pool;if(NBg)gcandBuf.reserve(maxEvBucket+1);
   StreamStore<Ev>& sev=surv[tid].sev;
@@ -8150,13 +8154,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(prefilter){
     // One valid record that has won (or has no copy) -> its person's bucket.
     Ev* const fl=sev.fill;auto* const fs=sev.bs;
-    // (t < 0: the record's thread is looked up when it is needed, i.e. for a user of a thread's fallback table.
-    // The put is StreamStore::put written out on local copies of the store's pointers.)
-    const auto emit=[&](const PRec* const r,int t) __attribute__((always_inline)) {
+    // (The put is StreamStore::put written out on local copies of the store's pointers.)
+    const auto emit=[&](const PRec* const r,const int t) __attribute__((always_inline)) {
       uint64_t w;memcpy(&w,(const void*)&r->user,8);
       size_t bkt;
       if(__builtin_expect(((uint32_t)w&(LOCAL_USER|DENSE_USER))!=0,0)){
-       if(t<0){t=0;while(!(r>=segB[t]&&r<segE[t]))++t;}
        const uint32_t ru=(uint32_t)w,pn=person_of(ru,t);
        w=(w&~0xffffffffull)|pn;
        bkt=(ru&DENSE_USER)?bnA+((pn-bBase)>>bshB):pn>>bshA;
@@ -8176,19 +8178,21 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      const PRec* const r0=tls[t].eb[p].data();
      #pragma GCC unroll 4
      for(size_t i=0;i<m;++i){
+      if(pf1)__builtin_prefetch((const char*)(r0+i)+pf1);
       const uint64_t c=((r0[i].ih&PR_HMASK)*C)>>PR_HBITS;const unsigned sh=2*((unsigned)c&31);
       const uint64_t w=bm[c>>5],b=1ull<<sh;bm[c>>5]=w|b|((w&b)<<1);
      }
     }
-    // Pass 2: alone in its cell = no copy in the bucket: passed on. The others are the candidates.
-    const PRec** const cand=candBuf.get(n+1);size_t nc=0;
+    // Pass 2: alone in its cell = no copy in the bucket: passed on. The others are the candidates: they are copied
+    // side by side (with their thread), so the table works on a small array of its own and not all over the bucket.
+    PRec* const cand=candBuf.get(n+1);uint16_t* const candT=candTBuf.get(n+1);size_t nc=0;
     for(int t=0;t<T;++t){
      const size_t m=(size_t)(segE[t]-segB[t]);if(!m)continue;
      const PRec* const r0=segB[t];
      const auto row=[&](const size_t i) __attribute__((always_inline)) {
        const PRec* const r=r0+i;
        const uint64_t c=((r->ih&PR_HMASK)*C)>>PR_HBITS;
-       if((bm[c>>5]>>(2*((unsigned)c&31)+1))&1){cand[nc++]=r;return;}
+       if((bm[c>>5]>>(2*((unsigned)c&31)+1))&1){memcpy((void*)&cand[nc],(const void*)r,sizeof(PRec));candT[nc]=(uint16_t)t;++nc;return;}
        if(r->k)emit(r,t);
      };
      size_t i=0;
@@ -8208,7 +8212,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
      uint32_t waitC[DEDUP_WAIT];unsigned wn=0;
      const auto oneC=[&](const uint32_t ci,const bool mayWait) __attribute__((always_inline)) {
-       const PRec* const r=cand[ci];
+       const PRec* const r=&cand[ci];
        const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
        const uint32_t tg=((uint32_t)r->hx&tagMask)<<ib;
        size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
@@ -8222,7 +8226,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        if(((any&(0u-any))&mz)!=0)j+=(unsigned)__builtin_ctz(mz);
        else for(uint32_t e;(e=S[j])!=0;){
         if((e^tg)<=imask){ // same tag: compare the IDs themselves
-         const uint32_t oc=(e&imask)-1;const PRec& o=*cand[oc];
+         const uint32_t oc=(e&imask)-1;const PRec& o=cand[oc];
          if(mayWait){ // the two texts lie in the input files: ask for them, come back later
           __builtin_prefetch(o.id);__builtin_prefetch(o.id+48);__builtin_prefetch(r->id);__builtin_prefetch(r->id+48);
           waitC[wn++]=ci;return;
@@ -8246,7 +8250,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(__builtin_expect(wn==DEDUP_WAIT,0)){for(unsigned q=0;q<DEDUP_WAIT;++q)oneC(waitC[q],false);wn=0;}
      }
      for(unsigned q=0;q<wn;++q)oneC(waitC[q],false);
-     for(size_t ci=0;ci<nc;++ci)if(!((lost[ci>>6]>>(ci&63))&1)&&cand[ci]->k)emit(cand[ci],-1);
+     for(size_t ci=0;ci<nc;++ci)if(!((lost[ci>>6]>>(ci&63))&1)&&cand[ci].k)emit(&cand[ci],(int)candT[ci]);
     }
     for(int t=0;t<T;++t)if(p<tls[t].eb.size()){Bucket<PRec>& B=tls[t].eb[p];
      if(recycle)sev.give((char*)B.b,B.capacity()*sizeof(PRec)); // nobody reads these records again
@@ -8424,7 +8428,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // Pass 2
    GCand* const cand=gcandBuf.get(n+1);size_t nc=0;
    for(int t=0;t<T;++t){
-    const uint64_t tbits=(uint64_t)t<<56;
+    const uint64_t tbits=(uint64_t)t<<50; // uc: user 0-31, category 32-47, class 48-49
     tls[t].gs.for_segments(b,[&](const GRec* r,const size_t m) __attribute__((always_inline)) {
       for(size_t i=0;i<m;++i){
        if(i+8<m)__builtin_prefetch((const char*)fl+(size_t)((uint32_t)r[i+8].uc>>bshA)*64,1,3);
@@ -8453,7 +8457,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      for(uint32_t e;(e=S[j])!=0;){
       if((e^tg)<=imask){ // same tag: the keys themselves
        const uint32_t oc=(e&imask)-1;const GCand& o=cand[oc];
-       const unsigned rc=(unsigned)(r.uc>>48)&0xff,ocl=(unsigned)(o.uc>>48)&0xff;
+       const unsigned rc=(unsigned)(r.uc>>48)&3,ocl=(unsigned)(o.uc>>48)&3;
        if(rc==ocl&&(rc==GCLS_OTHER?same_event_id((const char*)o.key,(const char*)r.key):(o.key==r.key&&o.hi==r.hi))){
         ++dups;
         const bool notEarlier=r.ingest>=o.ingest; // equal ingest_ts: the copies are identical, the first one stays
@@ -8467,7 +8471,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      }
      if(place)S[j]=tg|(ci+1);
     }
-    for(size_t ci=0;ci<nc;++ci)if(!((lost[ci>>6]>>(ci&63))&1)&&cand[ci].k)emit(cand[ci].k,cand[ci].uc&UCMASK,(int)(cand[ci].uc>>56));
+    for(size_t ci=0;ci<nc;++ci)if(!((lost[ci>>6]>>(ci&63))&1)&&cand[ci].k)emit(cand[ci].k,cand[ci].uc&UCMASK,(int)(cand[ci].uc>>50));
    }
    dedupCount+=n-dups;
    if(recycle)for(int t=0;t<T;++t){ // nobody reads this bucket's chunks again
