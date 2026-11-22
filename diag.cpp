@@ -401,12 +401,12 @@ int main(){
  for(int r=0;r<5;++r){
   add("B",1,{N8});add("c62",1,{N8},"core-b");add("b4",1,{N8},"core-d");
   add("sw",1,{N8,{"SS_WILLNEED","inline"}});add("sc",1,{N8,{"SS_CATALOG","inline"}});add("se",1,{N8,{"SS_CAMPWRITE","end"}});add("sp",1,{N8,{"SS_PATHSORT","path"}});add("ss",1,{N8,{"SS_SAMPLE","serial"}});
-  add("ub",1,{N8,UB});add("all",1,{N8,L2,UB});add("b4ub",1,{N8,UB},"core-d");
-  if(r<3){add("Bs",1,{N8,ST});add("b4s",1,{N8,ST},"core-d");}
+  add("ub",1,{N8,UB});add("all",1,{N8,L2,UB});add("b4ub",1,{N8,UB},"core-d");add("ln",1,{N8},"core-l");
+  if(r<3){add("Bs",1,{N8,ST});add("b4s",1,{N8,ST},"core-d");add("pB",1,{N8,PO},"core-b");add("pL",1,{N8,PO},"core-l");add("lne",1,{N8,{"SS_LANES","e"}},"core-l");add("ln2",1,{N8,{"SS_LANES_PF","512"},{"SS_LANES_PF2","576"}},"core-l");}
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("Hb4",1,{N8},"core-d",true);add("Hub",1,{N8,UB},"",true);add("Hall",1,{N8,L2,UB},"",true);add("Hb4ub",1,{N8,UB},"core-d",true);
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("Hb4",1,{N8},"core-d",true);add("Hub",1,{N8,UB},"",true);add("Hall",1,{N8,L2,UB},"",true);add("Hb4ub",1,{N8,UB},"core-d",true);add("Hln",1,{N8},"core-l",true);
   if(r<2)add("HBs",1,{N8,ST},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
@@ -486,11 +486,11 @@ int main(){
   auto mm=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wPRXA";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one))+"~"+to_string(med(grp,one));}return o+" ";};
   auto mk=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wMKP";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one));}return o+"~"+to_string(med(grp,"w"))+" ";};
   {char t[64];snprintf(t,sizeof t," | syncfs after replica %.1fs",syncSec);eqText+=t;}
-  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c63","B")+mm("c62","c62")+mm("B4(c62+B3+B4)","b4")+mm("c63-unmap-bg","ub")+mm("c63-lead2+unmap-bg","all")+mm("B4-unmap-bg","b4ub");
+  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c63","B")+mm("c62","c62")+mm("B4(c62+B3+B4)","b4")+mm("c63-unmap-bg","ub")+mm("c63-lead2+unmap-bg","all")+mm("B4-unmap-bg","b4ub")+mm("LANES+prefetch(on c62)","ln")+mm("lanes events only","lne")+mm("lanes pf 512","ln2")+"parse-only P/us: "+fmt("c62","pB","Pus")+fmt("lanes","pL","Pus");
   a+="| c63 with one of S's changes switched back, min w/MAP/KEYS/PARSE~median w: "+mk("c63","B")+mk("c62","c62")+mk("willneed-inline","sw")+mk("catalog-inline","sc")+mk("campwrite-end","se")+mk("pathsort-old","sp")+mk("sample-serial","ss");
   a+="| small stages MKLDYWE "+fmt("c63","Bs","MKLDYWE")+fmt("B4","b4s","MKLDYWE");
   {const RunResult* r=get("Bs#0");if(r)a+="| DENSE threads c63:"+squeeze(r->dth)+" ";}
-  c+="60M min~median w/P/R/X/A: "+mm("c63","HB")+mm("c62","H62")+mm("B4","Hb4")+mm("c63-unmap-bg","Hub")+mm("c63-lead2+unmap-bg","Hall")+mm("B4-unmap-bg","Hb4ub");
+  c+="60M min~median w/P/R/X/A: "+mm("c63","HB")+mm("c62","H62")+mm("B4","Hb4")+mm("c63-unmap-bg","Hub")+mm("c63-lead2+unmap-bg","Hall")+mm("B4-unmap-bg","Hb4ub")+mm("LANES+prefetch","Hln");
   {const RunResult* r=get("HBs#0");if(r)c+="| DENSE threads c63 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;

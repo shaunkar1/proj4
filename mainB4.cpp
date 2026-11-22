@@ -5969,6 +5969,15 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2,clickKeys3;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;clickKeys3.pool=&pool;fastC2.pool=&pool;
    uint32_t* const sortCnt=(uint32_t*)pool.take((CLICK_SORT_BUCKETS+1)*sizeof(uint32_t)); // click_key_sort's counters
    vector<uint8_t> lastOfV(ncamp+1,0xFF);uint8_t* const lastOf=lastOfV.data(); // small click sets: last position of a campaign
+   // Small click sets, set-up in four loops over the clicks instead of seven (SS_SMALLSET=old: the old set-up):
+   // times and campaigns out of the clicks; ranks; every click straight to its place (clicks of one moment
+   // show in the sum of the ranks and take the old way through keys and ID texts); for every place the
+   // place of the campaign's click before it (lastG: "set's number << 8 | place" per campaign, so that
+   // nothing has to be cleared after a set). A session then finds the first click of every campaign in
+   // its window by one compare of those places with the window's first place.
+   static const bool smallOld=[]{const char* v=getenv("SS_SMALLSET");return v&&!strcmp(v,"old");}();
+   vector<uint32_t> lastGV(ncamp+1,0);uint32_t* const lastG=lastGV.data();uint32_t smallGen=0;
+   alignas(16) static constexpr auto PLACE16=[]{array<array<int8_t,16>,17> a{};for(int v=0;v<17;++v)for(int i=0;i<16;++i)a[(size_t)v][(size_t)i]=(int8_t)v;return a;}();
    // The 32-bit click arithmetic below counts times from the window start (clicks: -7 days and up), so
    // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
    const bool smallClicksOk=(uint64_t)(window_end-window_start)<0x7fffffffull&&!getenv("SS_TEST_NOSMALLCLICKS");
@@ -5984,6 +5993,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // SS_LARGEASSIST=old: keys with positions, clicks copied out in order, the
    // active list, one ++ per session and active campaign.
    static const bool largeOld=[]{const char* v=getenv("SS_LARGEASSIST");return v&&!strcmp(v,"old");}();
+   static const size_t largeMax=[]{const char* v=getenv("SS_TEST_LARGEMAX");const long x=v?atol(v):4096;return (size_t)(x<1?1:x>4096?4096:x);}(); // tests: sets beyond this take the path of sets beyond 4096 clicks
    static const bool assistLoop=[]{const char* v=getenv("SS_SMALLASSIST");return v&&!strcmp(v,"loop");}(); // small sets: the row's counters added by a loop over the clicks (old) instead of eight at a time
    vector<uint32_t> sinceV(ncamp+1,0);uint32_t* const since=sinceV.data();
    vector<RowOut> rowsOut((size_t)ndays+2);
@@ -6093,7 +6103,50 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       // A larger set takes the sliding window over the sorted clicks, as the general lane does.
       enum{NONE,SMALL,LARGE,LARGEOLD} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:(largeOld||wideWindow)?LARGEOLD:LARGE; // (LARGE keeps times in 36 bits)
       alignas(16) int32_t cts[16];uint16_t ccamp[16],credit[17];uint16_t dupMask[17];size_t nvec=0;uint64_t cntLo=0,cntHi=0;
-      if(mode==SMALL){
+      alignas(16) int8_t prevPlace[16]; // of the campaign's click before this one, or -1
+      if(mode==SMALL&&!smallOld){
+       alignas(16) int32_t tm[16];alignas(16) uint8_t rnk[16];uint16_t cmp[16];
+       const __m128i far=_mm_set1_epi32(INT32_MAX); // later than every click: times from the window start stay below it
+       _mm_store_si128((__m128i*)tm,far);_mm_store_si128((__m128i*)(tm+4),far);_mm_store_si128((__m128i*)(tm+8),far);_mm_store_si128((__m128i*)(tm+12),far);
+       {const FClick* const q=C;const size_t mm=m;
+        for(size_t i=0;i<mm;++i){const uint64_t k=q[i].key;tm[i]=(int32_t)((int64_t)(k>>16)-WEEK);cmp[i]=(uint16_t)k;}}
+       const __m128i T0=_mm_load_si128((const __m128i*)tm),T1=_mm_load_si128((const __m128i*)(tm+4)),T2=_mm_load_si128((const __m128i*)(tm+8)),T3=_mm_load_si128((const __m128i*)(tm+12));
+       __m128i acc=_mm_setzero_si128();
+       for(size_t j=0;j<m;++j){const __m128i b=_mm_set1_epi32(tm[j]); // one byte per place: all ones where that click is later than click j
+        acc=_mm_sub_epi8(acc,_mm_packs_epi16(_mm_packs_epi32(_mm_cmpgt_epi32(T0,b),_mm_cmpgt_epi32(T1,b)),_mm_packs_epi32(_mm_cmpgt_epi32(T2,b),_mm_cmpgt_epi32(T3,b))));}
+       _mm_store_si128((__m128i*)rnk,acc);
+       // The rank of a click is the number of clicks before it in time. All moments different: the ranks are
+       // 0..m-1. Two clicks of one moment share a rank and a later one is missing, so the sum is smaller
+       // (the places without a click have rank m each).
+       const __m128i sad=_mm_sad_epu8(acc,_mm_setzero_si128());
+       const uint32_t rankSum=(uint32_t)_mm_cvtsi128_si32(sad)+(uint32_t)_mm_extract_epi16(sad,4);
+       _mm_store_si128((__m128i*)cts,far);_mm_store_si128((__m128i*)(cts+4),far);_mm_store_si128((__m128i*)(cts+8),far);_mm_store_si128((__m128i*)(cts+12),far);
+       memset(ccamp,0,sizeof ccamp); // (count_assists reads all sixteen places)
+       if(__builtin_expect(rankSum==(uint32_t)(m*(m-1)/2+(16-m)*m),1)){
+        const size_t mm=m;
+        for(size_t i=0;i<mm;++i){const unsigned r=rnk[i];const uint16_t c=cmp[i];cts[r]=tm[i];ccamp[r]=c;credit[r+1]=c;}
+       }
+       else{
+        // Clicks of one moment: by position first, then the larger ID text first, so that the last one has the smallest.
+        uint64_t keys[16];uint8_t taken[16];memset(taken,0,16);
+        for(size_t i=0;i<m;++i){const unsigned r=rnk[i];keys[r+taken[r]++]=((C[i].key>>16)<<32)|i;}
+        for(size_t i=1;i<m;++i)if((keys[i]>>32)==(keys[i-1]>>32)){
+         const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)key),dense.kc));};
+         const uint64_t key=keys[i];size_t j=i;
+         while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
+         keys[j]=key;
+        }
+        for(size_t i=0;i<m;++i){const uint16_t c=(uint16_t)C[(uint32_t)keys[i]].key;cts[i]=(int32_t)((int64_t)(keys[i]>>32)-WEEK);ccamp[i]=c;credit[i+1]=c;}
+       }
+       credit[0]=organic; // read when no click is in the window
+       if(__builtin_expect(++smallGen==(1u<<24),0)){memset(lastG,0,(ncamp+1)*sizeof(uint32_t));smallGen=1;} // (set numbers used up: start again)
+       {const uint32_t tag=smallGen<<8;const size_t mm=m;
+        #pragma GCC unroll 1
+        for(size_t i=0;i<mm;++i){const uint16_t c=ccamp[i];const uint32_t x=lastG[c]^tag,none=0u-(uint32_t)(x>255u); // x: the place, if the entry is of this set
+         lastG[c]=tag|(uint32_t)i;prevPlace[i]=(int8_t)(x|none);}}
+       nvec=(m+3)/4;
+      }
+      else if(mode==SMALL){
        uint64_t keys[16];
        // In time order, clicks of one moment by position, without a data-dependent branch: the place of a
        // click is the number of clicks with an earlier time (counted for all sixteen places at once, one
@@ -6132,9 +6185,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(mode==LARGE){
        uint64_t* const K=clickKeys3.get(m+1);LK=K;
        uint64_t all=0;
-       if(m<=4096){const FClick* q=C;const FClick* const qe=q+m;uint64_t* o=K;uint64_t at=0;
+       if(m<=largeMax){const FClick* q=C;const FClick* const qe=q+m;uint64_t* o=K;uint64_t at=0;
         for(;q<qe;++q,++o,at+=0x10000u){const uint64_t k=q->key;all|=k;*o=((k>>16)<<28)|at|(uint16_t)k;__asm__("");}} // (the empty statement keeps the loop scalar)
-       if(__builtin_expect(m>4096||(all>>48)!=0,0)){if(all>>48)mode=LARGEOLD;goto large_by_text;} // too many for a 12-bit position: the old order, keys made below (a time beyond 32 bits cannot be in a window this short, but would not fit the key)
+       if(__builtin_expect(m>largeMax||(all>>48)!=0,0)){if(all>>48)mode=LARGEOLD;goto large_by_text;} // too many for a 12-bit position: the old order, keys made below (a time beyond 32 bits cannot be in a window this short, but would not fit the key)
        if(m>1){
         click_key_sort28(K,m,clickKeys2.get(m),sortCnt);
         // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
@@ -6155,7 +6208,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        // in the final order.
        uint64_t* const keys=clickKeys.get(m);
        const bool wide=(C[0].key>>16)>>32!=0||(uint64_t)(window_end-clickStart)>>32!=0; // times that do not fit 32 bits: sort the clicks themselves
-       if(wide||m>4096){
+       if(wide||m>4096||(mode==LARGE&&m>largeMax)){
         if(direct){FClick* const G=fastC.get(m+1);for(size_t i=0;i<m;++i){G[i]=C[i];G[i].present=(uint32_t)(cf+i);}C=G;direct=false;} // sorted in a copy that carries the counters
         const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
          return ta!=tb?ta<tb:order36(dn::value_of(a.present,kc))>order36(dn::value_of(b.present,kc));};
@@ -6225,7 +6278,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
          out|=(uint32_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(_mm_cmplt_epi32(x,vlo),_mm_cmpgt_epi32(x,vhi))))<<(4*v);}
         const uint32_t in=~out&((1u<<(4*nvec))-1);
         credited=credit[31-__builtin_clz((in<<1)|1u)]; // the last click in the window, or entry 0
-        const uint32_t firsts=in&~(uint32_t)dupMask[__builtin_ctz(in|0x10000u)]; // bit 16: nothing in the window
+        const unsigned wfirst=(unsigned)__builtin_ctz(in|0x10000u); // the window's first place; 16: nothing in the window
+        const uint32_t firsts=smallOld?in&~(uint32_t)dupMask[wfirst]
+         :in&(uint32_t)_mm_movemask_epi8(_mm_cmpgt_epi8(_mm_load_si128((const __m128i*)(const void*)PLACE16[wfirst].data()),_mm_load_si128((const __m128i*)prevPlace))); // no click of its campaign before it in the window
         cntLo+=SPREAD8[firsts&255];cntHi+=SPREAD8[(firsts>>8)&255];
        }
        else if(mode==LARGE){
