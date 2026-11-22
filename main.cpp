@@ -5487,7 +5487,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   linkLines=genLines+replay.size(); // the lines that go through the table
  }
  // Every such line names at most two IDs; with ID blocks each thread may leave part of its last block unused.
- const uint64_t maxLinked=2*linkLines+(idBlocks?(uint64_t)T*KeyTable::ID_BLOCK:0);
+ // SS_LINKS on the general route (no dense users: every ID is an opaque text): unless SS_LINKS=old the link lines go
+ // through the "gen" form of the stages below - the usual line (two fields of up to 11 bytes, bare or quoted) is cut
+ // and packed from two 16-byte loads, new IDs note their table slot so that FLATTEN rewrites it without hashing, and the
+ // union-find entries need no first pass (see LkUF). Same table, same numbers' meaning, same names; only the cost differs.
+ const bool lkGen=!denseUsers&&lkm!="old";
+ const uint64_t maxLinked=2*linkLines+((idBlocks||lkGen)?(uint64_t)T*KeyTable::ID_BLOCK:0);
  __mark("LINKMAP");
  if(maxLinked+maxNew64>=0x60000000u)throw runtime_error("Too many IDs");
  const uint32_t maxIds=(uint32_t)(maxLinked+maxNew64);
@@ -5502,7 +5507,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // (Initialised by a pass below. Mapping the two arrays as zero pages with "value XOR index" entries,
  // to skip that pass, measured slower: every page then takes its faults in the middle of the hot loops.)
  static_assert(sizeof(atomic<uint32_t>)==sizeof(uint32_t));
- atomic<uint32_t>* const parent=(atomic<uint32_t>*)map_huge((maxLinked+1)*sizeof(uint32_t)); // stays mapped: the process ends with _exit
+ atomic<uint32_t>* const parent=lkGen?nullptr:(atomic<uint32_t>*)map_huge((maxLinked+1)*sizeof(uint32_t)); // stays mapped: the process ends with _exit
  auto find_root=[&](uint32_t u)->uint32_t{
   for(;;){
    uint32_t p=parent[u].load(memory_order_relaxed);if(p==u)return u;
@@ -5512,10 +5517,143 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
  };
  // best[r]: the ID with the byte-wise smallest name seen so far in root r's group.
- atomic<uint32_t>* const best=(atomic<uint32_t>*)map_huge((maxLinked+1)*sizeof(uint32_t));
+ atomic<uint32_t>* const best=lkGen?nullptr:(atomic<uint32_t>*)map_huge((maxLinked+1)*sizeof(uint32_t));
  atomic<size_t> nextLink{0},nextReplay{0};uint64_t idHoles=0;
  size_t maxGenList=0;for(const LinkOut& o:lout)maxGenList=max(maxGenList,o.gen.size());
+ // The "gen" form's union-find: one 8-byte entry per ID number, both fields "number + 1, 0 = myself", so the zero pages
+ // of a fresh mapping already say "every ID is its own group and its own best name": no pass that writes 2 entries per
+ // link line before the first line is read, whichever way an ID got its number (block, single number of a long key).
+ //   p: parent + 1 (a parent's number is smaller than its child's, so the forest cannot form a cycle), 0 = root
+ //   b: of a root, the member with the byte-wise smallest name so far + 1 (FLATTEN only), 0 = the root itself
+ // lkSlot[id]: table slot + 1 of an ID added by the link loop (0: added some other way; FLATTEN then looks the key up).
+ struct LkUF{atomic<uint32_t> p,b;};static_assert(sizeof(LkUF)==8);
+ LkUF* const uf=lkGen?(LkUF*)map_huge(((size_t)maxIds+1)*sizeof(LkUF)):nullptr;
+ uint32_t* const lkSlot=lkGen?(uint32_t*)map_huge(((size_t)maxIds+1)*sizeof(uint32_t)):nullptr;
+ const auto uf_root=[uf](uint32_t u)__attribute__((always_inline))->uint32_t{
+  for(;;){
+   uint32_t p=uf[u].p.load(memory_order_relaxed);if(!p)return u;
+   const uint32_t gp=uf[p-1].p.load(memory_order_relaxed);if(!gp)return p-1;
+   uf[u].p.compare_exchange_weak(p,gp); // path halving (gp - 1 < p - 1 < u); losing the race is harmless
+   u=gp-1;
+  }
+ };
+ uint64_t lkFast=0,lkSlowN=0,lkLongN=0;double lkCpu=0;
  __mark("LINKSETUP");
+ if(lkGen){
+  static const bool gStats=getenv("SS_STATS")!=nullptr;
+  #pragma omp parallel num_threads(T) reduction(+:idHoles,lkFast,lkSlowN,lkLongN,lkCpu)
+  {
+   const double cpu0=gStats?thr_cpu_s():0.0;
+   // Lines wait in batches of LB, one entry per ID (2 per line): the table slots of a batch, then the union-find
+   // entries of its IDs and of their parents, are asked for before they are used.
+   static constexpr int LB=16;
+   alignas(64) uint64_t K0[2*LB];uint32_t K1[2*LB],J[2*LB],ID[2*LB];string_view SV[2*LB]; // K1 == 0: the text (SV) does not pack
+   KeyTable::Slot* const slots=tab.slots;PName* const names=tab.newNames;const size_t tmask=tab.mask;
+   KeyTable::IdBlock blk;uint64_t nfast=0,nslow=0,nlong=0;
+   // KeyTable::find_or_add_packed_block, plus the note of the slot a new ID went into.
+   // (Cannot be full: the table holds every ID the link lines can name.)
+   const auto id_packed=[&](uint64_t k0,uint32_t k1,size_t j)__attribute__((always_inline))->uint32_t{
+    const auto R=memory_order_relaxed;
+    for(;;){
+     KeyTable::Slot& e=slots[j];uint32_t c=e.k1.load(memory_order_acquire);
+     if(c==k1){if(e.k0.load(R)==k0)return e.v.load(R);}
+     else if(c==0){
+      if(blk.next==blk.end){
+       const uint32_t b=tab.nextId.fetch_add(KeyTable::ID_BLOCK,R);
+       if(b>=tab.idLimit)return KeyTable::NONE;
+       blk.next=b;blk.end=tab.idLimit-b<KeyTable::ID_BLOCK?tab.idLimit:b+KeyTable::ID_BLOCK;
+      }
+      uint32_t expect=0;
+      if(!e.k1.compare_exchange_strong(expect,KeyTable::BUSY,memory_order_acquire))continue;
+      const uint32_t id=blk.next++;
+      names[id].set_packed(k0,k1);lkSlot[id]=(uint32_t)j+1;
+      e.k0.store(k0,R);e.v.store(tab.idBase+id,R);e.k1.store(k1,memory_order_release);
+      return tab.idBase+id;
+     }
+     else if(c==KeyTable::BUSY){__builtin_ia32_pause();continue;}
+     j=(j+1)&tmask;
+    }
+   };
+   const __m128i vnl=_mm_set1_epi8('\n'),vc=_mm_set1_epi8(','),vq=_mm_set1_epi8('"');
+   LkUF* const ufp=uf;
+   for(;;){
+    const size_t c=nextLink.fetch_add(1,memory_order_relaxed);if(c>=linkChunks.size())break;
+    const Chunk& ck=linkChunks[c];
+    // Every data line that begins in [from,to), as in for_lines; exactly two non-empty fields or the line is skipped.
+    if(ck.from>=ck.len)continue;
+    const char* const end=ck.base+ck.len;
+    const char* nl=(const char*)memchr(ck.from?ck.base+ck.from-1:ck.base,'\n',ck.from?ck.len-(ck.from-1):ck.len);
+    if(!nl)continue;
+    const char* const lim=ck.base+min(ck.to,ck.len);
+    for(const char* p=nl+1;p<lim;){
+     // ---- up to LB lines: cut, pack, hash, ask for the table slots ----
+     int n=0; // IDs in the batch (2 per line)
+     do{
+      // The usual line: the comma within the first 16 bytes, the newline within 16 bytes after it, no other comma, quotes
+      // only around a whole field, both fields 1..11 bytes. Then link_split would return exactly these two fields
+      // (one comma; a field that starts with a quote ends with one and holds no other; nothing empty) and both pack.
+      if(__builtin_expect(end-p>=32,1)){
+       const __m128i x0=_mm_loadu_si128((const __m128i*)p);
+       const uint32_t c0=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vc));
+       if(__builtin_expect(c0!=0,1)){
+        const unsigned P=(unsigned)__builtin_ctz(c0);const uint32_t mP=(1u<<P)-1;
+        const uint32_t n0=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vnl))&mP,q0=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x0,vq))&mP;
+        const __m128i x1=_mm_loadu_si128((const __m128i*)(p+P+1));
+        const uint32_t n1=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vnl));
+        if(__builtin_expect(n1!=0&&n0==0,1)){
+         const unsigned L=(unsigned)__builtin_ctz(n1);const uint32_t mL=(1u<<L)-1;
+         const uint32_t c1=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vc))&mL,q1=(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x1,vq))&mL;
+         const uint32_t qa=q0&1u,qb=q1&1u;
+         const unsigned na=P-2*qa,nbb=L-2*qb; // (wraps to a huge number when a field is only a quote: refused below)
+         const uint32_t wa=qa|(qa<<((P-1)&31)),wb=qb|(qb<<((L-1)&31));
+         if(__builtin_expect(c1==0&&q0==wa&&q1==wb&&na-1<11&&nbb-1<11,1)){
+          uint64_t ka,kb;uint32_t ha,hb;
+          KeyTable::pack(string_view(p+qa,na),ka,ha);
+          KeyTable::pack(string_view(p+P+1+qb,nbb),kb,hb);
+          const uint32_t ja=(uint32_t)(KeyTable::hash_packed(ka,ha)&tmask),jb=(uint32_t)(KeyTable::hash_packed(kb,hb)&tmask);
+          __builtin_prefetch(&slots[ja],1,1);__builtin_prefetch(&slots[jb],1,1);
+          K0[n]=ka;K0[n+1]=kb;K1[n]=ha;K1[n+1]=hb;J[n]=ja;J[n+1]=jb;
+          n+=2;++nfast;p+=P+L+2;
+          continue;
+         }
+        }
+       }
+      }
+      // Every other line: the line code of the old form.
+      string_view f[2];const char* next;
+      if(link_split(p,end,f,next)){
+       for(int k=0;k<2;++k){
+        if(KeyTable::pack(f[k],K0[n+k],K1[n+k])){J[n+k]=(uint32_t)(KeyTable::hash_packed(K0[n+k],K1[n+k])&tmask);__builtin_prefetch(&slots[J[n+k]],1,1);}
+        else{K1[n+k]=0;SV[n+k]=f[k];++nlong;}
+       }
+       n+=2;++nslow;
+      }
+      p=next;
+     }while(n<2*LB&&p<lim);
+     // ---- the batch's IDs: number of each (new IDs get one), then the unions ----
+     for(int q=0;q<n;++q){
+      const uint32_t id=__builtin_expect(K1[q]!=0,1)?id_packed(K0[q],K1[q],J[q]):tab.find_or_add_long(SV[q]);
+      if(__builtin_expect(id==KeyTable::NONE,0)){cerr<<"ERROR link ID table full\n";_exit(1);} // (the sizes above rule it out)
+      ID[q]=id;__builtin_prefetch(&ufp[id],1,1);
+     }
+     // One more level of each chain, so the walks below mostly find their entries in the cache.
+     for(int q=0;q<n;++q){const uint32_t pp=ufp[ID[q]].p.load(memory_order_relaxed);if(pp)__builtin_prefetch(&ufp[pp-1],1,1);}
+     for(int q=0;q<n;q+=2){
+      uint32_t a=ID[q],b=ID[q+1];
+      for(;;){
+       a=uf_root(a);b=uf_root(b);if(a==b)break;
+       if(a<b)swap(a,b);
+       uint32_t expect=0;if(ufp[a].p.compare_exchange_strong(expect,b+1))break; // a was still a root: now under the smaller root b
+      }
+     }
+    }
+   }
+   idHoles+=blk.end-blk.next;lkFast+=nfast;lkSlowN+=nslow;lkLongN+=nlong;
+   if(gStats)lkCpu+=thr_cpu_s()-cpu0;
+  }
+  if(gStats)cerr<<"STATS links gen: lines through the two-load form "<<lkFast<<" through link_split "<<lkSlowN<<" (IDs that do not pack: "<<lkLongN<<") thread cpu ms "<<lkCpu*1e3<<"\n";
+ }
+ else{
  #pragma omp parallel num_threads(T) reduction(+:idHoles)
  {
   #pragma omp for schedule(static)
@@ -5599,6 +5737,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
   idHoles+=blk.end-blk.next;
  }
+ }
  // nlinked: one past the highest linked ID number (with ID blocks a few numbers below it were never used:
  // they stay empty one-member groups that nothing refers to).
  const uint32_t nlinked=min(tab.nextId.load(),tab.idLimit);
@@ -5607,7 +5746,43 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __mark("LINKREAD");
  // Flatten: every linked ID that is not its group's root offers its name to the root (the byte-wise
  // smallest wins) and has its table entry pointed at the root, which is the person number.
- {
+ if(lkGen){
+  // The "gen" form: the same three steps per batch - parents asked for; roots found, the root's best name and the
+  // ID's own table slot asked for; the name offered and the slot rewritten - with the slot taken from lkSlot (no
+  // packing, hashing or probing; an ID without a note is looked up as before) and parent + best in one entry.
+  PName* const names=tab.newNames;KeyTable::Slot* const slots=tab.slots;const size_t tmask=tab.mask;
+  auto& longs=tab.longs;const size_t nlongs=longs.size();
+  #pragma omp parallel num_threads(T)
+  {
+   static constexpr uint32_t FB=32;
+   #pragma omp for schedule(static) nowait
+   for(size_t i=0;i<nlongs;++i)if(longs[i].v<nlinked)longs[i].v=uf_root(longs[i].v); // (values of other long keys are not read here: a root's entry is never written)
+   #pragma omp for schedule(static)
+   for(uint32_t b0=0;b0<nlinked;b0+=FB){
+    struct Fix{uint32_t i,r;} fix[FB];int nf=0;const uint32_t b1=nlinked-b0<FB?nlinked:b0+FB;
+    for(uint32_t i=b0;i<b1;++i){
+     const uint32_t p=uf[i].p.load(memory_order_relaxed);if(!p)continue;
+     fix[nf++]={i,p-1};__builtin_prefetch(&uf[p-1],1,1);
+    }
+    for(int q=0;q<nf;++q){Fix& f=fix[q];
+     const uint32_t r=uf_root(f.r);f.r=r;
+     const uint32_t bb=uf[r].b.load(memory_order_relaxed);__builtin_prefetch(&names[bb?bb-1:r],0,1);
+     const uint32_t sl=lkSlot[f.i];if(sl)__builtin_prefetch(&slots[sl-1],1,1);
+    }
+    for(int q=0;q<nf;++q){const Fix& f=fix[q];
+     uint32_t cur=uf[f.r].b.load(memory_order_relaxed);
+     while(name_less(names[f.i],names[cur?cur-1:f.r])&&!uf[f.r].b.compare_exchange_weak(cur,f.i+1)){}
+     const uint32_t sl=lkSlot[f.i];
+     if(__builtin_expect(sl!=0,1))slots[sl-1].v.store(f.r,memory_order_relaxed);
+     else{uint64_t k0;uint32_t k1;if(KeyTable::pack(names[f.i].view(),k0,k1))tab.set_packed(k0,k1,KeyTable::hash_packed(k0,k1)&tmask,f.r);} // longer keys: tab.longs, above
+    }
+   }
+   // A root's own name is no longer needed once every member has been compared, and no other person reads it.
+   #pragma omp for schedule(static)
+   for(uint32_t i=0;i<nlinked;++i)if(!uf[i].p.load(memory_order_relaxed)){const uint32_t bi=uf[i].b.load(memory_order_relaxed);if(bi)names[i]=names[bi-1];}
+  }
+ }
+ else{
   PName* names=tab.newNames;
   #pragma omp parallel num_threads(T)
   {
