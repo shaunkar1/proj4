@@ -6234,14 +6234,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       const uint64_t *add8=LK,*exp8=LK,*const ce8=LK+(mode==LARGE?m:0);
       int currentday=-1;uint64_t dsess=0,drev=0;uint32_t rowStart=0;size_t pi=0;
       RowOut* const R=rowsOut.data();size_t nr=0;
-      const auto close_row=[&](uint32_t evs){ // the finished row with its top category; written out after the person's last session
+      const auto close_row=[&](uint32_t evs) __attribute__((always_inline)) { // the finished row with its top category; written out after the person's last session
        RowOut& o=R[nr++];o.day=currentday;o.sess=(uint32_t)dsess;o.evs=evs;o.rev=drev;o.best=0;o.top=0;
        if(__builtin_expect(!touched.empty(),0)){
         uint16_t top=0;uint64_t best=0;
         for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
         touched.clear();o.best=best;o.top=top;
        }};
-      const auto count_assists=[&](int day){ // the row's byte counters into the totals
+      const auto count_assists=[&](int day) __attribute__((always_inline)) { // the row's byte counters into the totals
        if(!(cntLo|cntHi))return;
        uint64_t* const arow=assists+(size_t)day*ncamp;
        if(assistLoop){for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));}
@@ -6255,22 +6255,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        cntLo=0;cntHi=0;};
       // Large sets: the sessions [since, sn) of the row of `day` for every campaign in the window.
-      const auto flush_window=[&](int day,uint32_t sn){
+      const auto flush_window=[&](int day,uint32_t sn) __attribute__((always_inline)) {
        uint64_t* const arow=assists+(size_t)day*ncamp;
        for(const uint64_t* q=exp8;q<add8;++q){const uint16_t c=(uint16_t)*q;arow[c]+=sn-since[c];since[c]=sn;}};
+      // The sessions, in one copy of the loop per kind of click set (M is a constant in each).
+      uint64_t dayEnd=0;Totals* totRow=tot;uint64_t* assistRow=assists; // the row's day ends before dayEnd; its totals
+      const auto run_sessions=[&](const int M) __attribute__((always_inline)) {
       for(size_t sn=0;sn<ns;++sn){
-       const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);const int d=(int)((ts+dayOff)/(uint64_t)DAY);
-       if(d!=currentday){
+       const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);
+       if(ts>=dayEnd){ // the sessions come in time order, so a session is in a new day when it is past the end of the row's day
+        const int d=(int)((ts+dayOff)/(uint64_t)DAY);
         if(currentday>=0){
-         if(mode==SMALL)count_assists(currentday);
-         else if(mode==LARGE)flush_window(currentday,(uint32_t)sn);
+         if(M==SMALL)count_assists(currentday);
+         else if(M==LARGE)flush_window(currentday,(uint32_t)sn);
          close_row(ord-rowStart);dsess=0;drev=0;
         }
-        currentday=d;rowStart=ord;
+        currentday=d;rowStart=ord;dayEnd=(uint64_t)(d+1)*(uint64_t)DAY-dayOff;
+        totRow=tot+(size_t)d*ncamp;assistRow=assists+(size_t)d*ncamp;
        }
        ++dsess;
        uint16_t credited=organic;
-       if(mode==SMALL){
+       if(M==SMALL){
         // In the window: start - seven days <= click time <= start.
         const __m128i vlo=_mm_set1_epi32((int)((int64_t)ts-WEEK)),vhi=_mm_set1_epi32((int)ts);
         uint32_t out=0;
@@ -6283,9 +6288,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
          :in&(uint32_t)_mm_movemask_epi8(_mm_cmpgt_epi8(_mm_load_si128((const __m128i*)(const void*)PLACE16[wfirst].data()),_mm_load_si128((const __m128i*)prevPlace))); // no click of its campaign before it in the window
         cntLo+=SPREAD8[firsts&255];cntHi+=SPREAD8[(firsts>>8)&255];
        }
-       else if(mode==LARGE){
+       else if(M==LARGE){
         const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<28,expLim=ts<<28;const uint32_t s32=(uint32_t)sn;
-        uint64_t* const arow=assists+(size_t)d*ncamp;
+        uint64_t* const arow=assistRow;
         // (masks, not ?: - first / last click of a campaign in the window is as good as random)
         while(add8<ce8&&*add8<addLim){
          const uint16_t c=(uint16_t)*add8;const uint32_t f=fr[c],s=since[c];uint32_t first=0u-(uint32_t)(f==0);
@@ -6296,7 +6301,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
          fr[c]=f;arow[c]+=(s32-since[c])&(0u-(uint32_t)(f==0));++exp8;} // (a campaign that came and went with this session: nothing)
         if(add8>exp8)credited=(uint16_t)add8[-1];
        }
-       else if(mode==LARGEOLD){
+       else if(M==LARGEOLD){
         const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
         // Whether a click is the first (last) of its campaign in the window is as good as random, so the
         // list of active campaigns is kept without a branch on it: a write that must not happen goes to the
@@ -6310,11 +6315,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
          const uint16_t back=act[na];const uint32_t at=(uint32_t)na^(((uint32_t)na^pos[c])&(0u-gone)),pb=pos[back];
          act[at]=back;pos[back]=pb^((pb^at)&(0u-gone));++expire;}
         if(add>expire)credited=(uint16_t)add[-1].key;
-        uint64_t* const arow=assists+(size_t)d*ncamp;
+        uint64_t* const arow=assistRow;
         #pragma GCC unroll 4
         for(size_t q=0;q<na;++q)++arow[act[q]];
        }
-       Totals* const cur=&tot[(size_t)d*ncamp+credited];cur->sessions++;
+       Totals* const cur=totRow+credited;cur->sessions++;
        if((pur[pi]>>40)==sn){ // the list ends with an all-ones entry, which is no session's
         cur->purchasing_sessions++;
         do{const uint64_t price=pur[pi]&EV_PRICE;const uint16_t cat=(uint16_t)(pur[pi]>>24);
@@ -6324,8 +6329,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         }while((pur[++pi]>>40)==sn);
        }
       }
-      if(mode==SMALL)count_assists(currentday);
-      else if(mode==LARGE){flush_window(currentday,(uint32_t)ns);for(const uint64_t* q=exp8;q<add8;++q)fr[(uint16_t)*q]=0;}
+      if(M==SMALL)count_assists(currentday);
+      else if(M==LARGE){flush_window(currentday,(uint32_t)ns);for(const uint64_t* q=exp8;q<add8;++q)fr[(uint16_t)*q]=0;}
+      };
+      switch(mode){case NONE:run_sessions(NONE);break;case SMALL:run_sessions(SMALL);break;case LARGE:run_sessions(LARGE);break;default:run_sessions(LARGEOLD);}
       close_row((uint32_t)n-rowStart);
       put_rows(nm,R,nr);
       for(size_t q=0;q<na;++q)fr[act[q]]=0;
