@@ -1998,18 +1998,21 @@ static inline __attribute__((always_inline)) uint64_t sweep_event_runs(const cha
   for(;;){
    const size_t lim=min(stop,c+cap-2);
    const char* p=(const char*)&ev_at(j);const char* const pe=(const char*)&ev_at(lim);const char* lastp=p;
+   static constexpr uint32_t ALIAS_BIT[8]={1,2,4,8,16,32,64,128}; // (a table: one instruction instead of three for 1 << al)
+   uint64_t* out=blk+ns; // the next free entry (a moving pointer: blk and ns need no register in the loop)
    for(;p<pe;p+=stride){
     const ESmall& r=*(const ESmall*)(const void*)p;const uint64_t k=r.k;
     if(k<PR_KBIAS)continue;
     const uint32_t al=code_of(r)^code; // the alias if the row is this index's
     if(al>7)break;
-    mask|=1u<<al;
+    mask|=ALIAS_BIT[al];
     const uint64_t ts=(k-PR_KBIAS)>>EV_TS,step=ts-last;
     disorder|=step; // its top bit: a row before its predecessor
-    blk[ns]=(ts<<24)|n;ns+=step>(uint64_t)GAP;last=ts;
-    if(__builtin_expect((k&EV_PURCHASE)!=0,0))ar.pur.push_back(((uint64_t)(ns-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
+    *out=(ts<<24)|n;out+=step>(uint64_t)GAP;last=ts;
+    if(__builtin_expect((k&EV_PURCHASE)!=0,0))ar.pur.push_back(((uint64_t)(out-blk-1)<<40)|((uint64_t)r.cat<<24)|(k&EV_PRICE));
     ++n;lastp=p;
    }
+   ns=(size_t)(out-blk);
    j=(size_t)(p-(const char*)&ev_at(0))>>evShift;
    if(n)lastSlot=(size_t)(lastp-(const char*)&ev_at(0))>>evShift;
    if(p<pe)goto run_done; // a valid slot of somebody else
@@ -5879,7 +5882,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   };
   // The rows of one person in one go (the fast lane; its names are always of the fixed kind).
   struct RowOut{uint64_t rev,best;int day;uint32_t sess,evs;uint16_t top;};
-  auto put_rows=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&catv,&dbg,&catnames,dayp,revp,sess32p,evs32p,sessp,evsp,catbits,narrow,debugCsv,firstday,tid]
+  // (SS_ROWS=old: one loop that does everything for a row, as before.)
+  auto put_rows_old=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&catv,&dbg,&catnames,dayp,revp,sess32p,evs32p,sessp,evsp,catbits,narrow,debugCsv,firstday,tid]
    (const NameRef& nm,const RowOut* R,size_t k){
    const size_t room=k*((size_t)nm.L+4)+64;
    if(uidCap-uidLen<room)grow_uid(room);
@@ -5895,6 +5899,37 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     }
    }
    uidLen=(size_t)(o-uidp);nrows=r;
+  };
+  // The parts of a person's rows that few rows have: a top category (rows with a purchase), the test output.
+  auto put_rows_rare=[&catv,&dbg,&catnames,catbits,debugCsv,firstday,tid](const NameRef& nm,const RowOut* R,size_t k,size_t r) __attribute__((noinline)) {
+   for(size_t i=0;i<k;++i,++r){const RowOut& x=R[i];
+    if(x.best!=0){catbits[r>>3]|=(uint8_t)(1u<<(r&7));put_bytes(catv,catnames[x.top]);}
+    if(debugCsv){string& t=dbg[tid];
+     t+=hexstr(string_view(nm.p,nm.L));t+=',';t+=to_string(firstday+x.day);t+=',';t+=to_string(x.sess);t+=',';t+=to_string(x.evs);t+=',';t+=to_string(x.rev);t+=',';
+     t+=x.best==0?string("NULL"):hexstr(catnames[x.top]);t+='\n';
+    }
+   }
+  };
+  // The fixed-width columns and the name of every row in a loop that calls nothing and reads only locals
+  // (the byte stores of the name could be stores to anything, so captured pointers would be read again for
+  // every row); the rest in put_rows_rare, for persons that have any of it.
+  auto put_rows=[&nrows,&uidCap,&uidLen,&uidp,&grow_uid,&put_rows_rare,dayp,revp,sess32p,evs32p,sessp,evsp,narrow,debugCsv,firstday]
+   (const NameRef& nm,const RowOut* R,size_t k) __attribute__((always_inline)) {
+   const uint32_t L=nm.L;const size_t room=k*((size_t)L+4)+64;
+   if(__builtin_expect(uidCap-uidLen<room,0))grow_uid(room);
+   const size_t r0=nrows;char* o=uidp+uidLen;
+   const __m128i name=_mm_loadu_si128((const __m128i*)(const void*)nm.p);
+   const int32_t day0=(int32_t)firstday;uint64_t anyBest=0;
+   if(narrow){int32_t* const dp=dayp+r0;int64_t* const rp=revp+r0;int32_t* const sp=sess32p+r0;int32_t* const ep=evs32p+r0;
+    for(size_t i=0;i<k;++i){const RowOut& x=R[i];
+     memcpy(o,&L,4);_mm_storeu_si128((__m128i*)(void*)(o+4),name);o+=4+L;
+     dp[i]=day0+(int32_t)x.day;rp[i]=(int64_t)x.rev;sp[i]=(int32_t)x.sess;ep[i]=(int32_t)x.evs;anyBest|=x.best;}}
+   else{int32_t* const dp=dayp+r0;int64_t* const rp=revp+r0;int64_t* const sp=sessp+r0;int64_t* const ep=evsp+r0;
+    for(size_t i=0;i<k;++i){const RowOut& x=R[i];
+     memcpy(o,&L,4);_mm_storeu_si128((__m128i*)(void*)(o+4),name);o+=4+L;
+     dp[i]=day0+(int32_t)x.day;rp[i]=(int64_t)x.rev;sp[i]=(int64_t)x.sess;ep[i]=(int64_t)x.evs;anyBest|=x.best;}}
+   uidLen=(size_t)(o-uidp);nrows=r0+k;
+   if(__builtin_expect(anyBest!=0||debugCsv,0))put_rows_rare(nm,R,k,r0);
   };
   // All rows and campaign totals of one person. E[0..ne): the person's events in time order (ne > 0; the
   // order of events with the same time does not matter). cb..ce: the person's clicks in click_before order.
@@ -5975,6 +6010,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // place of the campaign's click before it (lastG: "set's number << 8 | place" per campaign, so that
    // nothing has to be cleared after a set). A session then finds the first click of every campaign in
    // its window by one compare of those places with the window's first place.
+   static const bool rowsOld=[]{const char* v=getenv("SS_ROWS");return v&&!strcmp(v,"old");}(); // the fast lane's row writer as it was
    static const bool smallOld=[]{const char* v=getenv("SS_SMALLSET");return v&&!strcmp(v,"old");}();
    vector<uint32_t> lastGV(ncamp+1,0);uint32_t* const lastG=lastGV.data();uint32_t smallGen=0;
    alignas(16) static constexpr auto PLACE16=[]{array<array<int8_t,16>,17> a{};for(int v=0;v<17;++v)for(int i=0;i<16;++i)a[(size_t)v][(size_t)i]=(int8_t)v;return a;}();
@@ -6334,7 +6370,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       };
       switch(mode){case NONE:run_sessions(NONE);break;case SMALL:run_sessions(SMALL);break;case LARGE:run_sessions(LARGE);break;default:run_sessions(LARGEOLD);}
       close_row((uint32_t)n-rowStart);
-      put_rows(nm,R,nr);
+      if(__builtin_expect(rowsOld,0))put_rows_old(nm,R,nr);else put_rows(nm,R,nr);
       for(size_t q=0;q<na;++q)fr[act[q]]=0;
       num_sessions+=ns;
       if(nrows>=FLUSH)flush_rows();
