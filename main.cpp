@@ -886,12 +886,12 @@ template<class T,size_t BYTES> struct Blocks{
 using EvList=Blocks<Ev,4096>;using ClickList=Blocks<Click,4096>;
 struct DRec;struct DCRec; // dense rows in bucket form, defined with the dense route below
 // ---- Stream store (BUCKETS.md, stage A): the rows of one parser thread, appended by bucket ----
-// One instance per thread. A row of bucket b goes into the bucket's staging line (one cache line = 64 / sizeof(REC)
+// One instance per thread. A row of bucket b goes into the bucket's fill line (one cache line = 64 / sizeof(REC)
 // records); the record that fills the line sends it out with ONE 64-byte non-temporal store into the bucket's current
 // chunk, so a row costs no read of the memory it ends up in and every byte of it is written once, in sequence.
-//   stg[b]   the staging line of bucket b
+//   fill[b]   the fill line of bucket b
 //   bs[b]    {w, n, first}: w = where the next full line goes (nullptr: the bucket needs a chunk), n = records
-//            appended so far (the staging line holds n mod RPL of them), first = id of its first chunk (0: none)
+//            appended so far (the fill line holds n mod RPL of them), first = id of its first chunk (0: none)
 //   chunks   chunk id - 1 -> {data, next id}; a chunk is 2^cs bytes of records and nothing else (64-byte aligned)
 // The lines, the states and the `last` ids of all buckets lie in one mapping on 2 MB pages. Chunks are taken on
 // demand from the thread's arena (map_huge blocks, bump pointer): with shuffled input all buckets fill at the same
@@ -906,10 +906,10 @@ struct DRec;struct DCRec; // dense rows in bucket form, defined with the dense r
 // release(out) hands the arena's mappings over for munmap (the store is empty after it).
 template<class REC> struct StreamStore{
  static_assert(sizeof(REC)<=64&&64%sizeof(REC)==0&&std::is_trivially_copyable_v<REC>);
- static constexpr unsigned RPL=64/sizeof(REC); // records per staging line
+ static constexpr unsigned RPL=64/sizeof(REC); // records per fill line
  struct BS{char* w;uint32_t n;uint32_t first;};
  struct Chunk{char* data;uint32_t next;uint32_t pad;};
- REC* stg=nullptr;BS* bs=nullptr;uint32_t* last=nullptr;size_t nb=0; // last[b]: id of the bucket's newest chunk
+ REC* fill=nullptr;BS* bs=nullptr;uint32_t* last=nullptr;size_t nb=0; // last[b]: id of the bucket's newest chunk
  unsigned cs=12;uintptr_t cmask=4095;size_t perChunk=4096/sizeof(REC);
  vector<Chunk> chunks;
  char* acur=nullptr;char* alim=nullptr;size_t firstBytes=size_t(8)<<20,nextBytes=size_t(8)<<20;
@@ -920,7 +920,7 @@ template<class REC> struct StreamStore{
   nb=nb_;cs=min(max(cs_,6u),20u);cmask=(uintptr_t(1)<<cs)-1;perChunk=(size_t(1)<<cs)/sizeof(REC);
   void* raw;size_t rawLen;const size_t lines=nb*64,states=nb*sizeof(BS);
   char* const m=(char*)map_huge(lines+states+nb*sizeof(uint32_t),&raw,&rawLen);maps.emplace_back((char*)raw,rawLen); // zero pages: every bucket starts empty
-  stg=(REC*)m;bs=(BS*)(m+lines);last=(uint32_t*)(m+lines+states);
+  fill=(REC*)m;bs=(BS*)(m+lines);last=(uint32_t*)(m+lines+states);
   firstBytes=expect+(nb<<cs)+(size_t(2)<<20);nextBytes=max<size_t>(size_t(8)<<20,firstBytes/4);
   chunks.reserve(firstBytes>>cs);
  }
@@ -935,10 +935,10 @@ template<class REC> struct StreamStore{
   BS& s=bs[b];if(s.first)chunks[last[b]-1].next=id;else s.first=id;
   last[b]=id;return d;
  }
- // The staging line of bucket b goes out to the bucket's chunk (the caller has put its last record in place).
- inline __attribute__((always_inline)) void flush_line(size_t b,BS& s){
+ // The fill line of bucket b goes out to the bucket's chunk (the caller has put its last record in place).
+ inline __attribute__((always_inline)) void send_line(size_t b,BS& s){
   char* w=s.w;if(__builtin_expect(!w,0))w=grow(b);
-  const __m128i* const l=(const __m128i*)(stg+b*RPL);
+  const __m128i* const l=(const __m128i*)(fill+b*RPL);
   _mm_stream_si128((__m128i*)w,_mm_load_si128(l));_mm_stream_si128((__m128i*)(w+16),_mm_load_si128(l+1));
   _mm_stream_si128((__m128i*)(w+32),_mm_load_si128(l+2));_mm_stream_si128((__m128i*)(w+48),_mm_load_si128(l+3));
   w+=64;s.w=((uintptr_t)w&cmask)?w:nullptr; // a full chunk: the next line asks for a new one
@@ -946,12 +946,12 @@ template<class REC> struct StreamStore{
  // One record into bucket b (plain x86-64 code: usable from every loop).
  inline __attribute__((always_inline)) void put(size_t b,const REC& r){
   BS& s=bs[b];const uint32_t n=s.n;s.n=n+1;const unsigned pos=n&(RPL-1);
-  stg[b*RPL+pos]=r;
-  if(pos==RPL-1)flush_line(b,s);
+  fill[b*RPL+pos]=r;
+  if(pos==RPL-1)send_line(b,s);
  }
  void finish(){
   for(size_t b=0;b<nb;++b){BS& s=bs[b];const unsigned pos=s.n&(RPL-1);if(!pos)continue;
-   REC* const line=stg+b*RPL;memset((void*)(line+pos),0,(RPL-pos)*sizeof(REC));
+   REC* const line=fill+b*RPL;memset((void*)(line+pos),0,(RPL-pos)*sizeof(REC));
    char* w=s.w;if(!w)w=grow(b);
    memcpy(w,line,64);w+=64;s.w=((uintptr_t)w&cmask)?w:nullptr;}
   _mm_sfence();
@@ -959,12 +959,16 @@ template<class REC> struct StreamStore{
  size_t count(size_t b)const{return bs[b].n;}
  template<class F> inline __attribute__((always_inline)) void for_segments(size_t b,F&& f)const{
   size_t left=bs[b].n;uint32_t id=bs[b].first;
-  while(left){const Chunk& c=chunks[id-1];const size_t n=min(left,perChunk);f((const REC*)c.data,n);left-=n;id=c.next;}
+  while(left){const Chunk& c=chunks[id-1];const size_t n=min(left,perChunk);
+   if(left>n){const char* const nx=chunks[c.next-1].data;__builtin_prefetch(nx);__builtin_prefetch(nx+64);__builtin_prefetch(nx+128);__builtin_prefetch(nx+192);} // the reader's next chunk is anywhere in the arena: its first lines are asked for a chunk ahead
+   f((const REC*)c.data,n);left-=n;id=c.next;}
  }
+ // The first lines of bucket b's first chunk (a reader that knows which bucket comes next asks for them early).
+ inline void prefetch_first(size_t b)const{if(const uint32_t id=bs[b].first){const char* const d=chunks[id-1].data;__builtin_prefetch(d);__builtin_prefetch(d+64);}}
  uint64_t records()const{uint64_t r=0;for(size_t b=0;b<nb;++b)r+=bs[b].n;return r;}
  void release(vector<pair<char*,size_t>>& out){
   out.insert(out.end(),maps.begin(),maps.end());maps.clear();vector<Chunk>().swap(chunks);
-  stg=nullptr;bs=nullptr;last=nullptr;nb=0;acur=alim=nullptr;
+  fill=nullptr;bs=nullptr;last=nullptr;nb=0;acur=alim=nullptr;
  }
 };
 // The record of a dense event row in a stream (stage A): the ESlot payload, with the low bits of the counter where
@@ -1465,17 +1469,73 @@ static inline __attribute__((always_inline)) void cslot_commit(CSlot& s,uint64_t
 }
 // SS_COMMIT=stream. A stream record into its slot, by the rule of eslot_commit: an empty slot takes it, a slot in use
 // only if the record's ingest_ts is smaller (the first copy stays on equal ingest). `base` = the slot of lo 0 of the
-// record's bucket, `thread` = the owner of the stream. Plain stores: the caller is the only writer of the bucket.
-static inline __attribute__((always_inline)) void erec_to_slot(ESlot* base,const ERec& r,uint64_t thread48){
- ESlot& s=base[erec_lo(r)];
- const uint64_t cur=s.k.load(memory_order_relaxed);
- if(cur==0||r.ingest<s.ingest){
-  const uint64_t uct=(r.ucl&0x0000FFFFFFFFFFFFull)|thread48;
-  s.k.store(r.k,memory_order_relaxed);memcpy((char*)&s+offsetof(ESlot,user),&uct,8);s.ingest=r.ingest;s.spare=r.spare;}
+// record's bucket, `th` = {0, owner thread of the stream << 48}, `sink` = a slot of the caller's that nobody reads:
+// the record that loses is stored there, so the rule costs no branch (about 7% of the rows are later copies, in no
+// order a predictor could learn). Plain stores: the caller is the only writer of the bucket's slots.
+static inline __attribute__((always_inline)) void erec_to_slot(ESlot* base,const ERec& r,__m128i th,ESlot* sink){
+ ESlot* const s=base+erec_lo(r);
+ const bool take=(s->k.load(memory_order_relaxed)==0)|(r.ingest<s->ingest);
+ ESlot* const d=take?s:sink;
+ const __m128i keep=_mm_set_epi64x(0x0000FFFFFFFFFFFFll,-1); // k whole; user and cat of ucl
+ const __m128i a=_mm_loadu_si128((const __m128i*)(const void*)&r),b=_mm_loadu_si128((const __m128i*)(const void*)&r+1);
+ _mm_storeu_si128((__m128i*)(void*)d,_mm_or_si128(_mm_and_si128(a,keep),th));_mm_storeu_si128((__m128i*)(void*)d+1,b);
+}
+// All records of stream bucket b (every thread's, in thread order, each in append order) into slots: the slot of
+// counter c is table[c & mask]. mask + 1 must be a multiple of the bucket's 2^bsh counters (the bucket's slots are
+// contiguous in the table); denseEv with mask = ~0 gives the global array. The caller must be the only writer of
+// those slots; empty slots must be zero (k == 0) beforehand. Returns the number of records read. This is THE
+// commit rule of stream mode: SCATTER and the bucket stage both come through here (BUCKETS.md).
+template<class TLS> static inline __attribute__((always_inline)) size_t stream_bucket_to_slots(const TLS& tls,int T,unsigned bsh,size_t b,ESlot* table,size_t mask){
+ ESlot* const base=table+(((size_t)b<<bsh)&mask);ESlot sink;size_t recs=0;
+ for(int t=0;t<T;++t){
+  const __m128i th=_mm_set_epi64x((long long)((uint64_t)tls[t].tid<<48),0);
+  if(t+1<T)tls[t+1].es.prefetch_first(b);
+  tls[t].es.for_segments(b,[&](const ERec* p,size_t n){recs+=n;for(size_t i=0;i<n;++i)erec_to_slot(base,p[i],th,&sink);});}
+ return recs;
 }
 // One dense event row into the stream of its bucket (uct without a thread: see erec_make).
 static inline __attribute__((always_inline)) void estream_put(StreamStore<ERec>& es,unsigned sh,uint64_t ve,uint64_t kk,uint64_t uct,int64_t ingest,uint64_t spare){
  es.put((size_t)(ve>>sh),erec_make(kk,uct,ingest,spare,(uint32_t)ve&((1u<<sh)-1)));
+}
+// The eight rows of a kernel group (all ok) into their streams in one call: the same streams as eight estream_put
+// calls in row order. O = the kernel's Ev8Out (ve, kk, uct, ingest, uw of rows 0-7; uct without a thread). AVX-512.
+// Why: with shuffled input the row-by-row form has a branch per row ("did this record fill the line?") that is taken
+// every other time in no order (half of them mispredicted), and 4 + 4 scalar moves per record. Here
+//   - the records are built by transposing the kernel's columns (four unpacks, four two-source permutes) and each
+//     goes to its fill line with one 32-byte store;
+//   - a bucket whose line became full is only noted (pend, no branch), and the noted lines leave in one loop at the
+//     end with one 64-byte load and one 64-byte non-temporal store each: one loop exit to predict per group.
+// A line must not get another record between "full" and its store, so a group with two rows of one bucket (2% of
+// the groups at 1,500 buckets; all of them in sorted input, where the branch per row predicts well) goes row by row.
+// The record layout is that of ERec / erec_make (two records per line); nothing else here depends on it.
+// The eight rows of a kernel group, row by row (plain x86-64 code; a call, to keep it out of the loops' bodies).
+template<class O> [[gnu::noinline]] static void estream_put8_rows(StreamStore<ERec>& es,unsigned sh,const O& o){
+ for(unsigned i=0;i<8;++i)estream_put(es,sh,o.ve[i],o.kk[i],o.uct[i],(int64_t)o.ingest[i],o.uw[i]);
+}
+#define SS_T5P __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512cd,avx2,bmi,bmi2,lzcnt,popcnt")))
+template<class O> SS_T5P [[gnu::noinline]] static void estream_put8_v5(StreamStore<ERec>& es,unsigned sh,const O& o){
+ static_assert(StreamStore<ERec>::RPL==2);
+ using BS=StreamStore<ERec>::BS;
+ const __m128i shc=_mm_cvtsi32_si128((int)sh);
+ const __m512i ve=_mm512_load_si512((const void*)o.ve),b8=_mm512_srl_epi64(ve,shc);
+ const __mmask8 dup=_mm512_cmpeq_epi64_mask(b8,_mm512_alignr_epi64(b8,b8,1))|_mm512_cmpeq_epi64_mask(b8,_mm512_alignr_epi64(b8,b8,2))
+                   |_mm512_cmpeq_epi64_mask(b8,_mm512_alignr_epi64(b8,b8,3))|_mm512_cmpeq_epi64_mask(b8,_mm512_alignr_epi64(b8,b8,4)); // every pair of rows is in one of the four rotations
+ if(__builtin_expect(dup!=0,0)){estream_put8_rows(es,sh,o);return;}
+ const __m512i lo48=_mm512_slli_epi64(_mm512_xor_si512(ve,_mm512_sll_epi64(b8,shc)),48);                 // the low sh bits of the counter, in bits 48-63
+ const __m512i ucl=_mm512_mask_blend_epi16((__mmask32)0x88888888u,_mm512_load_si512((const void*)o.uct),lo48); // user and cat from uct, lo above them
+ const __m512i kk=_mm512_load_si512((const void*)o.kk),ing=_mm512_load_si512((const void*)o.ingest),uw=_mm512_load_si512((const void*)o.uw);
+ const __m512i t0=_mm512_unpacklo_epi64(kk,ucl),t1=_mm512_unpackhi_epi64(kk,ucl),t2=_mm512_unpacklo_epi64(ing,uw),t3=_mm512_unpackhi_epi64(ing,uw); // (k, ucl) and (ingest, spare) of the even / odd rows
+ const __m512i ia=_mm512_setr_epi64(0,1,8,9,2,3,10,11),ib=_mm512_setr_epi64(4,5,12,13,6,7,14,15);
+ const __m512i r02=_mm512_permutex2var_epi64(t0,ia,t2),r46=_mm512_permutex2var_epi64(t0,ib,t2),r13=_mm512_permutex2var_epi64(t1,ia,t3),r57=_mm512_permutex2var_epi64(t1,ib,t3); // records of rows 0|2, 4|6, 1|3, 5|7
+ alignas(64) uint64_t bb[8];_mm512_store_si512((void*)bb,b8);
+ ERec* const fill=es.fill;BS* const bs=es.bs;const uintptr_t cmask=es.cmask;
+ uint64_t pend[8];unsigned cnt=0;
+#define SS_PUT8_ROW(I,V) {const size_t b_=(size_t)bb[I];const uint32_t n_=bs[b_].n;bs[b_].n=n_+1;const unsigned pos_=n_&1u;_mm256_store_si256((__m256i*)(void*)(fill+b_*2+pos_),V);pend[cnt]=b_;cnt+=pos_;}
+ SS_PUT8_ROW(0,_mm512_castsi512_si256(r02)) SS_PUT8_ROW(1,_mm512_castsi512_si256(r13)) SS_PUT8_ROW(2,_mm512_extracti64x4_epi64(r02,1)) SS_PUT8_ROW(3,_mm512_extracti64x4_epi64(r13,1))
+ SS_PUT8_ROW(4,_mm512_castsi512_si256(r46)) SS_PUT8_ROW(5,_mm512_castsi512_si256(r57)) SS_PUT8_ROW(6,_mm512_extracti64x4_epi64(r46,1)) SS_PUT8_ROW(7,_mm512_extracti64x4_epi64(r57,1))
+#undef SS_PUT8_ROW
+ for(unsigned j=0;j<cnt;++j){const size_t b=(size_t)pend[j];BS& st=bs[b];char* w=st.w;if(__builtin_expect(!w,0))w=es.grow(b);
+  _mm512_stream_si512((__m512i*)(void*)w,_mm512_load_si512((const void*)(fill+b*2)));w+=64;st.w=((uintptr_t)w&cmask)?w:nullptr;}
 }
 // Bit per user index: set in the links stage when one of the index's IDs is linked to anything but a
 // dense alias 0-7 of the same index. IDs of a complex index resolve through the ID table like general IDs.
@@ -1504,7 +1564,7 @@ static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32
 //           bucket (counter >> bsh; StreamStore, ERec) and writes no event slot; the SCATTER step right after the
 //           parse stage fills denseEv bucket by bucket, one thread per bucket, without a lock. bwin >= bsh: slots per
 //           SCATTER turn (SS_BSH itself; bsh = min(SS_BSH, 16) because a record has 16 bits for the low counter bits).
-struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false,batch=false,ev8=false,cl8=false,stream=false;unsigned ahead=8,shE=14,shC=14,bsh=14,bwin=14,bch=12;};
+struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false,batch=false,ev8=false,cl8=false,stream=false,put8=true,spf=false;unsigned ahead=8,shE=14,shC=14,bsh=14,bwin=14,bch=12;};
 // A dense event line in bucket form, valid or not. k as in PRec (0 = not a valid event), ingest = exact
 // ingest_ts in ms, lo = the low shE bits of the counter: counter = (bucket index << shE) | lo.
 struct DRec{uint64_t k;int64_t ingest;uint32_t user;uint16_t cat;uint16_t lo;};
@@ -2098,11 +2158,11 @@ static inline bool chunk_lines(const char* base,size_t len,size_t from,size_t to
 // What an event loop keeps across lines (never changes during a chunk).
 struct EvLoop{ThreadState& tl;KeyTable& tab;const KeyTable& products;size_t PE;const char* end;DateMemo3* memo;int64_t wstart;uint64_t wlen,ibase;Bucket<PRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t ke,ku,limE;ESlot* ev;uint64_t tid48;bool bucket,raw;unsigned ahead,shE;uint32_t loMask;Bucket<DRec>* db; // dense route (dparse); tid48 = thread index << 48 (eslot_uct), 0 in stream mode (a record has the low counter bits there)
- bool strm;unsigned bsh;StreamStore<ERec>* es; // SS_COMMIT=stream: rows go to es (bucket = counter >> bsh), no event slot is written or asked for
+ bool strm,strm8,spf;unsigned bsh;StreamStore<ERec>* es; // SS_COMMIT=stream: rows go to es (bucket = counter >> bsh), no event slot is written or asked for; strm8: whole kernel groups through estream_put8_v5
  EvLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& products_,size_t PE_,const char* end_):tl(tl_),tab(tab_),products(products_),PE(PE_),end(end_),memo(date_memo3()),
   wstart(window_start),wlen((uint64_t)(window_end-window_start)),ibase((uint64_t)ingestBase),buckets(tl_.eb.data()),slots(tab_.slots),tmask(tab_.mask),
   dUsers(dparse.users),ke(dense.ke),ku(dense.ku),limE(dense.limE),ev(denseEv),tid48(dparse.stream?0:(uint64_t)tl_.tid<<48),bucket(dparse.bucket),raw(dparse.raw),ahead(dparse.ahead),shE(dparse.shE),loMask((1u<<dparse.shE)-1),db(tl_.db.data()),
-  strm(dparse.stream),bsh(dparse.bsh),es(&tl_.es){}
+  strm(dparse.stream),strm8(dparse.stream&&dparse.put8&&vlk::lk_has512()),spf(dparse.stream&&dparse.spf),bsh(dparse.bsh),es(&tl_.es){}
 };
 // A finished dense event row of a line loop: into its slot, or (stream mode) behind the stream of its bucket.
 static inline __attribute__((always_inline)) void eslot_put(const EvLoop& lp,uint64_t ve,uint64_t kk,uint64_t uct,int64_t ingest,uint64_t spare){
@@ -3782,8 +3842,12 @@ static inline vert4::EvConst ev8_const4(uint64_t ke,uint64_t limE,int64_t wstart
 // Stream mode (lp.strm): the row goes behind the stream of its bucket instead (the kernel's uct has no thread then).
 #define SS_EV8_APPEND(O_,i_) estream_put(*lp.es,lp.bsh,O_.ve[i_],O_.kk[i_],O_.uct[i_],(int64_t)O_.ingest[i_],O_.uw[i_]);
 #define SS_EV8_COMMIT1(O_,i_) {if(lp.strm){SS_EV8_APPEND(O_,i_)}else{SS_EV8_COMMIT(O_,i_)}}
-#define SS_EV8_COMMIT8(O_) {if(lp.strm){SS_EV8_APPEND(O_,0) SS_EV8_APPEND(O_,1) SS_EV8_APPEND(O_,2) SS_EV8_APPEND(O_,3) SS_EV8_APPEND(O_,4) SS_EV8_APPEND(O_,5) SS_EV8_APPEND(O_,6) SS_EV8_APPEND(O_,7)} \
-  else{SS_EV8_COMMIT(O_,0) SS_EV8_COMMIT(O_,1) SS_EV8_COMMIT(O_,2) SS_EV8_COMMIT(O_,3) SS_EV8_COMMIT(O_,4) SS_EV8_COMMIT(O_,5) SS_EV8_COMMIT(O_,6) SS_EV8_COMMIT(O_,7)}}
+#define SS_EV8_COMMIT8(O_) {if(!lp.strm){SS_EV8_COMMIT(O_,0) SS_EV8_COMMIT(O_,1) SS_EV8_COMMIT(O_,2) SS_EV8_COMMIT(O_,3) SS_EV8_COMMIT(O_,4) SS_EV8_COMMIT(O_,5) SS_EV8_COMMIT(O_,6) SS_EV8_COMMIT(O_,7)} \
+  else if(lp.strm8)estream_put8_v5(*lp.es,lp.bsh,O_);else estream_put8_rows(*lp.es,lp.bsh,O_);}
+// Stream mode, at the time the direct commit asks for its slots (a group ahead of the append): with thousands of
+// buckets the fill lines and states of a thread no longer fit its share of the second-level cache, so the eight
+// rows' lines are asked for here (lp.spf: SS_SPF, default on from 3,000 buckets).
+#define SS_EV8_SPF(O_,M) {for(unsigned x_=(M);x_;x_&=x_-1){const size_t b_=(size_t)(O_.ve[__builtin_ctz(x_)]>>lp.bsh);__builtin_prefetch(lp.es->fill+b_*StreamStore<ERec>::RPL,1,3);__builtin_prefetch(lp.es->bs+b_,1,3);}}
 #define SS_EV8_FINISH(O,LS,NX,N,SLOW) {auto& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
   const unsigned ok_=O_.ok&((1u<<n_)-1);rows+=n_; \
   for(unsigned m_=O_.pur&ok_;m_;m_&=m_-1){const unsigned i_=(unsigned)__builtin_ctz(m_); \
@@ -3859,7 +3923,7 @@ template<unsigned LEAD,class GEN> TARGET static void NAME(const char* base,size_
   if(nD){ \
    VNS::Ev8Out& o_=*oD; \
    DEC(lD,xD,*sD,ec,o_); \
-   if(lp.strm){} /* stream mode: no slot is written here, so none is asked for */ \
+   if(lp.strm){if(lp.spf)SS_EV8_SPF(o_,o_.idok&((1u<<nD)-1))} /* stream mode: no slot is written here, so none is asked for */ \
    else if(__builtin_expect(pfw_,0)){for(unsigned x_=o_.idok&((1u<<nD)-1);x_;x_&=x_-1)SS_EV8_PFW(o_,__builtin_ctz(x_))} \
    else if(__builtin_expect((nD==8)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
    else for(unsigned x_=o_.idok&((1u<<nD)-1);x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
@@ -3977,7 +4041,7 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
   if(nD){ \
    VNS::Ev8Out& o_=*oD; \
    DEC(lD,xD,*sD,ec,o_); \
-   if(lp.strm){} /* stream mode: no slot is written here, so none is asked for */ \
+   if(lp.strm){if(lp.spf)SS_EV8_SPF(o_,o_.idok&nD)} /* stream mode: no slot is written here, so none is asked for */ \
    else if(__builtin_expect((nD==0xFFu)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
    else for(unsigned x_=o_.idok&nD;x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
   } \
@@ -5418,9 +5482,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  {const char* v=getenv("SS_COMMIT");dparse.stream=dparse.events&&!dparse.bucket&&v&&string_view(v)=="stream";
   if(const char* b=getenv("SS_BSH")){const int x=atoi(b);if(x>=4&&x<=20)dparse.bwin=(unsigned)x;}
   if(const char* b=getenv("SS_BCH")){const int x=atoi(b);if(x>=6&&x<=16)dparse.bch=(unsigned)x;}
+  if(const char* b=getenv("SS_PUT"))dparse.put8=string_view(b)!="row"; // SS_PUT=row: the ev8 loops append row by row (default on AVX-512: a kernel group at once, estream_put8_v5)
   dparse.bsh=min(dparse.bwin,16u);
   while(dparse.bsh<16&&(dense.limE>>dparse.bsh)>=(uint64_t(1)<<20))++dparse.bsh;
-  dparse.bwin=max(dparse.bwin,dparse.bsh);}
+  dparse.bwin=max(dparse.bwin,dparse.bsh);
+  // SS_SPF=0|1: the ev8 loops ask for a row's fill line and bucket state a group ahead (default: from 3,000 buckets,
+  // where a thread's lines and states are over 240 KB; not measured on the scoring machine).
+  dparse.spf=(dense.limE>>dparse.bsh)>=3000;if(const char* b=getenv("SS_SPF"))dparse.spf=b[0]=='1';}
  // Event lines with raw users use the two-phase loop (SS_EVENT_LOOP_2P) unless SS_DENSE_AHEAD is given: then the
  // loop with the ring of that length (0 = write at the end of the line) runs, for comparison.
  dparse.twoPhase=dparse.raw&&!getenv("SS_DENSE_AHEAD");
@@ -5434,7 +5502,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Where the CPU has the AVX-512 kernel it is also the default (see cl8Auto); any other SS_CLICKS value (SS_CLICKS=ix)
  // keeps the click loop with the line index (SS_CLICK_LOOP_IX). SS_CLICKS=cl8 with the avx2 masks runs the scalar twin.
  dparse.cl8=dparse.clicks&&!dparse.bucket&&getenv("SS_CLICKS")&&string_view(getenv("SS_CLICKS"))=="cl8";
- cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<" batch "<<dparse.batch<<" ev8 "<<dparse.ev8<<" cl8 "<<dparse.cl8<<(dparse.stream?" commit stream bsh ":" commit direct")<<(dparse.stream?to_string(dparse.bsh)+" turn "+to_string(dparse.bwin)+" bch "+to_string(dparse.bch):string())<<"\n";
+ cerr<<"dense parse: users "<<dparse.users<<" event records "<<dparse.events<<" click records "<<dparse.clicks<<" bucket "<<dparse.bucket<<" raw users "<<dparse.raw<<" two-phase "<<dparse.twoPhase<<" batch "<<dparse.batch<<" ev8 "<<dparse.ev8<<" cl8 "<<dparse.cl8<<(dparse.stream?" commit stream bsh ":" commit direct")<<(dparse.stream?to_string(dparse.bsh)+" turn "+to_string(dparse.bwin)+" bch "+to_string(dparse.bch)+(dparse.put8&&vlk::lk_has512()?" put group":" put row")+(dparse.spf?" spf":""):string())<<"\n";
  // First pass over the link files.
  // Without dense users it only counts lines (the table and the union-find arrays are sized by them).
  // With dense users it is the only pass that reads the files: a "simple" line - two dense user IDs
@@ -5871,7 +5939,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // would be more than half of a thread's expected rows, or than 8 MB if that is more).
  const size_t streamNB=dparse.stream?(size_t)(dense.limE>>dparse.bsh)+1:0;
  unsigned streamCS=dparse.bch;
- if(dparse.stream){const uint64_t per=estEvents*sizeof(ERec)/(uint64_t)T;while(streamCS>6&&((uint64_t)streamNB<<streamCS)>max<uint64_t>(uint64_t(8)<<20,per/2))--streamCS;}
+ // SS_TEST_STREAM_EST=n (test only): the stores are sized for n event rows instead of the estimate from the file size,
+ // and their arenas grow in the smallest steps (the estimate can be far off: rows of other lengths, many copies).
+ const bool streamEstTest=getenv("SS_TEST_STREAM_EST")!=nullptr;
+ const uint64_t streamEst=streamEstTest?strtoull(getenv("SS_TEST_STREAM_EST"),nullptr,10):estEvents;
+ if(dparse.stream){const uint64_t per=streamEst*sizeof(ERec)/(uint64_t)T;while(streamCS>6&&((uint64_t)streamNB<<streamCS)>max<uint64_t>(uint64_t(8)<<20,per/2))--streamCS;}
  __fine("parse-region");
  #pragma omp parallel num_threads(T)
  {
@@ -5888,7 +5960,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(auto& v:tl.eb)v.reserve(re);
    for(auto& v:tl.cb)v.reserve(rc);
    tl.db.resize(DE);tl.dcb.resize(DC);
-   if(dparse.stream)tl.es.init(streamNB,streamCS,(size_t)(estEvents*sizeof(ERec)/(uint64_t)T*5/4));
+   if(dparse.stream){tl.es.init(streamNB,streamCS,(size_t)(streamEst*sizeof(ERec)/(uint64_t)T*5/4));
+    if(streamEstTest)tl.es.nextBytes=size_t(2)<<20;} // test: the arena grows 2 MB at a time
    for(size_t i=0;i<DE;++i)tl.db[i].reserve(i<usedE?rdFull:16);
    for(size_t i=0;i<DC;++i)tl.dcb[i].reserve(i<usedC?rdcFull:16);
   }
@@ -5999,7 +6072,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(tl.denseMax)dense_note_index((tl.denseMax&~DENSE_USER)>>dn::ALIAS_BITS); // sizes the person numbers of the dense users
   dense_note_end(denseEvEnd,tl.evEnd);dense_note_end(denseClEnd,tl.clEnd);
   tl.slotWaits=eslotWaits;
-  if(dparse.stream)tl.es.finish(); // partial staging lines out, non-temporal stores visible
+  if(dparse.stream)tl.es.finish(); // partial fill lines out, non-temporal stores visible
  }
  populateStop.store(true,memory_order_relaxed);
  __mark("PARSE");
@@ -6009,11 +6082,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // 512 KB by default, so the stores stay in the owner's second-level cache; no lock, no other writer. After it the
  // slot array is what the direct commit leaves (same winners; `thread` = the thread that parsed the winning copy),
  // and nothing downstream knows the difference.
- // Whoever replaces this step (BUCKETS.md stages B-D) reads the streams the same way:
- //   for(size_t b=0;b<streamNB;++b)                       // bucket b = counters [b << dparse.bsh, (b+1) << dparse.bsh)
+ // Whoever replaces this step (BUCKETS.md stages B-D): bucket b = counters [b << dparse.bsh, (b+1) << dparse.bsh),
+ // b < streamNB; stream_bucket_to_slots(tls,T,dparse.bsh,b,table,mask) loads it into any table (several threads at
+ // once for different b, and again later for the same b: the streams are only read). Or record by record:
  //    for(int t=0;t<T;++t)                                // t = the thread that parsed the rows (the slot's `thread`)
  //     tls[t].es.for_segments(b,[&](const ERec* p,size_t n){...});   // n records at p (64-byte aligned), append order
  //   tls[t].es.count(b) = records of thread t in bucket b. Counter of a record = (b << dparse.bsh) | erec_lo(r).
+ // The streams stay until release() (below; SS_BKEEP=1 keeps them to the end of the run).
  if(dparse.stream){
   const unsigned gsh=dparse.bwin-dparse.bsh;const size_t turns=(streamNB+(size_t(1)<<gsh)-1)>>gsh;
   uint64_t recs=0,chunksAll=0,bytesAll=0;
@@ -6021,11 +6096,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   {
    #pragma omp for schedule(dynamic,1) nowait
    for(size_t g=0;g<turns;++g)
-    for(size_t b=g<<gsh;b<min(streamNB,(g+1)<<gsh);++b){
-     ESlot* const base=denseEv+(b<<dparse.bsh);
-     for(int t=0;t<T;++t){const uint64_t th=(uint64_t)tls[t].tid<<48;
-      tls[t].es.for_segments(b,[&](const ERec* p,size_t n){for(size_t i=0;i<n;++i)erec_to_slot(base,p[i],th);});}
-    }
+    for(size_t b=g<<gsh;b<min(streamNB,(g+1)<<gsh);++b)stream_bucket_to_slots(tls,T,dparse.bsh,b,denseEv,~size_t(0));
   }
   if(getenv("SS_STATS")){for(int t=0;t<T;++t){recs+=tls[t].es.records();chunksAll+=tls[t].es.chunks.size();bytesAll+=tls[t].es.arenaBytes;}
    cerr<<"STATS stream: records "<<recs<<" buckets "<<streamNB<<" chunks "<<chunksAll<<" of "<<(size_t(1)<<streamCS)<<" bytes, arena bytes "<<bytesAll<<"\n";}
@@ -6033,6 +6104,22 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(!getenv("SS_BKEEP")){vector<pair<char*,size_t>> v;for(int t=0;t<T;++t)tls[t].es.release(v);
    thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();}
   __mark("SCATTER");
+ }
+ // SS_SLOTSUM=1 (test only): three sums over the event slots as the parse stage (and SCATTER) left them, to compare
+ // the direct commit with the stream commit on sets too large for the text dump. `all` covers the 32 bytes of every
+ // slot in use with its counter (equal only if the same thread wrote each slot: one thread, or luck); `data` leaves
+ // the thread out (equal between runs unless a row and its copy with the same ingest_ts were parsed by different
+ // code: a raw user text in one, a user number in the other; which copy comes first depends on the threads);
+ // `rows` = counter, k, ingest and the category of a valid row (must agree whatever the loop and the threads).
+ if(getenv("SS_SLOTSUM")&&denseEv){
+  auto mix=[](uint64_t x){x^=x>>33;x*=0xff51afd7ed558ccdull;x^=x>>29;x*=0xc4ceb9fe1a85ec53ull;x^=x>>32;return x;};
+  uint64_t all=0,data=0,rows=0,used=0;const uint64_t e=denseEvEnd.load();
+  for(uint64_t i=0;i<dense.limE;++i){const ESlot& r=denseEv[i];const uint64_t k=r.k.load(memory_order_relaxed);if(!k)continue;
+   if(i>=e){cerr<<"SLOTSUM slot "<<i<<" in use beyond the end "<<e<<"\n";continue;}
+   uint64_t w;memcpy(&w,(const char*)&r+offsetof(ESlot,user),8);
+   const uint64_t a=mix(i+0x9E3779B97F4A7C15ull)^mix(k*3+1),b=mix((uint64_t)r.ingest+(a<<1));
+   ++used;rows+=mix(a+b+(k>ESLOT_INVALID?mix(r.cat+7):0));data+=mix(a+b+mix(w&0x0000FFFFFFFFFFFFull)+mix(r.spare^0x5555));all+=mix(a+b+mix(w)+mix(r.spare^0x5555));}
+  cerr<<"SLOTSUM end "<<e<<" used "<<used<<" rows "<<hex<<rows<<" data "<<data<<" all "<<all<<dec<<"\n";
  }
  if(getenv("SS_SMAPS")){ // measuring switch: how the kernel mapped things by the end of the parse stage (file PMD maps, anonymous huge pages)
   ifstream f("/proc/self/smaps_rollup");string l;
