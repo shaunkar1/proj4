@@ -4992,10 +4992,26 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __mark("KEYS");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0,linkBytes=0,linkFileCount=0;
+ // SS_LINKS: how the first pass over the link files finds the simple lines (dense users only; see the pass).
+ //   (unset)  eight lanes + the AVX-512 kernel vlk::lk8_v5 where the CPU has it (not under SS_ISA=sse2); else as "old"
+ //   old      one line after the other through link_split + link_dense
+ //   ref      eight lanes + the kernel's scalar twin vlk::lk8_ref (any CPU; for tests and instruction counts)
+ //   check / refcheck  as the default / as ref, and every line the kernel takes is compared with what link_split +
+ //            link_dense say about it (abort on a difference); counts under SS_STATS
+ //   cas      as the default, but every union is applied at once with comp_union (compare-and-swap), one kernel call
+ //            behind its prefetch, instead of going through the bucket lists
+ const char* const lkMode=getenv("SS_LINKS");const string_view lkm(lkMode?lkMode:"");
+ const bool lkRef=lkm=="ref"||lkm=="refcheck",lkCheck=lkm=="check"||lkm=="refcheck",lkCas=lkm=="cas";
+ const bool lkWanted=lkm!="old"&&(lkRef||(vlk::lk_has512()&&(lkMode||!(getenv("SS_ISA")&&string_view(getenv("SS_ISA"))=="sse2"))));
+ // Link files are handed out in pieces of 256 KB when the lane loop runs them (2 MB otherwise, as before): a piece is
+ // about 12,000 lines, cheap enough now that the threads' shares of a small link folder should be even (20M events:
+ // 18 MB of links = 13 pieces of 2 MB for 8 threads, or 72 of 256 KB). SS_LINKCH=bytes sets the size (measuring).
+ size_t linkCH=lkWanted?(size_t(256)<<10):CH;
+ if(const char* v=getenv("SS_LINKCH")){const unsigned long long x=strtoull(v,nullptr,10);if(x>=64&&x<=(1ull<<30))linkCH=(size_t)x;}
  for(const Mapped& m:map_files(csv_files(data/"links"),linkFiles)){if(!m.len)continue;
   ++linkLines; // a last line without '\n'
   linkBytes+=m.len;++linkFileCount;
-  for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+  for(size_t from=0;from<m.len;from+=linkCH)linkChunks.push_back({m.base,m.len,from,from+linkCH,false});}
  __fine("map-links");
  static const bool idBlocks=!getenv("SS_NOIDBLOCKS"); // measuring switch: per-thread ID blocks in the links stage
  // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
@@ -5054,23 +5070,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   bool v3=__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("popcnt")&&__builtin_cpu_supports("lzcnt");
   if(const char* isa=getenv("SS_ISA"))if(string_view(isa)=="sse2")v3=false;
   void (*const link_dense)(const char*,size_t,const char*,size_t,LinkDense&)=v3?link_dense_v3:link_dense_base;
-  // SS_LINKS: how the simple lines are found (dense users only).
-  //   (unset)  eight lanes + the AVX-512 kernel vlk::lk8_v5 where the CPU has it (not under SS_ISA=sse2); else as "old"
-  //   old      one line after the other through link_split + link_dense
-  //   ref      eight lanes + the kernel's scalar twin vlk::lk8_ref (any CPU; for tests and instruction counts)
-  //   check / refcheck  as the default / as ref, and every line the kernel takes is compared with what link_split +
-  //            link_dense say about it (abort on a difference); counts under SS_STATS
-  //   cas      as the default, but every union is applied at once with comp_union (compare-and-swap), one kernel call
-  //            behind its prefetch, instead of going through the bucket lists
+  // SS_LINKS (read where the link files are cut into pieces) decides how the simple lines are found.
   // The unions of the lane loop (default): a simple line with two different aliases becomes a 32-bit record in a list
   // of its thread, one list per bucket; a bucket is every lkR-th block of 4096 user indexes. When all chunks are done
   // each bucket is applied by one thread (vlk::lk_union_v5, sixteen records per turn; lk_union_ref under ref): no word
   // is changed by two threads, so no lock prefix, and a bucket's words are an lkR-th of the array. The result is the same word whatever the order: a word is "the
   // smallest alias of each alias's group", which the set of unions decides. (Unions from the line code - refused
   // lines, file tails - still go through comp_union at once; all of that is over before the buckets are applied.)
-  const char* const lkMode=getenv("SS_LINKS");const string_view lkm(lkMode?lkMode:"");
-  const bool lkRef=lkm=="ref"||lkm=="refcheck",lkCheck=lkm=="check"||lkm=="refcheck",lkCas=lkm=="cas";
-  const bool lkOn=denseUsers&&lkm!="old"&&(lkRef||(vlk::lk_has512()&&(lkMode||!(getenv("SS_ISA")&&string_view(getenv("SS_ISA"))=="sse2"))));
+  const bool lkOn=denseUsers&&lkWanted;
   void (*const lk8)(const char**,const char* const*,const vlk::LkConst&,vlk::LkOut&)=lkRef?vlk::lk8_ref:vlk::lk8_v5;
   int lkR=32;while(lkR<T&&lkR<LKR_MAX)lkR*=2;
   static constexpr array<uint8_t,256> POP8=[]{array<uint8_t,256> a{};for(unsigned m=0;m<256;++m){unsigned n=0;for(unsigned j=0;j<8;++j)n+=(m>>j)&1;a[m]=(uint8_t)n;}return a;}();
@@ -5130,15 +5137,23 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(s[j]<klim[j]){kp[j]=s[j];tail[j]=nullptr;}else{kp[j]=klim[j]=ck.base;tail[j]=s[j];}} // a lane that never runs reads the chunk's first bytes
    vlk::LkOut ob[2];memset(ob[0].mx,0,sizeof ob[0].mx);memset(ob[1].mx,0,sizeof ob[1].mx);
    vlk::LkOut* prev=nullptr;int cur=0;uint64_t nk=0,nslow=0;
+   // Memory for records: its own mapping, small pages on purpose (a list is touched a few pages at a time; a huge page
+   // under each of the 32 lists of a thread would be 2 MB of zeroing for a few kilobytes of records).
+   const auto rec_block=[](size_t records)->uint32_t*{
+    const size_t bytes=records*sizeof(uint32_t);
+    void* const m=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+    if(m==MAP_FAILED){cerr<<"ERROR out of memory\n";_exit(1);}
+    madvise(m,bytes,MADV_NOHUGEPAGE);
+    return (uint32_t*)m;};
    // Every LKG kernel calls: a bucket whose block could run full within the next LKG calls (8 records each at most)
    // gets a new block. The first blocks of a thread are one allocation, touched only as far as records are written.
    const auto refill=[&]()__attribute__((noinline,cold))->size_t{
-    if(!out.bp[lkR]){uint32_t* const slab=(uint32_t*)malloc((size_t)lkR*LKB*sizeof(uint32_t));if(!slab){cerr<<"ERROR out of memory\n";_exit(1);}
+    if(!out.bp[lkR]){uint32_t* const slab=rec_block((size_t)lkR*LKB);
      for(int r=0;r<lkR;++r){out.bstart[r]=out.bp[r]=slab+(size_t)r*LKB;out.bcap[r]=out.bp[r]+LKB;}
      out.bp[lkR]=out.trash;}
     for(int r=0;r<lkR;++r)if((size_t)(out.bcap[r]-out.bp[r])<8*LKG){
      out.blocks[r].push_back({out.bstart[r],out.bp[r]});
-     uint32_t* const nb=(uint32_t*)malloc(LKB*sizeof(uint32_t));if(!nb){cerr<<"ERROR out of memory\n";_exit(1);}
+     uint32_t* const nb=rec_block(LKB);
      out.bstart[r]=out.bp[r]=nb;out.bcap[r]=nb+LKB;}
     return LKG;};
    size_t room=0;
