@@ -1123,6 +1123,87 @@ static inline void dense_note_first(atomic<uint32_t>& first,uint32_t ctr1){
 }
 static size_t pow2_parts(uint64_t est){size_t p=1;while(p<2048&&p*32768<est)p<<=1;return p;}
 struct Camp{string id,channel;};
+// ---- Campaign lookup of the click loops: a complete table (SS_CAMP=hash: the KeyTable lookup as before) ----
+// Every campaign_id of up to 7 bytes is in one table without collisions (hash and displace): the text and its
+// length are one 64-bit key (the bytes as they stand, zero-padded, length in the top byte), key * mul picks a
+// displacement by its bits 32.. and a slot by its top bits, slot ^ displacement holds the key and the campaign
+// number. Since the table holds ALL campaigns of up to 7 bytes, a text of up to 7 bytes is a campaign exactly if
+// the one entry it points at has its key: found and not found are both exact after one compare. Longer texts,
+// and everything when the table could not be built, go through the KeyTable as before.
+// SS_CAMP=check: both lookups for every row; the run stops if they ever differ.
+// BEGIN camp table (fuzz/camp_test.cpp compiles the text between these marks)
+struct CampEnt{uint64_t key,ci;}; // empty entry: key = ~0 (no key has a length byte of 255)
+struct CampLook{const CampEnt* t=nullptr;const uint16_t* disp=nullptr;uint64_t mul=0,lim=0;uint32_t sh=0,mask=0;}; // lim: texts shorter than this use the table (8, or 0: table off)
+static constexpr uint64_t CAMP_LOW[8]={0,0xFFULL,0xFFFFULL,0xFFFFFFULL,0xFFFFFFFFULL,0xFFFFFFFFFFULL,0xFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFULL};
+static inline __attribute__((always_inline)) uint64_t camp_key(const char* s,size_t n){uint64_t w;__builtin_memcpy(&w,s,8);return (w&CAMP_LOW[n])|((uint64_t)n<<56);} // n <= 7; s may be read up to 8 bytes
+static inline __attribute__((always_inline)) uint32_t camp_table_find(const CampLook& c,uint64_t key){
+ const uint64_t h=key*c.mul;
+ const CampEnt& e=c.t[(h>>c.sh)^c.disp[(uint32_t)(h>>32)&c.mask]];
+ return e.key==key?(uint32_t)e.ci:UINT32_MAX;
+}
+struct CampTable{
+ vector<CampEnt> t;vector<uint16_t> disp;CampLook look;size_t keys=0;uint64_t checked=0;
+ // One attempt with multiplier mul and 2^b slots: false if two keys share bucket and slot or a bucket fits nowhere.
+ bool place(const vector<CampEnt>& ks,unsigned b,uint64_t mul){
+  const size_t S=(size_t)1<<b;const uint32_t mask=(uint32_t)(S-1);const unsigned sh=64-b;
+  vector<uint32_t> cnt(S+1,0),ord(ks.size());
+  for(const CampEnt& k:ks)++cnt[(((uint32_t)((k.key*mul)>>32))&mask)+1];
+  for(size_t i=0;i<S;++i)cnt[i+1]+=cnt[i];
+  {vector<uint32_t> at(cnt.begin(),cnt.end()-1);for(uint32_t i=0;i<ks.size();++i)ord[at[((uint32_t)((ks[i].key*mul)>>32))&mask]++]=i;}
+  vector<uint32_t> bys(S);for(uint32_t i=0;i<S;++i)bys[i]=i;
+  stable_sort(bys.begin(),bys.end(),[&](uint32_t x,uint32_t y){return cnt[x+1]-cnt[x]>cnt[y+1]-cnt[y];}); // biggest buckets first
+  t.assign(S,CampEnt{~0ULL,0});disp.assign(S,0);
+  size_t freeAt=0;
+  for(const uint32_t bk:bys){
+   const uint32_t lo=cnt[bk],hi=cnt[bk+1];if(lo==hi)break;
+   if(hi-lo==1){ // a single key takes the next free slot
+    while(t[freeAt].key!=~0ULL)++freeAt;
+    const CampEnt& k=ks[ord[lo]];disp[bk]=(uint16_t)(((k.key*mul)>>sh)^freeAt);t[freeAt]=k;continue;
+   }
+   for(uint32_t i=lo;i<hi;++i)for(uint32_t j=i+1;j<hi;++j)if(((ks[ord[i]].key*mul)>>sh)==((ks[ord[j]].key*mul)>>sh))return false;
+   size_t d=0;
+   for(;d<S;++d){bool fits=true;for(uint32_t i=lo;i<hi&&fits;++i)fits=t[((ks[ord[i]].key*mul)>>sh)^d].key==~0ULL;if(fits)break;}
+   if(d==S)return false;
+   disp[bk]=(uint16_t)d;for(uint32_t i=lo;i<hi;++i)t[((ks[ord[i]].key*mul)>>sh)^d]=ks[ord[i]];
+  }
+  look.t=t.data();look.disp=disp.data();look.mul=mul;look.sh=sh;look.mask=mask;look.lim=8;
+  return true;
+ }
+ // ks: (key, campaign number) of every campaign_id of up to 7 bytes, each key once. False: no table (look.lim stays 0).
+ bool build(const vector<CampEnt>& ks){
+  look=CampLook{};keys=ks.size();
+  if(ks.size()>32768)return false;
+  unsigned b=6;while(((size_t)1<<b)<ks.size())++b;
+  for(;b<=16;++b){
+   uint64_t x=0x9E3779B97F4A7C15ULL;
+   for(int a=0;a<12;++a){x+=0x9E3779B97F4A7C15ULL;uint64_t z=x;z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL;z=(z^(z>>27))*0x94D049BB133111EBULL;z^=z>>31;
+    if(place(ks,b,z|1)){for(const CampEnt& k:ks)if(camp_table_find(look,k.key)!=(uint32_t)k.ci){look=CampLook{};return false;} return true;}}
+  }
+  look=CampLook{};return false;
+ }
+};
+// END camp table
+static CampTable campTable;
+static bool campCheck=false; // SS_CAMP=check
+[[gnu::noinline,gnu::cold]] static void camp_check(const char* s,size_t n,uint32_t ci){ // SS_CAMP=check: the table against the KeyTable answer ci
+ if(n>=8||!campTable.look.t)return;
+ CampLook c=campTable.look;c.lim=8;
+ const uint32_t f=camp_table_find(c,camp_key(s,n));
+ if(f!=ci){cerr<<"SS_CAMP=check: campaign text '"<<string_view(s,n)<<"' table "<<f<<" KeyTable "<<ci<<"\n";abort();}
+ __atomic_fetch_add(&campTable.checked,1,__ATOMIC_RELAXED);
+}
+// The campaign number of the n bytes at s (which may be read up to 12, as KeyTable::pack does); false if it is no campaign.
+static inline __attribute__((always_inline)) bool camp_find(const CampLook& c,const KeyTable& camps,const char* s,size_t n,uint32_t& ci){
+ if(__builtin_expect(n<c.lim,1)){
+  const uint64_t key=camp_key(s,n),h=key*c.mul;
+  const CampEnt& e=c.t[(h>>c.sh)^c.disp[(uint32_t)(h>>32)&c.mask]];
+  ci=(uint32_t)e.ci;return __builtin_expect(e.key==key,1);
+ }
+ uint64_t k0;uint32_t k1;const string_view camp(s,n);
+ ci=__builtin_expect(KeyTable::pack(camp,k0,k1),1)?camps.find_packed(k0,k1):camps.find(camp);
+ if(__builtin_expect(campCheck,0))camp_check(s,n,ci);
+ return ci!=KeyTable::NONE;
+}
 struct Totals{uint64_t sessions=0,purchasing_sessions=0,revenue=0,assists=0;};
 struct UserTotals{uint64_t sessions=0,events=0,revenue=0;};
 static int64_t divfloor(int64_t a,int64_t b){int64_t q=a/b;return q-((a%b)<0);}
@@ -1507,7 +1588,12 @@ static inline __attribute__((always_inline)) void eslot_commit(ESlot& s,uint64_t
   return;
  }
 }
+// -DSS_ABL_CLICK=n (measuring builds only, wrong output): 1 = no click slot is written, 2 = none written and none
+// asked for by the cl8 loops, 3 = written but not asked for.
 static inline __attribute__((always_inline)) void cslot_commit(CSlot& s,uint64_t key,uint32_t user,uint32_t thread){
+#if defined(SS_ABL_CLICK)&&(SS_ABL_CLICK==1||SS_ABL_CLICK==2)
+ (void)s;(void)key;(void)user;(void)thread;return;
+#endif
  const uint64_t w=(uint64_t)user|((uint64_t)(thread+1)<<32);
  __atomic_store_n(&s.key,key,__ATOMIC_RELAXED);memcpy((void*)&s.user,&w,8);
 }
@@ -4109,6 +4195,7 @@ SS_EVENT_LOOP_EV8L(events_avx512y_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,ve
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
+ CampLook cf=campTable.look; // campaign lookup (camp_find)
  ClLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& camps_,size_t PC_,const char* end_,int64_t clickStart_):tl(tl_),tab(tab_),camps(camps_),PC(PC_),end(end_),memo(date_memo3()),
   clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask),
   dUsers(dparse.users),kc(dense.kc),ku(dense.ku),limC(dense.limC),cl(denseCl),tid(tl_.tid),bucket(dparse.bucket),ahead(dparse.ahead),shC(dparse.shC),dcb(tl_.dcb.data()){}
@@ -4156,8 +4243,7 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    const bool tsOk=ts_v3(p+b3,l3,memo,ts);
    if(!tsOk||(trel=(uint64_t)ts-(uint64_t)clickStart)>=wlen)break; // clickStart <= ts < window_end
    uint64_t k0;uint32_t k1;
-   const string_view camp(p+b2,l2);
-   const uint32_t ci=__builtin_expect(KeyTable::pack(camp,k0,k1),1)?camps.find_packed(k0,k1):camps.find(camp);if(ci==KeyTable::NONE)break;
+   uint32_t ci;if(!camp_find(lp.cf,camps,p+b2,l2,ci))break;
    const char* const s1=p+b1;
    // Dense route (DENSE.md): see event_line_v3.
    const uint64_t ckey=(trel<<16)|(uint16_t)ci;
@@ -5170,9 +5256,8 @@ static inline vcl2::ClConst cl8_const2(uint64_t kc,uint64_t limC,uint64_t ku,uin
 #define SS_CL8_CONST2(lp_) cl8_const2(lp_.kc,lp_.limC,lp_.ku,dense.limI,denseComplex,lp_.clickStart,lp_.wlen)
 #define SS_CL8_SLOT(O_,i_) (*(CSlot*)((char*)lp.cl+O_.so[i_]))
 // One ok row: the row code's campaign lookup; a campaign that is not found drops the row without a trace.
-#define SS_CL8_ROW(O_,i_) {uint64_t k0_;uint32_t k1_;const string_view camp_(O_.sc[i_],(size_t)O_.lc[i_]); \
-   const uint32_t ci_=__builtin_expect(KeyTable::pack(camp_,k0_,k1_),1)?lp.camps.find_packed(k0_,k1_):lp.camps.find(camp_); \
-   if(__builtin_expect(ci_!=KeyTable::NONE,1)){found_|=1u<<(i_);cslot_commit(SS_CL8_SLOT(O_,i_),O_.ckh[i_]|(uint16_t)ci_,(uint32_t)O_.user[i_],lp.tid);}}
+#define SS_CL8_ROW(O_,i_) {uint32_t ci_; \
+   if(__builtin_expect(camp_find(lp.cf,lp.camps,O_.sc[i_],(size_t)O_.lc[i_],ci_),1)){found_|=1u<<(i_);cslot_commit(SS_CL8_SLOT(O_,i_),O_.ckh[i_]|(uint16_t)ci_,(uint32_t)O_.user[i_],lp.tid);}}
 // Finishing the first N rows of a group in line order. The maxima of the group (umax, kend) cover all its ok rows:
 // they are used only if every ok row was committed, otherwise the committed rows are taken one by one.
 #define SS_CL8_FINISH(O,LS,NX,N,MASKS) {const auto& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned n_=(N); \
@@ -5183,7 +5268,11 @@ static inline vcl2::ClConst cl8_const2(uint64_t kc,uint64_t limC,uint64_t ku,uin
    else if(!((O_.drop>>i_)&1)){const char* const q_=L_[i_];++slow;click_line_v3<true>(q_,MASKS(q_),X_[i_]-1,lp,pend,pp,dmax,send,ring,rpos,general);}} \
   if(__builtin_expect(found_==ok_,1)){dmax=max(dmax,O_.umax);send=max(send,O_.kend);} \
   else for(unsigned x_=found_;x_;x_&=x_-1){const unsigned i_=(unsigned)__builtin_ctz(x_);dmax=max(dmax,(uint32_t)O_.user[i_]);send=max(send,(uint32_t)O_.kcn[i_]+1);} }
+#if defined(SS_ABL_CLICK)&&SS_ABL_CLICK>=2
+#define SS_CL8_PF(O_,i_) ;
+#else
 #define SS_CL8_PF(O_,i_) __builtin_prefetch(&SS_CL8_SLOT(O_,i_),1,3);
+#endif
 #define SS_CL8_PFW(O_,i_) SS_PFW_ASM(&SS_CL8_SLOT(O_,i_))
 // The line index and the three groups under way (N scanned, D decoded and its slots asked for, F finished) are those
 // of SS_EVENT_LOOP_EV8; see there. A short last group is filled up with the pointer behind its last line (a row with
@@ -5363,6 +5452,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(!ok)throw runtime_error("Malformed clean campaigns.csv");
   if(campaigns.size()>=65534)throw runtime_error("Too many campaigns");
   const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
+ {const char* const v=getenv("SS_CAMP");const string_view w(v?v:""); // table (default) | hash | check
+  campCheck=w=="check";
+  vector<CampEnt> ks;for(size_t i=0;i<campaigns.size();++i)if(campaigns[i].id.size()<=7)ks.push_back({camp_key((campaigns[i].id+string(8,'\0')).data(),campaigns[i].id.size()),i});
+  campTable.keys=ks.size();if(w!="hash")campTable.build(ks);
+  if(campCheck)campTable.look.lim=0;} // the loops take the KeyTable path, which compares
  organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
  };
  const bool catalogBg=getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="thread"; // default inline: on the scoring machine the side thread made KEYS wait 13-18 ms (diagnostic 17)
@@ -5901,6 +5995,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __mark("LINKS"); cerr<<"linked IDs: "<<nlinked-idHoles<<"\n";
  __fine("catalog-join");
  if(catalogBg){catalogThread.join();if(catalogErr)rethrow_exception(catalogErr);}else load_catalog();
+ cerr<<"click path: campaign lookup "<<(campCheck?"check":campTable.look.lim?"table":"hash")<<" ("<<campTable.keys<<" keys, "<<campTable.t.size()<<" slots)\n";
  __fine("catalog-ready");
 
  // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
@@ -6237,6 +6332,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  const uint32_t totalIds=tab.end_parallel();
  __mark("RESOLVE");
+ if(campCheck)cerr<<"STATS campaign lookups checked against the KeyTable: "<<campTable.checked<<"\n";
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
   cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";
   uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
