@@ -865,9 +865,20 @@ static constexpr unsigned EV_TS=25;
 static_assert(PR_KBIAS==1ull<<EV_TS);
 // One surviving click, 24 bytes. key = (ts - (window_start - 7 days))<<16 | campaign.
 struct Click{uint64_t key;const char* id;uint32_t person;uint32_t idlen;};
-// A surviving click as a record of a stream (32 bytes: two per fill line).
-struct SClick{Click c;uint64_t pad;};
-static_assert(sizeof(SClick)==32&&offsetof(SClick,c)==0);
+// ---- Clicks straight from the parser to the persons (GFAST.md "DIRECTION CHANGE AFTER SURVEY 2", item 1; SS_CLDIRECT) ----
+// Copies of a click have identical values and neither the credit (latest click at or before the session start, ties by
+// the smallest click_id) nor the assists (each campaign once per session) change when a click is there twice. So a
+// valid click needs no ID bucket and no dedup: the parser writes the SURVIVOR record itself. PClick = Click + padding
+// to 32 bytes (two per fill line of a StreamStore): c.key, c.id, c.idlen final; c.person = the user's table number,
+// which IS the person number (the links stage has rewritten every linked ID's slot to its root), or LOCAL_USER | n of
+// the writing thread for a user of the fallback table (those records wait in ThreadState::pclLocal: their person
+// number exists only after the parse). Store: ThreadState::pcl, bucket = person >> clDirSh ("person range": 2^clDirSh
+// persons, at most 512 ranges below the table's ID limit, fixed before the parse). After the parse a range is handed
+// to the person buckets of the last stage (a copy without any table; SS_CLDIRECT=dedup: through an exact set of the
+// ID texts of the range first, which gives the old answer even to a reader that minds copies).
+struct PClick{Click c;uint64_t pad;};
+static_assert(sizeof(PClick)==32&&offsetof(PClick,c)==0);
+static unsigned clDirect=0,clDirSh=0; // clDirect: 0 = click ID buckets + dedup (as before), 1 = direct, 2 = direct + exact dedup when the ranges are handed on; set by run() before the parse region
 // Order of a person's clicks: by ts, and at equal ts the byte-wise larger ID first, so the last click
 // at or before a moment is the latest one with the smallest ID.
 static inline bool click_before(const Click& a,const Click& b){
@@ -1069,12 +1080,18 @@ struct alignas(64) ThreadState{
  uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
  uint64_t gevRows=0,gevSlow=0,gevChecked=0; // general event loop (ev8g kernel): rows, rows the kernel refused (line code), rows compared in check mode
  PRec* gcap=nullptr;bool gcapHas=false;int64_t gcapIngest=0; // SS_GEV=check: the general handler stores its record here instead of in a bucket
+ StreamStore<PClick> pcl;vector<PClick> pclLocal; // clDirect: this thread's valid clicks by person range; those of fallback-table users
  StreamStore<ERec> es; // SS_COMMIT=stream: this thread's dense event rows by bucket (counter >> dparse.bsh)
- StreamStore<SClick> pcl; // clicks this thread parsed, by person bucket (see click_direct); empty unless the parser may use it
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
  string dumpRows; // SS_DENSE_DUMP only
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
 };
+// One valid click from the parser (clDirect): user = what the ID table said (or LOCAL_USER | n).
+static inline __attribute__((always_inline)) void click_direct(ThreadState& tl,const char* id,uint32_t idlen,uint64_t key,uint32_t user){
+ PClick r;r.c.key=key;r.c.id=id;r.c.person=user;r.c.idlen=idlen;r.pad=0;
+ if(__builtin_expect((user&LOCAL_USER)!=0,0)){tl.pclLocal.push_back(r);return;}
+ tl.pcl.put((size_t)(user>>clDirSh),r);
+}
 // ---- Dense route, users (DENSE.md stages 2 and 4) ----
 // These declarations need nothing of the dn:: block; the three functions that do are defined after run().
 // True once the links stage has decided that user IDs may take the dense route (keys found, table limit below DENSE_USER).
@@ -1554,25 +1571,12 @@ static bool infer(const vector<uint64_t>& ys,uint64_t limit,uint64_t step,uint64
 static dn::Info dense; // set once before the links stage, read-only after that
 // Records and shared state of the dense route (see DENSE.md).
 static constexpr uint32_t DENSE_USER=0x40000000u; // user field: DENSE_USER | (index<<3 | alias) of a user index that is not complex; table IDs stay below this
-// ---- Clicks without a dedup stage ----
-// rules: "Dedup on click_id. Copies of a click have identical values, so keep any one." Credit (latest click at or before
-// the session start, ties to the smallest click_id) and assists (a campaign counts once per session) come out the same
-// with a click present once or several times, so a valid click needs no dedup: the parser can hand it straight to its
-// person's bucket. For that the person bucket of a table person is fixed before parsing: person >> personShift.
-// SS_CLDEDUP=1: clicks go through the click-ID buckets and the dedup table as before.
+// The person bucket of a table person is fixed BEFORE parsing: person >> personShift. The parser's direct clicks
+// (click_direct, clDirSh) use the same shift, so a person range of theirs is a person bucket of the last stage.
 static unsigned personShift=0;
 static uint64_t person_bucket_events(){ // SS_PERSONBUCKET: events per person bucket to aim for
  static const uint64_t v=[]{const char* e=getenv("SS_PERSONBUCKET");const long long x=e?atoll(e):16384;return (uint64_t)(x<256?256:x>(1<<24)?(1<<24):x);}();
  return v;}
-// One valid click whose user number is known. True: the click is in the thread's person-bucket store (tl.pcl, set up
-// before parsing only when clicks may skip the dedup). False: the caller appends its CRec to the click-ID buckets as
-// before (dedup wanted, dense route, or a user that is not a table number: its person is only known after parsing).
-static inline __attribute__((always_inline)) bool click_direct(ThreadState& tl,uint64_t key,const char* id,uint32_t idlen,uint32_t user){
- const size_t b=(size_t)(user>>personShift);
- if(__builtin_expect(b>=tl.pcl.nb,0)||(user&(LOCAL_USER|DENSE_USER)))return false; // nb is 0 when the store is off
- SClick x;x.c.key=key;x.c.id=id;x.c.person=user;x.c.idlen=idlen;x.pad=0;
- tl.pcl.put(b,x);return true;
-}
 // Dense events and clicks do not go through buckets: the parse stage writes each one straight into a slot
 // indexed by its counter, so the slot arrays are the deduplicated tables when parsing is done.
 // Event slot. k: 0 empty, 1 busy (a thread is writing the slot), 2 a line that is not a valid event (it
@@ -4722,6 +4726,7 @@ SS_V3I bool click_long_fields(const char* const p,const uint64_t cA,const uint64
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
  CampLook cf=campTable.look; // campaign lookup (camp_find)
+ bool cdirect=clDirect!=0; // the click leaves as a survivor record (complete: its user is resolved before the put)
  unsigned win2=optClickWin2; // lines without a newline in the first window: click_long_fields (SS_CLWIN=1: the general handler, as before)
  ClLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& camps_,size_t PC_,const char* end_,int64_t clickStart_):tl(tl_),tab(tab_),camps(camps_),PC(PC_),end(end_),memo(date_memo3()),
   clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask),
@@ -4820,6 +4825,14 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    }else{
     bool tableUser=true;
     if(lp.dUsers){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode)){tableUser=false;dmax=max(dmax,ucode);}}
+    if(lp.cdirect){ // direct: the record leaves complete, so the user's number is found right here
+     if(tableUser){
+      if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0))ucode=long_user(s1,l1,tab,tl);
+      else{PendUser pu;pu.k0=k0;pu.k1=k1;pu.j=(uint32_t)(KeyTable::hash_packed(k0,k1)&tmask);pu.u=s1;pu.up=&ucode;resolve_users(&pu,&pu+1,tab,tl);}
+     }
+     click_direct(tl,s0,l0,ckey,ucode);
+     break;
+    }
     bool longUser=false; // a user ID that does not pack (over 11 bytes: every canonical long ID): waits in the batch like the others (SS_CLWIN=1: its number right here)
     if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){if(lp.win2)longUser=true;else{ucode=long_user(s1,l1,tab,tl);tableUser=false;}}
     CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=ckey;r.user=ucode;
@@ -6414,7 +6427,8 @@ static inline __attribute__((always_inline)) uint32_t clg_user(const vclg::Cl8gO
 // One ok row of group F.
 #define SS_CLG_ROW(O_,K_,i_) {uint32_t ci_=0;const bool f_=camp_find(lp.cf,lp.camps,O_.sc[i_],(size_t)O_.lc[i_],ci_);uint32_t g_=0; \
    if(__builtin_expect(f_,1)){g_=clg_user(O_,i_,K_,tab,tl); \
-    if(!click_direct(tl,O_.ckh[i_]|(uint16_t)ci_,O_.ks[i_],(uint32_t)O_.kl[i_],g_)){ \
+    if(__builtin_expect(lp.cdirect,1))click_direct(tl,O_.ks[i_],(uint32_t)O_.kl[i_],O_.ckh[i_]|(uint16_t)ci_,g_); \
+    else{ \
     CRec r_;r_.id=O_.ks[i_];r_.idlen=(uint32_t)O_.kl[i_];r_.h=hkey_v3(r_.id,r_.idlen);r_.key=O_.ckh[i_]|(uint16_t)ci_;r_.user=g_; \
     Bucket<CRec>& vec_=lp.buckets[(size_t)(((r_.h>>40)*PC)>>24)]; \
     if(__builtin_expect(vec_.full(),0))vec_.reserve(max<size_t>(16,2*vec_.capacity())); \
@@ -7351,6 +7365,29 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const uint32_t tagKeep=getenv("SS_TEST_TAG0")?0u:~0u;
  atomic<size_t> nextChunk{0};
  const int64_t clickStart=window_start-WEEK;
+ // Clicks straight to the persons (PClick: above). General route only (no dense click records, no dense users); the
+ // dump of the dense tests reads the click ID buckets and keeps them. SS_CLDIRECT=0: click ID buckets + dedup, as
+ // before. SS_CLDIRECT=dedup: direct, with an exact dedup on the ID texts when a range is handed on (the old answer
+ // whatever the reader does with copies; reports copies whose values differ). SS_CLDIRSH=n: 2^n persons per range.
+ // SS_TEST_CLEST=n (test): the stores are sized for n click rows and grow in 2 MB steps.
+ // The person shift is fixed here, before the parse, by the rule of the last stage fed with estimates: buckets wanted
+ // = events / SS_PERSONBUCKET, number space = linked IDs + one new ID per 64 events (the generator's ratio; a bad
+ // guess makes the person buckets bigger or smaller than wanted, nothing else). SS_TEST_PSHIFT forces it. The person
+ // ranges of the direct clicks take the same shift (unless that gives a silly number of ranges, or SS_CLDIRSH says
+ // otherwise): then a range IS a person bucket and the last stage reads tls[t].pcl where it is.
+ {const uint64_t want=max<uint64_t>(1,estEvents/person_bucket_events()),space=(uint64_t)nlinked+estEvents/64+1;
+  unsigned sh=0;while(sh<16&&(space>>sh)>want)++sh;
+  if(const char* v=getenv("SS_TEST_PSHIFT")){const int x=atoi(v);if(x>=0&&x<=16)sh=(unsigned)x;}
+  personShift=sh;}
+ {const char* const v=getenv("SS_CLDIRECT");const string_view w(v?v:"");
+  clDirect=(dparse.clicks||dparse.users||dumpText||w=="0")?0u:w=="dedup"?2u:1u;
+  unsigned sh=0;while(sh<31&&((uint64_t)tab.idLimit>>sh)>=512)++sh;
+  if(((uint64_t)tab.idLimit>>personShift)<(1u<<16))sh=personShift;
+  if(const char* x=getenv("SS_CLDIRSH")){const int y=atoi(x);if(y>=0&&y<=31&&((uint64_t)tab.idLimit>>y)<(1u<<20))sh=(unsigned)y;}
+  clDirSh=sh;}
+ const size_t NBd=clDirect?(size_t)((uint64_t)tab.idLimit>>clDirSh)+1:0; // person ranges (table numbers are below idLimit)
+ const bool clEstTest=getenv("SS_TEST_CLEST")!=nullptr;
+ const uint64_t clEst=clEstTest?strtoull(getenv("SS_TEST_CLEST"),nullptr,10):estClicks;
  // Dense slots: zero pages, touched by whoever writes a slot first.
  if(dparse.events&&!dparse.bucket)denseEv=(ESlot*)map_huge((size_t)(dense.limE+1)*sizeof(ESlot));
  if(dparse.clicks&&!dparse.bucket)denseCl=(CSlot*)map_huge((size_t)(dense.limC+1)*sizeof(CSlot));
@@ -7387,17 +7424,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool streamEstTest=getenv("SS_TEST_STREAM_EST")!=nullptr;
  const uint64_t streamEst=streamEstTest?strtoull(getenv("SS_TEST_STREAM_EST"),nullptr,10):estEvents;
  if(dparse.stream){const uint64_t per=streamEst*sizeof(ERec)/(uint64_t)T;while(streamCS>6&&((uint64_t)streamNB<<streamCS)>max<uint64_t>(uint64_t(8)<<20,per/2))--streamCS;}
- // Clicks straight from the parser to the person buckets (click_direct): only on the general route, and the person
- // shift must be fixed now. It is today's rule fed with estimates: buckets wanted = events / SS_PERSONBUCKET, number
- // space = linked IDs + one new ID per 64 events (the generator's ratio; a bad guess makes the buckets bigger or
- // smaller than wanted, nothing else). SS_TEST_PSHIFT forces it, as it forces the shifts of the last stage.
- static const bool clDedup=[]{const char* v=getenv("SS_CLDEDUP");return v&&v[0]=='1';}();
- const bool pclOn=!clDedup&&!dparse.events&&!dparse.clicks&&!denseUsers&&!dumpDir;
- {const uint64_t want=max<uint64_t>(1,estEvents/person_bucket_events()),space=(uint64_t)nlinked+estEvents/64+1;
-  unsigned sh=0;while(sh<16&&(space>>sh)>want)++sh;
-  if(const char* v=getenv("SS_TEST_PSHIFT")){const int x=atoi(v);if(x>=0&&x<=16)sh=(unsigned)x;}
-  personShift=sh;}
- const size_t pclNB=(size_t)(((uint64_t)maxIds+1)>>personShift)+1;
  __fine("parse-region");
  #pragma omp parallel num_threads(T)
  {
@@ -7406,7 +7432,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   tl.tid=(uint32_t)omp_get_thread_num();
   {// With the dense slots on, the hash buckets only get the few general rows: start them small (they grow).
    const size_t re=dparse.events?(size_t)(estEvents/((uint64_t)T*PE)/64)+16:(size_t)(estEvents/((uint64_t)T*PE)*9/8)+16;
-   const size_t rc=dparse.clicks?(size_t)(estClicks/((uint64_t)T*PC)/64)+16:(size_t)(estClicks/((uint64_t)T*PC)*9/8)+16;
+   const size_t rc=dparse.clicks?(size_t)(estClicks/((uint64_t)T*PC)/64)+16:clDirect?16:(size_t)(estClicks/((uint64_t)T*PC)*9/8)+16;
+   if(clDirect){const size_t per=(size_t)(clEst*sizeof(PClick)/(uint64_t)T);unsigned cs=12;while(cs>8&&(NBd<<cs)>max<size_t>(per/2,size_t(1)<<20))--cs;
+    tl.pcl.init(NBd,cs,per*5/4);if(clEstTest)tl.pcl.nextBytes=size_t(2)<<20;}
    // Dense buckets past the counters in use stay small.
    const size_t need=PE*(re*sizeof(PRec)+64)+PC*(rc*sizeof(CRec)+64)
     +usedE*(rdFull*sizeof(DRec)+64)+(DE-usedE)*(16*sizeof(DRec)+64)+usedC*(rdcFull*sizeof(DCRec)+64)+(DC-usedC)*(16*sizeof(DCRec)+64);
@@ -7414,7 +7442,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(auto& v:tl.eb)v.reserve(re);
    for(auto& v:tl.cb)v.reserve(rc);
    tl.db.resize(DE);tl.dcb.resize(DC);
-   if(pclOn)tl.pcl.init(pclNB,12,(size_t)(estClicks*sizeof(SClick)/(uint64_t)T*5/4));
    if(dparse.stream){tl.es.init(streamNB,streamCS,(size_t)(streamEst*sizeof(ERec)/(uint64_t)T*5/4));
     if(streamEstTest)tl.es.nextBytes=size_t(2)<<20;} // test: the arena grows 2 MB at a time
    for(size_t i=0;i<DE;++i)tl.db[i].reserve(i<usedE?rdFull:16);
@@ -7488,7 +7515,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     else{tl.clEnd=max(tl.clEnd,(uint32_t)kcn+1);cslot_commit(denseCl[kcn],ckey,user,tl.tid);}
     return;
    }
-   if(click_direct(tl,ckey,f[0].data(),(uint32_t)f[0].size(),user))return;
+   if(clDirect){click_direct(tl,f[0].data(),(uint32_t)f[0].size(),ckey,user);return;}
    CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.key=ckey;r.user=user;
    tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
   };
@@ -7532,7 +7559,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   dense_note_end(denseEvEnd,tl.evEnd);dense_note_end(denseClEnd,tl.clEnd);
   tl.slotWaits=eslotWaits;
   if(dparse.stream)tl.es.finish(); // partial fill lines out, non-temporal stores visible
-  if(pclOn)tl.pcl.finish();
+  if(clDirect)tl.pcl.finish();
  }
  populateStop.store(true,memory_order_relaxed);
  __mark("PARSE");
@@ -7824,6 +7851,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  size_t maxEvBucket=0,maxClBucket=0; // most parsed lines in one ID bucket (all threads together)
  for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
  for(size_t p=0;p<PC;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].cb.size())n+=tls[t].cb[p].size();parsedClicks+=n;maxClBucket=max(maxClBucket,n);}
+ uint64_t pcRecords=0,pcLocal=0;size_t pcMax=0; // clDirect: the clicks are in the person ranges (and the fallback users' lists)
+ for(size_t b=0;b<NBd;++b){size_t n=0;for(int t=0;t<T;++t)if(b<tls[t].pcl.nb)n+=tls[t].pcl.count(b);pcRecords+=n;pcMax=max(pcMax,n);}
+ for(int t=0;t<T;++t)pcLocal+=tls[t].pclLocal.size();
+ parsedClicks+=pcRecords+pcLocal;
+ atomic<uint64_t> pcCopies{0},pcOdd{0};
  // SS_PERSONBUCKET: events per person bucket to aim for (measuring switch; the last stage sorts one
  // bucket at a time in two buffers of 16 bytes per event, so this sets its working set).
  static const uint64_t perBucket=person_bucket_events();
@@ -7834,6 +7866,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // lane, so that stretch is mostly empty and is cut into at most a few hundred buckets (2^shB persons).
  // How many rows the first stretch gets from the slots is only known after the DENSE stage; a sample
  // of the event slots estimates it (a wrong guess costs time, nothing else).
+ // The direct clicks stay where the parser put them (tls[t].pcl) when their ranges are the person buckets.
+ const bool pclRead=clDirect==1&&clDirSh==personShift&&!slotMode;
  unsigned shA=0,shB=0;
  {uint64_t estA=parsedEvents;
   if(rawSlots)for(int t=0;t<T;++t)estA+=sideRows[t].size(); // the rows the event slots add to the first stretch: known exactly
@@ -7846,7 +7880,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(n&&(b+(size_t)t)%step==0){all+=n;if(!(B[0].user&DENSE_USER))tableRows+=n;}}
    if(all)estA+=total*tableRows/all;}
   const uint64_t want=max<uint64_t>(1,estA/perBucket);while(shA<16&&((uint64_t)denseBase>>shA)>want)++shA;
-  if(pclOn)shA=personShift; // the parser has put clicks by this shift (click_direct)
+  if(pclRead)shA=personShift; // the parser has put the clicks by this shift (click_direct)
   while(shB<16&&((npersons-denseBase)>>shB)>256)++shB;}
  if(const char* v=getenv("SS_TEST_PSHIFT")){int s=atoi(v);if(s>=0&&s<=16)shA=shB=(unsigned)s;} // tests force odd bucket widths
  const uint32_t WA=1u<<shA,WB=1u<<shB,Wmax=max(WA,WB);
@@ -7858,7 +7892,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // Survivors by person bucket, one list per thread and bucket (tls[t].uev/ucl are not used any more).
  struct Survivors{vector<EvList> ev;vector<ClickList> cl;HugePool pool; // pool: all of one thread's post-parse memory
   StreamStore<Ev> sev; // SS_EMIT=stream: the events this thread's dedup turns let through, by person bucket
-  StreamStore<SClick> scl;}; // SS_CLEMIT=stream: the same for clicks
+  StreamStore<PClick> scl;}; // SS_CLEMIT=stream: the same for clicks
  vector<Survivors> surv(T);
  // SS_EMIT (events of the general route): how the dedup stage hands its survivors to the person buckets.
  //   stream (default)  an ID bucket is deduplicated completely first (pass 1: every record through the tag table, the
@@ -7875,10 +7909,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // SS_CLEMIT=stream (default) | list: the same choice for the surviving clicks (a click is passed on when its ID is
  // first seen and never taken back, so the click dedup stays one pass).
  static const bool clStreamWanted=[]{const char* v=getenv("SS_CLEMIT");return !(v&&!strcmp(v,"list"));}();
- if(pclOn&&slotMode){fprintf(stderr,"ERROR parser click store with dense slots\n");_exit(1);}
  const bool clStream=clStreamWanted&&!slotMode;
- const bool clNoTable=!clDedup&&!slotMode; // SS_CLDEDUP: clicks are moved to the person buckets without the table
- const auto cl_count=[&surv,&tls](int t,size_t up)->size_t{return surv[t].cl[up].size()+surv[t].scl.count(up)+(up<tls[t].pcl.nb?tls[t].pcl.count(up):0);};
+ const auto cl_count=[&surv,&tls,pclRead](int t,size_t up)->size_t{return surv[t].cl[up].size()+surv[t].scl.count(up)+(pclRead&&up<tls[t].pcl.nb?tls[t].pcl.count(up):0);};
  // SS_PREFILTER=0: every record of an ID bucket goes through the tag table. Default: two bits per hash cell first
  // (SS_CELLS cells per record, default 16): a record whose cell holds no other record of the bucket has no copy and
  // is passed on without any table; only the records of cells seen twice (copies + chance meetings) take the table.
@@ -7933,8 +7965,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(prefilter){cellBuf.reserve(maxEvBucket*cellsPer/32+2);candBuf.reserve(maxEvBucket+1);}
   StreamStore<Ev>& sev=surv[tid].sev;
   if(evStream)sev.init(UPn,12,(size_t)(parsedEvents*sizeof(Ev)/(uint64_t)T*9/8));
-  StreamStore<SClick>& scl=surv[tid].scl;
-  if(clStream)scl.init(UPn,12,(size_t)(parsedClicks*sizeof(SClick)/(uint64_t)T*9/8));
+  StreamStore<PClick>& scl=surv[tid].scl;
+  if(clStream)scl.init(UPn,12,(size_t)(parsedClicks*sizeof(PClick)/(uint64_t)T*9/8));
   const bool probe4=simdProbe;const size_t ahead=pfe;const uint32_t tagMask=tagKeep&0xffffu; // plain locals for the hot loops
   const unsigned bshA=shA,bshB=shB;const size_t bnA=nA;const uint32_t bBase=denseBase;
   const auto person_of=person_of_shared; // this thread's copy
@@ -8184,14 +8216,47 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(const auto& g:sev.given)scl.give(g.first,(size_t)(g.second-g.first));
    sev.gcur=sev.glim=nullptr;sev.given.clear();
   }
+  // Direct clicks (clDirect): every person range goes to the person buckets as it is - no table, a copy of a click
+  // stays a copy (the last stage gives the same answer with it). SS_CLDIRECT=dedup: a range passes an exact set of
+  // its ID texts first (all copies of a click have one user, so one range); copies with other values are counted.
+  if(clDirect&&pclRead){ // the person ranges are read where they are; only the clicks of fallback-table users are moved
+   #pragma omp single
+   {for(int t=0;t<T;++t)for(const PClick& r:tls[t].pclLocal){
+     const uint32_t u=person_of(r.c.person,t);
+     if(clStream){PClick x=r;x.c.person=u;scl.put((size_t)(u>>bshA),x);}
+     else{Click* const out=myCl[u>>bshA].slot(pool);out->key=r.c.key;out->id=r.c.id;out->person=u;out->idlen=r.c.idlen;}}}
+  }
+  else if(clDirect){
+   const bool dd=clDirect==2;uint64_t copies=0,odd=0;
+   unordered_map<string_view,const PClick*> seen;
+   const auto hand=[&](const PClick& r,int t){
+    if(dd){const auto ins=seen.try_emplace(string_view(r.c.id,r.c.idlen),&r);
+     if(!ins.second){++copies;const PClick& o=*ins.first->second;if(o.c.key!=r.c.key||(!(r.c.person&LOCAL_USER)&&o.c.person!=r.c.person))++odd;return;}}
+    const uint32_t u=person_of(r.c.person,t);
+    Click* const out=myCl[u>>bshA].slot(pool);
+    __builtin_prefetch((const char*)out+ahead,1,3);
+    out->key=r.c.key;out->id=r.c.id;out->person=u;out->idlen=r.c.idlen;};
+   #pragma omp for schedule(dynamic,1) nowait
+   for(size_t b=0;b<NBd;++b){
+    if(dd)seen.clear();
+    for(int t=0;t<T;++t){
+     if(b>=tls[t].pcl.nb||!tls[t].pcl.count(b))continue;
+     tls[t].pcl.for_segments(b,[&](const PClick* r,size_t n){for(const PClick* const e=r+n;r!=e;++r)hand(*r,t);});
+    }
+   }
+   #pragma omp single
+   {if(dd)seen.clear(); // the clicks of fallback-table users, all threads' lists through one set
+    for(int t=0;t<T;++t)for(const PClick& r:tls[t].pclLocal)hand(r,t);}
+   pcCopies+=copies;pcOdd+=odd;
+  }
   // Copies of a click are identical, so the first one seen is kept.
   #pragma omp for schedule(dynamic,1)
   for(size_t p=0;p<PC;++p){
    size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=bucket_size(tls[t].cb,p);}off[T]=n;
    if(!n)continue;
    if(n>=0x7fffffffu){fprintf(stderr,"ERROR click ID bucket too large\n");_exit(1);}
-   const size_t cap=clNoTable?0:n*slotPct/100+2; // SS_CLDEDUP=0: no table, every click is passed on
-   uint32_t* const S=slotBuf.get(cap+4);if(!clNoTable){memset(S,0,cap*sizeof(uint32_t));memset(S+cap,0xff,4*sizeof(uint32_t));}
+   const size_t cap=n*slotPct/100+2;
+   uint32_t* const S=slotBuf.get(cap+4);memset(S,0,cap*sizeof(uint32_t));memset(S+cap,0xff,4*sizeof(uint32_t));
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
    const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
    for(int t=0;t<T;++t){
@@ -8200,7 +8265,6 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     for(;r!=rend;++r,++g1){
      if(clStream){const size_t ab=(size_t)((rend-r>8?r+8:r)->user>>bshA); // as in pass 2 of the events
       __builtin_prefetch((const char*)scl.fill+ab*64,1,3);__builtin_prefetch((const char*)scl.bs+ab*sizeof(*scl.bs),1,3);}
-     if(!clNoTable){
      const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
      size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
      unsigned mz=0,mt=1; // four slots at once, as for events
@@ -8221,14 +8285,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(++j==cap)j=0;
      }
      S[j]=tg|g1;
-     }
      {
       const uint32_t u=person_of(r->user,t);
       size_t bkt;
       uint32_t markedIx=~0u;
       if(r->user&DENSE_USER){bkt=bnA+((u-bBase)>>bshB);if(markInfo){markedIx=(r->user&~DENSE_USER)>>dn::ALIAS_BITS;markInfo[markedIx].general.store(1,memory_order_relaxed);}}
       else bkt=u>>bshA;
-      if(clStream){SClick x;x.c.key=r->key;x.c.id=r->id;x.c.person=u;x.c.idlen=r->idlen;x.pad=0;scl.put(bkt,x);goto next_click;}
+      if(clStream){PClick x;x.c.key=r->key;x.c.id=r->id;x.c.person=u;x.c.idlen=r->idlen;x.pad=0;scl.put(bkt,x);goto next_click;}
       Click* const out=myCl[bkt].slot(pool);
       __builtin_prefetch((const char*)out+ahead,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
@@ -8237,7 +8300,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      next_click:;
     }
    }
-   if(stats&&!clNoTable)for(size_t j=0;j<cap;++j){const uint32_t e=S[j];if(!e)continue;
+   if(stats)for(size_t j=0;j<cap;++j){const uint32_t e=S[j];if(!e)continue;
     const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
     const size_t home=(size_t)(((tls[ot].cb[p][og-off[ot]].h&0xffffffffu)*cap)>>32),d=j>=home?j-home:j+cap-home;
     ++stClN;stClDisp+=d;stClMax=max<uint64_t>(stClMax,d);}
@@ -8248,6 +8311,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(evStream)sev.finish(); // this thread appends no more events (the click loop above ended with a barrier for all)
   if(clStream)scl.finish();
  }
+ if(clDirect){ // the person ranges are not needed again: a helper thread unmaps them in 16 MB steps, as the event streams (SS_BKEEP=1: they stay)
+  if(stats||pcOdd.load())fprintf(stderr,"STATS direct clicks: %llu in %llu person ranges of %llu persons (largest %llu), %llu of fallback users%s\n",(unsigned long long)pcRecords,(unsigned long long)NBd,(unsigned long long)1<<clDirSh,(unsigned long long)pcMax,(unsigned long long)pcLocal,clDirect==2?" (SS_CLDIRECT=dedup)":"");
+  if(clDirect==2)fprintf(stderr,"STATS direct clicks dedup: copies %llu, of them with other values %llu\n",(unsigned long long)pcCopies.load(),(unsigned long long)pcOdd.load());
+  if(!pclRead&&!getenv("SS_BKEEP")){vector<pair<char*,size_t>> v;for(int t=0;t<T;++t){tls[t].pcl.release(v);vector<PClick>().swap(tls[t].pclLocal);}
+   thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();}}
  if(stats)fprintf(stderr,"STATS event dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\nSTATS click dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\n",
   (unsigned long long)stEvN,stEvN?(double)stEvDisp/stEvN:0.0,(unsigned long long)stEvMax,(unsigned long long)stEvFalse,(unsigned long long)stClN,stClN?(double)stClDisp/stClN:0.0,(unsigned long long)stClMax,(unsigned long long)stClFalse);
  vector<GRef> genRefs; // all threads' notes, by user index
@@ -8261,8 +8329,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(stats){uint64_t ch=0,gv=0,ab=0,cch=0,cgv=0,cab=0;
   for(int t=0;t<T;++t){ch+=surv[t].sev.chunks.size();gv+=surv[t].sev.givenChunks;ab+=surv[t].sev.arenaBytes;cch+=surv[t].scl.chunks.size();cgv+=surv[t].scl.givenChunks;cab+=surv[t].scl.arenaBytes;}
   uint64_t pc=0;for(int t=0;t<T;++t)pc+=tls[t].pcl.nb?tls[t].pcl.records():0;
-  fprintf(stderr,"STATS dedup: SS_PREFILTER=%d cells per record %zu, records through the table %llu of %llu; SS_CLDEDUP=%d, clicks put by the parser %llu, person shift %u\n",
-   (int)prefilter,cellsPer,(unsigned long long)(prefilter?stEvCand:parsedEvents),(unsigned long long)parsedEvents,(int)!clNoTable,(unsigned long long)pc,shA);
+  fprintf(stderr,"STATS dedup: SS_PREFILTER=%d cells per record %zu, records through the table %llu of %llu; direct clicks read in place %d, clicks put by the parser %llu, person shift %u\n",
+   (int)prefilter,cellsPer,(unsigned long long)(prefilter?stEvCand:parsedEvents),(unsigned long long)parsedEvents,(int)pclRead,(unsigned long long)pc,shA);
   fprintf(stderr,"STATS emit: SS_EMIT=%s SS_CLEMIT=%s SS_RECYCLE=%d person buckets %zu; event chunks %llu (from consumed buckets %llu) new bytes %llu; click chunks %llu (from consumed buckets %llu) new bytes %llu\n",
    evStream?"stream":"list",clStream?"stream":"list",(int)recycle,UPn,(unsigned long long)ch,(unsigned long long)gv,(unsigned long long)ab,(unsigned long long)cch,(unsigned long long)cgv,(unsigned long long)cab);}
  // The last stage takes the biggest person buckets first: a bucket that holds one of the few very big persons
@@ -9437,11 +9505,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   };
   // The clicks of person bucket `up` the same way: f(first, count, stride) - a Click at every `stride` bytes.
   // Three sources: the old lists, the rows the dedup stage moved (scl) and the rows the parser put itself (pcl).
-  const auto each_cl=[&surv,&tls,T](size_t up,auto&& f) __attribute__((always_inline)) {
+  const auto each_cl=[&surv,&tls,T,pclRead](size_t up,auto&& f) __attribute__((always_inline)) {
    for(int t=0;t<T;++t){const ClickList& L=surv[t].cl[up];
     for(const ClickList::Block* bl=L.head;bl;bl=bl->next)f((const char*)bl->items,L.count(bl),sizeof(Click));
-    surv[t].scl.for_segments(up,[&](const SClick* q,const size_t n) __attribute__((always_inline)) {f((const char*)q,n,sizeof(SClick));});
-    if(up<tls[t].pcl.nb)tls[t].pcl.for_segments(up,[&](const SClick* q,const size_t n) __attribute__((always_inline)) {f((const char*)q,n,sizeof(SClick));});}
+    surv[t].scl.for_segments(up,[&](const PClick* q,const size_t n) __attribute__((always_inline)) {f((const char*)q,n,sizeof(PClick));});
+    if(pclRead&&up<tls[t].pcl.nb)tls[t].pcl.for_segments(up,[&](const PClick* q,const size_t n) __attribute__((always_inline)) {f((const char*)q,n,sizeof(PClick));});}
   };
   if(cellPass)cellBuf.reserve(maxEvPerson+2);
   Cell* const cells=cellBuf.p;
