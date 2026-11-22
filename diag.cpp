@@ -173,7 +173,7 @@ static void run_child(const string& bin,vector<pair<string,string>> env,RunResul
   if(line.rfind("TIME ",0)==0){size_t sp=line.find(' ',5);if(sp!=string::npos)r.t[line.substr(5,sp-5)]+=atof(line.c_str()+sp+1);}
   if(line.rfind("CPU ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["c"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1);}
   if(line.rfind("SYS ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["s"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1);}
-  if(line.rfind("FLT ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["f"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1)/1e6;}
+  if(line.rfind("FLT ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["f"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1)/1e3;}
   if(line.rfind("SMAPS FilePmdMapped:",0)==0)r.t["pmd"]=atof(line.c_str()+20)/1e6;
   for(const char* pre:{"dense:","STATS dense keys","STATS ev8 loop","STATS cl8","STATS dense reader","linked IDs","STATS event buckets","STATS click buckets","ERROR"})
    if(line.rfind(pre,0)==0&&r.raw.size()<700){r.raw+=line.substr(0,150);r.raw+=" # ";}
@@ -507,15 +507,17 @@ int main(){
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  #define NL {"SS_LANES","0"}
  #define ND {"SS_NODENSE","1"}
- #define DW {"SS_DEDUPWAIT","0"}
- #define AO {"SS_AGGORDER","index"}
+ #define LO {"SS_LINKS","old"}
+ #define LB {"SS_LINKS","base"}
+ #define GO {"SS_GEV","old"}
+ #define CW {"SS_CLWIN","1"}
  for(int r=0;r<3;++r){
-  add("Bs",1,{N8,ST});add("dw",1,{N8,ST,DW});add("ao",1,{N8,ST,AO});add("da",1,{N8,ST,DW,AO});
+  add("Bs",1,{N8,ST});add("lo",1,{N8,ST,LO});add("lb",1,{N8,ST,LB});add("go",1,{N8,ST,GO});add("cw",1,{N8,ST,CW});
  }
  const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HBs",1,{N8,ST},"",true);add("Hdw",1,{N8,ST,DW},"",true);add("Hao",1,{N8,ST,AO},"",true);}
+ for(int r=0;r<3;++r){add("HBs",1,{N8,ST},"",true);if(r<2){add("Hlo",1,{N8,ST,LO},"",true);add("Hgo",1,{N8,ST,GO},"",true);}}
  if(quick){vars.clear();
   for(int r=0;r<4;++r){
    {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
@@ -589,7 +591,7 @@ int main(){
     double v;const string k=key;
     if(k=="w")v=r.wall;else if(k=="u")v=r.user;else if(k=="s")v=r.sys;else if(k=="f")v=r.minflt/1e3;else if(k=="r")v=r.maxrssMB/1e3;
     else if(k=="L"){v=0;for(auto& kv:r.t)if(kv.first.rfind("LINK",0)==0||kv.first=="FLATTEN")v+=kv.second;}
-    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="Y"?"DENSE1":k=="K"?"KEYS":k=="W"?"WRITE":k=="R"?"RESOLVE":k=="M"?"MAP":k=="E"?"zEXIT":k=="p"?"cPARSE":k=="q"?"cRESOLVE":k=="x"?"cDENSE":k=="a"?"cAGGREGATE":k=="i"?"sMAP":k=="y"?"sPARSE":k=="h"?"sRESOLVE":k=="z"?"sDENSE":k=="g"?"sAGGREGATE":k=="j"?"fPARSE":k=="k"?"fMAP":k=="e"?"pmd":k=="d"?"cDEDUP":k=="b"?"sDEDUP":k=="n"?"fDEDUP":k=="m"?"fAGGREGATE":k=="l"?"cLINKREAD":key);v=it==r.t.end()?0:it->second;}
+    else{auto it=r.t.find(k=="P"?"PARSE":k=="D"?"DEDUP":k=="A"?"AGGREGATE":k=="X"?"DENSE":k=="Y"?"DENSE1":k=="K"?"KEYS":k=="W"?"WRITE":k=="R"?"RESOLVE":k=="M"?"MAP":k=="E"?"zEXIT":k=="p"?"cPARSE":k=="q"?"cRESOLVE":k=="x"?"cDENSE":k=="a"?"cAGGREGATE":k=="i"?"sMAP":k=="y"?"sPARSE":k=="h"?"sRESOLVE":k=="z"?"sDENSE":k=="g"?"sAGGREGATE":k=="j"?"fPARSE":k=="k"?"fMAP":k=="e"?"pmd":k=="d"?"cDEDUP":k=="b"?"sDEDUP":k=="n"?"fDEDUP":k=="m"?"fAGGREGATE":k=="l"?"cLINKREAD":k=="L"?"LINKREAD":k=="F"?"FLATTEN":k=="N"?"LINKMAP":key);v=it==r.t.end()?0:it->second;}
     if(best<0||v<best)best=v;}
    return best<0?-1:(long)(best*1e3+0.5);};
   auto fmt=[&](const string& name,const string& grp,const char* keys)->string{string o=name+"=";for(const char* k=keys;*k;++k){if(k!=keys)o+="/";const char one[2]={*k,0};o+=to_string(mn(grp,one));}return o+" ";};
@@ -615,11 +617,14 @@ int main(){
   {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c68 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   if(!quick&&gV5){
-   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE c70 | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
+   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE c72 | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
    const char* SK="MKLPDAWE";
-   a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("dedupwait0","dw")+mm("aggorder-index","ao")+mm("both-old","da");
-   a+="| 20M stages MKLPDAWE: "+fmt("default","Bs",SK)+fmt("dedupwait0","dw",SK)+fmt("aggorder-index","ao",SK)+fmt("both-old","da",SK)+"cpu PARSE/DEDUP/AGG "+fmt("","Bs","pda")+"sys P/D/A "+fmt("","Bs","ybg")+"faults P/D/A "+fmt("","Bs","jnm")+"user/sys "+fmt("","Bs","us");
-   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("dedupwait0","Hdw")+mm("aggorder-index","Hao")+"stages MKLPDAWE "+fmt("default","HBs",SK)+fmt("dedupwait0","Hdw",SK)+fmt("aggorder-index","Hao",SK)+"cpu P/D/A "+fmt("","HBs","pda")+"sys P/D/A "+fmt("","HBs","ybg")+"faults P/D/A "+fmt("","HBs","jnm")+allw("walls","HBs");
+   const char* SL="MLPDAE";
+   a=string(t)+"20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("links-old","lo")+mm("links-base","lb")+mm("gev-old","go")+mm("clwin-old","cw");
+   a+="| 20M stages MAP/LINKS(all)/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("links-old","lo",SL)+fmt("links-base","lb",SL)+fmt("gev-old","go",SL)+fmt("clwin-old","cw",SL)+"flatten/linkmap "+fmt("default","Bs","FN")+fmt("old","lo","FN");
+   a+="cpu LINKREAD/PARSE/DEDUP/AGG "+fmt("","Bs","lpda")+fmt("gev-old","go","lpda")+"sys P/D/A "+fmt("","Bs","ybg")+"faults(k) P/D/A "+fmt("","Bs","jnm")+"user/sys "+fmt("","Bs","us");
+   {const RunResult* r=get("Bs#0");if(r)a+="| "+r->raw.substr(0,330);}
+   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("links-old","Hlo")+mm("gev-old","Hgo")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("links-old","Hlo",SL)+fmt("gev-old","Hgo",SL)+"flatten/linkmap "+fmt("","HBs","FN")+"cpu L/P/D/A "+fmt("","HBs","lpda")+"sys P/D/A "+fmt("","HBs","ybg")+"faults(k) P/D/A "+fmt("","HBs","jnm")+allw("walls","HBs");
   }
   if(quick){
    a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);
