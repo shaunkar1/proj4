@@ -977,6 +977,8 @@ template<class REC> struct StreamStore{
  char* acur=nullptr;char* alim=nullptr;size_t firstBytes=size_t(8)<<20,nextBytes=size_t(8)<<20;
  vector<pair<char*,size_t>> maps; // every mapping of this store (for munmap)
  uint64_t arenaBytes=0;
+ // Memory somebody else has finished with (see give()): chunks are cut from it before the arena is asked.
+ char* gcur=nullptr;char* glim=nullptr;vector<pair<char*,char*>> given;uint64_t givenChunks=0;
  // nb_ buckets, chunks of 2^cs_ bytes (6..20), the arena's first block for about `expect` bytes of records.
  void init(size_t nb_,unsigned cs_,size_t expect){
   nb=nb_;cs=min(max(cs_,6u),20u);cmask=(uintptr_t(1)<<cs)-1;perChunk=(size_t(1)<<cs)/sizeof(REC);
@@ -987,7 +989,21 @@ template<class REC> struct StreamStore{
   chunks.reserve(firstBytes>>cs);
  }
  // A fresh chunk for bucket b, linked behind its last one.
+ // [p, p+bytes) is free memory that stays mapped as long as this store is read: the whole chunks inside it (chunks
+ // start at multiples of the chunk size) are used before any new memory. Only the owning thread may call this.
+ void give(char* p,size_t bytes){
+  char* const a=(char*)(((uintptr_t)p+cmask)&~cmask);char* const e=(char*)(((uintptr_t)p+bytes)&~cmask);
+  if(a>=e)return;
+  if(gcur==glim){gcur=a;glim=e;}else given.emplace_back(a,e);
+ }
  [[gnu::noinline]] char* grow(size_t b){
+  if(gcur!=glim){
+   char* const d=gcur;gcur+=size_t(1)<<cs;++givenChunks;
+   if(gcur==glim&&!given.empty()){gcur=given.back().first;glim=given.back().second;given.pop_back();}
+   chunks.push_back(Chunk{d,0,0});const uint32_t id=(uint32_t)chunks.size();
+   BS& s=bs[b];if(s.first)chunks[last[b]-1].next=id;else s.first=id;
+   last[b]=id;return d;
+  }
   if(__builtin_expect(acur==alim,0)){
    void* raw;size_t rawLen;const size_t want=((maps.size()>1?nextBytes:firstBytes)+(size_t(2)<<20)-1)&~((size_t(2)<<20)-1); // a multiple of 2 MB, so of the chunk size
    acur=(char*)map_huge(want,&raw,&rawLen);alim=acur+want;maps.emplace_back((char*)raw,rawLen);arenaBytes+=want;
@@ -1035,8 +1051,9 @@ template<class REC> struct StreamStore{
    memcpy(w,line,64);w+=64;s.w=((uintptr_t)w&cmask)?w:nullptr;}
   _mm_sfence();
  }
- size_t count(size_t b)const{return bs[b].n;}
+ size_t count(size_t b)const{return nb?bs[b].n:0;}
  template<class F> inline __attribute__((always_inline)) void for_segments(size_t b,F&& f)const{
+  if(!nb)return;
   size_t left=bs[b].n;uint32_t id=bs[b].first;
   while(left){const Chunk& c=chunks[id-1];const size_t n=min(left,perChunk);
    if(left>n){const char* const nx=chunks[c.next-1].data;__builtin_prefetch(nx);__builtin_prefetch(nx+64);__builtin_prefetch(nx+128);__builtin_prefetch(nx+192);} // the reader's next chunk is anywhere in the arena: its first lines are asked for a chunk ahead
@@ -1598,6 +1615,12 @@ static bool infer(const vector<uint64_t>& ys,uint64_t limit,uint64_t step,uint64
 static dn::Info dense; // set once before the links stage, read-only after that
 // Records and shared state of the dense route (see DENSE.md).
 static constexpr uint32_t DENSE_USER=0x40000000u; // user field: DENSE_USER | (index<<3 | alias) of a user index that is not complex; table IDs stay below this
+// The person bucket of a table person is fixed BEFORE parsing: person >> personShift. The parser's direct clicks
+// (click_direct, clDirSh) use the same shift, so a person range of theirs is a person bucket of the last stage.
+static unsigned personShift=0;
+static uint64_t person_bucket_events(){ // SS_PERSONBUCKET: events per person bucket to aim for
+ static const uint64_t v=[]{const char* e=getenv("SS_PERSONBUCKET");const long long x=e?atoll(e):16384;return (uint64_t)(x<256?256:x>(1<<24)?(1<<24):x);}();
+ return v;}
 // Dense events and clicks do not go through buckets: the parse stage writes each one straight into a slot
 // indexed by its counter, so the slot arrays are the deduplicated tables when parsing is done.
 // Event slot. k: 0 empty, 1 busy (a thread is writing the slot), 2 a line that is not a valid event (it
@@ -7406,7 +7429,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __fine("catalog-ready");
 
  // ---- Parse every event and click line in parallel, bucketing by ID hash. ----
- const size_t PE=pow2_parts(eventBytes/70),PC=pow2_parts(clickBytes/40);
+ // SS_EBUCKETS / SS_CBUCKETS (measuring switches): the number of event / click ID buckets, rounded up to a power of two.
+ const auto parts_env=[](const char* name,size_t dflt)->size_t{const char* v=getenv(name);if(!v)return dflt;
+  const long long x=atoll(v);size_t q=1;while(q<65536&&(long long)q<x)q<<=1;return q;};
+ const size_t PE=parts_env("SS_EBUCKETS",pow2_parts(eventBytes/70)),PC=parts_env("SS_CBUCKETS",pow2_parts(clickBytes/40));
  const size_t UP=pow2_parts(eventBytes/70); // person buckets for the last stage
  // SS_ISA=sse2 forces the portable splitter (used by tests to check both paths give the same tables).
  // SS_ISA=avx512z / avx512y pick an AVX-512 mask builder (see the line loops) when the CPU has AVX-512BW+VL;
@@ -7496,9 +7522,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // before. SS_CLDIRECT=dedup: direct, with an exact dedup on the ID texts when a range is handed on (the old answer
  // whatever the reader does with copies; reports copies whose values differ). SS_CLDIRSH=n: 2^n persons per range.
  // SS_TEST_CLEST=n (test): the stores are sized for n click rows and grow in 2 MB steps.
+ // The person shift is fixed here, before the parse, by the rule of the last stage fed with estimates: buckets wanted
+ // = events / SS_PERSONBUCKET, number space = linked IDs + one new ID per 64 events (the generator's ratio; a bad
+ // guess makes the person buckets bigger or smaller than wanted, nothing else). SS_TEST_PSHIFT forces it. The person
+ // ranges of the direct clicks take the same shift (unless that gives a silly number of ranges, or SS_CLDIRSH says
+ // otherwise): then a range IS a person bucket and the last stage reads tls[t].pcl where it is.
+ {const uint64_t want=max<uint64_t>(1,estEvents/person_bucket_events()),space=(uint64_t)nlinked+estEvents/64+1;
+  unsigned sh=0;while(sh<16&&(space>>sh)>want)++sh;
+  if(const char* v=getenv("SS_TEST_PSHIFT")){const int x=atoi(v);if(x>=0&&x<=16)sh=(unsigned)x;}
+  personShift=sh;}
  {const char* const v=getenv("SS_CLDIRECT");const string_view w(v?v:"");
   clDirect=(dparse.clicks||dparse.users||dumpText||w=="0")?0u:w=="dedup"?2u:1u;
   unsigned sh=0;while(sh<31&&((uint64_t)tab.idLimit>>sh)>=512)++sh;
+  if(((uint64_t)tab.idLimit>>personShift)<(1u<<16))sh=personShift;
   if(const char* x=getenv("SS_CLDIRSH")){const int y=atoi(x);if(y>=0&&y<=31&&((uint64_t)tab.idLimit>>y)<(1u<<20))sh=(unsigned)y;}
   clDirSh=sh;}
  const size_t NBd=clDirect?(size_t)((uint64_t)tab.idLimit>>clDirSh)+1:0; // person ranges (table numbers are below idLimit)
@@ -7684,16 +7720,22 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  populateStop.store(true,memory_order_relaxed);
  __mark("PARSE");
  if(gevAbl){uint64_t x=0;for(int t=0;t<T;++t)x+=tls[t].gevAblSum;cerr<<"SS_ABL="<<getenv("SS_ABL")<<": TEST RUN, WRONG OUTPUT, stopping after the parse stage ("<<x<<")\n";cerr.flush();_exit(0);}
+ // The dedup stage reads the GRec / GRecL streams itself (prefilter + stream emit) unless told otherwise.
+ const bool gDirect=dparse.gstream&&!dparse.events&&!dparse.clicks&&!denseUsers&&T<16384
+  &&!(getenv("SS_GDEDUP")&&!strcmp(getenv("SS_GDEDUP"),"bridge"))&&!(getenv("SS_EMIT")&&!strcmp(getenv("SS_EMIT"),"list"))&&!(getenv("SS_PREFILTER")&&getenv("SS_PREFILTER")[0]=='0');
  if(dparse.gstream){
   if(getenv("SS_STATS")){const size_t nb=size_t(1)<<dparse.gbits;uint64_t ns=0,nl=0,big=0,chunks=0,bytes=0;
    for(size_t b=0;b<nb;++b){uint64_t n=0;for(int t=0;t<T;++t)n+=tls[t].gs.count(b)+tls[t].gl.count(b);big=max(big,n);}
    for(int t=0;t<T;++t){ns+=tls[t].gs.records();nl+=tls[t].gl.records();chunks+=tls[t].gs.chunks.size()+tls[t].gl.chunks.size();bytes+=tls[t].gs.arenaBytes+tls[t].gl.arenaBytes;}
    cerr<<"STATS gstream: buckets "<<nb<<" x threads "<<T<<", records "<<ns<<" short/other + "<<nl<<" long, mean per bucket "<<(ns+nl)/nb<<" largest "<<big<<", chunks "<<chunks<<" of "<<(size_t(1)<<tls[0].gs.cs)<<" bytes, arena "<<(bytes>>20)<<" MB"<<(dparse.gspf?", fill lines asked for a group ahead":"")<<"\n";}
-  // Nothing reads the streams yet: back into the PRec buckets (each thread's own: LOCAL_USER numbers stay with their thread).
+  // SS_GDEDUP=bridge (or a dedup that does not use the prefilter and the stream emit): back into the PRec buckets
+  // (each thread's own: LOCAL_USER numbers stay with their thread). Default: the dedup stage reads the streams.
+  if(!gDirect){
   #pragma omp parallel for num_threads(T) schedule(static,1)
   for(int t=0;t<T;++t){tlArena.stage=0;gbridge(tls[t],PE,dparse.gbits);
    vector<pair<char*,size_t>> maps;tls[t].gs.release(maps);tls[t].gl.release(maps);for(const auto& m:maps)munmap(m.first,m.second);}
   __mark("GBRIDGE");
+  }
  }
  // ---- SCATTER (SS_COMMIT=stream): the streams into the event slots, bucket by bucket ----
  // One thread owns a turn (2^bwin counters = one or more whole stream buckets), reads every thread's records of
@@ -7982,6 +8024,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  uint64_t parsedEvents=0,parsedClicks=0;
  size_t maxEvBucket=0,maxClBucket=0; // most parsed lines in one ID bucket (all threads together)
  for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
+ const size_t NBg=gDirect?size_t(1)<<dparse.gbits:0; // stream buckets the dedup reads itself
+ for(size_t b=0;b<NBg;++b){size_t n=0;for(int t=0;t<T;++t)n+=tls[t].gs.count(b)+tls[t].gl.count(b);parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
  for(size_t p=0;p<PC;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].cb.size())n+=tls[t].cb[p].size();parsedClicks+=n;maxClBucket=max(maxClBucket,n);}
  uint64_t pcRecords=0,pcLocal=0;size_t pcMax=0; // clDirect: the clicks are in the person ranges (and the fallback users' lists)
  for(size_t b=0;b<NBd;++b){size_t n=0;for(int t=0;t<T;++t)if(b<tls[t].pcl.nb)n+=tls[t].pcl.count(b);pcRecords+=n;pcMax=max(pcMax,n);}
@@ -7990,7 +8034,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  atomic<uint64_t> pcCopies{0},pcOdd{0};
  // SS_PERSONBUCKET: events per person bucket to aim for (measuring switch; the last stage sorts one
  // bucket at a time in two buffers of 16 bytes per event, so this sets its working set).
- static const uint64_t perBucket=[]{const char* v=getenv("SS_PERSONBUCKET");const long long x=v?atoll(v):16384;return (uint64_t)(x<256?256:x>(1<<24)?(1<<24):x);}();
+ static const uint64_t perBucket=person_bucket_events();
  // The person numbers come in two stretches that are used very differently, so each has its own
  // bucket width: table and fallback persons [0, denseBase) are numbered without gaps and get every
  // row of the general lane that is not a dense user's (2^shA persons per bucket, about perBucket events);
@@ -7998,6 +8042,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // lane, so that stretch is mostly empty and is cut into at most a few hundred buckets (2^shB persons).
  // How many rows the first stretch gets from the slots is only known after the DENSE stage; a sample
  // of the event slots estimates it (a wrong guess costs time, nothing else).
+ // The direct clicks stay where the parser put them (tls[t].pcl) when their ranges are the person buckets.
+ const bool pclRead=clDirect==1&&clDirSh==personShift&&!slotMode;
  unsigned shA=0,shB=0;
  {uint64_t estA=parsedEvents;
   if(rawSlots)for(int t=0;t<T;++t)estA+=sideRows[t].size(); // the rows the event slots add to the first stretch: known exactly
@@ -8010,6 +8056,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(n&&(b+(size_t)t)%step==0){all+=n;if(!(B[0].user&DENSE_USER))tableRows+=n;}}
    if(all)estA+=total*tableRows/all;}
   const uint64_t want=max<uint64_t>(1,estA/perBucket);while(shA<16&&((uint64_t)denseBase>>shA)>want)++shA;
+  if(pclRead)shA=personShift; // the parser has put the clicks by this shift (click_direct)
   while(shB<16&&((npersons-denseBase)>>shB)>256)++shB;}
  if(const char* v=getenv("SS_TEST_PSHIFT")){int s=atoi(v);if(s>=0&&s<=16)shA=shB=(unsigned)s;} // tests force odd bucket widths
  const uint32_t WA=1u<<shA,WB=1u<<shB,Wmax=max(WA,WB);
@@ -8019,8 +8066,38 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const auto bucket_of=[denseBase,shA,shB,nA](uint32_t p)->size_t{return p<denseBase?(size_t)(p>>shA):nA+((p-denseBase)>>shB);};
  const auto bucket_end=[denseBase,shA,shB](uint32_t p)->uint32_t{return p<denseBase?((p>>shA)+1)<<shA:denseBase+((((p-denseBase)>>shB)+1)<<shB);};
  // Survivors by person bucket, one list per thread and bucket (tls[t].uev/ucl are not used any more).
- struct Survivors{vector<EvList> ev;vector<ClickList> cl;HugePool pool;}; // pool: all of one thread's post-parse memory
+ struct Survivors{vector<EvList> ev;vector<ClickList> cl;HugePool pool; // pool: all of one thread's post-parse memory
+  StreamStore<Ev> sev; // SS_EMIT=stream: the events this thread's dedup turns let through, by person bucket
+  StreamStore<PClick> scl;}; // SS_CLEMIT=stream: the same for clicks
  vector<Survivors> surv(T);
+ // SS_EMIT (events of the general route): how the dedup stage hands its survivors to the person buckets.
+ //   stream (default)  an ID bucket is deduplicated completely first (pass 1: every record through the tag table, the
+ //                     loser of each pair of copies noted in a bit per record), then its winners are appended to the
+ //                     person buckets through the thread's write-combining store (pass 2: one fill line of four events
+ //                     per person bucket, sent out with one non-temporal store). Nothing is ever taken back, so there
+ //                     are no list marks, no emitted[] array and no tombstones.
+ //   list              as before: every new ID is passed on at once to a list of 4 KB blocks and turned into a
+ //                     tombstone when a later copy wins.
+ // The stream form needs rows that nobody refers to later: with dense slots in use (SS_DENSE=1) it is always `list`.
+ static const bool emitStreamWanted=[]{const char* v=getenv("SS_EMIT");return !(v&&!strcmp(v,"list"));}();
+ const bool evStream=emitStreamWanted&&!slotMode;
+ const auto ev_count=[&surv](int t,size_t up)->size_t{return surv[t].ev[up].size()+surv[t].sev.count(up);};
+ // SS_CLEMIT=stream (default) | list: the same choice for the surviving clicks (a click is passed on when its ID is
+ // first seen and never taken back, so the click dedup stays one pass).
+ static const bool clStreamWanted=[]{const char* v=getenv("SS_CLEMIT");return !(v&&!strcmp(v,"list"));}();
+ const bool clStream=clStreamWanted&&!slotMode;
+ const auto cl_count=[&surv,&tls,pclRead](int t,size_t up)->size_t{return surv[t].cl[up].size()+surv[t].scl.count(up)+(pclRead&&up<tls[t].pcl.nb?tls[t].pcl.count(up):0);};
+ // SS_PREFILTER=0: every record of an ID bucket goes through the tag table. Default: two bits per hash cell first
+ // (SS_CELLS cells per record, default 16): a record whose cell holds no other record of the bucket has no copy and
+ // is passed on without any table; only the records of cells seen twice (copies + chance meetings) take the table.
+ static const bool prefilterWanted=[]{const char* v=getenv("SS_PREFILTER");return !(v&&v[0]=='0');}();
+ static const size_t cellsPer=[]{const char* v=getenv("SS_CELLS");const long x=v?atol(v):16;return (size_t)(x<1?1:x>256?256:x);}();
+ const bool prefilter=prefilterWanted&&evStream;
+ if(gDirect&&!prefilter){fprintf(stderr,"ERROR event streams without the prefilter dedup\n");_exit(1);}
+ // SS_RECYCLE=0: the stream chunks come from new memory only. Default: the memory of an ID bucket whose records
+ // have all been read becomes chunks of the stores of the thread that read it (the parse arenas stay mapped to the
+ // end of the run), so the stage touches almost no new pages.
+ static const bool recycle=[]{const char* v=getenv("SS_RECYCLE");return !(v&&v[0]=='0');}();
  // One region per thread should hold its share of the survivors plus its dedup tables; a thread that
  // does more than its share continues in smaller regions.
  // Measuring switches for the dedup stage.
@@ -8045,8 +8122,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  atomic<bool> genRefOver{false};
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
+ uint64_t stEvCand=0; // SS_PREFILTER: records that took the table
  uint64_t stEvN=0,stEvDisp=0,stEvMax=0,stEvFalse=0,stClN=0,stClDisp=0,stClMax=0,stClFalse=0; // SS_STATS (the two "False" counts are always kept: they cost nothing)
- #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks,stEvN,stEvDisp,stEvFalse,stClN,stClDisp,stClFalse) reduction(max:stEvMax,stClMax)
+ #pragma omp parallel num_threads(T) reduction(+:dedupCount,surviving,survivingClicks,stEvN,stEvDisp,stEvFalse,stClN,stClDisp,stClFalse,stEvCand) reduction(max:stEvMax,stClMax)
  {
   const int tid=omp_get_thread_num();
   // With slots in use, a dense user whose row goes through the general lists is marked: the reader
@@ -8057,10 +8135,28 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   // Slot = tag<<ib | (record number+1), 0 = empty; ib bits are enough for the bucket's record count.
   // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
   Scratch<uint32_t> slotBuf,emitBuf;vector<size_t> off(T+1);
-  slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);emitBuf.reserve(maxEvBucket);
+  slotBuf.pool=&pool;emitBuf.pool=&pool;slotBuf.reserve(slotCap);if(!evStream)emitBuf.reserve(maxEvBucket);
+  Scratch<uint64_t> lostBuf;lostBuf.pool=&pool;if(evStream)lostBuf.reserve(maxEvBucket/64+2);
+  Scratch<uint64_t> cellBuf;cellBuf.pool=&pool;Scratch<PRec> candBuf;candBuf.pool=&pool;Scratch<uint16_t> candTBuf;candTBuf.pool=&pool;
+  vector<const PRec*> segB(T),segE(T); // the bucket's records, thread by thread
+  if(prefilter){cellBuf.reserve(maxEvBucket*cellsPer/32+2);candBuf.reserve(maxEvBucket+1);candTBuf.reserve(maxEvBucket+1);}
+  // SS_PF1=n (measuring switch): pass 1 asks for the records n bytes ahead (default 1024; 0 = off): the pass is the
+  // first reader of a bucket, one stretch per parser thread, and the hardware's stream detection starts again at
+  // every 4 KB of each stretch.
+  static const size_t pf1=[]{const char* v=getenv("SS_PF1");const long x=v?atol(v):1024;return (size_t)(x<0?0:x>65536?65536:x);}();
+  // A candidate of the stream reader: the record's fields side by side (uc also carries the thread, bits 50-63).
+  struct GCand{uint64_t key,hi,k,uc;int64_t ingest;uint64_t h;};
+  Scratch<GCand> gcandBuf;gcandBuf.pool=&pool;if(NBg)gcandBuf.reserve(maxEvBucket+1);
+  StreamStore<Ev>& sev=surv[tid].sev;
+  if(evStream)sev.init(UPn,12,(size_t)(parsedEvents*sizeof(Ev)/(uint64_t)T*9/8));
+  StreamStore<PClick>& scl=surv[tid].scl;
+  if(clStream)scl.init(UPn,12,(size_t)(parsedClicks*sizeof(PClick)/(uint64_t)T*9/8));
   const bool probe4=simdProbe;const size_t ahead=pfe;const uint32_t tagMask=tagKeep&0xffffu; // plain locals for the hot loops
   const unsigned bshA=shA,bshB=shB;const size_t bnA=nA;const uint32_t bBase=denseBase;
   const auto person_of=person_of_shared; // this thread's copy
+  // SS_DEDUPWAIT=0: every tag match is compared at once, as before (see `one` in the event loop).
+  struct DedupWait{const PRec* r;uint32_t g1;int t;};static constexpr unsigned DEDUP_WAIT=16;DedupWait waitQ[DEDUP_WAIT];
+  static const bool waitOn=[]{const char* v=getenv("SS_DEDUPWAIT");return !(v&&v[0]=='0');}();
   auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
   // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
   // turns out to be the earlier ingested one, the event already passed on is turned into a tombstone:
@@ -8070,16 +8166,127 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    size_t n=0;for(int t=0;t<T;++t){off[t]=n;n+=bucket_size(tls[t].eb,p);}off[T]=n;
    if(!n)continue;
    if(n>=0x7fffffffu){fprintf(stderr,"ERROR event ID bucket too large\n");_exit(1);}
+   if(prefilter){
+    // One valid record that has won (or has no copy) -> its person's bucket.
+    Ev* const fl=sev.fill;auto* const fs=sev.bs;
+    // (The put is StreamStore::put written out on local copies of the store's pointers.)
+    const auto emit=[&](const PRec* const r,const int t) __attribute__((always_inline)) {
+      uint64_t w;memcpy(&w,(const void*)&r->user,8);
+      size_t bkt;
+      if(__builtin_expect(((uint32_t)w&(LOCAL_USER|DENSE_USER))!=0,0)){
+       const uint32_t ru=(uint32_t)w,pn=person_of(ru,t);
+       w=(w&~0xffffffffull)|pn;
+       bkt=(ru&DENSE_USER)?bnA+((pn-bBase)>>bshB):pn>>bshA;
+      }
+      else bkt=(uint32_t)w>>bshA;
+      auto& st=fs[bkt];const uint32_t nn=st.n;st.n=nn+1;const unsigned pos=nn&3;
+      Ev* const d=fl+bkt*4+pos;d->k=r->k-PR_KBIAS;memcpy((void*)&d->person,&w,8);
+      if(pos==3)sev.send_line(bkt,st);
+    };
+    for(int t=0;t<T;++t){const size_t m=bucket_size(tls[t].eb,p);segB[t]=m?tls[t].eb[p].data():nullptr;segE[t]=segB[t]+m;}
+    // Pass 1: two bits per cell, "a record" and "a second record". The cell comes from the low 25 hash bits, which
+    // every copy of an ID shares, so all copies of an ID meet in one cell.
+    const uint64_t C=min<uint64_t>((uint64_t)n*cellsPer+32,uint64_t(1)<<31);const size_t words=(size_t)((C+31)/32);
+    uint64_t* const bm=cellBuf.get(words+1);memset(bm,0,words*sizeof(uint64_t));
+    for(int t=0;t<T;++t){
+     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
+     const PRec* const r0=tls[t].eb[p].data();
+     #pragma GCC unroll 4
+     for(size_t i=0;i<m;++i){
+      if(pf1)__builtin_prefetch((const char*)(r0+i)+pf1);
+      const uint64_t c=((r0[i].ih&PR_HMASK)*C)>>PR_HBITS;const unsigned sh=2*((unsigned)c&31);
+      const uint64_t w=bm[c>>5],b=1ull<<sh;bm[c>>5]=w|b|((w&b)<<1);
+     }
+    }
+    // Pass 2: alone in its cell = no copy in the bucket: passed on. The others are the candidates: they are copied
+    // side by side (with their thread), so the table works on a small array of its own and not all over the bucket.
+    PRec* const cand=candBuf.get(n+1);uint16_t* const candT=candTBuf.get(n+1);size_t nc=0;
+    for(int t=0;t<T;++t){
+     const size_t m=(size_t)(segE[t]-segB[t]);if(!m)continue;
+     const PRec* const r0=segB[t];
+     const auto row=[&](const size_t i) __attribute__((always_inline)) {
+       const PRec* const r=r0+i;
+       const uint64_t c=((r->ih&PR_HMASK)*C)>>PR_HBITS;
+       if((bm[c>>5]>>(2*((unsigned)c&31)+1))&1){memcpy((void*)&cand[nc],(const void*)r,sizeof(PRec));candT[nc]=(uint16_t)t;++nc;return;}
+       if(r->k)emit(r,t);
+     };
+     size_t i=0;
+     // (the fill line of a record a little ahead is asked for; a wrong guess for the few rows whose user is not a
+     // table number is harmless: a prefetch never faults)
+     for(;i+8<m;++i){__builtin_prefetch((const char*)fl+(size_t)(r0[i+8].user>>bshA)*64,1,3);row(i);}
+     for(;i<m;++i)row(i);
+    }
+    stEvCand+=nc;size_t dups=0;
+    // The candidates through the exact table, in the order of the records (threads, then append order): slot = tag |
+    // candidate number + 1. The copy with the smallest ingest_ts keeps the slot; the other gets its bit in `lost`.
+    if(nc){
+     const size_t cap=nc*slotPct/100+2;
+     uint32_t* const S=slotBuf.get(cap+4);memset(S,0,cap*sizeof(uint32_t));memset(S+cap,0xff,4*sizeof(uint32_t)); // the pad is never empty
+     uint64_t* const lost=lostBuf.get(nc/64+1);memset(lost,0,(nc/64+1)*sizeof(uint64_t));
+     const unsigned ib=(unsigned)bit_width(nc);const uint32_t imask=(1u<<ib)-1;
+     const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
+     uint32_t waitC[DEDUP_WAIT];unsigned wn=0;
+     const auto oneC=[&](const uint32_t ci,const bool mayWait) __attribute__((always_inline)) {
+       const PRec* const r=&cand[ci];
+       const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
+       const uint32_t tg=((uint32_t)r->hx&tagMask)<<ib;
+       size_t j=(size_t)(((uint64_t)hl*cap)>>PR_HBITS);
+       unsigned mz=0,mt=1;
+       if(probe4){
+        const __m128i a=_mm_loadu_si128((const __m128i*)(S+j));
+        mz=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a,vzero)));
+        mt=(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(a,vkeep),_mm_set1_epi32((int)tg))));
+       }
+       const unsigned any=mz|mt;
+       if(((any&(0u-any))&mz)!=0)j+=(unsigned)__builtin_ctz(mz);
+       else for(uint32_t e;(e=S[j])!=0;){
+        if((e^tg)<=imask){ // same tag: compare the IDs themselves
+         const uint32_t oc=(e&imask)-1;const PRec& o=cand[oc];
+         if(mayWait){ // the two texts lie in the input files: ask for them, come back later
+          __builtin_prefetch(o.id);__builtin_prefetch(o.id+48);__builtin_prefetch(r->id);__builtin_prefetch(r->id+48);
+          waitC[wn++]=ci;return;
+         }
+         if(same_event_id(o.id,r->id)){
+          ++dups;
+          const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
+          const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi;
+          const uint32_t lg=notEarlier?ci:oc;lost[lg>>6]|=1ull<<(lg&63);
+          if(notEarlier)return; // equal ingest_ts: the first one stays
+          break;
+         }
+         ++stEvFalse; // same tag, other ID
+        }
+        if(++j==cap)j=0;
+       }
+       S[j]=tg|(ci+1);
+     };
+     for(uint32_t ci=0;ci<(uint32_t)nc;++ci){
+      oneC(ci,waitOn);
+      if(__builtin_expect(wn==DEDUP_WAIT,0)){for(unsigned q=0;q<DEDUP_WAIT;++q)oneC(waitC[q],false);wn=0;}
+     }
+     for(unsigned q=0;q<wn;++q)oneC(waitC[q],false);
+     for(size_t ci=0;ci<nc;++ci)if(!((lost[ci>>6]>>(ci&63))&1)&&cand[ci].k)emit(&cand[ci],(int)candT[ci]);
+    }
+    for(int t=0;t<T;++t)if(p<tls[t].eb.size()){Bucket<PRec>& B=tls[t].eb[p];
+     if(recycle)sev.give((char*)B.b,B.capacity()*sizeof(PRec)); // nobody reads these records again
+     B=Bucket<PRec>();}
+    dedupCount+=n-dups;
+    continue;
+   }
    const size_t cap=n*slotPct/100+2;
    uint32_t* const S=slotBuf.get(cap+4);memset(S,0,cap*sizeof(uint32_t));memset(S+cap,0xff,4*sizeof(uint32_t)); // the pad is never empty
-   uint32_t* const emitted=emitBuf.get(n); // where record g's event went: its list mark (only read for valid winners)
+   uint32_t* const emitted=evStream?nullptr:emitBuf.get(n); // where record g's event went: its list mark (only read for valid winners)
+   uint64_t* const lost=evStream?lostBuf.get(n/64+1):nullptr; // SS_EMIT=stream: bit g = record g lost against a copy
+   if(evStream)memset(lost,0,(n/64+1)*sizeof(uint64_t));
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
    const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
    size_t dups=0,dead=0;
-   for(int t=0;t<T;++t){
-    const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
-    const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;
-    for(;r!=rend;++r,++g1){
+   unsigned wn=0; // records waiting in waitQ
+   // One record. A record whose tag is already in the table has to be compared with that record's ID text, and
+   // both texts lie in the input files, far from any cache: with mayWait the two texts are asked for and the record
+   // is put aside (waitQ); it comes back through here a little later (mayWait false), when they have arrived. The
+   // order in which the copies of an ID pass does not matter: the smallest ingest_ts stays.
+   const auto one=[&](const PRec* const r,const uint32_t g1,const int t,const bool mayWait) __attribute__((always_inline)) {
      // 41 hash bits per record: the low 25 pick the slot, the other 16 are the tag.
      const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
      const uint32_t tg=((uint32_t)r->hx&tagMask)<<ib;
@@ -8099,12 +8306,21 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if((e^tg)<=imask){ // same tag: compare the IDs themselves
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const PRec& o=tls[ot].eb[p][og-off[ot]];
+       if(mayWait){
+        __builtin_prefetch(o.id);__builtin_prefetch(o.id+48);__builtin_prefetch(r->id);__builtin_prefetch(r->id+48);
+        waitQ[wn++]=DedupWait{r,g1,t};return;
+       }
        if(same_event_id(o.id,r->id)){
         // Keep the earliest ingested copy; copies with equal ingest_ts are identical.
         ++dups;
         const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
         const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi;
-        if(notEarlier)goto next_event;
+        if(evStream){ // the loser's bit; the slot goes to (or stays with) the winner
+         const uint32_t lg=notEarlier?g1-1:og;lost[lg>>6]|=1ull<<(lg&63);
+         if(notEarlier)return;
+         break;
+        }
+        if(notEarlier)return;
         if(o.k){const uint32_t ou=person_of(o.user,ot);
          Ev* const gone=myEv[bucket_of(ou)].at_mark(emitted[og]);gone->person=bucket_end(ou);++dead;}
         break;
@@ -8114,7 +8330,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(++j==cap)j=0;
      }
      S[j]=tg|g1;
-     {
+     if(!evStream){
       const uint64_t rk=r->k;
       if(rk){
        // user, cat and the tag bits sit in the record as the event's second word does (person, cat, unused).
@@ -8138,20 +8354,164 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        if(__builtin_expect(markedIx!=~0u,0)){if(myRefs.size()<genRefCap)myRefs.push_back(GRef{markedIx,(uint32_t)w,(void*)out,false});else genRefOver.store(true,memory_order_relaxed);}
       }
      }
-     next_event:;
+   };
+   for(int t=0;t<T;++t){
+    const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
+    const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;
+    for(;r!=rend;++r,++g1){
+     one(r,g1,t,waitOn);
+     if(__builtin_expect(wn==DEDUP_WAIT,0)){for(unsigned q=0;q<DEDUP_WAIT;++q)one(waitQ[q].r,waitQ[q].g1,waitQ[q].t,false);wn=0;}
+    }
+   }
+   for(unsigned q=0;q<wn;++q)one(waitQ[q].r,waitQ[q].g1,waitQ[q].t,false);
+   if(evStream){
+    // Pass 2: every valid record that did not lose is an event of its person's bucket.
+    Ev* const fl=sev.fill;auto* const fs=sev.bs;
+    for(int t=0;t<T;++t){
+     const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
+     const PRec* const r0=tls[t].eb[p].data();const size_t g0=off[t];
+     for(size_t i=0;i<m;++i){
+      const PRec* const r=r0+i;
+      {// the fill line and the state of the bucket a record a little ahead goes to (a wrong guess for the few
+       // rows whose user is not a table number costs nothing: a prefetch never faults)
+       const size_t ab=(size_t)(r0[i+8<m?i+8:i].user>>bshA);
+       __builtin_prefetch((const char*)fl+ab*64,1,3);__builtin_prefetch((const char*)fs+ab*sizeof(*fs),1,3);}
+      const size_t g=g0+i;const uint64_t rk=r->k;
+      if(((lost[g>>6]>>(g&63))&1)|(rk==0))continue;
+      uint64_t w;memcpy(&w,(const void*)&r->user,8);
+      size_t bkt;
+      if((uint32_t)w&(LOCAL_USER|DENSE_USER)){
+       const uint32_t ru=(uint32_t)w,pn=person_of(ru,t);
+       w=(w&~0xffffffffull)|pn;
+       bkt=(ru&DENSE_USER)?bnA+((pn-bBase)>>bshB):pn>>bshA;
+      }
+      else bkt=(uint32_t)w>>bshA;
+      Ev e;e.k=rk-PR_KBIAS;memcpy((void*)&e.person,&w,8);
+      sev.put(bkt,e);
+     }
     }
    }
    if(stats)for(size_t j=0;j<cap;++j){const uint32_t e=S[j];if(!e)continue;
     const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
     const size_t home=(size_t)(((uint64_t)(uint32_t)(tls[ot].eb[p][og-off[ot]].ih&PR_HMASK)*cap)>>PR_HBITS),d=j>=home?j-home:j+cap-home;
     ++stEvN;stEvDisp+=d;stEvMax=max<uint64_t>(stEvMax,d);}
-   for(int t=0;t<T;++t)if(p<tls[t].eb.size())tls[t].eb[p]=Bucket<PRec>();
+   for(int t=0;t<T;++t)if(p<tls[t].eb.size()){Bucket<PRec>& B=tls[t].eb[p];
+    if(evStream&&recycle)sev.give((char*)B.b,B.capacity()*sizeof(PRec)); // nobody reads these records again
+    B=Bucket<PRec>();}
    surviving-=dead;dedupCount+=n-dups;
+  }
+  // ---- Events from the GRec / GRecL streams (SS_GCOMMIT=stream; SS_GDEDUP=bridge: through PRec buckets as above) ----
+  // The same two-bit prefilter per stream bucket: cell = low 25 bits of the record's hash (the hash whose top bits
+  // chose the bucket, recomputed from the key), rows alone in their cell are passed on, the others are copied side
+  // by side (GCand) and settled by an exact table: same class and same key (class 2: same text), smallest exact
+  // ingest_ts wins, a winner that is not a valid event is nothing. When the bucket is done its chunks are free.
+  #pragma omp for schedule(dynamic,1) nowait
+  for(size_t b=0;b<NBg;++b){
+   size_t n=0;for(int t=0;t<T;++t)n+=tls[t].gs.count(b)+tls[t].gl.count(b);
+   if(!n)continue;
+   if(n>=0x7fffffffu){fprintf(stderr,"ERROR event stream bucket too large\n");_exit(1);}
+   Ev* const fl=sev.fill;auto* const fs=sev.bs;
+   const auto emit=[&](const uint64_t k,uint64_t w,const int t) __attribute__((always_inline)) { // w = user | cat << 32
+     size_t bkt;
+     if(__builtin_expect(((uint32_t)w&(LOCAL_USER|DENSE_USER))!=0,0)){
+      const uint32_t ru=(uint32_t)w,pn=person_of(ru,t);
+      w=(w&~0xffffffffull)|pn;
+      bkt=(ru&DENSE_USER)?bnA+((pn-bBase)>>bshB):pn>>bshA;
+     }
+     else bkt=(uint32_t)w>>bshA;
+     auto& st=fs[bkt];const uint32_t nn=st.n;st.n=nn+1;const unsigned pos=nn&3;
+     Ev* const d=fl+bkt*4+pos;d->k=k-PR_KBIAS;memcpy((void*)&d->person,&w,8);
+     if(pos==3)sev.send_line(bkt,st);
+   };
+   static constexpr uint64_t UCMASK=0x0000FFFFFFFFFFFFull; // user and category of uc
+   const auto hash_s=[](const GRec& r) __attribute__((always_inline)) ->uint64_t{
+     if(__builtin_expect(grec_cls(r)==GCLS_SHORT,1))return gkey_hash_short(r.key);
+     const char* const s0=(const char*)r.key;size_t len=0;while(s0[len]!=','&&s0[len]!='"')++len; // class 2: the text
+     return hkey(string_view(s0,len));};
+   const uint64_t C=min<uint64_t>((uint64_t)n*cellsPer+32,uint64_t(1)<<31);const size_t words=(size_t)((C+31)/32);
+   uint64_t* const bm=cellBuf.get(words+1);memset(bm,0,words*sizeof(uint64_t));
+   const auto mark=[&](const uint64_t h) __attribute__((always_inline)) {
+     const uint64_t c=((h&PR_HMASK)*C)>>PR_HBITS;const unsigned sh=2*((unsigned)c&31);
+     const uint64_t w=bm[c>>5],bit=1ull<<sh;bm[c>>5]=w|bit|((w&bit)<<1);};
+   const auto again=[&](const uint64_t h) __attribute__((always_inline)) ->bool{
+     const uint64_t c=((h&PR_HMASK)*C)>>PR_HBITS;return (bm[c>>5]>>(2*((unsigned)c&31)+1))&1;};
+   // Pass 1
+   for(int t=0;t<T;++t){
+    tls[t].gs.for_segments(b,[&](const GRec* r,const size_t m) __attribute__((always_inline)) {for(size_t i=0;i<m;++i)mark(hash_s(r[i]));});
+    tls[t].gl.for_segments(b,[&](const GRecL* r,const size_t m) __attribute__((always_inline)) {for(size_t i=0;i<m;++i)mark(gkey_hash_long(r[i].lo,r[i].hi));});
+   }
+   // Pass 2
+   GCand* const cand=gcandBuf.get(n+1);size_t nc=0;
+   for(int t=0;t<T;++t){
+    const uint64_t tbits=(uint64_t)t<<50; // uc: user 0-31, category 32-47, class 48-49
+    tls[t].gs.for_segments(b,[&](const GRec* r,const size_t m) __attribute__((always_inline)) {
+      for(size_t i=0;i<m;++i){
+       if(i+8<m)__builtin_prefetch((const char*)fl+(size_t)((uint32_t)r[i+8].uc>>bshA)*64,1,3);
+       const uint64_t h=hash_s(r[i]);
+       if(again(h)){cand[nc++]=GCand{r[i].key,0,r[i].k,r[i].uc|tbits,r[i].ingest,h};continue;}
+       if(r[i].k)emit(r[i].k,r[i].uc&UCMASK,t);
+      }});
+    tls[t].gl.for_segments(b,[&](const GRecL* r,const size_t m) __attribute__((always_inline)) {
+      for(size_t i=0;i<m;++i){
+       const uint64_t h=gkey_hash_long(r[i].lo,r[i].hi);
+       if(again(h)){cand[nc++]=GCand{r[i].lo,r[i].hi,r[i].k,r[i].uc|tbits,r[i].ingest,h};continue;}
+       if(r[i].k)emit(r[i].k,r[i].uc&UCMASK,t);
+      }});
+   }
+   stEvCand+=nc;size_t dups=0;
+   if(nc){
+    const size_t cap=nc*slotPct/100+2;
+    uint32_t* const S=slotBuf.get(cap+4);memset(S,0,cap*sizeof(uint32_t));
+    uint64_t* const lost=lostBuf.get(nc/64+1);memset(lost,0,(nc/64+1)*sizeof(uint64_t));
+    const unsigned ib=(unsigned)bit_width(nc);const uint32_t imask=(1u<<ib)-1;
+    for(uint32_t ci=0;ci<(uint32_t)nc;++ci){
+     const GCand& r=cand[ci];
+     const uint32_t tg=((uint32_t)(r.h>>PR_HBITS)&tagMask)<<ib;
+     size_t j=(size_t)(((r.h&PR_HMASK)*cap)>>PR_HBITS);
+     bool place=true;
+     for(uint32_t e;(e=S[j])!=0;){
+      if((e^tg)<=imask){ // same tag: the keys themselves
+       const uint32_t oc=(e&imask)-1;const GCand& o=cand[oc];
+       const unsigned rc=(unsigned)(r.uc>>48)&3,ocl=(unsigned)(o.uc>>48)&3;
+       if(rc==ocl&&(rc==GCLS_OTHER?same_event_id((const char*)o.key,(const char*)r.key):(o.key==r.key&&o.hi==r.hi))){
+        ++dups;
+        const bool notEarlier=r.ingest>=o.ingest; // equal ingest_ts: the copies are identical, the first one stays
+        const uint32_t lg=notEarlier?ci:oc;lost[lg>>6]|=1ull<<(lg&63);
+        if(notEarlier)place=false;
+        break;
+       }
+       ++stEvFalse;
+      }
+      if(++j==cap)j=0;
+     }
+     if(place)S[j]=tg|(ci+1);
+    }
+    for(size_t ci=0;ci<nc;++ci)if(!((lost[ci>>6]>>(ci&63))&1)&&cand[ci].k)emit(cand[ci].k,cand[ci].uc&UCMASK,(int)(cand[ci].uc>>50));
+   }
+   dedupCount+=n-dups;
+   if(recycle)for(int t=0;t<T;++t){ // nobody reads this bucket's chunks again
+    tls[t].gs.for_segments(b,[&](const GRec* r,size_t){sev.give((char*)r,size_t(1)<<tls[t].gs.cs);});
+    tls[t].gl.for_segments(b,[&](const GRecL* r,size_t){sev.give((char*)r,size_t(1)<<tls[t].gl.cs);});
+   }
+  }
+  // (nowait: every event bucket has been taken when a thread gets here, so its event store is complete; what it
+  // was given and did not use goes on to its click store)
+  if(evStream&&clStream&&recycle){
+   if(sev.gcur!=sev.glim)scl.give(sev.gcur,(size_t)(sev.glim-sev.gcur));
+   for(const auto& g:sev.given)scl.give(g.first,(size_t)(g.second-g.first));
+   sev.gcur=sev.glim=nullptr;sev.given.clear();
   }
   // Direct clicks (clDirect): every person range goes to the person buckets as it is - no table, a copy of a click
   // stays a copy (the last stage gives the same answer with it). SS_CLDIRECT=dedup: a range passes an exact set of
   // its ID texts first (all copies of a click have one user, so one range); copies with other values are counted.
-  if(clDirect){
+  if(clDirect&&pclRead){ // the person ranges are read where they are; only the clicks of fallback-table users are moved
+   #pragma omp single
+   {for(int t=0;t<T;++t)for(const PClick& r:tls[t].pclLocal){
+     const uint32_t u=person_of(r.c.person,t);
+     if(clStream){PClick x=r;x.c.person=u;scl.put((size_t)(u>>bshA),x);}
+     else{Click* const out=myCl[u>>bshA].slot(pool);out->key=r.c.key;out->id=r.c.id;out->person=u;out->idlen=r.c.idlen;}}}
+  }
+  else if(clDirect){
    const bool dd=clDirect==2;uint64_t copies=0,odd=0;
    unordered_map<string_view,const PClick*> seen;
    const auto hand=[&](const PClick& r,int t){
@@ -8188,6 +8548,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const size_t m=bucket_size(tls[t].cb,p);if(!m)continue;
     const CRec* r=tls[t].cb[p].data();const CRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;
     for(;r!=rend;++r,++g1){
+     if(clStream){const size_t ab=(size_t)((rend-r>8?r+8:r)->user>>bshA); // as in pass 2 of the events
+      __builtin_prefetch((const char*)scl.fill+ab*64,1,3);__builtin_prefetch((const char*)scl.bs+ab*sizeof(*scl.bs),1,3);}
      const uint64_t h=r->h;const uint32_t tg=(uint32_t)(h>>32)<<ib;
      size_t j=(size_t)(((h&0xffffffffu)*cap)>>32);
      unsigned mz=0,mt=1; // four slots at once, as for events
@@ -8214,6 +8576,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       uint32_t markedIx=~0u;
       if(r->user&DENSE_USER){bkt=bnA+((u-bBase)>>bshB);if(markInfo){markedIx=(r->user&~DENSE_USER)>>dn::ALIAS_BITS;markInfo[markedIx].general.store(1,memory_order_relaxed);}}
       else bkt=u>>bshA;
+      if(clStream){PClick x;x.c.key=r->key;x.c.id=r->id;x.c.person=u;x.c.idlen=r->idlen;x.pad=0;scl.put(bkt,x);goto next_click;}
       Click* const out=myCl[bkt].slot(pool);
       __builtin_prefetch((const char*)out+ahead,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
@@ -8226,13 +8589,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
     const size_t home=(size_t)(((tls[ot].cb[p][og-off[ot]].h&0xffffffffu)*cap)>>32),d=j>=home?j-home:j+cap-home;
     ++stClN;stClDisp+=d;stClMax=max<uint64_t>(stClMax,d);}
-   for(int t=0;t<T;++t)if(p<tls[t].cb.size())tls[t].cb[p]=Bucket<CRec>();
+   for(int t=0;t<T;++t)if(p<tls[t].cb.size()){Bucket<CRec>& B=tls[t].cb[p];
+    if(clStream&&recycle)scl.give((char*)B.b,B.capacity()*sizeof(CRec));
+    B=Bucket<CRec>();}
   }
+  if(evStream)sev.finish(); // this thread appends no more events (the click loop above ended with a barrier for all)
+  if(clStream)scl.finish();
  }
  if(clDirect){ // the person ranges are not needed again: a helper thread unmaps them in 16 MB steps, as the event streams (SS_BKEEP=1: they stay)
   if(stats||pcOdd.load())fprintf(stderr,"STATS direct clicks: %llu in %llu person ranges of %llu persons (largest %llu), %llu of fallback users%s\n",(unsigned long long)pcRecords,(unsigned long long)NBd,(unsigned long long)1<<clDirSh,(unsigned long long)pcMax,(unsigned long long)pcLocal,clDirect==2?" (SS_CLDIRECT=dedup)":"");
   if(clDirect==2)fprintf(stderr,"STATS direct clicks dedup: copies %llu, of them with other values %llu\n",(unsigned long long)pcCopies.load(),(unsigned long long)pcOdd.load());
-  if(!getenv("SS_BKEEP")){vector<pair<char*,size_t>> v;for(int t=0;t<T;++t){tls[t].pcl.release(v);vector<PClick>().swap(tls[t].pclLocal);}
+  if(!pclRead&&!getenv("SS_BKEEP")){vector<pair<char*,size_t>> v;for(int t=0;t<T;++t){tls[t].pcl.release(v);vector<PClick>().swap(tls[t].pclLocal);}
    thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();}}
  if(stats)fprintf(stderr,"STATS event dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\nSTATS click dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\n",
   (unsigned long long)stEvN,stEvN?(double)stEvDisp/stEvN:0.0,(unsigned long long)stEvMax,(unsigned long long)stEvFalse,(unsigned long long)stClN,stClN?(double)stClDisp/stClN:0.0,(unsigned long long)stClMax,(unsigned long long)stClFalse);
@@ -8242,8 +8609,34 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  genRefT.clear();genRefT.shrink_to_fit();
  sort(genRefs.begin(),genRefs.end(),[](const GRef& a,const GRef& b){return a.ix!=b.ix?a.ix<b.ix:a.click!=b.click?a.click<b.click:(uintptr_t)a.at<(uintptr_t)b.at;});
  size_t maxEvPerson=0,maxClPerson=0; // most survivors in one person bucket
- for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
+ for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=ev_count(t,up);nc+=cl_count(t,up);}
   surviving+=ne;survivingClicks+=nc;maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
+ if(stats){uint64_t ch=0,gv=0,ab=0,cch=0,cgv=0,cab=0;
+  for(int t=0;t<T;++t){ch+=surv[t].sev.chunks.size();gv+=surv[t].sev.givenChunks;ab+=surv[t].sev.arenaBytes;cch+=surv[t].scl.chunks.size();cgv+=surv[t].scl.givenChunks;cab+=surv[t].scl.arenaBytes;}
+  uint64_t pc=0;for(int t=0;t<T;++t)pc+=tls[t].pcl.nb?tls[t].pcl.records():0;
+  if(dparse.gstream)fprintf(stderr,"STATS dedup: event streams %s\n",gDirect?"read by the dedup (SS_GDEDUP=direct)":"through the bridge (SS_GDEDUP=bridge)");
+  fprintf(stderr,"STATS dedup: SS_PREFILTER=%d cells per record %zu, records through the table %llu of %llu; direct clicks read in place %d, clicks put by the parser %llu, person shift %u\n",
+   (int)prefilter,cellsPer,(unsigned long long)(prefilter?stEvCand:parsedEvents),(unsigned long long)parsedEvents,(int)pclRead,(unsigned long long)pc,shA);
+  fprintf(stderr,"STATS emit: SS_EMIT=%s SS_CLEMIT=%s SS_RECYCLE=%d person buckets %zu; event chunks %llu (from consumed buckets %llu) new bytes %llu; click chunks %llu (from consumed buckets %llu) new bytes %llu\n",
+   evStream?"stream":"list",clStream?"stream":"list",(int)recycle,UPn,(unsigned long long)ch,(unsigned long long)gv,(unsigned long long)ab,(unsigned long long)cch,(unsigned long long)cgv,(unsigned long long)cab);}
+ // The last stage takes the biggest person buckets first: a bucket that holds one of the few very big persons
+ // (1-2% of all events each) is one turn of one thread however long it takes, so it must start while the other
+ // threads still have small buckets to do - at the end of the loop it would be the whole stage's tail.
+ // SS_AGGORDER=index: in bucket order, as before.
+ vector<uint32_t> upOrder;
+ const auto order_buckets=[&]{
+  upOrder.resize(UPn);for(size_t up=0;up<UPn;++up)upOrder[up]=(uint32_t)up;
+  static const bool byIndex=[]{const char* v=getenv("SS_AGGORDER");return v&&!strcmp(v,"index");}();
+  if(byIndex)return;
+  vector<uint64_t> w(UPn);
+  for(size_t up=0;up<UPn;++up){uint64_t x=0;for(int t=0;t<T;++t)x+=ev_count(t,up)+cl_count(t,up);w[up]=x;}
+  // Only the outliers move (more than four times the mean), biggest first; the others keep their order, in which
+  // neighbouring buckets' lists are neighbours in memory.
+  uint64_t sum=0;for(size_t up=0;up<UPn;++up)sum+=w[up];
+  const uint64_t big=4*(sum/max<size_t>(1,UPn))+1024;
+  stable_sort(upOrder.begin(),upOrder.end(),[&w,big](uint32_t a,uint32_t b){const uint64_t x=w[a]>big?w[a]:0,y=w[b]>big?w[b]:0;return x>y;});
+ };
+ order_buckets();
  cerr<<"deduplicated events: "<<dedupCount<<", surviving: "<<surviving<<"\n";
  cerr<<"surviving clicks: "<<survivingClicks<<"\n";
  __mark("DEDUP");
@@ -9378,9 +9771,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     const double thrSg0=stats?now_s():0;
     if(slots){
      maxEvPerson=0;maxClPerson=0;
-     for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
+     for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=ev_count(t,up);nc+=cl_count(t,up);}
       maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
      size_pools();
+     order_buckets(); // (the index pass has added rows)
      if(stats){thrSingle=now_s()-thrSg0;thr_line("dense",dstat,thrR0,thrR0-thrS0,thrSingle);}
      __mark("DENSE");
     }
@@ -9389,12 +9783,27 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   }
   if(stats){cur=&astat[tid];cur->in=now_s();cur->cIn=thr_cpu_s();} // from here on: the AGGREGATE stage
   bufA.reserve(maxEvPerson);bufB.reserve(maxEvPerson);bufC.reserve(maxClPerson);bufD.reserve(maxClPerson);
+  // The events of person bucket `up`, piece by piece: every thread's list of blocks, then its stream chunks (SS_EMIT).
+  const auto each_ev=[&surv,T](size_t up,auto&& f) __attribute__((always_inline)) {
+   for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
+    for(const EvList::Block* bl=L.head;bl;bl=bl->next)f((const Ev*)bl->items,L.count(bl));
+    surv[t].sev.for_segments(up,f);}
+  };
+  // The clicks of person bucket `up` the same way: f(first, count, stride) - a Click at every `stride` bytes.
+  // Three sources: the old lists, the rows the dedup stage moved (scl) and the rows the parser put itself (pcl).
+  const auto each_cl=[&surv,&tls,T,pclRead](size_t up,auto&& f) __attribute__((always_inline)) {
+   for(int t=0;t<T;++t){const ClickList& L=surv[t].cl[up];
+    for(const ClickList::Block* bl=L.head;bl;bl=bl->next)f((const char*)bl->items,L.count(bl),sizeof(Click));
+    surv[t].scl.for_segments(up,[&](const PClick* q,const size_t n) __attribute__((always_inline)) {f((const char*)q,n,sizeof(PClick));});
+    if(pclRead&&up<tls[t].pcl.nb)tls[t].pcl.for_segments(up,[&](const PClick* q,const size_t n) __attribute__((always_inline)) {f((const char*)q,n,sizeof(PClick));});}
+  };
   if(cellPass)cellBuf.reserve(maxEvPerson+2);
   Cell* const cells=cellBuf.p;
   #pragma omp for schedule(dynamic,1)
-  for(size_t up=0;up<UPn;++up){
+  for(size_t oi=0;oi<UPn;++oi){
+   const size_t up=upOrder[oi];
    size_t nE=0,nC=0;
-   for(int t=0;t<T;++t){nE+=surv[t].ev[up].size();nC+=surv[t].cl[up].size();}
+   for(int t=0;t<T;++t){nE+=ev_count(t,up);nC+=cl_count(t,up);}
    if(!nE)continue;
    thr_chunk_in();thr_chunk_out();
    const uint32_t base=up<nA?(uint32_t)(up<<shA):denseBase+(uint32_t)((up-nA)<<shB),W=up<nA?WA:WB;
@@ -9402,14 +9811,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     // Few rows for the bucket's width: sort them by person and time and go person by person, so the
     // work follows the rows and not the width (the counting passes below touch every person number).
     Ev* const A=bufA.get(nE);size_t n=0;const uint32_t tomb=base+W;
-    for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
-     for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
-      for(size_t i=0;i<m;++i){A[n]=s[i];n+=s[i].person!=tomb;}}}
+    each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
+      for(size_t i=0;i<m;++i){A[n]=s[i];n+=s[i].person!=tomb;}});
     if(!n)continue;
     sort(A,A+n,[](const Ev& a,const Ev& b){return a.person!=b.person?a.person<b.person:a.k<b.k;});
     Click* const CA=bufC.get(nC+1);size_t m=0;
-    for(int t=0;t<T;++t){const ClickList& L=surv[t].cl[up];
-     for(const ClickList::Block* bl=L.head;bl;bl=bl->next){const size_t k=L.count(bl);memcpy((void*)(CA+m),(const void*)bl->items,k*sizeof(Click));m+=k;}}
+    each_cl(up,[&](const char* s,const size_t k,const size_t st) __attribute__((always_inline)) {
+      for(size_t i=0;i<k;++i)memcpy((void*)(CA+m+i),(const void*)(s+i*st),sizeof(Click));
+      m+=k;});
     if(m>1)sort(CA,CA+m,[](const Click& a,const Click& b){return a.person!=b.person?a.person<b.person:click_before(a,b);});
     size_t c0=0;
     for(size_t i=0;i<n;){
@@ -9425,10 +9834,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // lists directly, so the events are never gathered separately.
    const unsigned sh0=tpass[0].sh;const uint32_t m0=tpass[0].mask;
    memset(th,0,((size_t)m0+2)*sizeof(uint32_t));memset(pp,0,((size_t)W+3)*sizeof(uint32_t));
-   for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
-    for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
+   each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
      #pragma GCC unroll 4
-     for(size_t i=0;i<m;++i){++th[((s[i].k>>sh0)&m0)+1];++pp[(s[i].person-base)+2];}}}
+     for(size_t i=0;i<m;++i){++th[((s[i].k>>sh0)&m0)+1];++pp[(s[i].person-base)+2];}});
    for(uint32_t d=0;d<m0;++d)th[d+1]+=th[d];
    // pp[i+1] = where person i's events start; after the person pass pp[i]..pp[i+1] is person i's range.
    // nE counts tombstones too.
@@ -9438,14 +9846,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    }
    pp[W+2]+=pp[W+1]; // tombstones (person = base+W) are placed after everybody and never looked at
    Ev* A=bufA.get(nE);Ev* B=bufB.get(nE);
-   for(int t=0;t<T;++t){const EvList& L=surv[t].ev[up];
-    for(const EvList::Block* bl=L.head;bl;bl=bl->next){const Ev* s=bl->items;const size_t m=L.count(bl);
+   each_ev(up,[&](const Ev* s,const size_t m) __attribute__((always_inline)) {
      if(pfa)
      #pragma GCC unroll 4
      for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));Ev* const d=A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++;__builtin_prefetch((const char*)d+pfa,1,3);_mm_storeu_si128((__m128i*)d,e);}
      else
      #pragma GCC unroll 4
-     for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));_mm_storeu_si128((__m128i*)(A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++),e);}}}
+     for(size_t i=0;i<m;++i){const __m128i e=_mm_loadu_si128((const __m128i*)(s+i));_mm_storeu_si128((__m128i*)(A+th[((uint64_t)_mm_cvtsi128_si64(e)>>sh0)&m0]++),e);}});
    for(size_t q=1;q<tpass.size();++q){
     const unsigned sh=tpass[q].sh;const uint32_t mk=tpass[q].mask;
     memset(th,0,((size_t)mk+2)*sizeof(uint32_t));
@@ -9467,18 +9874,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(nC){
     const unsigned csh0=cpass[0].sh;const uint32_t cm0=cpass[0].mask;
     memset(cp,0,((size_t)W+2)*sizeof(uint32_t));memset(th,0,((size_t)cm0+2)*sizeof(uint32_t));
-    for(int t=0;t<T;++t){const ClickList& L=surv[t].cl[up];
-     for(const ClickList::Block* bl=L.head;bl;bl=bl->next){const Click* s=bl->items;const size_t m=L.count(bl);
+    each_cl(up,[&](const char* s,const size_t m,const size_t st) __attribute__((always_inline)) {
       #pragma GCC unroll 4
-      for(size_t i=0;i<m;++i){const uint32_t x=s[i].person-base;const uint32_t keep=pp[x]!=pp[x+1];cp[x+2]+=keep;th[((s[i].key>>csh0)&cm0)+1]+=keep;}}}
+      for(size_t i=0;i<m;++i){const Click& c=*(const Click*)(const void*)(s+i*st);const uint32_t x=c.person-base;const uint32_t keep=pp[x]!=pp[x+1];cp[x+2]+=keep;th[((c.key>>csh0)&cm0)+1]+=keep;}});
     for(uint32_t d=0;d<cm0;++d)th[d+1]+=th[d];
     for(uint32_t i=0;i<W;++i)cp[i+2]+=cp[i+1];
     const size_t nK=cp[W+1]; // clicks kept
     Click* CA=bufC.get(nC);Click* CB=bufD.get(nC);
-    for(int t=0;t<T;++t){const ClickList& L=surv[t].cl[up];
-     for(const ClickList::Block* bl=L.head;bl;bl=bl->next){const Click* s=bl->items;const size_t m=L.count(bl);
+    each_cl(up,[&](const char* s,const size_t m,const size_t st) __attribute__((always_inline)) {
       #pragma GCC unroll 4
-      for(size_t i=0;i<m;++i){const uint32_t x=s[i].person-base;if(pp[x]!=pp[x+1])memcpy((void*)(CA+th[(s[i].key>>csh0)&cm0]++),(const void*)(s+i),sizeof(Click));}}}
+      for(size_t i=0;i<m;++i){const Click& c=*(const Click*)(const void*)(s+i*st);const uint32_t x=c.person-base;if(pp[x]!=pp[x+1])memcpy((void*)(CA+th[(c.key>>csh0)&cm0]++),(const void*)&c,sizeof(Click));}});
     for(size_t q=1;q<cpass.size();++q){
      const unsigned sh=cpass[q].sh;const uint32_t mk=cpass[q].mask;
      memset(th,0,((size_t)mk+2)*sizeof(uint32_t));

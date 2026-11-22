@@ -507,14 +507,15 @@ int main(){
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  #define NL {"SS_LANES","0"}
  #define ND {"SS_NODENSE","1"}
+ #define GS {"SS_GCOMMIT","stream"}
  for(int r=0;r<3;++r){
-  add("Bs",1,{N8,ST});add("cd",1,{N8,ST,{"SS_CLDIRECT","0"}});add("gl",1,{N8,ST,{"SS_GEV_LONG","text"}});add("ne",1,{N8,ST,{"SS_NOEARLYUNMAP","1"}});
-  add("pf",1,{N8,ST,{"SS_PREFAULT","1"}});add("pa",1,{N8,ST,{"SS_POPULATE","ahead"}});add("fa",1,{N8,ST,{"SS_FILEALIGN","off"}});add("uw",1,{N8,ST,{"SS_UNMAP","workers"}});add("gs",1,{N8,ST,{"SS_GCOMMIT","stream"}});
+  add("Bs",1,{N8,ST});add("p0",1,{N8,ST,{"SS_PREFILTER","0"}});add("el",1,{N8,ST,{"SS_EMIT","list"},{"SS_CLEMIT","list"}});add("rc",1,{N8,ST,{"SS_RECYCLE","0"}});
+  add("gs",1,{N8,ST,GS});add("e2",1,{N8,ST,{"SS_EBUCKETS","2048"}});add("e4",1,{N8,ST,{"SS_EBUCKETS","4096"}});add("g2",1,{N8,ST,GS,{"SS_GBITS","11"}});add("g4",1,{N8,ST,GS,{"SS_GBITS","12"}});
  }
  const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<2;++r){add("HBs",1,{N8,ST},"",true);add("Hcd",1,{N8,ST,{"SS_CLDIRECT","0"}},"",true);add("Hne",1,{N8,ST,{"SS_NOEARLYUNMAP","1"}},"",true);add("Hpf",1,{N8,ST,{"SS_PREFAULT","1"}},"",true);add("Hpa",1,{N8,ST,{"SS_POPULATE","ahead"}},"",true);}
+ for(int r=0;r<2;++r){add("HBs",1,{N8,ST},"",true);add("Hgs",1,{N8,ST,GS},"",true);add("He4",1,{N8,ST,{"SS_EBUCKETS","4096"}},"",true);add("He8",1,{N8,ST,{"SS_EBUCKETS","8192"}},"",true);add("Hp0",1,{N8,ST,{"SS_PREFILTER","0"}},"",true);add("Hg3",1,{N8,ST,GS,{"SS_GBITS","13"}},"",true);}
  if(quick){vars.clear();
   for(int r=0;r<4;++r){
    {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
@@ -617,10 +618,10 @@ int main(){
    char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
    const char* SK="MKLPDAWE";
    const char* SL="MLPDAE";
-   a=string(t)+"cand75 SWITCHES. 20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("CLDIRECT=0","cd")+mm("GEV_LONG=text","gl")+mm("NOEARLYUNMAP","ne")+mm("PREFAULT","pf")+mm("POPULATE=ahead","pa")+mm("FILEALIGN=off","fa")+mm("UNMAP=workers","uw")+mm("GCOMMIT=stream","gs");
-   a+="| 20M stages MAP/LINKS/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("CLDIRECT=0","cd",SL)+fmt("NOEARLYUNMAP","ne",SL)+fmt("PREFAULT","pf",SL)+fmt("POPULATE=ahead","pa",SL)+fmt("FILEALIGN=off","fa",SL)+fmt("UNMAP=workers","uw",SL);
-   a+="| cpu L/P/D/A "+fmt("default","Bs","lpda")+fmt("CLDIRECT=0","cd","lpda")+"sys P/D/A "+fmt("default","Bs","ybg")+fmt("NOEARLYUNMAP","ne","ybg")+fmt("PREFAULT","pf","ybg")+fmt("FILEALIGN=off","fa","ybg")+"faults P/D/A "+fmt("default","Bs","jnm")+fmt("NOEARLYUNMAP","ne","jnm")+fmt("FILEALIGN=off","fa","jnm");
-   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("CLDIRECT=0","Hcd")+mm("NOEARLYUNMAP","Hne")+mm("PREFAULT","Hpf")+mm("POPULATE=ahead","Hpa")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("CLDIRECT=0","Hcd",SL)+fmt("NOEARLYUNMAP","Hne",SL)+fmt("PREFAULT","Hpf",SL)+fmt("POPULATE=ahead","Hpa",SL)+"cpu L/P/D/A "+fmt("default","HBs","lpda")+fmt("CLDIRECT=0","Hcd","lpda")+"sys P/D/A "+fmt("default","HBs","ybg")+fmt("NOEARLYUNMAP","Hne","ybg")+allw("walls","HBs");
+   a=string(t)+"BE 1250057 (prefilter dedup). 20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("PREFILTER=0","p0")+mm("EMIT=list","el")+mm("RECYCLE=0","rc")+mm("GCOMMIT=stream","gs")+mm("EBUCKETS=2048","e2")+mm("EBUCKETS=4096","e4")+mm("stream+GBITS=11","g2")+mm("stream+GBITS=12","g4");
+   a+="| 20M stages MAP/LINKS/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("PREFILTER=0","p0",SL)+fmt("EMIT=list","el",SL)+fmt("RECYCLE=0","rc",SL)+fmt("stream","gs",SL)+fmt("EB2048","e2",SL)+fmt("EB4096","e4",SL)+fmt("s+GB11","g2",SL)+fmt("s+GB12","g4",SL);
+   a+="| cpu L/P/D/A "+fmt("default","Bs","lpda")+fmt("stream","gs","lpda")+"sys P/D/A "+fmt("default","Bs","ybg")+fmt("stream","gs","ybg")+"faults P/D/A "+fmt("default","Bs","jnm")+fmt("stream","gs","jnm");
+   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("stream","Hgs")+mm("EB4096","He4")+mm("EB8192","He8")+mm("PREFILTER=0","Hp0")+mm("stream+GBITS=13","Hg3")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("stream","Hgs",SL)+fmt("EB4096","He4",SL)+fmt("EB8192","He8",SL)+fmt("PREFILTER=0","Hp0",SL)+fmt("s+GB13","Hg3",SL)+"cpu L/P/D/A "+fmt("default","HBs","lpda")+fmt("stream","Hgs","lpda")+"sys P/D/A "+fmt("default","HBs","ybg")+fmt("stream","Hgs","ybg")+allw("walls","HBs");
   }
   if(quick){
    a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);
