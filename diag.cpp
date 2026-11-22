@@ -507,13 +507,14 @@ int main(){
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
  #define NL {"SS_LANES","0"}
  #define ND {"SS_NODENSE","1"}
- for(int r=0;r<4;++r){
-  add("Bs",1,{N8,ST});add("vb",1,{N8,ST},"core-b");add("hb",1,{N8,ST},"core-h");add("vh",1,{N8,ST},"core-v");add("ob",1,{N8,ST},"core-o");
+ for(int r=0;r<3;++r){
+  add("Bs",1,{N8,ST});add("cd",1,{N8,ST,{"SS_CLDIRECT","0"}});add("gl",1,{N8,ST,{"SS_GEV_LONG","text"}});add("ne",1,{N8,ST,{"SS_NOEARLYUNMAP","1"}});
+  add("pf",1,{N8,ST,{"SS_PREFAULT","1"}});add("pa",1,{N8,ST,{"SS_POPULATE","ahead"}});add("fa",1,{N8,ST,{"SS_FILEALIGN","off"}});add("uw",1,{N8,ST,{"SS_UNMAP","workers"}});add("gs",1,{N8,ST,{"SS_GCOMMIT","stream"}});
  }
  const size_t nSmall=vars.size();
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HBs",1,{N8,ST},"",true);add("Hvb",1,{N8,ST},"core-b",true);add("Hhb",1,{N8,ST},"core-h",true);add("Hvh",1,{N8,ST},"core-v",true);}
+ for(int r=0;r<2;++r){add("HBs",1,{N8,ST},"",true);add("Hcd",1,{N8,ST,{"SS_CLDIRECT","0"}},"",true);add("Hne",1,{N8,ST,{"SS_NOEARLYUNMAP","1"}},"",true);add("Hpf",1,{N8,ST,{"SS_PREFAULT","1"}},"",true);add("Hpa",1,{N8,ST,{"SS_POPULATE","ahead"}},"",true);}
  if(quick){vars.clear();
   for(int r=0;r<4;++r){
    {const string o=od();pipeline("nd#"+to_string(r),data,o,{N8,ST,{"SS_NODENSE","1"}});error_code ec;fs::remove_all(o,ec);}
@@ -613,13 +614,13 @@ int main(){
   {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c68 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   if(!quick&&gV5){
-   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE EV dbccecb | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
+   char t[160];snprintf(t,sizeof t,"V5 REPLICA (opaque IDs, %zu whale IDs kept = %.1f%% of rows; syncfs %.1fs) GENERAL ROUTE | ",gWhaleIds.size(),100.0*gBotRows/1072000.0,syncSec);
    const char* SK="MKLPDAWE";
    const char* SL="MLPDAE";
-   a=string(t)+"BUILD FLAGS, cand73. 20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("base(x86-64)","Bs")+mm("x86-64-v3","vb")+mm("branch-align","hb")+mm("v3+align","vh")+mm("O2","ob");
-   a+="| 20M stages MAP/LINKS/PARSE/DEDUP/AGG/exit: "+fmt("base","Bs",SL)+fmt("v3","vb",SL)+fmt("align","hb",SL)+fmt("v3+align","vh",SL)+fmt("O2","ob",SL);
-   a+="| cpu LINKREAD/PARSE/DEDUP/AGG "+fmt("base","Bs","lpda")+fmt("v3","vb","lpda")+fmt("align","hb","lpda")+fmt("v3+align","vh","lpda")+fmt("O2","ob","lpda")+allw("walls base","Bs")+allw("v3","vb")+allw("align","hb")+allw("v3+align","vh");
-   c="60M min~median w/P/R/X/A: "+mm("base","HBs")+mm("v3","Hvb")+mm("align","Hhb")+mm("v3+align","Hvh")+"stages MLPDAE "+fmt("base","HBs",SL)+fmt("v3","Hvb",SL)+fmt("align","Hhb",SL)+fmt("v3+align","Hvh",SL)+"cpu L/P/D/A "+fmt("base","HBs","lpda")+fmt("v3","Hvb","lpda")+fmt("align","Hhb","lpda")+fmt("v3+align","Hvh","lpda")+allw("walls","HBs");
+   a=string(t)+"cand75 SWITCHES. 20M min~median wall/PARSE/RESOLVE/DENSE/AGG: "+mm("default","Bs")+mm("CLDIRECT=0","cd")+mm("GEV_LONG=text","gl")+mm("NOEARLYUNMAP","ne")+mm("PREFAULT","pf")+mm("POPULATE=ahead","pa")+mm("FILEALIGN=off","fa")+mm("UNMAP=workers","uw")+mm("GCOMMIT=stream","gs");
+   a+="| 20M stages MAP/LINKS/PARSE/DEDUP/AGG/exit: "+fmt("default","Bs",SL)+fmt("CLDIRECT=0","cd",SL)+fmt("NOEARLYUNMAP","ne",SL)+fmt("PREFAULT","pf",SL)+fmt("POPULATE=ahead","pa",SL)+fmt("FILEALIGN=off","fa",SL)+fmt("UNMAP=workers","uw",SL);
+   a+="| cpu L/P/D/A "+fmt("default","Bs","lpda")+fmt("CLDIRECT=0","cd","lpda")+"sys P/D/A "+fmt("default","Bs","ybg")+fmt("NOEARLYUNMAP","ne","ybg")+fmt("PREFAULT","pf","ybg")+fmt("FILEALIGN=off","fa","ybg")+"faults P/D/A "+fmt("default","Bs","jnm")+fmt("NOEARLYUNMAP","ne","jnm")+fmt("FILEALIGN=off","fa","jnm");
+   c="60M min~median w/P/R/X/A: "+mm("default","HBs")+mm("CLDIRECT=0","Hcd")+mm("NOEARLYUNMAP","Hne")+mm("PREFAULT","Hpf")+mm("POPULATE=ahead","Hpa")+"stages MLPDAE "+fmt("default","HBs",SL)+fmt("CLDIRECT=0","Hcd",SL)+fmt("NOEARLYUNMAP","Hne",SL)+fmt("PREFAULT","Hpf",SL)+fmt("POPULATE=ahead","Hpa",SL)+"cpu L/P/D/A "+fmt("default","HBs","lpda")+fmt("CLDIRECT=0","Hcd","lpda")+"sys P/D/A "+fmt("default","HBs","ybg")+fmt("NOEARLYUNMAP","Hne","ybg")+allw("walls","HBs");
   }
   if(quick){
    a="NEW PUBLIC SET. samples: "+sampleText+" || pipeline (c68) says: "+(results.empty()?string("no run"):results[0].raw);

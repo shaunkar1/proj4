@@ -865,6 +865,20 @@ static constexpr unsigned EV_TS=25;
 static_assert(PR_KBIAS==1ull<<EV_TS);
 // One surviving click, 24 bytes. key = (ts - (window_start - 7 days))<<16 | campaign.
 struct Click{uint64_t key;const char* id;uint32_t person;uint32_t idlen;};
+// ---- Clicks straight from the parser to the persons (GFAST.md "DIRECTION CHANGE AFTER SURVEY 2", item 1; SS_CLDIRECT) ----
+// Copies of a click have identical values and neither the credit (latest click at or before the session start, ties by
+// the smallest click_id) nor the assists (each campaign once per session) change when a click is there twice. So a
+// valid click needs no ID bucket and no dedup: the parser writes the SURVIVOR record itself. PClick = Click + padding
+// to 32 bytes (two per fill line of a StreamStore): c.key, c.id, c.idlen final; c.person = the user's table number,
+// which IS the person number (the links stage has rewritten every linked ID's slot to its root), or LOCAL_USER | n of
+// the writing thread for a user of the fallback table (those records wait in ThreadState::pclLocal: their person
+// number exists only after the parse). Store: ThreadState::pcl, bucket = person >> clDirSh ("person range": 2^clDirSh
+// persons, at most 512 ranges below the table's ID limit, fixed before the parse). After the parse a range is handed
+// to the person buckets of the last stage (a copy without any table; SS_CLDIRECT=dedup: through an exact set of the
+// ID texts of the range first, which gives the old answer even to a reader that minds copies).
+struct PClick{Click c;uint64_t pad;};
+static_assert(sizeof(PClick)==32&&offsetof(PClick,c)==0);
+static unsigned clDirect=0,clDirSh=0; // clDirect: 0 = click ID buckets + dedup (as before), 1 = direct, 2 = direct + exact dedup when the ranges are handed on; set by run() before the parse region
 // Order of a person's clicks: by ts, and at equal ts the byte-wise larger ID first, so the last click
 // at or before a moment is the latest one with the smallest ID.
 static inline bool click_before(const Click& a,const Click& b){
@@ -997,6 +1011,23 @@ template<class REC> struct StreamStore{
   fill[b*RPL+pos]=r;
   if(pos==RPL-1)send_line(b,s);
  }
+ // The same without a branch on "did this record fill the line?" (taken every other time in no order with shuffled
+ // input): the record goes to its fill line and a line that became full is only NOTED (pend[cnt], cnt grows by one
+ // then; room for one entry per put) and marked in the top bit of the bucket's count; send_noted() sends the noted
+ // lines. A put that finds the mark (the bucket's line is full and still here: two records of one bucket between two
+ // send_noted calls, rare) sends the line first. Between a put_noted and the send_noted behind it nothing else may
+ // look at the store (put, finish, count, for_segments): the counts carry the mark until then.
+ static constexpr uint32_t NOTED=0x80000000u;
+ inline __attribute__((always_inline)) void put_noted(size_t b,const REC& r,uint32_t* pend,unsigned& cnt){
+  BS& s=bs[b];uint32_t n=s.n;
+  if(__builtin_expect((n&NOTED)!=0,0)){n&=~NOTED;s.n=n;send_line(b,s);}
+  const unsigned pos=n&(RPL-1);const uint32_t full=(uint32_t)(pos==RPL-1);
+  fill[b*RPL+pos]=r;s.n=(n+1)|(full<<31);
+  pend[cnt]=(uint32_t)b;cnt+=full;
+ }
+ inline __attribute__((always_inline)) void send_noted(const uint32_t* pend,unsigned cnt){
+  for(unsigned j=0;j<cnt;++j){const size_t b=pend[j];BS& s=bs[b];const uint32_t n=s.n;if(__builtin_expect((n&NOTED)!=0,1)){s.n=n&~NOTED;send_line(b,s);}}
+ }
  void finish(){
   for(size_t b=0;b<nb;++b){BS& s=bs[b];const unsigned pos=s.n&(RPL-1);if(!pos)continue;
    REC* const line=fill+b*RPL;memset((void*)(line+pos),0,(RPL-pos)*sizeof(REC));
@@ -1032,6 +1063,31 @@ static_assert(sizeof(ERec)==32);
 static inline __attribute__((always_inline)) ERec erec_make(uint64_t kk,uint64_t uct,int64_t ingest,uint64_t spare,uint32_t lo){
  return ERec{kk,(uct&0x0000FFFFFFFFFFFFull)|((uint64_t)lo<<48),ingest,spare};}
 static inline __attribute__((always_inline)) uint32_t erec_lo(const ERec& r){return (uint32_t)(r.ucl>>48);}
+// ---- General route: event records in streams (GFAST.md package B; layout: agent P1's board note of 23:12) ----
+// A parsed event line of the general route, appended to the stream of bucket (hash of the event key) >> (64 - gbits)
+// of the parsing thread (ThreadState::gs / gl). The event_id is in the record as a CLASS and a KEY that are
+// one-to-one with its text, so "same event_id" = same class and same key; no ID text is read again:
+//   class 0 (GCLS_SHORT)  'e' + 0..8 bytes of [0-9a-z]: key = those bytes as a word, first byte lowest, zero padded
+//   class 1 (GCLS_LONG)   'e' + exactly 32 of [0-9a-f]: GRecL, hi = the first 16 digits as a number, lo = the last 16
+//   class 2 (GCLS_OTHER)  any other text: key = pointer to the text in the mapped input (ends at ',' or '"'):
+//                         compare with same_event_id()
+//   k       as PRec::k (0 = the line is not a valid event)
+//   uc      user (bits 0-31; a LOCAL_USER number belongs to the thread that owns the stream) | cat << 32 | class << 48
+//   ingest  exact ingest_ts in ms (no code, no side list)
+// Rule for the reader: per (class, key) the copy with the smallest ingest wins; a winner with k == 0 is no event.
+// The hash: gkey_hash_short(key) / gkey_hash_long(lo, hi) / hkey(text) for class 2; its top gbits are the bucket,
+// the rest is free for the bucket's own table (recomputable from the record: one or two multiplies).
+struct GRec{uint64_t key;uint64_t k;uint64_t uc;int64_t ingest;};
+struct GRecL{uint64_t lo,hi;uint64_t k;uint64_t uc;int64_t ingest;uint64_t pad[3];};
+static_assert(sizeof(GRec)==32&&sizeof(GRecL)==64);
+static constexpr uint64_t GCLS_SHORT=0,GCLS_LONG=1,GCLS_OTHER=2;
+static inline __attribute__((always_inline)) uint64_t grec_uc(uint32_t user,unsigned cat,uint64_t cls){return (uint64_t)user|((uint64_t)(uint16_t)cat<<32)|(cls<<48);}
+template<class R> static inline __attribute__((always_inline)) uint32_t grec_user(const R& r){return (uint32_t)r.uc;}
+template<class R> static inline __attribute__((always_inline)) unsigned grec_cat(const R& r){return (unsigned)(uint16_t)(r.uc>>32);}
+template<class R> static inline __attribute__((always_inline)) unsigned grec_cls(const R& r){return (unsigned)(r.uc>>48);}
+static constexpr uint64_t GKEY_SALT=0xD6E8FEB86659FD93ull;
+static inline __attribute__((always_inline)) uint64_t gkey_hash_short(uint64_t key){return mix64(key^GKEY_SALT);}
+static inline __attribute__((always_inline)) uint64_t gkey_hash_long(uint64_t lo,uint64_t hi){return mix64(lo^mix64(hi^GKEY_SALT));}
 struct alignas(64) ThreadState{
  SmallTable users; // IDs that did not fit in the shared table
  vector<pair<const char*,int64_t>> ingestSide; // (event id pointer, ingest ms) of records whose ingest code is INGEST_SIDE
@@ -1047,13 +1103,22 @@ struct alignas(64) ThreadState{
  uint64_t laneFixE=0,laneFixC=0; // lane loops: line ends of event / click rows looked up with memchr (SS_STATS)
  uint64_t laneShort=0; // lane loops: groups with fewer than eight lanes at work (SS_STATS)
  uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
+ uint64_t gevAblSum=0; // SS_ABL=norec
  uint64_t gevRows=0,gevSlow=0,gevChecked=0; // general event loop (ev8g kernel): rows, rows the kernel refused (line code), rows compared in check mode
- PRec* gcap=nullptr;bool gcapHas=false;int64_t gcapIngest=0; // SS_GEV=check: the general handler stores its record here instead of in a bucket
+ struct GCap{PRec prec;uint64_t cls,key,hi;int64_t ingest;bool has;};GCap* gcap=nullptr; // SS_GEV=check: the general handler stores its record here instead of committing it
+ StreamStore<PClick> pcl;vector<PClick> pclLocal; // clDirect: this thread's valid clicks by person range; those of fallback-table users
  StreamStore<ERec> es; // SS_COMMIT=stream: this thread's dense event rows by bucket (counter >> dparse.bsh)
+ StreamStore<GRec> gs;StreamStore<GRecL> gl; // SS_GCOMMIT=stream: this thread's general event rows by bucket (short / other IDs; long IDs)
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
  string dumpRows; // SS_DENSE_DUMP only
  vector<AVec<Ev>> uev;vector<AVec<Click>> ucl; // survivors by person
 };
+// One valid click from the parser (clDirect): user = what the ID table said (or LOCAL_USER | n).
+static inline __attribute__((always_inline)) void click_direct(ThreadState& tl,const char* id,uint32_t idlen,uint64_t key,uint32_t user){
+ PClick r;r.c.key=key;r.c.id=id;r.c.person=user;r.c.idlen=idlen;r.pad=0;
+ if(__builtin_expect((user&LOCAL_USER)!=0,0)){tl.pclLocal.push_back(r);return;}
+ tl.pcl.put((size_t)(user>>clDirSh),r);
+}
 // ---- Dense route, users (DENSE.md stages 2 and 4) ----
 // These declarations need nothing of the dn:: block; the three functions that do are defined after run().
 // True once the links stage has decided that user IDs may take the dense route (keys found, table limit below DENSE_USER).
@@ -1702,7 +1767,49 @@ static inline bool dense_decode_user(const char* s,size_t n,uint64_t& idx,uint32
 //           bucket (counter >> bsh; StreamStore, ERec) and writes no event slot; the SCATTER step right after the
 //           parse stage fills denseEv bucket by bucket, one thread per bucket, without a lock. bwin >= bsh: slots per
 //           SCATTER turn (SS_BSH itself; bsh = min(SS_BSH, 16) because a record has 16 bits for the low counter bits).
-struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false,batch=false,ev8=false,cl8=false,stream=false,put8=true,spf=false;unsigned ahead=8,shE=14,shC=14,bsh=14,bwin=14,bch=12;};
+struct DenseParse{bool users=false,events=false,clicks=false,bucket=false,raw=false,twoPhase=false,batch=false,ev8=false,cl8=false,stream=false,put8=true,spf=false;unsigned ahead=8,shE=14,shC=14,bsh=14,bwin=14,bch=12;
+ bool gstream=false,gspf=false,gnote=true;unsigned gbits=6;}; // gstream: general event rows go to GRec streams of 2^gbits buckets (SS_GCOMMIT=stream)
+// The class and key of an event_id text (n >= 1 bytes at s, quotes stripped): the reading of the ev8g kernel (vertg).
+static inline uint64_t gkey_classify(const char* s,size_t n,uint64_t& key,uint64_t& hi){
+ hi=0;
+ if(s[0]=='e'){
+  if(n<=9){uint64_t w=0;bool g=true;for(size_t j=1;j<n;++j){const unsigned ch=(unsigned char)s[j];g&=(ch-(unsigned)'0'<10u)|(ch-(unsigned)'a'<26u);w|=(uint64_t)ch<<(8*(j-1));}
+   if(g){key=w;return GCLS_SHORT;}}
+  else if(n==33){uint64_t h,l;if(KeyTable::hex16(s+1,h)&&KeyTable::hex16(s+17,l)){key=l;hi=h;return GCLS_LONG;}}
+ }
+ key=(uint64_t)(uintptr_t)s;return GCLS_OTHER;
+}
+// One general event row into the calling thread's streams (h = the hash of its class, see GRec).
+static inline __attribute__((always_inline)) void gstream_put(ThreadState& tl,unsigned gbits,uint64_t cls,uint64_t key,uint64_t hi,uint64_t h,uint64_t k,uint32_t user,unsigned cat,int64_t ingest){
+ const size_t b=(size_t)(h>>(64-gbits));
+ if(cls==GCLS_LONG)tl.gl.put(b,GRecL{key,hi,k,grec_uc(user,cat,cls),ingest,{0,0,0}});
+ else tl.gs.put(b,GRec{key,k,grec_uc(user,cat,cls),ingest});
+}
+// The scalar entry: classify the text, hash, put.
+static inline void gcommit_row(ThreadState& tl,unsigned gbits,const char* s,size_t n,uint64_t k,uint32_t user,unsigned cat,int64_t ingest){
+ uint64_t key,hi;const uint64_t cls=gkey_classify(s,n,key,hi);
+ gstream_put(tl,gbits,cls,key,hi,cls==GCLS_SHORT?gkey_hash_short(key):cls==GCLS_LONG?gkey_hash_long(key,hi):hkey(string_view(s,n)),k,user,cat,ingest);
+}
+// SS_GCOMMIT=stream while nothing reads the streams directly: one thread's streams back into its PRec buckets, so
+// that the bucket dedup runs unchanged. The text of a class 0 / 1 ID is written out again ('e' + bytes + ',') into
+// the thread's arena: hkey and same_event_id then see exactly the text the line had. Test bridge: costs a pass.
+static void gbridge(ThreadState& tl,size_t PE,unsigned gbits){
+ const size_t NB=size_t(1)<<gbits;
+ char* txt=(char*)tlArena.get((size_t)tl.gs.records()*10+(size_t)tl.gl.records()*34+64); // 'e' + 8 + ',' or 'e' + 32 + ',' at most per record; hkey / same_event_id read a little past a text
+ auto emit=[&](const char* id,size_t n,uint64_t k,uint64_t uc,int64_t ingest){
+  const uint64_t h=hkey(string_view(id,n)),code=ingest_code(ingest);
+  if(code==INGEST_SIDE)tl.ingestSide.emplace_back(id,ingest);
+  tl.eb[(size_t)(((h>>40)*PE)>>24)].push_back(make_prec(id,h,code,k,(unsigned)(uint16_t)(uc>>32),(uint32_t)uc));};
+ static const char* const HX="0123456789abcdef";
+ for(size_t b=0;b<NB;++b){
+  tl.gs.for_segments(b,[&](const GRec* p,size_t n){for(size_t i=0;i<n;++i){const GRec& r=p[i];
+   if(grec_cls(r)==GCLS_SHORT){char* const t=txt;t[0]='e';memcpy(t+1,&r.key,8);size_t len=0;while(len<8&&((r.key>>(8*len))&0xff))++len;t[1+len]=',';txt+=len+2;emit(t,len+1,r.k,r.uc,r.ingest);}
+   else{const char* const t=(const char*)(uintptr_t)r.key;size_t len=0;while(t[len]!=','&&t[len]!='"')++len;emit(t,len,r.k,r.uc,r.ingest);}}});
+  tl.gl.for_segments(b,[&](const GRecL* p,size_t n){for(size_t i=0;i<n;++i){const GRecL& r=p[i];
+   char* const t=txt;t[0]='e';for(int d=0;d<16;++d){t[1+d]=HX[(r.hi>>(60-4*d))&15];t[17+d]=HX[(r.lo>>(60-4*d))&15];}t[33]=',';txt+=34;emit(t,33,r.k,r.uc,r.ingest);}});
+ }
+}
+
 // A dense event line in bucket form, valid or not. k as in PRec (0 = not a valid event), ingest = exact
 // ingest_ts in ms, lo = the low shE bits of the counter: counter = (bucket index << shE) | lo.
 struct DRec{uint64_t k;int64_t ingest;uint32_t user;uint16_t cat;uint16_t lo;};
@@ -2313,10 +2420,12 @@ static inline bool chunk_lines(const char* base,size_t len,size_t from,size_t to
 // What an event loop keeps across lines (never changes during a chunk).
 struct EvLoop{ThreadState& tl;KeyTable& tab;const KeyTable& products;size_t PE;const char* end;DateMemo3* memo;int64_t wstart;uint64_t wlen,ibase;Bucket<PRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t ke,ku,limE;ESlot* ev;uint64_t tid48;bool bucket,raw;unsigned ahead,shE;uint32_t loMask;Bucket<DRec>* db; // dense route (dparse); tid48 = thread index << 48 (eslot_uct), 0 in stream mode (a record has the low counter bits there)
+ bool gstrm,gspf,gnote;unsigned gsh;StreamStore<GRec>* gs;StreamStore<GRecL>* gl; /* general route, SS_GCOMMIT=stream: rows go to gs / gl (bucket = hash >> gsh) */
  bool strm,strm8,spf;unsigned bsh;StreamStore<ERec>* es; // SS_COMMIT=stream: rows go to es (bucket = counter >> bsh), no event slot is written or asked for; strm8: whole kernel groups through estream_put8_v5
  EvLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& products_,size_t PE_,const char* end_):tl(tl_),tab(tab_),products(products_),PE(PE_),end(end_),memo(date_memo3()),
   wstart(window_start),wlen((uint64_t)(window_end-window_start)),ibase((uint64_t)ingestBase),buckets(tl_.eb.data()),slots(tab_.slots),tmask(tab_.mask),
   dUsers(dparse.users),ke(dense.ke),ku(dense.ku),limE(dense.limE),ev(denseEv),tid48(dparse.stream?0:(uint64_t)tl_.tid<<48),bucket(dparse.bucket),raw(dparse.raw),ahead(dparse.ahead),shE(dparse.shE),loMask((1u<<dparse.shE)-1),db(tl_.db.data()),
+  gstrm(dparse.gstream),gspf(dparse.gstream&&dparse.gspf),gnote(dparse.gstream&&dparse.gnote),gsh(64-dparse.gbits),gs(&tl_.gs),gl(&tl_.gl),
   strm(dparse.stream),strm8(dparse.stream&&dparse.put8&&vlk::lk_has512()),spf(dparse.stream&&dparse.spf),bsh(dparse.bsh),es(&tl_.es){}
 };
 // A finished dense event row of a line loop: into its slot, or (stream mode) behind the stream of its bucket.
@@ -4539,52 +4648,87 @@ SS_EVENT_LOOP_EV8L(events_avx512y_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,ve
 // otherwise learn IDs the reference never saw). Rows are finished in lane order; the buckets do not care.
 // SS_GEV=check: gev_check_row gives the line to the general handler as well (which then stores into tl.gcap instead of
 // a bucket) and compares the 32 bytes of the two records, the exact ingest_ts and the line end.
-static bool gevCheck=false;
-struct alignas(64) GevSide{uint64_t h[8];uint32_t j[8];};
-template<class GEN> [[gnu::noinline]] static void gev_check_row(const char* l,const char* nx,const PRec& r,int64_t ingest,const EvLoop& lp,GEN&& general){
+// SS_ABL (TEST ONLY, WRONG OUTPUT: pricing on the scoring machine; the run stops after the PARSE mark): 1 nouser = no
+// user lookup and no slot request (every row user 0); 2 norec = the row is decoded and resolved but its record is not
+// stored (no bucket append / stream put, no fill-line request); 3 nokern = lane scan only: line starts found, nothing decoded.
+static unsigned gevAbl=0;
+static bool gevCheck=false,gevLongText=false; // gevLongText (SS_GEV_LONG=text): canonical long users through their text (long_user), as before
+struct alignas(64) GevSide{uint64_t h[8];uint64_t hu[8];uint32_t j[8];}; // per row: hash of the event key; hash of a canonical long user; table slot of a packed user
+template<class GEN> [[gnu::noinline]] static void gev_check_row(const char* l,const char* nx,const PRec* prec,uint64_t cls,uint64_t key,uint64_t hi,uint64_t k,uint32_t user,unsigned cat,int64_t ingest,const EvLoop& lp,GEN&& general){
  ThreadState& tl=lp.tl;
  const char* const nl=(const char*)memchr(l,'\n',(size_t)(lp.end-l));
- PRec cap;memset((void*)&cap,0,sizeof cap);tl.gcap=&cap;tl.gcapHas=false;tl.gcapIngest=0;
+ ThreadState::GCap cap;memset((void*)&cap,0,sizeof cap);tl.gcap=&cap;
  line_general<7>(l,lp.end,general);tl.gcap=nullptr;
- if(nl&&nl+1==nx&&tl.gcapHas&&memcmp((const void*)&cap,(const void*)&r,sizeof r)==0&&tl.gcapIngest==ingest){++tl.gevChecked;return;}
+ uint32_t cu;memcpy(&cu,(const void*)&cap.prec.user,4);
+ if(nl&&nl+1==nx&&cap.has&&cap.cls==cls&&cap.key==key&&cap.hi==hi&&cap.prec.k==k&&cu==user&&cap.prec.cat==cat&&cap.ingest==ingest
+    &&(!prec||memcmp((const void*)&cap.prec,(const void*)prec,sizeof(PRec))==0)){++tl.gevChecked;return;}
  const size_t n=nl?(size_t)(nl-l):(size_t)(lp.end-l);
- fprintf(stderr,"SS_GEV=check: row differs (line end %d, record %d): kernel k %llu user %u cat %u hx %u ih %llu ingest %lld | handler k %llu user %u cat %u hx %u ih %llu ingest %lld | id offsets %lld | line: %.*s\n",
-  (int)(nl&&nl+1==nx),(int)tl.gcapHas,(unsigned long long)r.k,r.user,(unsigned)r.cat,(unsigned)r.hx,(unsigned long long)r.ih,(long long)ingest,
-  (unsigned long long)cap.k,cap.user,(unsigned)cap.cat,(unsigned)cap.hx,(unsigned long long)cap.ih,(long long)tl.gcapIngest,(long long)(r.id-cap.id),(int)min<size_t>(n,300),l);
+ fprintf(stderr,"SS_GEV=check: row differs (line end %d, record %d, PRec %d): kernel class %llu key %llx hi %llx k %llu user %u cat %u ingest %lld | handler class %llu key %llx hi %llx k %llu user %u cat %u ingest %lld | line: %.*s\n",
+  (int)(nl&&nl+1==nx),(int)cap.has,(int)(!prec||memcmp((const void*)&cap.prec,(const void*)prec,sizeof(PRec))==0),(unsigned long long)cls,(unsigned long long)key,(unsigned long long)hi,(unsigned long long)k,user,cat,(long long)ingest,
+  (unsigned long long)cap.cls,(unsigned long long)cap.key,(unsigned long long)cap.hi,(unsigned long long)cap.prec.k,cu,(unsigned)cap.prec.cat,(long long)cap.ingest,(int)min<size_t>(n,300),l);
  abort();
 }
-// D: what F wants ready. m = the rows of the group that are lines of this chunk.
-SS_V3I void gev_ahead(const vertg::Ev8gOut& o,GevSide& s,const unsigned m,const EvLoop& lp){
- for(unsigned x=m&o.ok;x;x&=x-1){const unsigned i=(unsigned)__builtin_ctz(x);
-  s.h[i]=hkey_v3(o.es[i],(size_t)o.el[i]);
-  if(o.kk[i]){
-   if(__builtin_expect(o.ucls[i]==0,1)){const size_t j=KeyTable::hash_packed(o.uk0[i],(uint32_t)o.uk1[i])&lp.tmask;s.j[i]=(uint32_t)j;__builtin_prefetch(&lp.slots[j],0,1);}
-   else if(o.ucls[i]==1){const uint64_t hl=mix64(o.ulo[i]^mix64(o.uhi[i]^((uint64_t)(0x100u|(uint8_t)'u')*0x9E3779B97F4A7C15ull)));__builtin_prefetch(&lp.slots[hl&lp.tmask],0,1);} // KeyTable::long_key's hash
-  }
+// D: what F wants ready, for one ok row.
+SS_V3I void gev_ahead_row(const vertg::Ev8gOut& o,GevSide& s,const unsigned i,const EvLoop& lp){
+ if(lp.gstrm){ // the hash of the record's class; its bucket's fill line and state
+  const uint64_t cls=o.ecls[i];
+  const uint64_t h=__builtin_expect(cls==GCLS_SHORT,1)?gkey_hash_short(o.ekey[i]):cls==GCLS_LONG?gkey_hash_long(o.ekey[i],o.ehi[i]):hkey_v3(o.es[i],(size_t)o.el[i]);
+  s.h[i]=h;
+  if(lp.gspf&&gevAbl!=2){const size_t b=(size_t)(h>>lp.gsh);
+   if(cls==GCLS_LONG){__builtin_prefetch(lp.gl->fill+b,1,3);__builtin_prefetch(lp.gl->bs+b,1,3);}
+   else{__builtin_prefetch(lp.gs->fill+b*2,1,3);__builtin_prefetch(lp.gs->bs+b,1,3);}}
+ }else s.h[i]=hkey_v3(o.es[i],(size_t)o.el[i]);
+ if(o.kk[i]&&__builtin_expect(gevAbl!=1,1)){
+  if(__builtin_expect(o.ucls[i]==0,1)){const size_t j=KeyTable::hash_packed(o.uk0[i],(uint32_t)o.uk1[i])&lp.tmask;s.j[i]=(uint32_t)j;__builtin_prefetch(&lp.slots[j],0,1);}
+  else if(o.ucls[i]==1){const uint64_t hl=mix64(o.ulo[i]^mix64(o.uhi[i]^((uint64_t)(0x100u|(uint8_t)'u')*0x9E3779B97F4A7C15ull)));s.hu[i]=hl;__builtin_prefetch(&lp.slots[hl&lp.tmask],0,1);} // KeyTable::long_key's hash of 'u' + 32 hex
  }
 }
-// F: the ok rows of a group become records.
-template<class GEN> SS_V3I void gev_finish(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned m,const EvLoop& lp,GEN&& general){
+// m = the rows of the group that are lines of this chunk. A whole group takes the loop without the row mask.
+SS_V3I void gev_ahead(const vertg::Ev8gOut& o,GevSide& s,const unsigned m,const EvLoop& lp){
+ const unsigned live=m&o.ok;
+ if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_ahead_row(o,s,i,lp);}
+ else for(unsigned x=live;x;x&=x-1)gev_ahead_row(o,s,(unsigned)__builtin_ctz(x),lp);
+}
+// F: one ok row becomes a record.
+template<class GEN> SS_V3I void gev_finish_row(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned i,const EvLoop& lp,uint32_t* const pend,unsigned& cnt,GEN&& general){
  ThreadState& tl=lp.tl;KeyTable& tab=lp.tab;const auto R_=memory_order_relaxed;
- for(unsigned x=m&o.ok;x;x&=x-1){const unsigned i=(unsigned)__builtin_ctz(x);
-  const uint64_t k=o.kk[i];uint32_t user=0;unsigned cat=0;
-  if(k){
-   if(__builtin_expect(o.ucls[i]==0,1)){
-    const uint64_t k0=o.uk0[i];const uint32_t k1=(uint32_t)o.uk1[i];const size_t j=s.j[i];KeyTable::Slot& e=lp.slots[j];
-    if(__builtin_expect(e.k1.load(memory_order_acquire)==k1&&e.k0.load(R_)==k0,1))user=e.v.load(R_);
-    else{const string_view u(o.us[i],(size_t)o.ul[i]);user=tab.find_or_add_packed(k0,k1,j,u);if(user==KeyTable::NONE)user=LOCAL_USER|tl.users.intern(u);}
-   }else user=long_user(o.us[i],(size_t)o.ul[i],tab,tl);
-   if((o.pur>>i)&1){const uint32_t ci=lp.products.find(string_view(o.s5[i],(size_t)o.l5[i]));cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;}
-  }
-  const int64_t ingest=(int64_t)o.ingest[i];const uint64_t code=ingest_code(ingest);
-  if(__builtin_expect(code==INGEST_SIDE,0))tl.ingestSide.emplace_back(o.es[i],ingest); // out of the code's range: the exact value on the side, as the general handler does
-  const uint64_t h=s.h[i];
-  const PRec r=make_prec(o.es[i],h,code,k,cat,user);
-  if(__builtin_expect(gevCheck,0))gev_check_row(L[i],X[i],r,ingest,lp,general);
-  Bucket<PRec>& vec=lp.buckets[(size_t)(((h>>40)*lp.PE)>>24)];
-  if(__builtin_expect(vec.full(),0))vec.reserve(max<size_t>(16,2*vec.capacity()));
-  vec.append(r);
+ const uint64_t k=o.kk[i];uint32_t user=0;unsigned cat=0;
+ if(k){
+  if(__builtin_expect(gevAbl==1,0)){} // SS_ABL=nouser
+  else if(__builtin_expect(o.ucls[i]==0,1)){
+   const uint64_t k0=o.uk0[i];const uint32_t k1=(uint32_t)o.uk1[i];const size_t j=s.j[i];KeyTable::Slot& e=lp.slots[j];
+   if(__builtin_expect(e.k1.load(memory_order_acquire)==k1&&e.k0.load(R_)==k0,1))user=e.v.load(R_);
+   else{const string_view u(o.us[i],(size_t)o.ul[i]);user=tab.find_or_add_packed(k0,k1,j,u);if(user==KeyTable::NONE)user=LOCAL_USER|tl.users.intern(u);}
+  }else if(o.ucls[i]==1&&!gevLongText){ // 'u' + 32 hex: the table's key of that text is (kind, lo, hi), which the kernel has (KeyTable::long_key)
+   KeyTable::Long key;key.a=o.ulo[i];key.b=o.uhi[i];key.v=0;key.kind=0x100u|(uint8_t)'u';
+   const string_view u(o.us[i],(size_t)o.ul[i]);user=tab.find_or_add_long_key(key,s.hu[i],u);if(user==KeyTable::NONE)user=LOCAL_USER|tl.users.intern(u);
+  }else user=long_user(o.us[i],(size_t)o.ul[i],tab,tl);
+  if((o.pur>>i)&1){const uint32_t ci=lp.products.find(string_view(o.s5[i],(size_t)o.l5[i]));cat=ci==KeyTable::NONE?0:(unsigned)(uint16_t)ci;}
  }
+ const int64_t ingest=(int64_t)o.ingest[i];const uint64_t h=s.h[i];
+ if(__builtin_expect(gevAbl==2,0)){lp.tl.gevAblSum+=k^h^user^cat^(uint64_t)ingest;return;} // SS_ABL=norec: the values are used, nothing is stored
+ if(lp.gstrm){
+  const uint64_t cls=o.ecls[i];
+  if(__builtin_expect(gevCheck,0))gev_check_row(L[i],X[i],nullptr,cls,o.ekey[i],o.ehi[i],k,user,cat,ingest,lp,general);
+  const size_t b=(size_t)(h>>lp.gsh);
+  if(__builtin_expect(cls==GCLS_LONG,0))lp.gl->put(b,GRecL{o.ekey[i],o.ehi[i],k,grec_uc(user,cat,cls),ingest,{0,0,0}});
+  else if(lp.gnote)lp.gs->put_noted(b,GRec{o.ekey[i],k,grec_uc(user,cat,cls),ingest},pend,cnt); // a full line leaves at the end of the group (no branch per row)
+  else lp.gs->put(b,GRec{o.ekey[i],k,grec_uc(user,cat,cls),ingest});
+  return;
+ }
+ const uint64_t code=ingest_code(ingest);
+ if(__builtin_expect(code==INGEST_SIDE,0))tl.ingestSide.emplace_back(o.es[i],ingest); // out of the code's range: the exact value on the side, as the general handler does
+ const PRec r=make_prec(o.es[i],h,code,k,cat,user);
+ if(__builtin_expect(gevCheck,0))gev_check_row(L[i],X[i],&r,o.ecls[i],o.ekey[i],o.ehi[i],k,user,cat,ingest,lp,general);
+ Bucket<PRec>& vec=lp.buckets[(size_t)(((h>>40)*lp.PE)>>24)];
+ if(__builtin_expect(vec.full(),0))vec.reserve(max<size_t>(16,2*vec.capacity()));
+ vec.append(r);
+}
+template<class GEN> SS_V3I void gev_finish(const vertg::Ev8gOut& o,const GevSide& s,const char* const* const L,const char* const* const X,const unsigned m,const EvLoop& lp,GEN&& general){
+ const unsigned live=m&o.ok;uint32_t pend[8];unsigned cnt=0;
+ if(__builtin_expect(live==0xFFu,1)){for(unsigned i=0;i<8;++i)gev_finish_row(o,s,L,X,i,lp,pend,cnt,general);}
+ else for(unsigned x=live;x;x&=x-1)gev_finish_row(o,s,L,X,(unsigned)__builtin_ctz(x),lp,pend,cnt,general);
+ lp.gs->send_noted(pend,cnt); // (nothing noted unless lp.gnote; before any other use of the store: the slow rows, the next group)
 }
 // The stand-in instance (scalar twin): no scan stage, every line end through lane_fix (memchr).
 static inline unsigned gev_scan_none(const char* const*,const char**,vertg::Ev8gScan&){return 0xFFu;}
@@ -4593,6 +4737,7 @@ static inline unsigned gev_scan_none(const char* const*,const char**,vertg::Ev8g
 template<class GEN> TARGET [[gnu::noinline]] static void NAME##_slow(const char* const q,const EvLoop& lp,GEN&& general){ \
  PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0,send=0;unsigned rpos=0; \
  ++lp.tl.gevSlow; \
+ if(lp.gstrm){line_general<7>(q,lp.end,general);return;} /* streams: the general handler resolves the user and puts the record */ \
  const WinMasks w1=MASKS(q);const char* const bb=event_window2(q,w1.c); \
  event_line_v3<false,false>(q,bb,w1,MASKS(bb),nullptr,0,lp,pend,pp,dmax,send,(ERing*)nullptr,rpos,general); \
  resolve_users(pend,pp,lp.tab,lp.tl); /* its record's user: before anything else is appended to that bucket */ \
@@ -4618,8 +4763,9 @@ template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t f
     for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
    else more=false; \
   } \
-  if(nD){DEC(lD,xD,*sD,ec,*oD);gev_ahead(*oD,*dD,nD,lp);} \
-  if(nF){rows+=(unsigned)__builtin_popcount(nF);gev_finish(*oF,*dF,lF,xF,nF,lp,general); \
+  if(nD&&__builtin_expect(gevAbl!=3,1)){DEC(lD,xD,*sD,ec,*oD);gev_ahead(*oD,*dD,nD,lp);} \
+  if(nF&&__builtin_expect(gevAbl==3,0)){rows+=(unsigned)__builtin_popcount(nF);} /* SS_ABL=nokern */ \
+  else if(nF){rows+=(unsigned)__builtin_popcount(nF);gev_finish(*oF,*dF,lF,xF,nF,lp,general); \
    for(unsigned r_=nF&~(unsigned)oF->ok;__builtin_expect(r_!=0,0);r_&=r_-1)NAME##_slow(lF[__builtin_ctz(r_)],lp,general);} \
   lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=nN;++g; /* D becomes F, N becomes D */ \
   {vertg::Ev8gScan* const t_=sN;sN=sD;sD=t_;vertg::Ev8gOut* const u_=oD;oD=oF;oF=u_;GevSide* const v_=dD;dD=dF;dF=v_;} \
@@ -4682,6 +4828,7 @@ SS_V3I bool click_long_fields(const char* const p,const uint64_t cA,const uint64
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
  CampLook cf=campTable.look; // campaign lookup (camp_find)
+ bool cdirect=clDirect!=0; // the click leaves as a survivor record (complete: its user is resolved before the put)
  unsigned win2=optClickWin2; // lines without a newline in the first window: click_long_fields (SS_CLWIN=1: the general handler, as before)
  ClLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& camps_,size_t PC_,const char* end_,int64_t clickStart_):tl(tl_),tab(tab_),camps(camps_),PC(PC_),end(end_),memo(date_memo3()),
   clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask),
@@ -4780,6 +4927,14 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    }else{
     bool tableUser=true;
     if(lp.dUsers){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode)){tableUser=false;dmax=max(dmax,ucode);}}
+    if(lp.cdirect){ // direct: the record leaves complete, so the user's number is found right here
+     if(tableUser){
+      if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0))ucode=long_user(s1,l1,tab,tl);
+      else{PendUser pu;pu.k0=k0;pu.k1=k1;pu.j=(uint32_t)(KeyTable::hash_packed(k0,k1)&tmask);pu.u=s1;pu.up=&ucode;resolve_users(&pu,&pu+1,tab,tl);}
+     }
+     click_direct(tl,s0,l0,ckey,ucode);
+     break;
+    }
     bool longUser=false; // a user ID that does not pack (over 11 bytes: every canonical long ID): waits in the batch like the others (SS_CLWIN=1: its number right here)
     if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){if(lp.win2)longUser=true;else{ucode=long_user(s1,l1,tab,tl);tableUser=false;}}
     CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=ckey;r.user=ucode;
@@ -6293,6 +6448,20 @@ SS_LKG5 static const char* fill_v5(Batch& B,const char* p,const char* lim,const 
  B.n=n;B.fast+=fast;
  return p;
 }
+// name_less for the names the link loop wrote: a name kept as pointer + length (16 bytes or more) also carries its first
+// three bytes in b[12..14], so that such a name is ordered against any other without reading its text unless the
+// first three bytes are equal. Exact: a stored name's first three bytes are zero padded; where two such triples first
+// differ, either both bytes are text (the texts' order), or one is padding - then every earlier byte was equal, the
+// padded name is a proper prefix of the other (which has real zero bytes up to there and now a non-zero one) and is
+// the smaller, as 0 < that byte says. Equal triples: the full comparison.
+static inline bool name_less(const PName& a,const PName& b){
+ const bool la=(unsigned char)a.b[15]==0xFF,lb=(unsigned char)b.b[15]==0xFF;
+ if(__builtin_expect(!(la|lb),1))return ::name_less(a,b);
+ const unsigned char* const pa=(const unsigned char*)(la?a.b+12:a.b);const unsigned char* const pb=(const unsigned char*)(lb?b.b+12:b.b);
+ const uint32_t xa=(uint32_t)pa[0]<<16|(uint32_t)pa[1]<<8|pa[2],xb=(uint32_t)pb[0]<<16|(uint32_t)pb[1]<<8|pb[2];
+ if(__builtin_expect(xa!=xb,1))return xa<xb;
+ return a.view()<b.view();
+}
 static inline bool has_v5(){
  static const bool h=[]{memset(FILL_C[0],'\n',64);memset(FILL_C[1],',',64);memset(FILL_C[2],'"',64);
   return __builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("lzcnt")&&__builtin_cpu_supports("popcnt");}();
@@ -6374,10 +6543,12 @@ static inline __attribute__((always_inline)) uint32_t clg_user(const vclg::Cl8gO
 // One ok row of group F.
 #define SS_CLG_ROW(O_,K_,i_) {uint32_t ci_=0;const bool f_=camp_find(lp.cf,lp.camps,O_.sc[i_],(size_t)O_.lc[i_],ci_);uint32_t g_=0; \
    if(__builtin_expect(f_,1)){g_=clg_user(O_,i_,K_,tab,tl); \
+    if(__builtin_expect(lp.cdirect,1))click_direct(tl,O_.ks[i_],(uint32_t)O_.kl[i_],O_.ckh[i_]|(uint16_t)ci_,g_); \
+    else{ \
     CRec r_;r_.id=O_.ks[i_];r_.idlen=(uint32_t)O_.kl[i_];r_.h=hkey_v3(r_.id,r_.idlen);r_.key=O_.ckh[i_]|(uint16_t)ci_;r_.user=g_; \
     Bucket<CRec>& vec_=lp.buckets[(size_t)(((r_.h>>40)*PC)>>24)]; \
     if(__builtin_expect(vec_.full(),0))vec_.reserve(max<size_t>(16,2*vec_.capacity())); \
-    vec_.append(r_);} \
+    vec_.append(r_);}} \
    if(__builtin_expect(chk_,0))clg_check_row(O_,i_,L_[i_],X_[i_],end,true,f_,ci_,g_,tab,camps,clickStart);}
 #define SS_CLG_FINISH(O,K,LS,NX,M,MASKS) {const auto& O_=(O);const auto& K_=(K);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned m_=(M); \
   const unsigned ok_=O_.ok&m_; \
@@ -7000,7 +7171,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(!e.k1.compare_exchange_strong(expect,KeyTable::BUSY,memory_order_acquire))continue;
       const uint32_t id=blk.next++;
       const size_t li=tab.longs.n.fetch_add(1,R); // below longs.room: at most idLimit IDs are added in this mode
-      names[id].set(string_view(B.s[q],B.len[q]));key.v=tab.idBase+id;tab.longs.d[li]=key;
+      names[id].set(string_view(B.s[q],B.len[q]));if(B.len[q]>15)memcpy(names[id].b+12,B.s[q],3); // a name kept as pointer + length: + its first three bytes, for lkg::name_less
+      key.v=tab.idBase+id;tab.longs.d[li]=key;
       note[id]=li<noteLim?0x80000000u|(uint32_t)li:0;
       e.k0.store(h,R);e.v.store((uint32_t)li,R);e.k1.store(KeyTable::LONGK,memory_order_release);
       return tab.idBase+id;
@@ -7176,7 +7348,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     {const Fix* const fx=fix[(t+FR-4)%FR];const int n=nf[(t+FR-4)%FR];
      for(int q=0;q<n;++q){const Fix& f=fx[q];
       uint32_t cur=uf[f.r].b.load(memory_order_relaxed);
-      while(name_less(names[f.i],names[cur?cur-1:f.r])&&!uf[f.r].b.compare_exchange_weak(cur,f.i+1)){}
+      while(lkg::name_less(names[f.i],names[cur?cur-1:f.r])&&!uf[f.r].b.compare_exchange_weak(cur,f.i+1)){}
       const uint32_t sl=lkSlot[f.i];
       if(sl&0x80000000u)longs[sl&0x7FFFFFFFu].v=f.r; // a long key: its value is in its entry
       else if(__builtin_expect(sl!=0,1))slots[sl-1].v.store(f.r,memory_order_relaxed);
@@ -7289,7 +7461,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool gevRef=hasV3&&isaUse!=ISA_SSE2&&(gevW=="ref"||gevW=="checkref");
  const bool gevVec=!gevRef&&hasE8&&gevW!="old"&&!getenv("SS_LINES")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  gevCheck=gevW=="check"||gevW=="checkref";
+ gevLongText=getenv("SS_GEV_LONG")&&string_view(getenv("SS_GEV_LONG"))=="text";
+ if(const char* v=getenv("SS_ABL")){const string_view w(v);gevAbl=w=="nouser"?1:w=="norec"?2:w=="nokern"?3:0;}
  const bool gevUse=(gevRef||gevVec)&&!dparse.events&&!dparse.users;
+ // SS_GCOMMIT=stream (needs the loop above for every event file): the rows go to GRec / GRecL streams of 2^gbits
+ // buckets per thread instead of PRec buckets. gbits: the smallest with estimated rows / buckets <= 6,000, 6..12
+ // (4,096 fill lines of 64 bytes per thread at most); SS_GBITS=n (1..16) sets it. SS_GSPF=0|1: ask for a row's fill line
+ // and bucket state a group ahead (default: from 1,024 buckets). Until a stage reads the streams, each thread's
+ // streams are turned back into its PRec buckets after PARSE (gbridge, stage mark GBRIDGE): same output.
+ dparse.gstream=gevUse&&getenv("SS_GCOMMIT")&&string_view(getenv("SS_GCOMMIT"))=="stream";
+ if(dparse.gstream){unsigned gb=6;while(gb<12&&(estEvents>>gb)>6000)++gb;
+  if(const char* v=getenv("SS_GBITS")){const long long x=atoll(v);gb=(unsigned)(x<1?1:x>16?16:x);}
+  dparse.gbits=gb;dparse.gspf=gb>=10;if(const char* v=getenv("SS_GSPF"))dparse.gspf=atoi(v)!=0;
+  if(const char* v=getenv("SS_GNOTE"))dparse.gnote=atoi(v)!=0;} // SS_GNOTE=0: every record through StreamStore::put (a branch per row)
  const bool cl8Auto=hasE8&&dparse.clicks&&!dparse.bucket&&!getenv("SS_CLICKS")&&!getenv("SS_DENSE_AHEAD")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  // The click loop of the general route (opaque IDs: no dense click records, no dense users) is the lane loop with
  // kernel cl8g (SS_CLICK_LOOP_CLG) on a CPU with the kernel's extensions; SS_CLG=0, any SS_CLICKS or SS_LINES value,
@@ -7298,7 +7482,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool clgRef=optClg>=3&&isaUse!=ISA_SSE2&&!dparse.clicks&&!dparse.users;
  const bool clgUse=clgRef||(optClg&&hasE8&&!dparse.clicks&&!dparse.users&&!getenv("SS_CLICKS")&&!getenv("SS_LINES")&&lanesC&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2));
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")<<(clgUse?(clgRef?" clicks: cl8g kernel (scalar twin) in lanes":" clicks: cl8g kernel in lanes"):"")<<(clgUse&&(optClg==2||optClg==4)?" (check)":"")
-  <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":lanes?" events: ev8 kernel v4 in lanes":" events: ev8 kernel v4"):"")<<(cl8Auto?(cl8V1?" clicks: cl8 kernel v1":lanesC?" clicks: cl8 kernel v2 in lanes":" clicks: cl8 kernel v2"):"")<<(gevUse?(gevRef?" general events: ev8g scalar twin in lanes":" general events: ev8g kernel in lanes"):"")<<(gevUse&&gevCheck?" (checked)":"")<<(evLead2?" evlead 2":"")<<(clLead2?" cllead 2":"")<<(optPfw==1?" pf w":optPfw==2?" pf t1":optPfw==3?" pf none":"")<<"\n";
+  <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":lanes?" events: ev8 kernel v4 in lanes":" events: ev8 kernel v4"):"")<<(cl8Auto?(cl8V1?" clicks: cl8 kernel v1":lanesC?" clicks: cl8 kernel v2 in lanes":" clicks: cl8 kernel v2"):"")<<(gevUse?(gevRef?" general events: ev8g scalar twin in lanes":" general events: ev8g kernel in lanes"):"")<<(gevUse&&gevCheck?" (checked)":"")<<(dparse.gstream?" -> GRec streams":"")<<(evLead2?" evlead 2":"")<<(clLead2?" cllead 2":"")<<(optPfw==1?" pf w":optPfw==2?" pf t1":optPfw==3?" pf none":"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -7307,6 +7491,19 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const uint32_t tagKeep=getenv("SS_TEST_TAG0")?0u:~0u;
  atomic<size_t> nextChunk{0};
  const int64_t clickStart=window_start-WEEK;
+ // Clicks straight to the persons (PClick: above). General route only (no dense click records, no dense users); the
+ // dump of the dense tests reads the click ID buckets and keeps them. SS_CLDIRECT=0: click ID buckets + dedup, as
+ // before. SS_CLDIRECT=dedup: direct, with an exact dedup on the ID texts when a range is handed on (the old answer
+ // whatever the reader does with copies; reports copies whose values differ). SS_CLDIRSH=n: 2^n persons per range.
+ // SS_TEST_CLEST=n (test): the stores are sized for n click rows and grow in 2 MB steps.
+ {const char* const v=getenv("SS_CLDIRECT");const string_view w(v?v:"");
+  clDirect=(dparse.clicks||dparse.users||dumpText||w=="0")?0u:w=="dedup"?2u:1u;
+  unsigned sh=0;while(sh<31&&((uint64_t)tab.idLimit>>sh)>=512)++sh;
+  if(const char* x=getenv("SS_CLDIRSH")){const int y=atoi(x);if(y>=0&&y<=31&&((uint64_t)tab.idLimit>>y)<(1u<<20))sh=(unsigned)y;}
+  clDirSh=sh;}
+ const size_t NBd=clDirect?(size_t)((uint64_t)tab.idLimit>>clDirSh)+1:0; // person ranges (table numbers are below idLimit)
+ const bool clEstTest=getenv("SS_TEST_CLEST")!=nullptr;
+ const uint64_t clEst=clEstTest?strtoull(getenv("SS_TEST_CLEST"),nullptr,10):estClicks;
  // Dense slots: zero pages, touched by whoever writes a slot first.
  if(dparse.events&&!dparse.bucket)denseEv=(ESlot*)map_huge((size_t)(dense.limE+1)*sizeof(ESlot));
  if(dparse.clicks&&!dparse.bucket)denseCl=(CSlot*)map_huge((size_t)(dense.limC+1)*sizeof(CSlot));
@@ -7351,7 +7548,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   tl.tid=(uint32_t)omp_get_thread_num();
   {// With the dense slots on, the hash buckets only get the few general rows: start them small (they grow).
    const size_t re=dparse.events?(size_t)(estEvents/((uint64_t)T*PE)/64)+16:(size_t)(estEvents/((uint64_t)T*PE)*9/8)+16;
-   const size_t rc=dparse.clicks?(size_t)(estClicks/((uint64_t)T*PC)/64)+16:(size_t)(estClicks/((uint64_t)T*PC)*9/8)+16;
+   const size_t rc=dparse.clicks?(size_t)(estClicks/((uint64_t)T*PC)/64)+16:clDirect?16:(size_t)(estClicks/((uint64_t)T*PC)*9/8)+16;
+   if(clDirect){const size_t per=(size_t)(clEst*sizeof(PClick)/(uint64_t)T);unsigned cs=12;while(cs>8&&(NBd<<cs)>max<size_t>(per/2,size_t(1)<<20))--cs;
+    tl.pcl.init(NBd,cs,per*5/4);if(clEstTest)tl.pcl.nextBytes=size_t(2)<<20;}
    // Dense buckets past the counters in use stay small.
    const size_t need=PE*(re*sizeof(PRec)+64)+PC*(rc*sizeof(CRec)+64)
     +usedE*(rdFull*sizeof(DRec)+64)+(DE-usedE)*(16*sizeof(DRec)+64)+usedC*(rdcFull*sizeof(DCRec)+64)+(DC-usedC)*(16*sizeof(DCRec)+64);
@@ -7359,6 +7558,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(auto& v:tl.eb)v.reserve(re);
    for(auto& v:tl.cb)v.reserve(rc);
    tl.db.resize(DE);tl.dcb.resize(DC);
+   if(dparse.gstream){const size_t nb=size_t(1)<<dparse.gbits;const uint64_t per=estEvents/(uint64_t)T+1;unsigned cs=12;while(cs>6&&((uint64_t)nb<<cs)>max<uint64_t>(uint64_t(4)<<20,per*sizeof(GRec)/2))--cs;
+    tl.gs.init(nb,cs,(size_t)(per*sizeof(GRec)*9/8));tl.gl.init(nb,cs,(size_t)(per*sizeof(GRecL)/6));}
    if(dparse.stream){tl.es.init(streamNB,streamCS,(size_t)(streamEst*sizeof(ERec)/(uint64_t)T*5/4));
     if(streamEstTest)tl.es.nextBytes=size_t(2)<<20;} // test: the arena grows 2 MB at a time
    for(size_t i=0;i<DE;++i)tl.db[i].reserve(i<usedE?rdFull:16);
@@ -7412,7 +7613,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     return;
    }
    uint64_t code=testSide?INGEST_SIDE:ingest_code(ingest);
-   if(__builtin_expect(tl.gcap!=nullptr,0)){*tl.gcap=make_prec(f[0].data(),h,code,k,cat,user);tl.gcapIngest=ingest;tl.gcapHas=true;return;} // SS_GEV=check
+   if(__builtin_expect(tl.gcap!=nullptr,0)){ThreadState::GCap& c=*tl.gcap;c.prec=make_prec(f[0].data(),h,code,k,cat,user);c.cls=gkey_classify(f[0].data(),f[0].size(),c.key,c.hi);c.ingest=ingest;c.has=true;return;} // SS_GEV=check
+   if(dparse.gstream){gcommit_row(tl,dparse.gbits,f[0].data(),f[0].size(),k,user,cat,ingest);return;} // general route, SS_GCOMMIT=stream
    if(code==INGEST_SIDE)tl.ingestSide.emplace_back(f[0].data(),ingest); // rare: keep the exact value on the side
    PRec r=make_prec(f[0].data(),h,code,k,cat);r.user=user;
    tl.eb[(size_t)(((h>>40)*PE)>>24)].push_back(r);
@@ -7432,6 +7634,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     else{tl.clEnd=max(tl.clEnd,(uint32_t)kcn+1);cslot_commit(denseCl[kcn],ckey,user,tl.tid);}
     return;
    }
+   if(clDirect){click_direct(tl,f[0].data(),(uint32_t)f[0].size(),ckey,user);return;}
    CRec r;r.id=f[0].data();r.idlen=(uint32_t)f[0].size();r.h=hkey(f[0]);r.key=ckey;r.user=user;
    tl.cb[(size_t)(((r.h>>40)*PC)>>24)].push_back(r);
   };
@@ -7475,9 +7678,23 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   dense_note_end(denseEvEnd,tl.evEnd);dense_note_end(denseClEnd,tl.clEnd);
   tl.slotWaits=eslotWaits;
   if(dparse.stream)tl.es.finish(); // partial fill lines out, non-temporal stores visible
+  if(dparse.gstream){tl.gs.finish();tl.gl.finish();}
+  if(clDirect)tl.pcl.finish();
  }
  populateStop.store(true,memory_order_relaxed);
  __mark("PARSE");
+ if(gevAbl){uint64_t x=0;for(int t=0;t<T;++t)x+=tls[t].gevAblSum;cerr<<"SS_ABL="<<getenv("SS_ABL")<<": TEST RUN, WRONG OUTPUT, stopping after the parse stage ("<<x<<")\n";cerr.flush();_exit(0);}
+ if(dparse.gstream){
+  if(getenv("SS_STATS")){const size_t nb=size_t(1)<<dparse.gbits;uint64_t ns=0,nl=0,big=0,chunks=0,bytes=0;
+   for(size_t b=0;b<nb;++b){uint64_t n=0;for(int t=0;t<T;++t)n+=tls[t].gs.count(b)+tls[t].gl.count(b);big=max(big,n);}
+   for(int t=0;t<T;++t){ns+=tls[t].gs.records();nl+=tls[t].gl.records();chunks+=tls[t].gs.chunks.size()+tls[t].gl.chunks.size();bytes+=tls[t].gs.arenaBytes+tls[t].gl.arenaBytes;}
+   cerr<<"STATS gstream: buckets "<<nb<<" x threads "<<T<<", records "<<ns<<" short/other + "<<nl<<" long, mean per bucket "<<(ns+nl)/nb<<" largest "<<big<<", chunks "<<chunks<<" of "<<(size_t(1)<<tls[0].gs.cs)<<" bytes, arena "<<(bytes>>20)<<" MB"<<(dparse.gspf?", fill lines asked for a group ahead":"")<<"\n";}
+  // Nothing reads the streams yet: back into the PRec buckets (each thread's own: LOCAL_USER numbers stay with their thread).
+  #pragma omp parallel for num_threads(T) schedule(static,1)
+  for(int t=0;t<T;++t){tlArena.stage=0;gbridge(tls[t],PE,dparse.gbits);
+   vector<pair<char*,size_t>> maps;tls[t].gs.release(maps);tls[t].gl.release(maps);for(const auto& m:maps)munmap(m.first,m.second);}
+  __mark("GBRIDGE");
+ }
  // ---- SCATTER (SS_COMMIT=stream): the streams into the event slots, bucket by bucket ----
  // One thread owns a turn (2^bwin counters = one or more whole stream buckets), reads every thread's records of
  // those buckets in thread order and stores them by the rule of eslot_commit (erec_to_slot). The slots of a turn are
@@ -7766,6 +7983,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  size_t maxEvBucket=0,maxClBucket=0; // most parsed lines in one ID bucket (all threads together)
  for(size_t p=0;p<PE;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].eb.size())n+=tls[t].eb[p].size();parsedEvents+=n;maxEvBucket=max(maxEvBucket,n);}
  for(size_t p=0;p<PC;++p){size_t n=0;for(int t=0;t<T;++t)if(p<tls[t].cb.size())n+=tls[t].cb[p].size();parsedClicks+=n;maxClBucket=max(maxClBucket,n);}
+ uint64_t pcRecords=0,pcLocal=0;size_t pcMax=0; // clDirect: the clicks are in the person ranges (and the fallback users' lists)
+ for(size_t b=0;b<NBd;++b){size_t n=0;for(int t=0;t<T;++t)if(b<tls[t].pcl.nb)n+=tls[t].pcl.count(b);pcRecords+=n;pcMax=max(pcMax,n);}
+ for(int t=0;t<T;++t)pcLocal+=tls[t].pclLocal.size();
+ parsedClicks+=pcRecords+pcLocal;
+ atomic<uint64_t> pcCopies{0},pcOdd{0};
  // SS_PERSONBUCKET: events per person bucket to aim for (measuring switch; the last stage sorts one
  // bucket at a time in two buffers of 16 bytes per event, so this sets its working set).
  static const uint64_t perBucket=[]{const char* v=getenv("SS_PERSONBUCKET");const long long x=v?atoll(v):16384;return (uint64_t)(x<256?256:x>(1<<24)?(1<<24):x);}();
@@ -7926,6 +8148,32 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(int t=0;t<T;++t)if(p<tls[t].eb.size())tls[t].eb[p]=Bucket<PRec>();
    surviving-=dead;dedupCount+=n-dups;
   }
+  // Direct clicks (clDirect): every person range goes to the person buckets as it is - no table, a copy of a click
+  // stays a copy (the last stage gives the same answer with it). SS_CLDIRECT=dedup: a range passes an exact set of
+  // its ID texts first (all copies of a click have one user, so one range); copies with other values are counted.
+  if(clDirect){
+   const bool dd=clDirect==2;uint64_t copies=0,odd=0;
+   unordered_map<string_view,const PClick*> seen;
+   const auto hand=[&](const PClick& r,int t){
+    if(dd){const auto ins=seen.try_emplace(string_view(r.c.id,r.c.idlen),&r);
+     if(!ins.second){++copies;const PClick& o=*ins.first->second;if(o.c.key!=r.c.key||(!(r.c.person&LOCAL_USER)&&o.c.person!=r.c.person))++odd;return;}}
+    const uint32_t u=person_of(r.c.person,t);
+    Click* const out=myCl[u>>bshA].slot(pool);
+    __builtin_prefetch((const char*)out+ahead,1,3);
+    out->key=r.c.key;out->id=r.c.id;out->person=u;out->idlen=r.c.idlen;};
+   #pragma omp for schedule(dynamic,1) nowait
+   for(size_t b=0;b<NBd;++b){
+    if(dd)seen.clear();
+    for(int t=0;t<T;++t){
+     if(b>=tls[t].pcl.nb||!tls[t].pcl.count(b))continue;
+     tls[t].pcl.for_segments(b,[&](const PClick* r,size_t n){for(const PClick* const e=r+n;r!=e;++r)hand(*r,t);});
+    }
+   }
+   #pragma omp single
+   {if(dd)seen.clear(); // the clicks of fallback-table users, all threads' lists through one set
+    for(int t=0;t<T;++t)for(const PClick& r:tls[t].pclLocal)hand(r,t);}
+   pcCopies+=copies;pcOdd+=odd;
+  }
   // Copies of a click are identical, so the first one seen is kept.
   #pragma omp for schedule(dynamic,1)
   for(size_t p=0;p<PC;++p){
@@ -7981,6 +8229,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    for(int t=0;t<T;++t)if(p<tls[t].cb.size())tls[t].cb[p]=Bucket<CRec>();
   }
  }
+ if(clDirect){ // the person ranges are not needed again: a helper thread unmaps them in 16 MB steps, as the event streams (SS_BKEEP=1: they stay)
+  if(stats||pcOdd.load())fprintf(stderr,"STATS direct clicks: %llu in %llu person ranges of %llu persons (largest %llu), %llu of fallback users%s\n",(unsigned long long)pcRecords,(unsigned long long)NBd,(unsigned long long)1<<clDirSh,(unsigned long long)pcMax,(unsigned long long)pcLocal,clDirect==2?" (SS_CLDIRECT=dedup)":"");
+  if(clDirect==2)fprintf(stderr,"STATS direct clicks dedup: copies %llu, of them with other values %llu\n",(unsigned long long)pcCopies.load(),(unsigned long long)pcOdd.load());
+  if(!getenv("SS_BKEEP")){vector<pair<char*,size_t>> v;for(int t=0;t<T;++t){tls[t].pcl.release(v);vector<PClick>().swap(tls[t].pclLocal);}
+   thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();}}
  if(stats)fprintf(stderr,"STATS event dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\nSTATS click dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\n",
   (unsigned long long)stEvN,stEvN?(double)stEvDisp/stEvN:0.0,(unsigned long long)stEvMax,(unsigned long long)stEvFalse,(unsigned long long)stClN,stClN?(double)stClDisp/stClN:0.0,(unsigned long long)stClMax,(unsigned long long)stClFalse);
  vector<GRef> genRefs; // all threads' notes, by user index
