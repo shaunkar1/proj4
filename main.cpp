@@ -6418,6 +6418,20 @@ SS_LKG5 static const char* fill_v5(Batch& B,const char* p,const char* lim,const 
  B.n=n;B.fast+=fast;
  return p;
 }
+// name_less for the names the link loop wrote: a name kept as pointer + length (16 bytes or more) also carries its first
+// three bytes in b[12..14], so that such a name is ordered against any other without reading its text unless the
+// first three bytes are equal. Exact: a stored name's first three bytes are zero padded; where two such triples first
+// differ, either both bytes are text (the texts' order), or one is padding - then every earlier byte was equal, the
+// padded name is a proper prefix of the other (which has real zero bytes up to there and now a non-zero one) and is
+// the smaller, as 0 < that byte says. Equal triples: the full comparison.
+static inline bool name_less(const PName& a,const PName& b){
+ const bool la=(unsigned char)a.b[15]==0xFF,lb=(unsigned char)b.b[15]==0xFF;
+ if(__builtin_expect(!(la|lb),1))return ::name_less(a,b);
+ const unsigned char* const pa=(const unsigned char*)(la?a.b+12:a.b);const unsigned char* const pb=(const unsigned char*)(lb?b.b+12:b.b);
+ const uint32_t xa=(uint32_t)pa[0]<<16|(uint32_t)pa[1]<<8|pa[2],xb=(uint32_t)pb[0]<<16|(uint32_t)pb[1]<<8|pb[2];
+ if(__builtin_expect(xa!=xb,1))return xa<xb;
+ return a.view()<b.view();
+}
 static inline bool has_v5(){
  static const bool h=[]{memset(FILL_C[0],'\n',64);memset(FILL_C[1],',',64);memset(FILL_C[2],'"',64);
   return __builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("lzcnt")&&__builtin_cpu_supports("popcnt");}();
@@ -7125,7 +7139,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(!e.k1.compare_exchange_strong(expect,KeyTable::BUSY,memory_order_acquire))continue;
       const uint32_t id=blk.next++;
       const size_t li=tab.longs.n.fetch_add(1,R); // below longs.room: at most idLimit IDs are added in this mode
-      names[id].set(string_view(B.s[q],B.len[q]));key.v=tab.idBase+id;tab.longs.d[li]=key;
+      names[id].set(string_view(B.s[q],B.len[q]));if(B.len[q]>15)memcpy(names[id].b+12,B.s[q],3); // a name kept as pointer + length: + its first three bytes, for lkg::name_less
+      key.v=tab.idBase+id;tab.longs.d[li]=key;
       note[id]=li<noteLim?0x80000000u|(uint32_t)li:0;
       e.k0.store(h,R);e.v.store((uint32_t)li,R);e.k1.store(KeyTable::LONGK,memory_order_release);
       return tab.idBase+id;
@@ -7301,7 +7316,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     {const Fix* const fx=fix[(t+FR-4)%FR];const int n=nf[(t+FR-4)%FR];
      for(int q=0;q<n;++q){const Fix& f=fx[q];
       uint32_t cur=uf[f.r].b.load(memory_order_relaxed);
-      while(name_less(names[f.i],names[cur?cur-1:f.r])&&!uf[f.r].b.compare_exchange_weak(cur,f.i+1)){}
+      while(lkg::name_less(names[f.i],names[cur?cur-1:f.r])&&!uf[f.r].b.compare_exchange_weak(cur,f.i+1)){}
       const uint32_t sl=lkSlot[f.i];
       if(sl&0x80000000u)longs[sl&0x7FFFFFFFu].v=f.r; // a long key: its value is in its entry
       else if(__builtin_expect(sl!=0,1))slots[sl-1].v.store(f.r,memory_order_relaxed);
