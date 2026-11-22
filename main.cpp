@@ -519,11 +519,50 @@ static inline bool name_less(const PName& a,const PName& b){
 // size where many threads look keys up and add the ones nobody has seen.
 struct KeyTable{
  struct Slot{atomic<uint64_t> k0;atomic<uint32_t> k1;atomic<uint32_t> v;}; // k1 top byte: 0 empty, len+1 inline, 0xFE being written, 0xFF long (k0=hash, v=index into longs)
- struct Long{string_view key;uint32_t v;};
+ // A key that does not fit a slot (over 11 bytes). kind 0: any text (a = pointer into a mapped input, b = length).
+ // kind != 0: a CANONICAL LONG ID, one byte + exactly 32 of [0-9a-f] (GFAST.md: one ID in eight): a = the last 16 hex
+ // digits as a number, b = the first 16, kind = 0x100 | the first byte. Text and (kind, a, b) are one-to-one, so
+ // such keys are compared as two words and never as text. The slot holds a hash (k0) and the index of the entry.
+ struct Long{uint64_t a,b;uint32_t v;uint32_t kind;
+  string str()const{if(!kind)return string((const char*)a,(size_t)b);
+   static const char* const HX="0123456789abcdef";string t(33,(char)(uint8_t)kind);for(int i=0;i<16;++i){t[1+i]=HX[(b>>(60-4*i))&15];t[17+i]=HX[(a>>(60-4*i))&15];}return t;}
+ };
+ // The entries: appended one at a time in serial mode (grows), by index from an atomic counter in lock-free mode
+ // (room for every ID the mode may add is mapped by begin_parallel, untouched until used).
+ struct LongList{
+  Long* d=nullptr;atomic<size_t> n{0};size_t room=0;void* raw=nullptr;size_t rawLen=0;
+  ~LongList(){if(raw)munmap(raw,rawLen);}
+  size_t size()const{return min(n.load(memory_order_relaxed),room);}
+  Long& operator[](size_t i){return d[i];}const Long& operator[](size_t i)const{return d[i];}
+  Long* begin(){return d;}Long* end(){return d+size();}const Long* begin()const{return d;}const Long* end()const{return d+size();}
+  void reserve(size_t want){if(want<=room)return;void* r;size_t rl;Long* const nd=(Long*)map_huge(want*sizeof(Long),&r,&rl);
+   const size_t have=size();if(have)memcpy((void*)nd,(const void*)d,have*sizeof(Long));if(raw)munmap(raw,rawLen);d=nd;raw=r;rawLen=rl;room=want;}
+  void push_back(const Long& l){const size_t i=size();if(i==room)reserve(max<size_t>(1024,room*2));d[i]=l;n.store(i+1,memory_order_relaxed);}
+ };
+ // Sixteen hex digits [0-9a-f] at p as a number (first digit highest); false if any byte is something else.
+ __attribute__((always_inline)) static bool hex16(const char* p,uint64_t& v){
+  const __m128i x=_mm_loadu_si128((const __m128i*)(const void*)p);
+  const __m128i dg=_mm_sub_epi8(x,_mm_set1_epi8('0')),al=_mm_sub_epi8(x,_mm_set1_epi8('a'));
+  const __m128i isd=_mm_cmpeq_epi8(_mm_min_epu8(dg,_mm_set1_epi8(9)),dg),isa=_mm_cmpeq_epi8(_mm_min_epu8(al,_mm_set1_epi8(5)),al);
+  if(_mm_movemask_epi8(_mm_or_si128(isd,isa))!=0xFFFF)return false;
+  const __m128i nib=_mm_or_si128(_mm_and_si128(isd,dg),_mm_and_si128(isa,_mm_add_epi8(al,_mm_set1_epi8(10))));
+  const __m128i w=_mm_or_si128(_mm_slli_epi16(_mm_and_si128(nib,_mm_set1_epi16(0x00FF)),4),_mm_srli_epi16(nib,8)); // per pair of digits: first << 4 | second
+  v=__builtin_bswap64((uint64_t)_mm_cvtsi128_si64(_mm_packus_epi16(w,w)));return true;
+ }
+ // The key of a text that pack() refused, and its hash for the slot.
+ __attribute__((always_inline)) static uint64_t long_key(string_view s,Long& l){
+  if(s.size()==33&&hex16(s.data()+1,l.b)&&hex16(s.data()+17,l.a)){l.kind=0x100u|(uint8_t)s[0];return mix64(l.a^mix64(l.b^((uint64_t)l.kind*0x9E3779B97F4A7C15ull)));}
+  l.a=(uint64_t)(uintptr_t)s.data();l.b=s.size();l.kind=0;return hkey(s);
+ }
+ __attribute__((always_inline)) static bool same_long(const Long& x,const Long& y){
+  if(x.kind!=y.kind)return false;
+  if(x.kind)return ((x.a^y.a)|(x.b^y.b))==0;
+  return x.b==y.b&&memcmp((const void*)(uintptr_t)x.a,(const void*)(uintptr_t)y.a,(size_t)x.b)==0;
+ }
  static constexpr uint32_t NONE=UINT32_MAX,BUSY=0xFE000000u,LONGK=0xFF000000u;
- Slot* slots=nullptr;size_t cap=0,mask=0,count=0;vector<Long> longs;void* slotsMap=nullptr;size_t slotsMapLen=0;
+ Slot* slots=nullptr;size_t cap=0,mask=0,count=0;LongList longs;void* slotsMap=nullptr;size_t slotsMapLen=0;
  // lock-free mode: new keys get idBase+0, idBase+1, ... up to idLimit keys; newNames keeps their text
- atomic<uint32_t> nextId{0};uint32_t idBase=0,idLimit=0;PName* newNames=nullptr;void* namesMap=nullptr;size_t namesMapLen=0;mutex longMu;
+ atomic<uint32_t> nextId{0};uint32_t idBase=0,idLimit=0;PName* newNames=nullptr;void* namesMap=nullptr;size_t namesMapLen=0;
  explicit KeyTable(size_t want=1024){alloc(want);}
  KeyTable(const KeyTable&)=delete;KeyTable& operator=(const KeyTable&)=delete;
  ~KeyTable(){if(slotsMap)munmap(slotsMap,slotsMapLen);if(namesMap)munmap(namesMap,namesMapLen);}
@@ -551,10 +590,10 @@ struct KeyTable{
     if(!c){e.k0.store(k0,R);e.k1.store(k1,R);e.v.store(v,R);++count;return v;}
    }
   }
-  uint64_t h=hkey(s);
+  Long key;const uint64_t h=long_key(s,key);
   for(size_t j=h&mask;;j=(j+1)&mask){Slot& e=slots[j];uint32_t c=e.k1.load(R);
-   if(!c){e.k0.store(h,R);e.k1.store(LONGK,R);e.v.store((uint32_t)longs.size(),R);longs.push_back({s,v});++count;return v;}
-   if(c==LONGK&&e.k0.load(R)==h&&longs[e.v.load(R)].key==s)return longs[e.v.load(R)].v;
+   if(!c){e.k0.store(h,R);e.k1.store(LONGK,R);e.v.store((uint32_t)longs.size(),R);key.v=v;longs.push_back(key);++count;return v;}
+   if(c==LONGK&&e.k0.load(R)==h&&same_long(longs[e.v.load(R)],key))return longs[e.v.load(R)].v;
   }
  }
  void grow(size_t want=0){
@@ -578,6 +617,7 @@ struct KeyTable{
   idBase=base;idLimit=maxNew;nextId.store(0);
   // Straight from a lazily touched mapping: calloc would hand out heap memory and zero all of it here, on one thread.
   newNames=(PName*)map_huge(((size_t)maxNew+1)*sizeof(PName),&namesMap,&namesMapLen);
+  longs.reserve(longs.size()+(size_t)maxNew+1); // every new ID could be a long one
   if((count+maxNew)*5/4>cap)grow((count+maxNew)*5/4); // safety net: the caller sizes the table (at most 80% full)
  }
  uint32_t end_parallel(){uint32_t n=min(nextId.load(),idLimit);count+=n;return n;}
@@ -602,10 +642,10 @@ struct KeyTable{
   const auto R=memory_order_relaxed;
   uint64_t k0;uint32_t k1;
   if(pack(s,k0,k1))return find_packed(k0,k1);
-  const uint64_t h=hkey(s);
-  for(size_t j=h&mask;;j=(j+1)&mask){const Slot& e=slots[j];const uint32_t c=e.k1.load(R);
+  Long key;const uint64_t h=long_key(s,key);
+  for(size_t j=h&mask;;j=(j+1)&mask){const Slot& e=slots[j];const uint32_t c=e.k1.load(memory_order_acquire);
    if(!c)return NONE;
-   if(c==LONGK&&e.k0.load(R)==h&&longs[e.v.load(R)].key==s)return longs[e.v.load(R)].v;
+   if(c==LONGK&&e.k0.load(R)==h&&same_long(longs[e.v.load(R)],key))return longs[e.v.load(R)].v;
   }
  }
  void prefetch(string_view s)const{uint64_t k0;uint32_t k1;if(pack(s,k0,k1))__builtin_prefetch(&slots[hash_packed(k0,k1)&mask],0,1);}
@@ -660,20 +700,24 @@ struct KeyTable{
    j=(j+1)&mask;
   }
  }
+ // A key over 11 bytes, lock-free like the packed keys: the slot is claimed (BUSY), the entry written at an index
+ // of its own, then the slot published. (Until GFAST this path held one mutex for all threads and compared texts:
+ // with one ID in eight long, every thread queued here.)
  uint32_t find_or_add_long(string_view s){
   const auto R=memory_order_relaxed;
-  lock_guard<mutex> guard(longMu);uint64_t h=hkey(s);
+  Long key;const uint64_t h=long_key(s,key);
   for(size_t j=h&mask;;){
    Slot& e=slots[j];uint32_t c=e.k1.load(memory_order_acquire);
-   if(c==LONGK){if(e.k0.load(R)==h&&longs[e.v.load(R)].key==s)return longs[e.v.load(R)].v;}
+   if(c==LONGK){if(e.k0.load(R)==h){const Long& l=longs.d[e.v.load(R)];if(same_long(l,key))return l.v;}}
    else if(c==0){
     if(nextId.load(R)>=idLimit)return NONE;
     uint32_t expect=0;
     if(!e.k1.compare_exchange_strong(expect,BUSY,memory_order_acquire))continue;
     uint32_t id=nextId.fetch_add(1,R);
     if(id>=idLimit){e.k1.store(0,memory_order_release);return NONE;}
-    newNames[id].set(s);longs.push_back({s,idBase+id});
-    e.k0.store(h,R);e.v.store((uint32_t)longs.size()-1,R);e.k1.store(LONGK,memory_order_release);
+    const size_t li=longs.n.fetch_add(1,R); // below longs.room: at most idLimit IDs are added in this mode
+    newNames[id].set(s);key.v=idBase+id;longs.d[li]=key;
+    e.k0.store(h,R);e.v.store((uint32_t)li,R);e.k1.store(LONGK,memory_order_release);
     return idBase+id;
    }
    else if(c==BUSY){__builtin_ia32_pause();continue;}
@@ -2087,6 +2131,11 @@ static inline __attribute__((always_inline)) bool link_split(const char* p,const
 // checks), so `rec` cannot be left pointing into storage that has moved.
 struct PendUser{uint64_t k0;const char* u;uint32_t* up;uint32_t j;uint32_t k1;}; // up: the record's user field; j fits: the table has at most 2^32 slots
 static constexpr int V3_BATCH=16;
+// A user ID that does not pack (over 11 bytes: every canonical long ID): through the table right here, as the
+// general handler's user_of does. Nothing waits on it, so it can be done in the middle of a pending batch.
+static inline uint32_t long_user(const char* u,size_t n,KeyTable& tab,ThreadState& tl){
+ const string_view t(u,n);const uint32_t g=tab.find_or_add(t);return g!=KeyTable::NONE?g:(LOCAL_USER|tl.users.intern(t));
+}
 static void resolve_users(const PendUser* pend,const PendUser* pendEnd,KeyTable& tab,ThreadState& tl){
  const auto R_=memory_order_relaxed;
  KeyTable::Slot* const slots=tab.slots;
@@ -2285,9 +2334,9 @@ template<bool DREC,bool PRE,class GEN> SS_V3I const char* event_line_v3(const ch
     uint32_t user=ucode;
     if(__builtin_expect(tableUser,0)){ // a general user (about 1% of the rows): through the ID table right here
      PendUser pu;
-     if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),pu.k0,pu.k1),0)){done=false;break;} // long user ID: nothing has been stored yet
-     pu.j=(uint32_t)(KeyTable::hash_packed(pu.k0,pu.k1)&tmask);pu.u=s1;pu.up=&user;
-     resolve_users(&pu,&pu+1,tab,tl);
+     if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),pu.k0,pu.k1),0))user=long_user(s1,l1,tab,tl);
+     else{pu.j=(uint32_t)(KeyTable::hash_packed(pu.k0,pu.k1)&tmask);pu.u=s1;pu.up=&user;
+      resolve_users(&pu,&pu+1,tab,tl);}
     }
     if(__builtin_expect(dEv,1)){
      if(PRE){send=max(send,(uint32_t)ve+1);eslot_put(lp,ve,k?k:ESLOT_INVALID,(uint64_t)user|((uint64_t)cat<<32)|lp.tid48,ingest,rawU);}
@@ -2316,7 +2365,7 @@ template<bool DREC,bool PRE,class GEN> SS_V3I const char* event_line_v3(const ch
    }else{
     if(lp.dUsers&&k){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode)){tableUser=false;dmax=max(dmax,ucode);}}
     uint64_t k0=0;uint32_t k1=0;
-    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID: nothing has been stored yet
+    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){ucode=long_user(s1,l1,tab,tl);tableUser=false;} // long user ID: its number right here
     const uint64_t h=hkey_v3(s0,l0);
     const PRec r=make_prec(s0,h,icode,k,cat,ucode);
     Bucket<PRec>& vec=buckets[(size_t)(((h>>40)*PE)>>24)];
@@ -4117,9 +4166,9 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
     if(__builtin_expect(uDense,1))dmax=max(dmax,ucode);
     else{ // a general user: through the ID table right here
      PendUser pu;
-     if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),pu.k0,pu.k1),0)){done=false;break;} // long user ID
-     pu.j=(uint32_t)(KeyTable::hash_packed(pu.k0,pu.k1)&tmask);pu.u=s1;pu.up=&user;
-     resolve_users(&pu,&pu+1,tab,tl);
+     if(__builtin_expect(!KeyTable::pack(string_view(s1,l1),pu.k0,pu.k1),0))user=long_user(s1,l1,tab,tl);
+     else{pu.j=(uint32_t)(KeyTable::hash_packed(pu.k0,pu.k1)&tmask);pu.u=s1;pu.up=&user;
+      resolve_users(&pu,&pu+1,tab,tl);}
     }
     if(__builtin_expect(dCl,1)){
      if(lp.bucket){
@@ -4146,7 +4195,7 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    }else{
     bool tableUser=true;
     if(lp.dUsers){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode)){tableUser=false;dmax=max(dmax,ucode);}}
-    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){done=false;break;} // long user ID
+    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){ucode=long_user(s1,l1,tab,tl);tableUser=false;} // long user ID: its number right here
     CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=ckey;r.user=ucode;
     Bucket<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
     if(__builtin_expect(vec.full(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record appended below stays put
@@ -6246,7 +6295,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
     if(!c||c==KeyTable::LONGK||c==KeyTable::BUSY)continue;
     char tx[12];const uint64_t k0=e.k0.load(R);const uint32_t k1=c&0xFFFFFFu;memcpy(tx,&k0,8);memcpy(tx+8,&k1,4);
     o<<e.v.load(R)<<'\t'<<hexstr(string_view(tx,(c>>24)-1))<<'\n';}
-   for(const auto& l:tab.longs)o<<l.v<<'\t'<<hexstr(l.key)<<'\n';
+   for(const auto& l:tab.longs)o<<l.v<<'\t'<<hexstr(l.str())<<'\n';
    ofstream oc(fs::path(dumpDir)/"complex.txt",ios::binary);
    if(denseComplex)for(uint64_t i=0;i<dense.limI;++i)if(dense_complex(i))oc<<i<<'\n';
   }
