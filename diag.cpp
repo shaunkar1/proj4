@@ -450,15 +450,17 @@ int main(){
  #define PO {"SS_DENSE_DUMP","-"}
  #define UB {"SS_UNMAP","bg"}
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
+ #define NL {"SS_LANES","0"}
  for(int r=0;r<4;++r){
-  add("B",1,{N8});add("ck",1,{N8},"core-k");add("c65",1,{N8},"core-d");add("cpf",1,{N8},"core-l");add("c66",1,{N8},"core-m");
-  add("uw",1,{N8,{"SS_UNMAP","workers"}});add("nl",1,{N8,{"SS_LANES","0"}});
-  if(r<3){add("Bs",1,{N8,ST});add("ms",1,{N8,ST},"core-m");}
+  add("B",1,{N8});add("g",1,{N8},"core-g");
+  add("pB",1,{N8,PO});add("pN",1,{N8,PO},"core-n");add("pK",1,{N8,PO},"core-k");
+  add("qB",1,{N8,PO,NL});add("qK",1,{N8,PO,NL,{"SS_PF","none"}},"core-k");
+  if(r<3){add("Bs",1,{N8,ST});add("gs",1,{N8,ST},"core-g");}
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hk",1,{N8},"core-k",true);add("H65",1,{N8},"core-d",true);add("Hpf",1,{N8},"core-l",true);add("H66",1,{N8},"core-m",true);
-  if(r<2)add("HBs",1,{N8,ST},"",true);}
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("Hg",1,{N8},"core-g",true);add("HpB",1,{N8,PO},"",true);add("HpN",1,{N8,PO},"core-n",true);add("HpK",1,{N8,PO},"core-k",true);
+  if(r<2){add("HBs",1,{N8,ST},"",true);add("Hgs",1,{N8,ST},"core-g",true);}}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
  // every other one into the scratch mount: the two mounts may not cost the same.
@@ -493,9 +495,9 @@ int main(){
    close(fd);unlink(pth.c_str());return true;};
   uint64_t ur[3]={0,0,0},us_[3]={0,0,0},cr[3]={0,0,0},cs[3]={0,0,0};bool ok[3]={false,false,false};
   for(int i=0;i<2;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
-   {const string o=od();pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,o,env,"");error_code ec;fs::remove_all(o,ec);}ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
+   {const string o=od();pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,o,env,"core-g");error_code ec;fs::remove_all(o,ec);}ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c64 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
+  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: G build (c67) dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
   if(fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
@@ -538,11 +540,13 @@ int main(){
   auto mk=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wMKP";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one));}return o+"~"+to_string(med(grp,"w"))+" ";};
   {char t[64];snprintf(t,sizeof t," | syncfs after replica %.1fs",syncSec);eqText+=t;}
   {char t[96];snprintf(t,sizeof t," | BOT REPLICA: %zu bots hold %.1f%% of rows",gBots.size(),100.0*gBotRows/1072000.0);eqText+=t;}
-  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c64","B")+mm("c64+K links","ck")+mm("c65(+B4 last)","c65")+mm("c64+C4 prefetch","cpf")+mm("c64 unmap by workers","uw")+mm("c64 no lanes","nl")+mm("c66=all","c66");
-  a+="| small stages MKLDYWE "+fmt("c64","Bs","MKLDYWE")+fmt("c66","ms","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","Bs","pqxa");
-  {const RunResult* r=get("Bs#0");if(r)a+="| handed over: "+r->hand+" | DENSE threads c64:"+squeeze(r->dth)+" ";}
-  c+="60M min~median w/P/R/X/A: "+mm("c64","HB")+mm("c64+K","Hk")+mm("c65","H65")+mm("c64+C4 prefetch","Hpf")+mm("c66=all","H66")+fmt("link stages c64","HB","L")+fmt("c66","H66","L")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","HBs","pqxa");
-  {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c64 60M:"+squeeze(r->dth)+" ";}
+  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c66","B")+mm("G(bots)","g");
+  a+="| parse-only P/user/sys, lanes: "+fmt("c66","pB","Pus")+fmt("nolock","pN","Pus")+fmt("nocommit(prefetch stays)","pK","Pus")+"index loops: "+fmt("c66","qB","Pus")+fmt("nocommit+no prefetch","qK","Pus");
+  a+="| small stages MKLDYWE "+fmt("c66","Bs","MKLDYWE")+fmt("G","gs","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("c66","Bs","pqxa")+fmt("G","gs","pqxa");
+  {const RunResult* r=get("Bs#0");if(r)a+="| handed over c66: "+r->hand+" ";}
+  {const RunResult* r=get("gs#0");if(r)a+="| G: "+r->hand+" | DENSE threads G:"+squeeze(r->dth)+" ";}
+  c+="60M min~median w/P/R/X/A: "+mm("c66","HB")+mm("G","Hg")+"parse-only P/user/sys: "+fmt("c66","HpB","Pus")+fmt("nolock","HpN","Pus")+fmt("nocommit","HpK","Pus")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("c66","HBs","pqxa")+fmt("G","Hgs","pqxa");
+  {const RunResult* r=get("Hgs#0");if(r)c+="| G handed over: "+r->hand+" | DENSE threads G 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}

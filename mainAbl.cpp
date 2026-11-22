@@ -1333,6 +1333,11 @@ static constexpr uint32_t DENSE_USER_RAW=0xC0000000u;
 // empty, without reading it; any other state falls into the same loop. Fewer instructions for a first copy, a
 // second locked instruction for every later copy.
 static inline __attribute__((always_inline)) void eslot_commit(ESlot& s,uint64_t kk,uint64_t uct,int64_t ingest,uint64_t spare=0){
+#ifdef SS_ABL_NOCOMMIT /* DIAGNOSTIC ONLY: measures the parse stage without the slot write (wrong output) */
+ (void)s;(void)kk;(void)uct;(void)ingest;(void)spare;return;
+#elif defined(SS_ABL_NOLOCK) /* DIAGNOSTIC ONLY: an empty slot is written with plain stores (not safe between threads) */
+ if(s.k.load(memory_order_relaxed)==0){memcpy((char*)&s+offsetof(ESlot,user),&uct,8);s.ingest=ingest;s.spare=spare;s.k.store(kk,memory_order_relaxed);return;}
+#endif
 #ifdef SS_CAS_FIRST
  uint64_t cur=0;
  if(__builtin_expect(s.k.compare_exchange_strong(cur,ESLOT_BUSY,memory_order_acquire,memory_order_relaxed),1)){
