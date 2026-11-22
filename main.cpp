@@ -987,7 +987,7 @@ struct Camp{string id,channel;};
 // the one entry it points at has its key: found and not found are both exact after one compare. Longer texts,
 // and everything when the table could not be built, go through the KeyTable as before.
 // SS_CAMP=check: both lookups for every row; the run stops if they ever differ.
-// BEGIN camp table (ut/camp_test.cpp compiles the text between these marks)
+// BEGIN camp table (fuzz/camp_test.cpp compiles the text between these marks)
 struct CampEnt{uint64_t key,ci;}; // empty entry: key = ~0 (no key has a length byte of 255)
 struct CampLook{const CampEnt* t=nullptr;const uint16_t* disp=nullptr;uint64_t mul=0,lim=0;uint32_t sh=0,mask=0;}; // lim: texts shorter than this use the table (8, or 0: table off)
 static constexpr uint64_t CAMP_LOW[8]={0,0xFFULL,0xFFFFULL,0xFFFFFFULL,0xFFFFFFFFULL,0xFFFFFFFFFFULL,0xFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFULL};
@@ -1444,7 +1444,12 @@ static inline __attribute__((always_inline)) void eslot_commit(ESlot& s,uint64_t
   return;
  }
 }
+// -DSS_ABL_CLICK=n (measuring builds only, wrong output): 1 = no click slot is written, 2 = none written and none
+// asked for by the cl8 loops, 3 = written but not asked for.
 static inline __attribute__((always_inline)) void cslot_commit(CSlot& s,uint64_t key,uint32_t user,uint32_t thread){
+#if defined(SS_ABL_CLICK)&&(SS_ABL_CLICK==1||SS_ABL_CLICK==2)
+ (void)s;(void)key;(void)user;(void)thread;return;
+#endif
  const uint64_t w=(uint64_t)user|((uint64_t)(thread+1)<<32);
  __atomic_store_n(&s.key,key,__ATOMIC_RELAXED);memcpy((void*)&s.user,&w,8);
 }
@@ -5022,7 +5027,11 @@ static inline vcl2::ClConst cl8_const2(uint64_t kc,uint64_t limC,uint64_t ku,uin
    else if(!((O_.drop>>i_)&1)){const char* const q_=L_[i_];++slow;click_line_v3<true>(q_,MASKS(q_),X_[i_]-1,lp,pend,pp,dmax,send,ring,rpos,general);}} \
   if(__builtin_expect(found_==ok_,1)){dmax=max(dmax,O_.umax);send=max(send,O_.kend);} \
   else for(unsigned x_=found_;x_;x_&=x_-1){const unsigned i_=(unsigned)__builtin_ctz(x_);dmax=max(dmax,(uint32_t)O_.user[i_]);send=max(send,(uint32_t)O_.kcn[i_]+1);} }
+#if defined(SS_ABL_CLICK)&&SS_ABL_CLICK>=2
+#define SS_CL8_PF(O_,i_) ;
+#else
 #define SS_CL8_PF(O_,i_) __builtin_prefetch(&SS_CL8_SLOT(O_,i_),1,3);
+#endif
 #define SS_CL8_PFW(O_,i_) SS_PFW_ASM(&SS_CL8_SLOT(O_,i_))
 // The line index and the three groups under way (N scanned, D decoded and its slots asked for, F finished) are those
 // of SS_EVENT_LOOP_EV8; see there. A short last group is filled up with the pointer behind its last line (a row with
@@ -5205,7 +5214,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  {const char* const v=getenv("SS_CAMP");const string_view w(v?v:""); // table (default) | hash | check
   campCheck=w=="check";
   vector<CampEnt> ks;for(size_t i=0;i<campaigns.size();++i)if(campaigns[i].id.size()<=7)ks.push_back({camp_key((campaigns[i].id+string(8,'\0')).data(),campaigns[i].id.size()),i});
-  if(w!="hash")campTable.build(ks);
+  campTable.keys=ks.size();if(w!="hash")campTable.build(ks);
   if(campCheck)campTable.look.lim=0;} // the loops take the KeyTable path, which compares
  organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
  };
@@ -6005,11 +6014,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  const uint32_t totalIds=tab.end_parallel();
  __mark("RESOLVE");
+ if(campCheck)cerr<<"STATS campaign lookups checked against the KeyTable: "<<campTable.checked<<"\n";
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
   cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";
   uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
   if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";
-  if(campCheck)cerr<<"STATS campaign lookups checked against the KeyTable: "<<campTable.checked<<"\n";
   uint64_t er=0,es=0;for(int t=0;t<T;++t){er+=tls[t].ev8Rows;es+=tls[t].ev8Slow;}
   if(er)cerr<<"STATS ev8 loop: rows "<<er<<" left to the line code "<<es<<"\n";
   uint64_t lsg=0,lfe=0,lfc=0;for(int t=0;t<T;++t){lsg+=tls[t].laneShort;lfe+=tls[t].laneFixE;lfc+=tls[t].laneFixC;}
