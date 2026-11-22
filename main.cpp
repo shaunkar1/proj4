@@ -6578,6 +6578,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   const bool probe4=simdProbe;const size_t ahead=pfe;const uint32_t tagMask=tagKeep&0xffffu; // plain locals for the hot loops
   const unsigned bshA=shA,bshB=shB;const size_t bnA=nA;const uint32_t bBase=denseBase;
   const auto person_of=person_of_shared; // this thread's copy
+  // SS_DEDUPWAIT=0: every tag match is compared at once, as before (see `one` in the event loop).
+  struct DedupWait{const PRec* r;uint32_t g1;int t;};static constexpr unsigned DEDUP_WAIT=16;DedupWait waitQ[DEDUP_WAIT];
+  static const bool waitOn=[]{const char* v=getenv("SS_DEDUPWAIT");return !(v&&v[0]=='0');}();
   auto bucket_size=[&](const auto& buckets,size_t p)->size_t{return p<buckets.size()?buckets[p].size():0;};
   // One pass per bucket: a record whose ID is new is passed on at once (if valid). When a later copy
   // turns out to be the earlier ingested one, the event already passed on is turned into a tombstone:
@@ -6593,10 +6596,12 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const unsigned ib=(unsigned)bit_width(n);const uint32_t imask=(1u<<ib)-1;
    const __m128i vkeep=_mm_set1_epi32((int)~imask),vzero=_mm_setzero_si128();
    size_t dups=0,dead=0;
-   for(int t=0;t<T;++t){
-    const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
-    const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;
-    for(;r!=rend;++r,++g1){
+   unsigned wn=0; // records waiting in waitQ
+   // One record. A record whose tag is already in the table has to be compared with that record's ID text, and
+   // both texts lie in the input files, far from any cache: with mayWait the two texts are asked for and the record
+   // is put aside (waitQ); it comes back through here a little later (mayWait false), when they have arrived. The
+   // order in which the copies of an ID pass does not matter: the smallest ingest_ts stays.
+   const auto one=[&](const PRec* const r,const uint32_t g1,const int t,const bool mayWait) __attribute__((always_inline)) {
      // 41 hash bits per record: the low 25 pick the slot, the other 16 are the tag.
      const uint64_t ih=r->ih;const uint32_t hl=(uint32_t)(ih&PR_HMASK);
      const uint32_t tg=((uint32_t)r->hx&tagMask)<<ib;
@@ -6616,12 +6621,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if((e^tg)<=imask){ // same tag: compare the IDs themselves
        const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
        const PRec& o=tls[ot].eb[p][og-off[ot]];
+       if(mayWait){
+        __builtin_prefetch(o.id);__builtin_prefetch(o.id+48);__builtin_prefetch(r->id);__builtin_prefetch(r->id+48);
+        waitQ[wn++]=DedupWait{r,g1,t};return;
+       }
        if(same_event_id(o.id,r->id)){
         // Keep the earliest ingested copy; copies with equal ingest_ts are identical.
         ++dups;
         const uint64_t ri=ih>>PR_HBITS,oi=o.ih>>PR_HBITS;
         const bool notEarlier=__builtin_expect((ri==INGEST_SIDE)|(oi==INGEST_SIDE),0)?ingest_ms(*r)>=ingest_ms(o):ri>=oi;
-        if(notEarlier)goto next_event;
+        if(notEarlier)return;
         if(o.k){const uint32_t ou=person_of(o.user,ot);
          Ev* const gone=myEv[bucket_of(ou)].at_mark(emitted[og]);gone->person=bucket_end(ou);++dead;}
         break;
@@ -6655,9 +6664,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        if(__builtin_expect(markedIx!=~0u,0)){if(myRefs.size()<genRefCap)myRefs.push_back(GRef{markedIx,(uint32_t)w,(void*)out,false});else genRefOver.store(true,memory_order_relaxed);}
       }
      }
-     next_event:;
+   };
+   for(int t=0;t<T;++t){
+    const size_t m=bucket_size(tls[t].eb,p);if(!m)continue;
+    const PRec* r=tls[t].eb[p].data();const PRec* const rend=r+m;uint32_t g1=(uint32_t)off[t]+1;
+    for(;r!=rend;++r,++g1){
+     one(r,g1,t,waitOn);
+     if(__builtin_expect(wn==DEDUP_WAIT,0)){for(unsigned q=0;q<DEDUP_WAIT;++q)one(waitQ[q].r,waitQ[q].g1,waitQ[q].t,false);wn=0;}
     }
    }
+   for(unsigned q=0;q<wn;++q)one(waitQ[q].r,waitQ[q].g1,waitQ[q].t,false);
    if(stats)for(size_t j=0;j<cap;++j){const uint32_t e=S[j];if(!e)continue;
     const uint32_t og=(e&imask)-1;int ot=0;while(og>=off[ot+1])++ot;
     const size_t home=(size_t)(((uint64_t)(uint32_t)(tls[ot].eb[p][og-off[ot]].ih&PR_HMASK)*cap)>>PR_HBITS),d=j>=home?j-home:j+cap-home;
@@ -6730,6 +6746,24 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  size_t maxEvPerson=0,maxClPerson=0; // most survivors in one person bucket
  for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
   surviving+=ne;survivingClicks+=nc;maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
+ // The last stage takes the biggest person buckets first: a bucket that holds one of the few very big persons
+ // (1-2% of all events each) is one turn of one thread however long it takes, so it must start while the other
+ // threads still have small buckets to do - at the end of the loop it would be the whole stage's tail.
+ // SS_AGGORDER=index: in bucket order, as before.
+ vector<uint32_t> upOrder;
+ const auto order_buckets=[&]{
+  upOrder.resize(UPn);for(size_t up=0;up<UPn;++up)upOrder[up]=(uint32_t)up;
+  static const bool byIndex=[]{const char* v=getenv("SS_AGGORDER");return v&&!strcmp(v,"index");}();
+  if(byIndex)return;
+  vector<uint64_t> w(UPn);
+  for(size_t up=0;up<UPn;++up){uint64_t x=0;for(int t=0;t<T;++t)x+=surv[t].ev[up].size()+surv[t].cl[up].size();w[up]=x;}
+  // Only the outliers move (more than four times the mean), biggest first; the others keep their order, in which
+  // neighbouring buckets' lists are neighbours in memory.
+  uint64_t sum=0;for(size_t up=0;up<UPn;++up)sum+=w[up];
+  const uint64_t big=4*(sum/max<size_t>(1,UPn))+1024;
+  stable_sort(upOrder.begin(),upOrder.end(),[&w,big](uint32_t a,uint32_t b){const uint64_t x=w[a]>big?w[a]:0,y=w[b]>big?w[b]:0;return x>y;});
+ };
+ order_buckets();
  cerr<<"deduplicated events: "<<dedupCount<<", surviving: "<<surviving<<"\n";
  cerr<<"surviving clicks: "<<survivingClicks<<"\n";
  __mark("DEDUP");
@@ -7867,6 +7901,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
       maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
      size_pools();
+     order_buckets(); // (the index pass has added rows)
      if(stats){thrSingle=now_s()-thrSg0;thr_line("dense",dstat,thrR0,thrR0-thrS0,thrSingle);}
      __mark("DENSE");
     }
@@ -7878,7 +7913,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(cellPass)cellBuf.reserve(maxEvPerson+2);
   Cell* const cells=cellBuf.p;
   #pragma omp for schedule(dynamic,1)
-  for(size_t up=0;up<UPn;++up){
+  for(size_t oi=0;oi<UPn;++oi){
+   const size_t up=upOrder[oi];
    size_t nE=0,nC=0;
    for(int t=0;t<T;++t){nE+=surv[t].ev[up].size();nC+=surv[t].cl[up].size();}
    if(!nE)continue;
