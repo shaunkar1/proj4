@@ -829,6 +829,21 @@ static inline void click_insertion_sort(Click* c0,Click* c1){
   if(click_before(*x,x[-1])){const Click v=*x;Click* y=x;do{*y=y[-1];--y;}while(y>c0&&click_before(v,y[-1]));*y=v;}
  }
 }
+// Keys "time << 24 | position" (positions ascending, n < 2^24, times below 2^40) into time order, positions
+// ascending inside one moment: stable counting passes of 11 bits over the time bits in use. h: 2048 counters.
+// Returns where the result is, K or K2.
+static inline uint64_t* time_pos_sort(uint64_t* K,uint64_t* K2,size_t n,uint32_t* h){
+ if(n<=64){sort(K,K+n);return K;}
+ uint64_t any=0;for(size_t i=0;i<n;++i)any|=K[i];
+ for(unsigned sh=24;sh<64&&(any>>sh)!=0;sh+=11){
+  memset(h,0,2048*sizeof(uint32_t));
+  for(size_t i=0;i<n;++i)++h[(K[i]>>sh)&2047];
+  uint32_t at=0;for(size_t d=0;d<2048;++d){const uint32_t c=h[d];h[d]=at;at+=c;}
+  for(size_t i=0;i<n;++i){const uint64_t x=K[i];K2[h[(x>>sh)&2047]++]=x;}
+  swap(K,K2);
+ }
+ return K;
+}
 // A person's events into time order (ties in any order). They usually are in order or nearly so:
 // insertion, and a real sort only when that has moved more than a few places per event.
 static inline void ev_time_sort(Ev* e0,Ev* e1){
@@ -6117,6 +6132,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  for(int t=0;t<T;++t){surv[t].ev.resize(UPn);surv[t].cl.resize(UPn);tls[t].uev.clear();tls[t].ucl.clear();
   surv[t].pool.first=(size_t)((parsedEvents*sizeof(Ev)+parsedClicks*sizeof(Click))/(uint64_t)T*9/8)+slotCap*sizeof(uint32_t)+maxEvBucket*sizeof(uint32_t)+(size_t(2)<<20);
   surv[t].pool.next=max<size_t>(size_t(8)<<20,surv[t].pool.first/4);}
+ // Every general-lane row of a dense user (the rows that put the general-lane mark on a user index: a handful
+ // per million) is also noted here: its index, its person, and where it lies in the general lists. The index
+ // pass can then finish a marked index itself and take these rows along (see "marked indexes" there).
+ // `person` is the row's person when it was passed on; a row that lost to an earlier copy afterwards holds its
+ // bucket's tombstone number instead, which is never that person.
+ struct GRef{uint32_t ix,person;void* at;bool click;};
+ vector<vector<GRef>> genRefT((size_t)T);
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
  uint64_t stEvN=0,stEvDisp=0,stEvMax=0,stEvFalse=0,stClN=0,stClDisp=0,stClMax=0,stClFalse=0; // SS_STATS (the two "False" counts are always kept: they cost nothing)
@@ -6126,6 +6148,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   // With slots in use, a dense user whose row goes through the general lists is marked: the reader
   // then leaves all of that user index to the general lane.
   DInfo* const markInfo=slotMode?denseInfo:nullptr;
+  vector<GRef>& myRefs=genRefT[(size_t)tid];
   EvList* const myEv=surv[tid].ev.data();ClickList* const myCl=surv[tid].cl.data();HugePool& pool=surv[tid].pool;
   // Slot = tag<<ib | (record number+1), 0 = empty; ib bits are enough for the bucket's record count.
   // The table has two slots per record; the low half of the hash picks the slot, the high half is the tag.
@@ -6192,13 +6215,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       if(rk){
        // user, cat and the tag bits sit in the record as the event's second word does (person, cat, unused).
        uint64_t w;memcpy(&w,(const void*)&r->user,8);
-       size_t bkt;
+       size_t bkt;uint32_t markedIx=~0u;
        if((uint32_t)w&(LOCAL_USER|DENSE_USER)){
         const uint32_t ru=(uint32_t)w,pn=person_of(ru,t);
         w=(w&~0xffffffffull)|pn;
         if(ru&DENSE_USER){ // a dense person: second stretch
          bkt=bnA+((pn-bBase)>>bshB);
-         if(markInfo)markInfo[(ru&~DENSE_USER)>>dn::ALIAS_BITS].general.store(1,memory_order_relaxed);
+         if(markInfo){markedIx=(ru&~DENSE_USER)>>dn::ALIAS_BITS;markInfo[markedIx].general.store(1,memory_order_relaxed);}
         }
         else bkt=pn>>bshA;
        }
@@ -6208,6 +6231,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        __builtin_prefetch((const char*)out+ahead,1,3); // every time: testing for a new cache line would be an unpredictable branch
        out->k=rk-PR_KBIAS; // otherwise already in its final form
        memcpy((void*)&out->person,&w,8);
+       if(__builtin_expect(markedIx!=~0u,0))myRefs.push_back(GRef{markedIx,(uint32_t)w,(void*)out,false});
       }
      }
      next_event:;
@@ -6257,11 +6281,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      {
       const uint32_t u=person_of(r->user,t);
       size_t bkt;
-      if(r->user&DENSE_USER){bkt=bnA+((u-bBase)>>bshB);if(markInfo)markInfo[(r->user&~DENSE_USER)>>dn::ALIAS_BITS].general.store(1,memory_order_relaxed);}
+      uint32_t markedIx=~0u;
+      if(r->user&DENSE_USER){bkt=bnA+((u-bBase)>>bshB);if(markInfo){markedIx=(r->user&~DENSE_USER)>>dn::ALIAS_BITS;markInfo[markedIx].general.store(1,memory_order_relaxed);}}
       else bkt=u>>bshA;
       Click* const out=myCl[bkt].slot(pool);
       __builtin_prefetch((const char*)out+ahead,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
+      if(__builtin_expect(markedIx!=~0u,0))myRefs.push_back(GRef{markedIx,u,(void*)out,true});
      }
      next_click:;
     }
@@ -6275,6 +6301,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  }
  if(stats)fprintf(stderr,"STATS event dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\nSTATS click dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\n",
   (unsigned long long)stEvN,stEvN?(double)stEvDisp/stEvN:0.0,(unsigned long long)stEvMax,(unsigned long long)stEvFalse,(unsigned long long)stClN,stClN?(double)stClDisp/stClN:0.0,(unsigned long long)stClMax,(unsigned long long)stClFalse);
+ vector<GRef> genRefs; // all threads' notes, by user index
+ for(const auto& v:genRefT)genRefs.insert(genRefs.end(),v.begin(),v.end());
+ sort(genRefs.begin(),genRefs.end(),[](const GRef& a,const GRef& b){return a.ix!=b.ix?a.ix<b.ix:a.click!=b.click?a.click<b.click:(uintptr_t)a.at<(uintptr_t)b.at;});
  size_t maxEvPerson=0,maxClPerson=0; // most survivors in one person bucket
  for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
   surviving+=ne;survivingClicks+=nc;maxEvPerson=max(maxEvPerson,ne);maxClPerson=max(maxClPerson,nc);}
@@ -6293,6 +6322,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  static const uint32_t noTightN=[]{const char* v=getenv("SS_TEST_NOTIGHT");return v?(uint32_t)max(1,atoi(v)):0u;}();
  static const uint32_t noFastN=[]{const char* v=getenv("SS_TEST_NOFAST");return v?(uint32_t)max(1,atoi(v)):0u;}();
  uint64_t rdSlotCl=0,rdHandEv=0,rdHandCl=0,rdFastIdx=0,rdFastEv=0,rdFastCl=0,rdDeferIdx=0; // SS_STATS
+ uint64_t rdMarkIdx=0,rdMarkEv=0,rdMarkCl=0,rdMarkRows=0,rdMarkSorted=0,rdMarkPulled=0; // marked indexes finished by the index pass: how many, their events and clicks, general-lane rows among those, events that went through the full sort
+ // Test switch: every n-th user index is treated as if one of its rows had gone through the general lane.
+ static const uint32_t testMarkN=[]{const char* v=getenv("SS_TEST_MARK");return v?(uint32_t)max(1,atoi(v)):0u;}();
  // Who is handed over, in events (SS_STATS): rows of users that came through the ID table - of a linked
  // person, of an unlinked dense-looking ID with alias 8 or more, of an unlinked ID of a complex index, of
  // any other text - or through the fallback; then dense users whose index has rows in the general lane,
@@ -6575,7 +6607,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   if(stats)cerr<<"STATS unmap: SS_UNMAP="<<(mode==1?"bg":mode==2?"bgfirst":mode==3?"late":"workers")<<" first "<<unmapFirst.size()<<" last "<<unmapLast.size()<<" helper-last "<<unmapLastBg.size()<<"\n";
  }
  if(stats)thrR0=now_s();
- #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9])
+ // Turns of the index loop. On generated data the user index is a rank: the first five indexes hold about 1.1%
+ // of all events each, the first 512 a sixth, the first 4096 over a quarter. With 512 indexes per turn the
+ // first turn alone was more than a thread's share of the stage, so the low indexes get turns of their own
+ // (the first 64 one by one, then 16 and 64 at a time). SS_TURNS=old: 512 everywhere.
+ vector<uint32_t> turnLo;
+ {static const bool turnsOld=[]{const char* v=getenv("SS_TURNS");return v&&!strcmp(v,"old");}();
+  for(size_t i=0;i<idxEnd;){turnLo.push_back((uint32_t)i);const size_t step=turnsOld||i>=4096?ICH:i<64?1:i<512?16:64;i=min(idxEnd,i+step);}
+  turnLo.push_back((uint32_t)idxEnd);}
+ const size_t nTurns=turnLo.size()-1;
+ #pragma omp parallel num_threads(T) reduction(+:num_sessions,rdHandEv,rdHandCl,rdFastIdx,rdFastEv,rdFastCl,rdDeferIdx,rdWhy[:9],rdMarkIdx,rdMarkEv,rdMarkCl,rdMarkRows,rdMarkSorted,rdMarkPulled)
  {
   const int tid=omp_get_thread_num();
   ThrStat thrNone;ThrStat* cur=stats?&dstat[tid]:&thrNone; // the stage this thread is in
@@ -6818,17 +6859,153 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    static const size_t largeMax=[]{const char* v=getenv("SS_TEST_LARGEMAX");const long x=v?atol(v):4096;return (size_t)(x<1?1:x>4096?4096:x);}(); // tests: sets beyond this take the path of sets beyond 4096 clicks
    static const bool assistLoop=[]{const char* v=getenv("SS_SMALLASSIST");return v&&!strcmp(v,"loop");}(); // small sets: the row's counters added by a loop over the clicks (old) instead of eight at a time
    vector<uint32_t> sinceV(ncamp+1,0);uint32_t* const since=sinceV.data();
+   static const bool clickSortOld=[]{const char* v=getenv("SS_CLICKSORT");return v&&!strcmp(v,"old");}();
+   vector<uint32_t> bigHist(2048);
    vector<RowOut> rowsOut((size_t)ndays+2);
    const atomic<uint32_t>* const comp=denseComp;const uint32_t dBase=denseBase;
+   // ---- Marked indexes. ----
+   // A user index with a row in the general lane (an event or click whose own ID is not a dense one: about
+   // five rows per million, so a user with 200,000 rows has one more often than not) used to be handed to the
+   // general lane with all its rows. The biggest users are exactly those, they sit next to each other at the
+   // lowest indexes, and so they all fell into one person bucket of the last stage: one thread. Now such an
+   // index is finished here, by the thread that has it, if it has events in the slots and is one person:
+   //   - its events are copied out of the slots and its general-lane events (genRefs) are added; those are
+   //     turned into tombstones in the general lists, so the last stage does not see the person at all
+   //     (its general-lane clicks stay in the lists and are dropped there, as clicks of a person without events);
+   //   - the events are put in time order: they almost are, so the rows that come too early are taken out,
+   //     sorted and merged back in (a full sort if that is more than an eighth of them);
+   //   - its clicks, slots and general ones, are ordered through keys "time << 24 | position" by counting
+   //     passes; clicks of one moment are then ordered by their ID texts, larger first (click_before);
+   //   - sessionize_person, the general lane's per-person function, does the rest.
+   // Anything else (no event in the slots, several persons, a click time or count beyond the key) returns
+   // false before anything is changed, and the index is handed over as before. SS_MARKED=old: always.
+   static const bool markedOld=[]{const char* v=getenv("SS_MARKED");return v&&!strcmp(v,"old");}();
+   struct KeyOnly{uint64_t key;};
+   Scratch<Ev> mkE,mkX;Scratch<uint64_t> mkK,mkK2,mkSrc;Scratch<uint32_t> mkCtr;Scratch<KeyOnly> mkOut;
+   mkE.pool=mkX.pool=&pool;mkK.pool=mkK2.pool=mkSrc.pool=&pool;mkCtr.pool=&pool;mkOut.pool=&pool;
+   vector<uint32_t> mkHist(2048);vector<const Click*> mkSide;vector<Ev*> mkSideEv;
+   const auto marked_index=[&mkE,&mkX,&mkK,&mkK2,&mkSrc,&mkCtr,&mkOut,&mkHist,&mkSide,&mkSideEv,&sessionize_person,&person_name,&rdMarkIdx,&rdMarkEv,&rdMarkCl,&rdMarkRows,&rdMarkSorted,&rdMarkPulled,
+     ucode,ev_at,bucket_end,dBase,cls=(const CSlot*)denseCl,kc=dense.kc,gref=genRefs.data(),ngref=genRefs.size()]
+    (size_t ix,uint32_t ec,uint32_t cc,size_t ef,size_t el,size_t cf,size_t cl,uint32_t stored) __attribute__((noinline)) ->bool{
+    const uint32_t code=DENSE_USER|(uint32_t)(ix<<dn::ALIAS_BITS);
+    // The index's general-lane rows that are still alive.
+    const GRef* g0=lower_bound(gref,gref+ngref,(uint32_t)ix,[](const GRef& a,uint32_t x){return a.ix<x;});
+    const GRef* const gEnd=gref+ngref;
+    mkSide.clear();mkSideEv.clear();
+    uint32_t sidePerson=0;bool sideAny=false,sideOne=true;
+    for(const GRef* g=g0;g<gEnd&&g->ix==ix;++g){
+     const uint32_t now=g->click?((const Click*)g->at)->person:((const Ev*)g->at)->person;
+     if(now!=g->person)continue; // lost to an earlier copy in the dedup: a tombstone
+     if(sideAny&&g->person!=sidePerson)sideOne=false;
+     sidePerson=g->person;sideAny=true;
+     if(g->click)mkSide.push_back((const Click*)g->at);else mkSideEv.push_back((Ev*)g->at);
+    }
+    if(!sideOne)return false;
+    const size_t nxe=mkSideEv.size(),nxc=mkSide.size();
+    // Events out of the slots. (A slot is laid out like an Ev: the key with its bias, the user where the person
+    // is, the category. sessionize_person reads the key and the category only, so the copy is one load, one
+    // subtraction and one store.)
+    static_assert(sizeof(ESmall)==sizeof(Ev)&&offsetof(ESmall,k)==offsetof(Ev,k)&&offsetof(ESmall,cat)==offsetof(Ev,cat));
+    Ev* const E=mkE.get((size_t)ec+nxe+1);size_t n=0;uint32_t mask=0;
+    {const __m128i bias=_mm_set_epi64x(0,(long long)PR_KBIAS);
+     for(size_t c=ef;c<el;++c){
+      const ESmall& sl=ev_at(c);
+      if(sl.k<PR_KBIAS)continue;
+      const uint32_t u=ucode(sl);
+      if((u^code)>=8)continue;
+      mask|=1u<<(u&7);
+      _mm_storeu_si128((__m128i*)(void*)(E+n),_mm_sub_epi64(_mm_loadu_si128((const __m128i*)(const void*)&sl),bias));++n;
+     }}
+    // Clicks out of the slots: key and counter.
+    const size_t mAll=(size_t)cc+nxc;
+    uint64_t* const src=mkSrc.get(mAll+1);uint32_t* const ctr=mkCtr.get((size_t)cc+1);size_t m=0;uint64_t allKeys=0;
+    for(size_t c=cf;c<cl;++c){
+     const CSlot& sl=cls[c];const uint32_t u=sl.user;
+     if(!sl.present||(u^code)>=8)continue;
+     mask|=1u<<(u&7);src[m]=sl.key;ctr[m]=(uint32_t)c;allKeys|=sl.key;++m;
+    }
+    if(__builtin_expect(n!=ec||m!=cc,0)){fprintf(stderr,"ERROR dense slots changed under the reader\n");_exit(1);}
+    // One person: every alias in use has the same smallest alias of its group, and the general rows are that person's.
+    const uint32_t a0=(uint32_t)__builtin_ctz(mask|0x100u),root=a0^((stored>>(3*a0))&7);
+    {const uint32_t x=(stored^COMP_IDENT)^(root*0x249249u),differs=(x|(x>>1)|(x>>2))&0x249249u;
+     if(differs&SPREAD3[mask&255u])return false;}
+    const uint32_t person=dBase+(uint32_t)((ix<<dn::ALIAS_BITS)|root);
+    if(sideAny&&sidePerson!=person)return false;
+    for(size_t i=0;i<nxc;++i){src[m+i]=mkSide[i]->key;allKeys|=mkSide[i]->key;}
+    if(mAll>=(size_t(1)<<24)||(allKeys>>16)>>40)return false; // the click key below has 24 bits for the position and 40 for the time
+    // From here on the index is finished here. Its general events come along and leave the general lists.
+    for(size_t i=0;i<nxe;++i){Ev* const g=mkSideEv[i];E[n]=*g;++n;g->person=bucket_end(person);}
+    // Time order: rows earlier than a row before them are taken out, sorted, and merged back from the end.
+    // (Only the times are compared: rows of one moment may stay in any order.)
+    {const size_t xcap=n/8+1;Ev* const X=mkX.get(xcap+1);size_t nk=0,nx=0,i=0;uint64_t mx=0;
+     for(;i<n;++i){const uint64_t t=E[i].k>>EV_TS;if(t<mx)break;mx=t;} // (in order up to here: nothing to move)
+     for(nk=i;i<n;++i){const uint64_t t=E[i].k>>EV_TS;
+      if(t>=mx){mx=t;E[nk++]=E[i];}
+      else{if(nx==xcap)break;X[nx++]=E[i];}}
+     if(i<n){ // too many: everything back into one array and a full sort, by counting passes over the times
+      memcpy((void*)(E+nk),(const void*)X,nx*sizeof(Ev));rdMarkSorted+=n;
+      if(n<2048)sort(E,E+n,[](const Ev& a,const Ev& b){return a.k<b.k;});
+      else{
+       uint64_t tmin=~0ull,tmax=0;
+       for(size_t q=0;q<n;++q){const uint64_t t=E[q].k>>EV_TS;tmin=min(tmin,t);tmax=max(tmax,t);}
+       Ev* A=E;Ev* B=mkX.get(n+1);uint32_t* const h=mkHist.data();
+       for(unsigned sh=0;sh<64&&((tmax-tmin)>>sh)!=0;sh+=11){
+        memset(h,0,2048*sizeof(uint32_t));
+        for(size_t q=0;q<n;++q)++h[(((A[q].k>>EV_TS)-tmin)>>sh)&2047];
+        uint32_t at=0;for(size_t d=0;d<2048;++d){const uint32_t c=h[d];h[d]=at;at+=c;}
+        for(size_t q=0;q<n;++q){const __m128i e=_mm_loadu_si128((const __m128i*)(const void*)(A+q));
+         _mm_storeu_si128((__m128i*)(void*)(B+h[((((uint64_t)_mm_cvtsi128_si64(e)>>EV_TS)-tmin)>>sh)&2047]++),e);}
+        swap(A,B);
+       }
+       if(A!=E)memcpy((void*)E,(const void*)A,n*sizeof(Ev));
+      }
+     }
+     else if(nx){
+      sort(X,X+nx,[](const Ev& a,const Ev& b){return a.k<b.k;});
+      size_t a=nk,b=nx,o=n;
+      while(b){if(a&&(E[a-1].k>>EV_TS)>(X[b-1].k>>EV_TS))E[--o]=E[--a];else E[--o]=X[--b];}
+      rdMarkPulled+=nx;
+     }}
+    // Clicks in click_before order.
+    KeyOnly* const out=mkOut.get(mAll+1);
+    if(mAll){
+     uint64_t* K=mkK.get(mAll+1);
+     for(size_t i=0;i<mAll;++i)K[i]=((src[i]>>16)<<24)|i;
+     K=time_pos_sort(K,mkK2.get(mAll+1),mAll,mkHist.data());
+     // Clicks of one moment: the larger ID text first.
+     const auto text_of=[&](uint64_t key,char* buf)->string_view{const size_t i=(size_t)(key&0xFFFFFFu);
+      if(i<m)return string_view(buf,text36_fast('k',dn::value_of(ctr[i],kc),buf));
+      const Click* const c=mkSide[i-m];return string_view(c->id,c->idlen);};
+     for(size_t r0=0;r0<mAll;){
+      const uint64_t t=K[r0]>>24;size_t r1=r0+1;
+      while(r1<mAll&&(K[r1]>>24)==t)++r1;
+      if(__builtin_expect(r1-r0>1,0)){ // (common for big users: click times are whole seconds and come in bursts)
+       bool slotsOnly=true;for(size_t q=r0;q<r1;++q)slotsOnly&=(size_t)(K[q]&0xFFFFFFu)<m;
+       if(slotsOnly){ // dense IDs: order36 of the ID's number orders as the texts do
+        const auto ord=[&](uint64_t key){return order36(dn::value_of(ctr[key&0xFFFFFFu],kc));};
+        if(r1-r0==2){if(ord(K[r0])<ord(K[r0+1]))swap(K[r0],K[r0+1]);}
+        else sort(K+r0,K+r1,[&](uint64_t x,uint64_t y){return ord(x)>ord(y);});
+       }
+       else sort(K+r0,K+r1,[&](uint64_t x,uint64_t y){char bx[16],by[16];return text_of(x,bx)>text_of(y,by);});
+      }
+      r0=r1;
+     }
+     for(size_t i=0;i<mAll;++i)out[i].key=src[K[i]&0xFFFFFFu];
+    }
+    char tmp[16];
+    sessionize_person(person_name(person,tmp),E,n,(const KeyOnly*)out,(const KeyOnly*)out+mAll);
+    ++rdMarkIdx;rdMarkEv+=n;rdMarkCl+=mAll;rdMarkRows+=nxe+nxc;
+    return true;
+   };
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
-   for(size_t i0=0;i0<idxEnd;i0+=ICH){
-    const size_t i1=min(idxEnd,i0+ICH);
+   for(size_t tn=0;tn<nTurns;++tn){
+    const size_t i0=turnLo[tn],i1=turnLo[tn+1];
     thr_chunk_in();
     for(size_t ix=i0;ix<i1;++ix){
      DInfo& f=info[ix];
      const uint32_t ec=f.ec.load(memory_order_relaxed),cc=f.cc.load(memory_order_relaxed);
      if(!(ec|cc))continue;
-     const bool general=f.general.load(memory_order_relaxed)!=0;
+     const bool general=f.general.load(memory_order_relaxed)!=0||(testMarkN&&ix%testMarkN==0);
      if(!ec&&!general)continue; // clicks of people without any event: nothing to write
      const size_t ef=ec?f.ef.load(memory_order_relaxed)-1:0,el=ec?f.el.load(memory_order_relaxed):0; // [ef, el)
      const size_t cf=cc?f.cf.load(memory_order_relaxed)-1:0,cl=cc?f.cl.load(memory_order_relaxed):0;
@@ -6845,6 +7022,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      bool fast=!general;
      int why=5; // why the index is handed over, if it is
      if(noFastN&&ix%noFastN==0){if(fast)why=7;fast=false;}
+     else if(__builtin_expect(general,0)&&ec&&!markedOld&&marked_index(ix,ec,cc,ef,el,cf,cl,stored))continue; // a marked index that is one person: finished
      size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;bool direct=false;
      const auto ctr_of=[&C,&direct,cf](uint32_t i)->uint32_t{return direct?(uint32_t)cf+i:C[i].present;}; // the counter of click i of C (before C is put in order)
      const uint64_t* SL=nullptr;uint64_t* mySL=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0; // SL: session entries "start << 24 | rows before", then the row count
@@ -7034,7 +7212,28 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         if(direct){FClick* const G=fastC.get(m+1);for(size_t i=0;i<m;++i){G[i]=C[i];G[i].present=(uint32_t)(cf+i);}C=G;direct=false;} // sorted in a copy that carries the counters
         const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
          return ta!=tb?ta<tb:order36(dn::value_of(a.present,kc))>order36(dn::value_of(b.present,kc));};
-        sort(C,C+m,before);
+        // The same order through keys "time << 24 | position" and counting passes: the sort above is n log n
+        // compares, and the biggest users have 50,000 clicks and more (SS_CLICKSORT=old: always that sort).
+        uint64_t allT=0;for(size_t i=0;i<m;++i)allT|=C[i].key>>16;
+        if(clickSortOld||wide||m>=(size_t(1)<<24)||(allT>>40)!=0)sort(C,C+m,before);
+        else{
+         uint64_t* K=clickKeys.get(m+1);
+         for(size_t i=0;i<m;++i)K[i]=((C[i].key>>16)<<24)|i;
+         K=time_pos_sort(K,clickKeys2.get(m+1),m,bigHist.data());
+         const auto ord=[&](uint64_t key){return order36(dn::value_of(C[key&0xFFFFFFu].present,dense.kc));};
+         for(size_t r0=0;r0<m;){ // clicks of one moment: the larger ID text first
+          const uint64_t t=K[r0]>>24;size_t r1=r0+1;
+          while(r1<m&&(K[r1]>>24)==t)++r1;
+          if(__builtin_expect(r1-r0>1,0)){
+           if(r1-r0==2){if(ord(K[r0])<ord(K[r0+1]))swap(K[r0],K[r0+1]);}
+           else sort(K+r0,K+r1,[&](uint64_t x,uint64_t y){return ord(x)>ord(y);});
+          }
+          r0=r1;
+         }
+         FClick* const S=fastC2.get(m+1);
+         for(size_t i=0;i<m;++i)S[i]=C[K[i]&0xFFFFFFu];
+         C=S;
+        }
        }
        else{
         for(size_t i=0;i<m;++i)keys[i]=((C[i].key>>16)<<32)|i;
@@ -7453,6 +7652,8 @@ __mark("AGGREGATE");
  if(slots&&stats){
   fprintf(stderr,"STATS dense reader: slots %llu events %llu clicks, fast lane %llu indexes %llu events %llu clicks, handed over %llu events %llu clicks, deferred indexes %llu\n",
    (unsigned long long)rdSlotEv,(unsigned long long)rdSlotCl,(unsigned long long)rdFastIdx,(unsigned long long)rdFastEv,(unsigned long long)rdFastCl,(unsigned long long)rdHandEv,(unsigned long long)rdHandCl,(unsigned long long)rdDeferIdx);
+  fprintf(stderr,"STATS marked indexes finished by the index pass: %llu indexes %llu events %llu clicks, %llu general-lane rows among them, %llu events taken out of line and merged back, %llu events fully sorted; %zu general-lane rows of dense users noted\n",
+   (unsigned long long)rdMarkIdx,(unsigned long long)rdMarkEv,(unsigned long long)rdMarkCl,(unsigned long long)rdMarkRows,(unsigned long long)rdMarkPulled,(unsigned long long)rdMarkSorted,genRefs.size());
   fprintf(stderr,"STATS handed-over events: table users %llu linked person, %llu alias 8+, %llu complex index (unlinked ID), %llu other text, %llu fallback; dense users %llu general-lane mark, %llu several persons, %llu test switch, %llu spread out\n",
    (unsigned long long)rdWhy[0],(unsigned long long)rdWhy[1],(unsigned long long)rdWhy[2],(unsigned long long)rdWhy[3],(unsigned long long)rdWhy[4],(unsigned long long)rdWhy[5],(unsigned long long)rdWhy[6],(unsigned long long)rdWhy[7],(unsigned long long)rdWhy[8]);
   fprintf(stderr,"STATS person buckets: %zu of 2^%u table persons, %zu of 2^%u dense persons\n",nA,shA,UPn-nA,shB);
