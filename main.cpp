@@ -5717,8 +5717,13 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // pass can then finish a marked index itself and take these rows along (see "marked indexes" there).
  // `person` is the row's person when it was passed on; a row that lost to an earlier copy afterwards holds its
  // bucket's tombstone number instead, which is never that person.
+ // The notes are meant for a handful of rows. Data in which such rows are common (not the generator's) gets at
+ // most genRefCap notes per thread; one thread reaching that switches the whole thing off (genRefOver), and
+ // marked indexes are handed to the general lane as they always were. SS_TEST_REFCAP=n: tests make it small.
  struct GRef{uint32_t ix,person;void* at;bool click;};
  vector<vector<GRef>> genRefT((size_t)T);
+ static const size_t genRefCap=[]{const char* v=getenv("SS_TEST_REFCAP");const long long x=v?atoll(v):(1ll<<18);return (size_t)(x<0?0:x);}();
+ atomic<bool> genRefOver{false};
  // ---- Dedup each ID bucket on its own; survivors go to person buckets. ----
  uint64_t dedupCount=0,surviving=0,survivingClicks=0;
  uint64_t stEvN=0,stEvDisp=0,stEvMax=0,stEvFalse=0,stClN=0,stClDisp=0,stClMax=0,stClFalse=0; // SS_STATS (the two "False" counts are always kept: they cost nothing)
@@ -5811,7 +5816,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        __builtin_prefetch((const char*)out+ahead,1,3); // every time: testing for a new cache line would be an unpredictable branch
        out->k=rk-PR_KBIAS; // otherwise already in its final form
        memcpy((void*)&out->person,&w,8);
-       if(__builtin_expect(markedIx!=~0u,0))myRefs.push_back(GRef{markedIx,(uint32_t)w,(void*)out,false});
+       if(__builtin_expect(markedIx!=~0u,0)){if(myRefs.size()<genRefCap)myRefs.push_back(GRef{markedIx,(uint32_t)w,(void*)out,false});else genRefOver.store(true,memory_order_relaxed);}
       }
      }
      next_event:;
@@ -5867,7 +5872,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       Click* const out=myCl[bkt].slot(pool);
       __builtin_prefetch((const char*)out+ahead,1,3);
       out->key=r->key;out->id=r->id;out->person=u;out->idlen=r->idlen;
-      if(__builtin_expect(markedIx!=~0u,0))myRefs.push_back(GRef{markedIx,u,(void*)out,true});
+      if(__builtin_expect(markedIx!=~0u,0)){if(myRefs.size()<genRefCap)myRefs.push_back(GRef{markedIx,u,(void*)out,true});else genRefOver.store(true,memory_order_relaxed);}
      }
      next_click:;
     }
@@ -5882,7 +5887,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  if(stats)fprintf(stderr,"STATS event dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\nSTATS click dedup: %llu IDs, displacement avg %.3f max %llu, tag matches of different IDs %llu\n",
   (unsigned long long)stEvN,stEvN?(double)stEvDisp/stEvN:0.0,(unsigned long long)stEvMax,(unsigned long long)stEvFalse,(unsigned long long)stClN,stClN?(double)stClDisp/stClN:0.0,(unsigned long long)stClMax,(unsigned long long)stClFalse);
  vector<GRef> genRefs; // all threads' notes, by user index
- for(const auto& v:genRefT)genRefs.insert(genRefs.end(),v.begin(),v.end());
+ const bool genRefsComplete=!genRefOver.load(); // every general-lane row of a dense user has its note
+ if(genRefsComplete)for(const auto& v:genRefT)genRefs.insert(genRefs.end(),v.begin(),v.end());
+ genRefT.clear();genRefT.shrink_to_fit();
  sort(genRefs.begin(),genRefs.end(),[](const GRef& a,const GRef& b){return a.ix!=b.ix?a.ix<b.ix:a.click!=b.click?a.click<b.click:(uintptr_t)a.at<(uintptr_t)b.at;});
  size_t maxEvPerson=0,maxClPerson=0; // most survivors in one person bucket
  for(size_t up=0;up<UPn;++up){size_t ne=0,nc=0;for(int t=0;t<T;++t){ne+=surv[t].ev[up].size();nc+=surv[t].cl[up].size();}
@@ -6466,6 +6473,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    // over as before. SS_MARKED=old: marked indexes are always handed over. SS_SEVERAL=old: indexes with
    // several persons are.
    static const bool markedOld=[]{const char* v=getenv("SS_MARKED");return v&&!strcmp(v,"old");}();
+   const bool markedOn=!markedOld&&genRefsComplete; // (without the notes a marked index cannot be finished here)
    struct KeyOnly{uint64_t key;};
    Scratch<Ev> mkE,mkX;Scratch<uint64_t> mkK,mkK2,mkSrc;Scratch<uint32_t> mkCtr;Scratch<KeyOnly> mkOut;
    mkE.pool=mkX.pool=&pool;mkK.pool=mkK2.pool=mkSrc.pool=&pool;mkCtr.pool=&pool;mkOut.pool=&pool;
@@ -6646,7 +6654,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
      bool fast=!general;
      int why=5; // why the index is handed over, if it is
      if(noFastN&&ix%noFastN==0){if(fast)why=7;fast=false;}
-     else if(__builtin_expect(general,0)&&ec&&!markedOld&&marked_index(ix,ec,cc,ef,el,cf,cl,stored))continue; // a marked index that is one person: finished
+     else if(__builtin_expect(general,0)&&ec&&markedOn&&marked_index(ix,ec,cc,ef,el,cf,cl,stored))continue; // a marked index: finished here
      size_t n=0,m=0;Ev* E=nullptr;FClick* C=nullptr;uint32_t root=0;bool direct=false;
      const auto ctr_of=[&C,&direct,cf](uint32_t i)->uint32_t{return direct?(uint32_t)cf+i:C[i].present;}; // the counter of click i of C (before C is put in order)
      const uint64_t* SL=nullptr;uint64_t* mySL=nullptr;const uint64_t* pur=nullptr;size_t ns=0;uint64_t disorder=0; // SL: session entries "start << 24 | rows before", then the row count
@@ -7277,8 +7285,8 @@ __mark("AGGREGATE");
  if(slots&&stats){
   fprintf(stderr,"STATS dense reader: slots %llu events %llu clicks, fast lane %llu indexes %llu events %llu clicks, handed over %llu events %llu clicks, deferred indexes %llu\n",
    (unsigned long long)rdSlotEv,(unsigned long long)rdSlotCl,(unsigned long long)rdFastIdx,(unsigned long long)rdFastEv,(unsigned long long)rdFastCl,(unsigned long long)rdHandEv,(unsigned long long)rdHandCl,(unsigned long long)rdDeferIdx);
-  fprintf(stderr,"STATS marked indexes finished by the index pass: %llu indexes %llu persons %llu events %llu clicks, %llu general-lane rows among them, %llu events taken out of line and merged back, %llu events fully sorted; %zu general-lane rows of dense users noted\n",
-   (unsigned long long)rdMarkIdx,(unsigned long long)rdMarkPersons,(unsigned long long)rdMarkEv,(unsigned long long)rdMarkCl,(unsigned long long)rdMarkRows,(unsigned long long)rdMarkPulled,(unsigned long long)rdMarkSorted,genRefs.size());
+  fprintf(stderr,"STATS marked indexes finished by the index pass: %llu indexes %llu persons %llu events %llu clicks, %llu general-lane rows among them, %llu events taken out of line and merged back, %llu events fully sorted; %zu general-lane rows of dense users noted%s\n",
+   (unsigned long long)rdMarkIdx,(unsigned long long)rdMarkPersons,(unsigned long long)rdMarkEv,(unsigned long long)rdMarkCl,(unsigned long long)rdMarkRows,(unsigned long long)rdMarkPulled,(unsigned long long)rdMarkSorted,genRefs.size(),genRefsComplete?"":" (too many: notes dropped, marked indexes handed over)");
   fprintf(stderr,"STATS handed-over events: table users %llu linked person, %llu alias 8+, %llu complex index (unlinked ID), %llu other text, %llu fallback; dense users %llu general-lane mark, %llu several persons, %llu test switch, %llu spread out\n",
    (unsigned long long)rdWhy[0],(unsigned long long)rdWhy[1],(unsigned long long)rdWhy[2],(unsigned long long)rdWhy[3],(unsigned long long)rdWhy[4],(unsigned long long)rdWhy[5],(unsigned long long)rdWhy[6],(unsigned long long)rdWhy[7],(unsigned long long)rdWhy[8]);
   fprintf(stderr,"STATS person buckets: %zu of 2^%u table persons, %zu of 2^%u dense persons\n",nA,shA,UPn-nA,shB);
