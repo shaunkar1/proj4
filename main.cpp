@@ -8329,12 +8329,14 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  //            goes with the process). No worker waits in munmap, and a worker's mmap waits for one step at most.
  //   bgfirst  the helper takes the event files only; the rest as today.
  //   late     the workers unmap everything after the last loop, nothing before the index loop.
- //   end      (default) nothing is unmapped while anybody computes: every worker, once its own output file is
- //            written and closed, takes pieces of 32 MB of ALL input mappings until none is left. With bg the
- //            helper only started when the last loop was over, so nearly all of the input (5.7 GB of mapped
- //            files at 60M rows) was left to process exit, which tears mappings down on one thread.
+ //   end      nothing is unmapped while anybody computes: every worker, once its own output file is written
+ //            and closed, takes pieces of 32 MB of ALL input mappings until none is left. (With bg the helper
+ //            only starts when the last loop is over on v5 data - long names point into the event files - so
+ //            nearly all of the input, 5.7 GB of mapped files at 60M rows, is left to process exit, which tears
+ //            mappings down on one thread: the 9 / 27 ms of "exit" at 20M / 60M.) To be A/B-ed on the scoring
+ //            machine before it becomes the default: parallel munmap cost more CPU than exit in the workers mode.
  vector<pair<char*,size_t>> unmapLastBg,unmapEnd;
- {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=w=="bg"?1:w=="bgfirst"?2:w=="late"?3:w=="workers"?0:4; // bg was the default up to cand73 (scoring machine: DENSE -3 ms, AGGREGATE -4 ms at 20M against workers; -10 and -13 at 60M); SS_UNMAP=workers = the workers unmap
+ {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=w=="end"?4:w=="bgfirst"?2:w=="late"?3:w=="workers"?0:1; // default bg (scoring machine: DENSE -3 ms, AGGREGATE -4 ms at 20M against workers; -10 and -13 at 60M); SS_UNMAP=workers = the workers unmap; SS_UNMAP=end is NOT measured there yet
   const auto unmap_bg=[](vector<pair<char*,size_t>> v){if(v.empty())return;
    thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();};
   // SS_POOLPRE=1 (measuring switch): every thread's pool gets its next region here, before any unmapping starts,
