@@ -1578,6 +1578,275 @@ SS_V3I bool parse36x2_v3(const char* sa,unsigned na,const char* sb,unsigned nb,u
  return (bool)_mm_testz_si128(bad,bad);
 }
 static inline __attribute__((always_inline)) bool parse36x2_ok(uint64_t y,unsigned m){return y-MIN36[m]<=SPAN36[m];}
+// ==== lk8: the link kernel (text of vert/lk8.h, agent K) ====
+// lk8.h - the link kernel: eight link lines per call, one per lane (agent K, 2026-11-21). Text to paste into main.cpp.
+//
+// A link line is `user_id_a,user_id_b`. The links stage (DENSE.md, stage 2) calls a line SIMPLE if both IDs are dense
+// user IDs (canonical 'u' + base 36, user index below limI) with aliases 0-7 of the same user index. lk8 finds the
+// simple lines; every other line is refused and stays with the line code of main.cpp (link_split + link_dense), unchanged.
+//
+// CONTRACT  lk8_v5(lp, klim, c, o) / lk8_ref (the scalar twin: same contract, plain code, same outputs bit for bit)
+//   lp[0..7]    line starts, one per lane. lp[i] must be a true line start with at least 96 readable bytes.
+//   klim[0..7]  a lane with lp[i] >= klim[i] is dead: nothing is reported for it and lp[i] stays (it is still read).
+//   c           ku = the user key (dense.ku), limU = min(limI, 2^31) << 9 (a counter below it has an index below limI).
+//   o.ok        bit i: lane i is live and its line is a simple line as link_split + link_dense see it: exactly two fields,
+//               each `u` + 1-8 canonical base-36 digits below 2^40 (bare, or the whole field wrapped in quotes), both user
+//               indexes below limI and equal, both aliases 0-7. Then o.idx[i] = the index, o.aa[i] / o.ab[i] = the two
+//               aliases, and lp[i] has been moved to the start of the next line (the byte after the line's newline).
+//   o.un        the ok lanes with aa != ab (the lines that are a union).
+//   o.rec[i]    for a union lane: idx << 5 | pair number of the two aliases, lk_pair(lo, hi) = hi*(hi-1)/2 + lo (0..27;
+//               LK_PAIR_LO / LK_PAIR_HI turn it back). It fits 32 bits when idx < 2^27. Unspecified for other lanes.
+//   o.bk[i]     for a union lane: (idx >> LK_BLOCK_BITS) & c.bmask, the bucket of the index; c.btrash for every other lane.
+//   o.slow      bit i: lane i is live and the line was refused: lp[i] is unchanged, the caller's line code decides
+//               everything about the line, including where the next one starts.
+//   o.idx[i]    0 for every lane that is not ok (so it can be used as a prefetch address without a test).
+//   o.mx[0..7]  running maximum of the indexes of ok lines, per lane; the caller zeroes it before the first call.
+// Why accept => same fields as link_split: P = first comma and L = first newline of the 64 bytes at lp[i]. Field a is
+// bytes [0,P), field b is bytes (P,L). Every byte of both is checked: an optional opening quote, the letter, N digits
+// (N = field length - 1 - 2*quoted), and for a quoted field the closing quote as its last byte. So the line has one
+// comma, quotes only around whole fields, both fields non-empty, and L <= 23: link_split's two-compare path returns
+// these two fields and next = lp[i]+L+1. (A newline before the comma, a missing comma, a second comma, a quote in
+// the wrong place, an empty field, \r, upper case: some checked byte is not a base-36 digit, or a length is out of range.)
+// Reads: 64 bytes at lp[i], 16 bytes at lp[i]+P+1 with P <= 64, i.e. below lp[i]+82. No read before lp[i].
+// CPU: AVX-512 F+BW+DQ+VL+CD, BMI1 (lk_has512). No gather instructions. Real calls, not always_inline.
+#ifndef LK8_H
+#define LK8_H
+namespace vlk{
+#define VLK_T5 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512cd,avx2,bmi,bmi2,lzcnt,popcnt")))
+static constexpr uint64_t MASK40=(1ull<<40)-1;
+static constexpr uint64_t M1=0x9E3779B97F4Bull&MASK40,M2=0xD6E8FEB86659ull&MASK40;
+static constexpr uint64_t inv40(uint64_t a){uint64_t x=a;for(int i=0;i<6;++i)x*=2-a*x;return x&MASK40;}
+static constexpr uint64_t I1=inv40(M1),I2=inv40(M2);
+static constexpr unsigned LK_GEN_ALIAS_BITS=9,LK_ALIAS_BITS=3; // main.cpp: dn::GEN_ALIAS_BITS, dn::ALIAS_BITS
+static constexpr unsigned LK_BLOCK_BITS=12; // 4096 user indexes (16 KB of component words) per block; blocks go to buckets in turn
+struct LkConst{uint64_t ku,limU,bmask,btrash;}; // bmask = buckets - 1 (a power of two), btrash = the bucket number for lanes without a union
+static inline LkConst lk_const(uint64_t ku,uint64_t limI,uint64_t buckets){
+ return {ku,(limI<(1ull<<(40-LK_GEN_ALIAS_BITS))?limI:(1ull<<(40-LK_GEN_ALIAS_BITS)))<<LK_GEN_ALIAS_BITS,buckets-1,buckets};
+}
+static constexpr uint64_t lk_pair(uint64_t lo,uint64_t hi){return hi*(hi-1)/2+lo;}
+static constexpr uint8_t LK_PAIR_LO[28]={0, 0,1, 0,1,2, 0,1,2,3, 0,1,2,3,4, 0,1,2,3,4,5, 0,1,2,3,4,5,6};
+static constexpr uint8_t LK_PAIR_HI[28]={1, 2,2, 3,3,3, 4,4,4,4, 5,5,5,5,5, 6,6,6,6,6,6, 7,7,7,7,7,7,7};
+struct alignas(64) LkOut{uint64_t idx[8],aa[8],ab[8],mx[8],rec[8],bk[8];uint8_t ok,un,slow;};
+static inline bool lk_has512(){
+ static const bool h=__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512dq")&&__builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx512cd")&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("lzcnt")&&__builtin_cpu_supports("popcnt");
+ return h;
+}
+// ---- the scalar twin (the definition; also what runs under SS_LINKS=ref and in valgrind) ----
+// One field of f bytes at s (16 readable): true if it is `u` + canonical base 36 below 2^40, bare or quoted; ctr = its counter.
+static inline bool lk_field_ref(const unsigned char* s,uint64_t f,uint64_t key,uint64_t& ctr){
+ if(f<2||f>11)return false;
+ const unsigned z=s[0]=='"';
+ if(z&&(f<4||s[f-1]!='"'))return false;
+ if(s[z]!='u')return false;
+ const uint64_t n=f-1-2*z; // digits
+ if(n<1||n>8)return false;
+ const unsigned char* d=s+z+1;
+ if(d[0]=='0'&&n>1)return false;
+ uint64_t v=0;
+ for(uint64_t i=0;i<n;++i){unsigned x=(unsigned)d[i]-(unsigned)'0';if(x>9){x=(unsigned)d[i]-(unsigned)'a';if(x>25)return false;x+=10;}v=v*36+x;}
+ if(v>MASK40)return false;
+ uint64_t m=(v*I2)&MASK40;m^=(m>>17)^(m>>34);
+ ctr=((m^key)*I1)&MASK40;return true;
+}
+static inline void lk8_ref(const char** lp,const char* const* klim,const LkConst& c,LkOut& o){
+ unsigned ok=0,un=0,slow=0;
+ for(int i=0;i<8;++i){
+  o.idx[i]=0;o.aa[i]=0;o.ab[i]=0;o.rec[i]=0;o.bk[i]=c.btrash;
+  const unsigned char* p=(const unsigned char*)lp[i];
+  if((const char*)p>=klim[i])continue;
+  uint64_t P=64,L=64;
+  for(uint64_t k=0;k<64;++k)if(p[k]==','){P=k;break;}
+  for(uint64_t k=0;k<64;++k)if(p[k]=='\n'){L=k;break;}
+  uint64_t ca=0,cb=0;
+  const bool good=P<L&&lk_field_ref(p,P,c.ku,ca)&&lk_field_ref(p+P+1,L-P-1,c.ku,cb)&&ca<c.limU&&cb<c.limU
+   &&(ca>>LK_GEN_ALIAS_BITS)==(cb>>LK_GEN_ALIAS_BITS)&&(ca&((1u<<LK_GEN_ALIAS_BITS)-1))<(1u<<LK_ALIAS_BITS)&&(cb&((1u<<LK_GEN_ALIAS_BITS)-1))<(1u<<LK_ALIAS_BITS);
+  if(!good){slow|=1u<<i;continue;}
+  ok|=1u<<i;
+  o.idx[i]=ca>>LK_GEN_ALIAS_BITS;o.aa[i]=ca&((1u<<LK_ALIAS_BITS)-1);o.ab[i]=cb&((1u<<LK_ALIAS_BITS)-1);
+  if(o.aa[i]!=o.ab[i]){un|=1u<<i;
+   const uint64_t lo=o.aa[i]<o.ab[i]?o.aa[i]:o.ab[i],hi=o.aa[i]<o.ab[i]?o.ab[i]:o.aa[i];
+   o.rec[i]=o.idx[i]<<5|lk_pair(lo,hi);o.bk[i]=(o.idx[i]>>LK_BLOCK_BITS)&c.bmask;}
+  if(o.idx[i]>o.mx[i])o.mx[i]=o.idx[i];
+  lp[i]=(const char*)p+L+1;
+ }
+ o.ok=(uint8_t)ok;o.un=(uint8_t)un;o.slow=(uint8_t)slow;
+}
+// ---- the AVX-512 kernel ----
+// constants, one 8-byte entry each, broadcast from memory (read through a pointer the compiler cannot see through, so
+// that it does not rebuild them in registers on every use)
+static const uint64_t LKK[]={
+ /*0*/ 64,
+ /*1*/ 0x3030303030303030ull,           // eight '0'
+ /*2*/ 0x3030303030303030ull,           // '0' per byte
+ /*3*/ 0x6161616161616161ull,           // 'a' per byte
+ /*4*/ 0x0909090909090909ull,
+ /*5*/ 0x1919191919191919ull,           // 25
+ /*6*/ 0xA9A9A9A9A9A9A9A9ull,           // 10-'a'
+ /*7*/ 0x0124012401240124ull,           // bytes 36,1
+ /*8*/ 0x0001051000010510ull,           // words 1296,1
+ /*9*/ 1679616ull,                      // 36^4
+ /*10*/ MASK40,
+ /*11*/ I2,
+ /*12*/ I1,
+ /*13*/ 0xFFull,
+ /*14*/ 0xFFFFull,
+ /*15*/ 0x75ull,                        // 'u'
+ /*16*/ 0x7522ull,                      // '"' then 'u'
+ /*17*/ 0x22ull,                        // '"'
+ /*18*/ 8,
+ /*19*/ 16,
+ /*20*/ 1,
+ /*21*/ 3,
+ /*22*/ ~7ull,                          // counter bits that must agree: everything above the low three alias bits
+ /*23*/ (uint64_t)(((1u<<LK_GEN_ALIAS_BITS)-1)&~((1u<<LK_ALIAS_BITS)-1)), // alias bits that must be zero (alias < 8)
+ /*24*/ 7,
+};
+alignas(64) static const uint64_t LKV[]={
+ /*0*/ 78364164096ull,0,36,1296,46656,1679616,60466176,2176782336ull, // MIN36[n] by the low three bits of n
+ /*8*/ 0,2,4,6,8,10,12,14,
+ /*16*/ 1,3,5,7,9,11,13,15,
+ /*24*/ 0,0,1,3,6,10,15,21,                                           // hi*(hi-1)/2
+};
+static inline __attribute__((always_inline)) const uint64_t* lkk_ptr(){const uint64_t* p=LKK;__asm__("":"+r"(p));return p;}
+static inline __attribute__((always_inline)) const uint64_t* lkv_ptr(){const uint64_t* p=LKV;__asm__("":"+r"(p));return p;}
+#define VLK_K(i) _mm512_set1_epi64((long long)K[i])
+// One field per lane: lo / hi = its first 16 bytes, F = its length. Returns the counter; ok = `u` + canonical base 36
+// below 2^40 (bare or quoted) with a counter below limU.
+VLK_T5 static inline __attribute__((always_inline)) __m512i lk_field_v5(__m512i lo,__m512i hi,__m512i F,const uint64_t* K,const uint64_t* V,const LkConst& c,__mmask8& okOut){
+ const __m512i c64=VLK_K(0),c8=VLK_K(18),ff=VLK_K(13);
+ const __mmask8 kq=_mm512_cmpeq_epi64_mask(_mm512_and_si512(lo,VLK_K(14)),VLK_K(16)); // starts with `"u`
+ const __mmask8 kb=_mm512_cmpeq_epi64_mask(_mm512_and_si512(lo,ff),VLK_K(15));        // starts with `u`
+ const __m512i s=_mm512_mask_mov_epi64(c8,kq,VLK_K(19));                               // bits to the first digit
+ const __m512i W=_mm512_or_si512(_mm512_srlv_epi64(lo,s),_mm512_sllv_epi64(hi,_mm512_sub_epi64(c64,s))); // the 8 bytes from the first digit
+ const __m512i N=_mm512_sub_epi64(F,_mm512_mask_mov_epi64(VLK_K(20),kq,VLK_K(21)));   // digits = F - 1 - 2*quoted
+ // closing quote of a quoted field: byte F-1 of the sixteen (a shift count of 64 or more gives zero)
+ const __m512i t=_mm512_sub_epi64(_mm512_slli_epi64(F,3),c8);
+ const __m512i cq=_mm512_or_si512(_mm512_srlv_epi64(lo,t),_mm512_srlv_epi64(hi,_mm512_sub_epi64(t,c64)));
+ const __mmask8 kc=_mm512_mask_cmpeq_epi64_mask(kq,_mm512_and_si512(cq,ff),VLK_K(17));
+ const __mmask8 shape=_kor_mask8(kb,kc);
+ // the digits: moved so that the last one is the top byte, '0' below the first; n = 0 gives val = 0 < MIN36[8] (the entry
+ // n & 7 == 0 picks), n >= 9 or negative gives x = 0, and a zero byte is not a digit
+ const __m512i n8=_mm512_slli_epi64(N,3);
+ const __m512i x=_mm512_or_si512(_mm512_sllv_epi64(W,_mm512_sub_epi64(c64,n8)),_mm512_srlv_epi64(VLK_K(1),n8));
+ const __m512i tt=_mm512_sub_epi8(x,VLK_K(2)),u=_mm512_sub_epi8(x,VLK_K(3));
+ const __m512i bad=_mm512_min_epu8(_mm512_subs_epu8(tt,VLK_K(4)),_mm512_subs_epu8(u,VLK_K(5)));
+ const __m512i d=_mm512_min_epu8(tt,_mm512_add_epi8(x,VLK_K(6)));
+ const __m512i p2=_mm512_maddubs_epi16(d,VLK_K(7));
+ const __m512i p4=_mm512_madd_epi16(p2,VLK_K(8));
+ const __m512i val=_mm512_add_epi64(_mm512_mul_epu32(p4,VLK_K(9)),_mm512_srli_epi64(p4,32));
+ const __m512i min36=_mm512_permutexvar_epi64(N,_mm512_load_si512((const void*)V));
+ const __m512i mask=VLK_K(10);
+ __mmask8 ok=_mm512_mask_testn_epi64_mask(shape,bad,bad);
+ ok=_mm512_mask_cmpge_epu64_mask(ok,val,min36);
+ ok=_mm512_mask_cmple_epu64_mask(ok,val,mask);
+ __m512i m=_mm512_and_si512(_mm512_mullo_epi64(val,VLK_K(11)),mask);
+ m=_mm512_ternarylogic_epi64(m,_mm512_srli_epi64(m,17),_mm512_srli_epi64(m,34),0x96);
+ m=_mm512_xor_si512(m,_mm512_set1_epi64((long long)c.ku));
+ const __m512i ctr=_mm512_and_si512(_mm512_mullo_epi64(m,VLK_K(12)),mask);
+ okOut=_mm512_mask_cmplt_epu64_mask(ok,ctr,_mm512_set1_epi64((long long)c.limU));
+ return ctr;
+}
+VLK_T5 [[gnu::noinline]] static void lk8_v5(const char** lp,const char* const* klim,const LkConst& c,LkOut& o){
+ const uint64_t* const K=lkk_ptr();const uint64_t* const V=lkv_ptr();
+ alignas(64) uint64_t PL[16]; // P of the eight lanes, then L
+ alignas(64) uint64_t AB[32]; // the first 16 bytes of field a of each lane, then of field b
+ const __m512i vnl=_mm512_set1_epi8('\n'),vc=_mm512_set1_epi8(',');
+ for(int i=0;i<8;++i){
+  const char* const p=lp[i];
+  const __m512i x=_mm512_loadu_si512((const void*)p);
+  const uint64_t L=_tzcnt_u64(_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vnl))),P=_tzcnt_u64(_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc)));
+  PL[i]=P;PL[8+i]=L;
+  _mm_store_si128((__m128i*)(AB+2*i),_mm512_castsi512_si128(x));
+  _mm_store_si128((__m128i*)(AB+16+2*i),_mm_loadu_si128((const __m128i*)(p+P+1)));
+ }
+ const uint64_t* pl=PL;const uint64_t* ab=AB;__asm__("":"+r"(pl),"+r"(ab)::"memory"); // the vector part reads what the loop stored
+ const __m512i Pv=_mm512_load_si512((const void*)pl),Lv=_mm512_load_si512((const void*)(pl+8));
+ const __m512i ie=_mm512_load_si512((const void*)(V+8)),io=_mm512_load_si512((const void*)(V+16));
+ const __m512i Z0=_mm512_load_si512((const void*)ab),Z1=_mm512_load_si512((const void*)(ab+8));
+ const __m512i Z2=_mm512_load_si512((const void*)(ab+16)),Z3=_mm512_load_si512((const void*)(ab+24));
+ const __m512i Alo=_mm512_permutex2var_epi64(Z0,ie,Z1),Ahi=_mm512_permutex2var_epi64(Z0,io,Z1);
+ const __m512i Blo=_mm512_permutex2var_epi64(Z2,ie,Z3),Bhi=_mm512_permutex2var_epi64(Z2,io,Z3);
+ const __m512i one=VLK_K(20);
+ __mmask8 oka,okb;
+ const __m512i ca=lk_field_v5(Alo,Ahi,Pv,K,V,c,oka);
+ const __m512i cb=lk_field_v5(Blo,Bhi,_mm512_sub_epi64(_mm512_sub_epi64(Lv,Pv),one),K,V,c,okb);
+ const __m512i LP=_mm512_loadu_si512((const void*)lp);
+ __mmask8 ok=_mm512_mask_cmplt_epu64_mask(_kand_mask8(oka,okb),LP,_mm512_loadu_si512((const void*)klim));
+ const __mmask8 live=_mm512_cmplt_epu64_mask(LP,_mm512_loadu_si512((const void*)klim));
+ ok=_mm512_mask_testn_epi64_mask(ok,_mm512_xor_si512(ca,cb),VLK_K(22)); // same index (and then alias b < 8 if alias a is)
+ ok=_mm512_mask_testn_epi64_mask(ok,ca,VLK_K(23));                       // alias a < 8
+ const __m512i idx=_mm512_maskz_srli_epi64(ok,ca,LK_GEN_ALIAS_BITS);
+ const __m512i a7=VLK_K(24),aa=_mm512_and_si512(ca,a7),ab7=_mm512_and_si512(cb,a7);
+ _mm512_store_si512((void*)o.idx,idx);
+ _mm512_store_si512((void*)o.aa,aa);
+ _mm512_store_si512((void*)o.ab,ab7);
+ _mm512_store_si512((void*)o.mx,_mm512_max_epu64(_mm512_load_si512((const void*)o.mx),idx));
+ _mm512_mask_storeu_epi64((void*)lp,ok,_mm512_add_epi64(_mm512_add_epi64(LP,Lv),one));
+ const __mmask8 un=_mm512_mask_cmpneq_epi64_mask(ok,aa,ab7);
+ const __m512i tri=_mm512_permutexvar_epi64(_mm512_max_epu64(aa,ab7),_mm512_load_si512((const void*)(V+24)));
+ _mm512_store_si512((void*)o.rec,_mm512_or_si512(_mm512_slli_epi64(idx,5),_mm512_add_epi64(tri,_mm512_min_epu64(aa,ab7))));
+ _mm512_store_si512((void*)o.bk,_mm512_mask_and_epi64(_mm512_set1_epi64((long long)c.btrash),un,_mm512_srli_epi64(idx,LK_BLOCK_BITS),_mm512_set1_epi64((long long)c.bmask)));
+ o.ok=(uint8_t)_cvtmask8_u32(ok);
+ o.un=(uint8_t)_cvtmask8_u32(un);
+ o.slow=(uint8_t)_cvtmask8_u32(_kandn_mask8(ok,live));
+}
+#undef VLK_K
+// ---- the unions of one bucket (second step) ----
+// comp = the alias words (main.cpp: denseComp; see comp_union there for the format: three bits per alias = alias XOR the
+// smallest alias of its group). Each record (LkOut::rec) is one union. The caller is the only thread that changes the
+// words these records name while the call runs.
+static constexpr uint32_t LK_IDENT=0xFAC688u; // main.cpp: COMP_IDENT
+static inline __attribute__((always_inline)) void lk_union1(uint32_t* comp,uint32_t rec){ // the arithmetic of comp_union, plain load and store
+ const uint32_t a=LK_PAIR_LO[rec&31],b=LK_PAIR_HI[rec&31];uint32_t& c=comp[rec>>5];
+ const uint32_t w=c^LK_IDENT,ra=(w>>(3*a))&7,rb=(w>>(3*b))&7;
+ if(ra==rb)return;
+ const uint32_t lo=ra<rb?ra:rb,hi=ra<rb?rb:ra,F=0x249249u,x=w^(hi*F),eq=~(x|(x>>1)|(x>>2))&F;
+ c=(w^((hi^lo)*eq))^LK_IDENT;
+}
+static inline void lk_union_ref(uint32_t* comp,const uint32_t* b,const uint32_t* e){for(;b<e;++b)lk_union1(comp,*b);}
+alignas(64) static const uint32_t LKU[]={
+ /*0*/  0,0,3,0,3,6,0,3,6,9,0,3,6,9,12,0,   3,6,9,12,15,0,3,6,9,12,15,18,0,0,0,0,                 // 3 * LK_PAIR_LO[t]
+ /*32*/ 3,6,6,9,9,9,12,12,12,12,15,15,15,15,15,18,   18,18,18,18,18,21,21,21,21,21,21,21,0,0,0,0, // 3 * LK_PAIR_HI[t]
+ /*64*/ 0,0x249249u,2*0x249249u,3*0x249249u,4*0x249249u,5*0x249249u,6*0x249249u,7*0x249249u,0,0,0,0,0,0,0,0, // root * F
+};
+// Sixteen records per turn: the sixteen words are read one by one (no gather instruction), changed together and written
+// back one by one. Two records of one turn that name the same index would not see each other's result, so a turn with
+// a repeated index (vpconflictd) is done one record at a time, like the last n mod 16 records. A record whose two
+// aliases are already in one group writes its word back unchanged.
+VLK_T5 [[gnu::noinline]] static void lk_union_v5(uint32_t* comp,const uint32_t* b,const uint32_t* e){
+ const uint32_t* U=LKU;__asm__("":"+r"(U));
+ const __m512i salo=_mm512_load_si512((const void*)U),sahi=_mm512_load_si512((const void*)(U+16));
+ const __m512i sblo=_mm512_load_si512((const void*)(U+32)),sbhi=_mm512_load_si512((const void*)(U+48));
+ const __m512i hf=_mm512_load_si512((const void*)(U+64));
+ const __m512i ident=_mm512_set1_epi32((int)LK_IDENT),F=_mm512_set1_epi32(0x249249),c31=_mm512_set1_epi32(31),c7=_mm512_set1_epi32(7);
+ for(;e-b>=16;b+=16){
+  const __m512i R=_mm512_loadu_si512((const void*)b),idx=_mm512_srli_epi32(R,5);
+  const __m512i cf=_mm512_conflict_epi32(idx);
+  if(__builtin_expect(_mm512_test_epi32_mask(cf,cf)!=0,0)){for(int i=0;i<16;++i)lk_union1(comp,b[i]);continue;}
+  alignas(64) uint32_t IX[16],W[16];
+  _mm512_store_si512((void*)IX,idx);
+  {const uint32_t* ix=IX;__asm__("":"+r"(ix)::"memory");
+   for(int i=0;i<16;++i){uint32_t v=comp[ix[i]];__asm__("":"+r"(v));W[i]=v;}} // (the empty asm keeps these loads scalar)
+  const uint32_t* wp=W;__asm__("":"+r"(wp)::"memory");
+  const __m512i w=_mm512_xor_si512(_mm512_load_si512((const void*)wp),ident);
+  const __m512i t=_mm512_and_si512(R,c31);
+  const __m512i ra=_mm512_and_si512(_mm512_srlv_epi32(w,_mm512_permutex2var_epi32(salo,t,sahi)),c7);
+  const __m512i rb=_mm512_and_si512(_mm512_srlv_epi32(w,_mm512_permutex2var_epi32(sblo,t,sbhi)),c7);
+  const __m512i lo=_mm512_min_epu32(ra,rb),hi=_mm512_max_epu32(ra,rb);
+  const __m512i x=_mm512_xor_si512(w,_mm512_permutexvar_epi32(hi,hf));
+  const __m512i eq=_mm512_and_si512(_mm512_ternarylogic_epi32(x,_mm512_srli_epi32(x,1),_mm512_srli_epi32(x,2),0x01),F); // fields equal to hi
+  const __m512i w2=_mm512_xor_si512(w,_mm512_mullo_epi32(eq,_mm512_xor_si512(hi,lo)));
+  alignas(64) uint32_t O[16];
+  _mm512_store_si512((void*)O,_mm512_xor_si512(w2,ident));
+  {const uint32_t* ix=IX;const uint32_t* op=O;__asm__("":"+r"(ix),"+r"(op)::"memory");
+   for(int i=0;i<16;++i){uint32_t v=op[i];__asm__("":"+r"(v));comp[ix[i]]=v;}}
+ }
+ for(;b<e;++b)lk_union1(comp,*b);
+}
+} // namespace vlk
+#endif
+static_assert(vlk::MASK40==dn::MASK&&vlk::I1==dn::I1&&vlk::I2==dn::I2&&vlk::LK_GEN_ALIAS_BITS==dn::GEN_ALIAS_BITS&&vlk::LK_ALIAS_BITS==dn::ALIAS_BITS&&vlk::LK_IDENT==COMP_IDENT);
+// ==== end of lk8 ====
 // ---- Links stage helpers ----
 // The two IDs of a link line as dense user IDs: da / db say whether each is one (canonical 'u' + base 36,
 // user index below the limit; any alias), ia / ib and aa / ab are their user indexes and aliases.
@@ -4947,10 +5216,26 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  __mark("KEYS");
  // ---- Linked IDs: parse link files in parallel, intern both IDs lock-free, union with compare-and-swap. ----
  vector<Chunk> linkChunks;uint64_t linkLines=0,linkBytes=0,linkFileCount=0;
+ // SS_LINKS: how the first pass over the link files finds the simple lines (dense users only; see the pass).
+ //   (unset)  eight lanes + the AVX-512 kernel vlk::lk8_v5 where the CPU has it (not under SS_ISA=sse2); else as "old"
+ //   old      one line after the other through link_split + link_dense
+ //   ref      eight lanes + the kernel's scalar twin vlk::lk8_ref (any CPU; for tests and instruction counts)
+ //   check / refcheck  as the default / as ref, and every line the kernel takes is compared with what link_split +
+ //            link_dense say about it (abort on a difference); counts under SS_STATS
+ //   cas      as the default, but every union is applied at once with comp_union (compare-and-swap), one kernel call
+ //            behind its prefetch, instead of going through the bucket lists
+ const char* const lkMode=getenv("SS_LINKS");const string_view lkm(lkMode?lkMode:"");
+ const bool lkRef=lkm=="ref"||lkm=="refcheck",lkCheck=lkm=="check"||lkm=="refcheck",lkCas=lkm=="cas";
+ const bool lkWanted=lkm!="old"&&(lkRef||(vlk::lk_has512()&&(lkMode||!(getenv("SS_ISA")&&string_view(getenv("SS_ISA"))=="sse2"))));
+ // Link files are handed out in pieces of 256 KB when the lane loop runs them (2 MB otherwise, as before): a piece is
+ // about 12,000 lines, cheap enough now that the threads' shares of a small link folder should be even (20M events:
+ // 18 MB of links = 13 pieces of 2 MB for 8 threads, or 72 of 256 KB). SS_LINKCH=bytes sets the size (measuring).
+ size_t linkCH=lkWanted?(size_t(256)<<10):CH;
+ if(const char* v=getenv("SS_LINKCH")){const unsigned long long x=strtoull(v,nullptr,10);if(x>=64&&x<=(1ull<<30))linkCH=(size_t)x;}
  for(const Mapped& m:map_files(csv_files(data/"links"),linkFiles)){if(!m.len)continue;
   ++linkLines; // a last line without '\n'
   linkBytes+=m.len;++linkFileCount;
-  for(size_t from=0;from<m.len;from+=CH)linkChunks.push_back({m.base,m.len,from,from+CH,false});}
+  for(size_t from=0;from<m.len;from+=linkCH)linkChunks.push_back({m.base,m.len,from,from+linkCH,false});}
  __fine("map-links");
  static const bool idBlocks=!getenv("SS_NOIDBLOCKS"); // measuring switch: per-thread ID blocks in the links stage
  // Room for IDs that only appear in events and clicks: about 3x what the generator produces.
@@ -4999,13 +5284,32 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // A complex index keeps the general route for all its IDs, so the simple lines already applied to its
  // word have to reach the table too: they are replayed from the word afterwards (same groups).
  struct LinkGen{const char* a;const char* b;uint32_t la,lb;};
- struct alignas(64) LinkOut{vector<LinkGen> gen;vector<uint32_t> cplx;uint32_t maxIdx=0;};
+ static constexpr int LKR_MAX=64;static constexpr size_t LKB=size_t(1)<<16,LKG=1024; // most buckets; records per block of a bucket's list; kernel calls between two looks at the room left
+ struct alignas(64) LinkOut{vector<LinkGen> gen;vector<uint32_t> cplx;uint32_t maxIdx=0;uint64_t nk=0,nslow=0,ntail=0,missed=0;double cpu=0,cpu2=0; // cpu2: of the second step; nk..: lane loop counts, cpu: thread seconds in the pass (SS_STATS)
+  // Lane loop: the unions of the simple lines wait here as records (vlk::LkOut::rec), one list per bucket of user
+  // indexes; bp = where the next record of a bucket goes (bp[buckets] is the place for lanes without a union).
+  uint32_t* bp[LKR_MAX+1]={};uint32_t* bcap[LKR_MAX+1]={};uint32_t* bstart[LKR_MAX]={};vector<pair<uint32_t*,uint32_t*>> blocks[LKR_MAX];uint32_t trash[16];};
  vector<LinkOut> lout(denseUsers?T:0);
  {
   bool v3=__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("popcnt")&&__builtin_cpu_supports("lzcnt");
   if(const char* isa=getenv("SS_ISA"))if(string_view(isa)=="sse2")v3=false;
   void (*const link_dense)(const char*,size_t,const char*,size_t,LinkDense&)=v3?link_dense_v3:link_dense_base;
-  #pragma omp parallel for num_threads(T) schedule(dynamic,1) reduction(+:linkLines)
+  // SS_LINKS (read where the link files are cut into pieces) decides how the simple lines are found.
+  // The unions of the lane loop (default): a simple line with two different aliases becomes a 32-bit record in a list
+  // of its thread, one list per bucket; a bucket is every lkR-th block of 4096 user indexes. When all chunks are done
+  // each bucket is applied by one thread (vlk::lk_union_v5, sixteen records per turn; lk_union_ref under ref): no word
+  // is changed by two threads, so no lock prefix, and a bucket's words are an lkR-th of the array. The result is the same word whatever the order: a word is "the
+  // smallest alias of each alias's group", which the set of unions decides. (Unions from the line code - refused
+  // lines, file tails - still go through comp_union at once; all of that is over before the buckets are applied.)
+  const bool lkOn=denseUsers&&lkWanted;
+  void (*const lk8)(const char**,const char* const*,const vlk::LkConst&,vlk::LkOut&)=lkRef?vlk::lk8_ref:vlk::lk8_v5;
+  int lkR=32;while(lkR<T&&lkR<LKR_MAX)lkR*=2;
+  static constexpr array<uint8_t,256> POP8=[]{array<uint8_t,256> a{};for(unsigned m=0;m<256;++m){unsigned n=0;for(unsigned j=0;j<8;++j)n+=(m>>j)&1;a[m]=(uint8_t)n;}return a;}();
+  const vlk::LkConst lkc=vlk::lk_const(dense.ku,dense.limI,(uint64_t)lkR);
+  static const bool lkStats=getenv("SS_STATS")!=nullptr;
+  #pragma omp parallel num_threads(T)
+  {
+  #pragma omp for schedule(dynamic,1) reduction(+:linkLines)
   for(size_t c=0;c<linkChunks.size();++c){const Chunk& ck=linkChunks[c];
    if(!denseUsers){linkLines+=count_newlines(ck.base+ck.from,min(ck.to,ck.len)-ck.from);continue;}
    if(ck.from>=ck.len)continue;
@@ -5014,30 +5318,142 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    if(!nl)continue;
    const char* const lim=ck.base+min(ck.to,ck.len);
    LinkOut& out=lout[omp_get_thread_num()];
+   struct CpuNote{LinkOut& o;double t0;~CpuNote(){if(lkStats)o.cpu+=thr_cpu_s()-t0;}} cpuNote{out,lkStats?thr_cpu_s():0.0};
    // Simple lines wait in a small batch so that their index's word is in the cache when it is changed.
    static constexpr int SB=8;
    struct Simple{uint32_t idx,aa,ab;} sb[SB];int ns=0;uint32_t maxIdx=out.maxIdx;
    const auto apply=[&]{for(int i=0;i<ns;++i)comp_union(sb[i].idx,sb[i].aa,sb[i].ab);ns=0;};
-   for(const char* p=nl+1;p<lim;){
+   // The line code: everything about the line that starts at p; returns where the next line starts.
+   const auto one_line=[&](const char* p)__attribute__((always_inline))->const char*{
     string_view f[2];const char* next;
     const bool ok=link_split(p,end,f,next);
-    p=next;
-    if(!ok)continue;
+    if(!ok)return next;
     LinkDense r;link_dense(f[0].data(),f[0].size(),f[1].data(),f[1].size(),r);
     if(r.da&&r.db&&r.ia==r.ib&&r.aa<8&&r.ab<8){
      maxIdx=max(maxIdx,(uint32_t)r.ia);
      if(r.aa!=r.ab){__builtin_prefetch(&denseComp[r.ia],1,1);sb[ns++]={(uint32_t)r.ia,r.aa,r.ab};if(ns==SB)apply();}
-     continue;
+     return next;
     }
     // Whoever turns an index's bit on notes the index for the replay (so each index is noted once).
     if(r.da&&!dense_set_complex(r.ia))out.cplx.push_back((uint32_t)r.ia);
     if(r.db&&!dense_set_complex(r.ib))out.cplx.push_back((uint32_t)r.ib);
     out.gen.push_back({f[0].data(),f[1].data(),(uint32_t)f[0].size(),(uint32_t)f[1].size()});
+    return next;
+   };
+   if(!lkOn||ck.len<512){
+    for(const char* p=nl+1;p<lim;)p=one_line(p);
+    apply();out.maxIdx=maxIdx;
+    continue;
    }
-   apply();out.maxIdx=maxIdx;
+   // Eight lanes (SS_LINKS): the chunk's lines are cut into eight runs at line starts and each lane walks its own run,
+   // one line per lane and kernel call. vlk::lk8 takes the simple lines (see its contract); a line it refuses, and the
+   // last lines of a file (the kernel reads up to 96 bytes from a line start), go through one_line. The lines and what
+   // is done for each are those of the loop above; only the order differs, and nothing here depends on the order
+   // (a union is commutative; the lists are per thread and already depend on which thread gets which chunk).
+   const char* s[9];s[0]=nl+1;s[8]=lim;
+   {const size_t span=s[0]<lim?(size_t)(lim-s[0]):0;
+    for(int j=1;j<8;++j){const char* const t=s[0]+span*(size_t)j/8; // t-1 >= nl: the byte before a lane start is a newline
+     const char* const q=(const char*)memchr(t-1,'\n',(size_t)(end-(t-1)));
+     s[j]=q&&q+1<lim?q+1:lim;}}
+   const char* const kend=end-160; // a live lane has 160 readable bytes, so a lane that has just ended still has 96
+   const char* kp[8];const char* klim[8];const char* tail[8];
+   for(int j=0;j<8;++j){klim[j]=min(s[j+1],kend);
+    if(s[j]<klim[j]){kp[j]=s[j];tail[j]=nullptr;}else{kp[j]=klim[j]=ck.base;tail[j]=s[j];}} // a lane that never runs reads the chunk's first bytes
+   vlk::LkOut ob[2];memset(ob[0].mx,0,sizeof ob[0].mx);memset(ob[1].mx,0,sizeof ob[1].mx);
+   vlk::LkOut* prev=nullptr;int cur=0;uint64_t nk=0,nslow=0;
+   // Memory for records: its own mapping, small pages on purpose (a list is touched a few pages at a time; a huge page
+   // under each of the 32 lists of a thread would be 2 MB of zeroing for a few kilobytes of records).
+   const auto rec_block=[](size_t records)->uint32_t*{
+    const size_t bytes=records*sizeof(uint32_t);
+    void* const m=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+    if(m==MAP_FAILED){cerr<<"ERROR out of memory\n";_exit(1);}
+    madvise(m,bytes,MADV_NOHUGEPAGE);
+    return (uint32_t*)m;};
+   // Every LKG kernel calls: a bucket whose block could run full within the next LKG calls (8 records each at most)
+   // gets a new block. The first blocks of a thread are one allocation, touched only as far as records are written.
+   const auto refill=[&]()__attribute__((noinline,cold))->size_t{
+    if(!out.bp[lkR]){uint32_t* const slab=rec_block((size_t)lkR*LKB);
+     for(int r=0;r<lkR;++r){out.bstart[r]=out.bp[r]=slab+(size_t)r*LKB;out.bcap[r]=out.bp[r]+LKB;}
+     out.bp[lkR]=out.trash;}
+    for(int r=0;r<lkR;++r)if((size_t)(out.bcap[r]-out.bp[r])<8*LKG){
+     out.blocks[r].push_back({out.bstart[r],out.bp[r]});
+     uint32_t* const nb=rec_block(LKB);
+     out.bstart[r]=out.bp[r]=nb;out.bcap[r]=nb+LKB;}
+    return LKG;};
+   size_t room=0;
+   const auto unions=[&](const vlk::LkOut& o)__attribute__((always_inline)){
+    for(unsigned i=0;i<8;++i)if((o.un>>i)&1)comp_union(o.idx[i],(uint32_t)o.aa[i],(uint32_t)o.ab[i]);};
+   for(;;){
+    vlk::LkOut& o=ob[cur];
+    const char* was[8];if(__builtin_expect(lkCheck,0))memcpy(was,kp,sizeof was);
+    lk8(kp,klim,lkc,o);
+    if(!(o.ok|o.slow))break; // no lane is live any more: this call did nothing
+    if(lkCas)for(int i=0;i<8;++i)__builtin_prefetch(&denseComp[o.idx[i]],1,1);
+    if(__builtin_expect(lkCheck,0)){
+     // Test mode: every line the kernel took is put through the line code's own functions and compared.
+     for(int i=0;i<8;++i){
+      const bool kok=(o.ok>>i)&1,ksl=(o.slow>>i)&1;
+      if(!kok&&!ksl){if(kp[i]!=was[i]||o.idx[i]){cerr<<"LINKCHECK FAIL dead lane changed\n";abort();}continue;}
+      string_view f[2];const char* next;LinkDense r{};
+      const bool ok=link_split(was[i],end,f,next);
+      if(ok)link_dense(f[0].data(),f[0].size(),f[1].data(),f[1].size(),r);
+      const bool simple=ok&&r.da&&r.db&&r.ia==r.ib&&r.aa<8&&r.ab<8;
+      if(kok==ksl||(kok&&(!simple||r.ia!=o.idx[i]||r.aa!=o.aa[i]||r.ab!=o.ab[i]||next!=kp[i]||(((o.un>>i)&1)!=(r.aa!=r.ab))))||(!kok&&(kp[i]!=was[i]||o.idx[i]||((o.un>>i)&1)))){
+       cerr<<"LINKCHECK FAIL line '"<<string_view(was[i],(size_t)min<ptrdiff_t>(next-was[i],60))<<"' kernel ok "<<kok<<" slow "<<ksl<<" idx "<<o.idx[i]<<" aa "<<o.aa[i]<<" ab "<<o.ab[i]<<" line code simple "<<simple<<" idx "<<r.ia<<" aa "<<r.aa<<" ab "<<r.ab<<"\n";abort();}
+      if(ksl&&simple)++out.missed;
+      const bool kun=(o.un>>i)&1;
+      if(o.bk[i]!=(kun?((o.idx[i]>>vlk::LK_BLOCK_BITS)&lkc.bmask):lkc.btrash)||(kun&&(o.rec[i]>>32||o.rec[i]>>5!=o.idx[i]||vlk::LK_PAIR_LO[o.rec[i]&31]!=min(o.aa[i],o.ab[i])||vlk::LK_PAIR_HI[o.rec[i]&31]!=max(o.aa[i],o.ab[i])))){
+       cerr<<"LINKCHECK FAIL record "<<o.rec[i]<<" bucket "<<o.bk[i]<<" idx "<<o.idx[i]<<" aa "<<o.aa[i]<<" ab "<<o.ab[i]<<"\n";abort();}
+     }
+    }
+    nk+=POP8[o.ok];
+    if(__builtin_expect(o.slow,0)){
+     for(unsigned m=o.slow;m;m&=m-1){const int i=__builtin_ctz(m);++nslow;
+      const char* const next=one_line(kp[i]);
+      if(next<klim[i])kp[i]=next;else{tail[i]=next;kp[i]=klim[i]=ck.base;}} // the lane ends here: its pointer may be too close to the file's end to be read
+    }
+    if(lkCas){if(prev)unions(*prev);prev=&o;cur^=1;}
+    else{
+     if(__builtin_expect(room==0,0))room=refill();
+     --room;
+     uint32_t** const bp=out.bp;
+     for(int i=0;i<8;++i){const uint64_t r=o.bk[i];uint32_t* const q=bp[r];*q=(uint32_t)o.rec[i];bp[r]=q+1;} // a lane without a union writes to the spare place
+     bp[lkR]=out.trash;
+    }
+   }
+   if(prev)unions(*prev);
+   for(int j=0;j<8;++j){
+    maxIdx=max(maxIdx,(uint32_t)max(ob[0].mx[j],ob[1].mx[j]));
+    for(const char* p=tail[j]?tail[j]:kp[j];p<s[j+1];++out.ntail)p=one_line(p);
+   }
+   apply();out.maxIdx=maxIdx;out.nk+=nk;out.nslow+=nslow;
+  }
+  // Second step of the lane loop: every bucket's records, from all threads' lists, applied by one thread.
+  if(lkOn&&!lkCas){
+   #pragma omp for schedule(dynamic,1) nowait
+   for(int r=0;r<lkR;++r){
+    const double t0=lkStats?thr_cpu_s():0.0;
+    uint32_t* const words=(uint32_t*)denseComp; // plain loads and stores: this thread alone changes bucket r's words now
+    const auto run_block=[&](const uint32_t* b,const uint32_t* e){if(lkRef)vlk::lk_union_ref(words,b,e);else vlk::lk_union_v5(words,b,e);};
+    for(LinkOut& o:lout){
+     for(const auto& bl:o.blocks[r])run_block(bl.first,bl.second);
+     if(o.bstart[r])run_block(o.bstart[r],o.bp[r]);
+    }
+    if(lkStats)lout[omp_get_thread_num()].cpu2+=thr_cpu_s()-t0;
+   }
+  }
   }
  }
  __fine("link-pass");
+ // Test only, SS_LINKS_DUMP=file: what the first pass left behind - every non-zero alias word, every complex index and the
+ // number of lines kept for the ID table - as text (compared between SS_LINKS=old and the lane loop).
+ if(const char* v=getenv("SS_LINKS_DUMP"))if(denseUsers){ofstream o(v,ios::binary);
+  uint64_t gen=0;uint32_t mx=0;for(const LinkOut& l:lout){gen+=l.gen.size();mx=max(mx,l.maxIdx);}
+  o<<"gen "<<gen<<" maxIdx "<<mx<<"\n";
+  for(uint64_t i=0;i<dense.limI;++i){const uint32_t w=denseComp[i].load(memory_order_relaxed);if(w)o<<"w "<<i<<' '<<w<<'\n';if(dense_complex(i))o<<"c "<<i<<'\n';}}
+ if(getenv("SS_STATS")&&denseUsers){uint64_t nk=0,nslow=0,ntail=0,missed=0;for(const LinkOut& o:lout){nk+=o.nk;nslow+=o.nslow;ntail+=o.ntail;missed+=o.missed;}
+  double cpu=0,cpu2=0;for(const LinkOut& o:lout){cpu+=o.cpu;cpu2+=o.cpu2;}
+  cerr<<"STATS links: kernel lines "<<nk<<" refused "<<nslow<<" (simple among them, check modes only: "<<missed<<") file tails "<<ntail<<" thread cpu ms "<<cpu*1e3<<" + bucket unions "<<cpu2*1e3<<"\n";}
  // The pairs to replay: for every complex index, each alias that the simple lines put into a group
  // with a smaller one. (Indexes the test switch marked complex were never noted; they are looked up here.)
  struct Replay{uint32_t idx;uint8_t a,b;};
