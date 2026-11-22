@@ -703,9 +703,10 @@ struct KeyTable{
  // A key over 11 bytes, lock-free like the packed keys: the slot is claimed (BUSY), the entry written at an index
  // of its own, then the slot published. (Until GFAST this path held one mutex for all threads and compared texts:
  // with one ID in eight long, every thread queued here.)
- uint32_t find_or_add_long(string_view s){
+ uint32_t find_or_add_long(string_view s){Long key;const uint64_t h=long_key(s,key);return find_or_add_long_key(key,h,s);}
+ // The same with the key at hand: h = long_key(s, key) (a caller that asked for the slot h & mask ahead of time).
+ uint32_t find_or_add_long_key(Long& key,const uint64_t h,string_view s){
   const auto R=memory_order_relaxed;
-  Long key;const uint64_t h=long_key(s,key);
   for(size_t j=h&mask;;){
    Slot& e=slots[j];uint32_t c=e.k1.load(memory_order_acquire);
    if(c==LONGK){if(e.k0.load(R)==h){const Long& l=longs.d[e.v.load(R)];if(same_long(l,key))return l.v;}}
@@ -1036,6 +1037,7 @@ struct alignas(64) ThreadState{
  deque<array<char,16>> rawNames; // texts of raw users that ended up with a LOCAL_USER number (they need a place that stays)
  vector<Bucket<DRec>> db;vector<Bucket<DCRec>> dcb; // dense rows in bucket form, by counter range (SS_DENSE_RECORDS=bucket)
  uint64_t slotWaits=0; // eslotWaits of this thread
+ uint64_t clWin2=0,clGeneral=0; // click line code: lines read through three windows (click_long_fields), lines left to the general handler (SS_STATS)
  uint64_t cl8Rows=0,cl8Slow=0; // cl8 click loop: lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
  uint64_t laneFixE=0,laneFixC=0; // lane loops: line ends of event / click rows looked up with memchr (SS_STATS)
@@ -2222,12 +2224,24 @@ static constexpr int V3_BATCH=16;
 static inline uint32_t long_user(const char* u,size_t n,KeyTable& tab,ThreadState& tl){
  const string_view t(u,n);const uint32_t g=tab.find_or_add(t);return g!=KeyTable::NONE?g:(LOCAL_USER|tl.users.intern(t));
 }
+// A waiting record whose user ID does not pack (click_line_v3, DREC=false): k1 = the length of the text (below 2^24,
+// so no packed k1 looks like it), k0 = KeyTable::long_key's hash, j = its slot (asked for when the line was read).
+static inline void pend_long_user(PendUser& pu,const char* u,size_t n,KeyTable& tab,uint32_t* up){
+ KeyTable::Long key;const uint64_t h=KeyTable::long_key(string_view(u,n),key);
+ const size_t j=h&tab.mask;__builtin_prefetch(&tab.slots[j],0,1);
+ pu.k0=h;pu.u=u;pu.up=up;pu.j=(uint32_t)j;pu.k1=(uint32_t)n;
+}
 static void resolve_users(const PendUser* pend,const PendUser* pendEnd,KeyTable& tab,ThreadState& tl){
  const auto R_=memory_order_relaxed;
  KeyTable::Slot* const slots=tab.slots;
  for(;pend!=pendEnd;++pend){
   const PendUser& q=*pend;KeyTable::Slot& e=slots[q.j];uint32_t g;
   if(__builtin_expect(e.k1.load(memory_order_acquire)==q.k1&&e.k0.load(R_)==q.k0,1))g=e.v.load(R_);
+  else if(!(q.k1>>24)){ // a text that does not pack (pend_long_user)
+   const string_view u(q.u,(size_t)q.k1);KeyTable::Long key;const uint64_t h=KeyTable::long_key(u,key);
+   g=tab.find_or_add_long_key(key,h,u);
+   if(g==KeyTable::NONE)g=LOCAL_USER|tl.users.intern(u);
+  }
   else{
    const string_view u(q.u,(size_t)(q.k1>>24)-1);
    g=tab.find_or_add_packed(q.k0,q.k1,q.j,u);
@@ -4009,6 +4023,7 @@ static constexpr size_t EV8_BLOCK=4096; // bytes indexed at a time
 // for in exclusive state; opt-in, no CPU test: every x86-64 CPU with AVX-512 has it); t1 = PREFETCHT1 (into the
 // second-level cache only); none = no request at all. Same output for all.
 static unsigned optPfw=0; // 0 default, 1 w, 2 t1, 3 none
+static unsigned optClickWin2=1; // click lines of 64+ bytes: 1 = three windows in the line code (click_long_fields), 0 = the general handler (SS_CLWIN=1), 2 = three windows, every such line checked against the portable splitter (SS_CLWIN=check)
 #define SS_PFW_ASM(p_) {if(pfw_==1)__asm__ volatile("prefetchw %0"::"m"(*(const char*)(p_)));else if(pfw_==2)__asm__ volatile("prefetcht1 %0"::"m"(*(const char*)(p_)));}
 #define SS_EV8_PFW(O_,i_) SS_PFW_ASM(&SS_EV8_SLOT(O_,i_))
 // NAME_slow: a row the kernel did not decide goes through the line code, kept out of the loop so that the loop
@@ -4193,9 +4208,59 @@ SS_EVENT_LOOP_EV8L(events_avx2_e8l,SS_V3,lane_scan_ev_avx2,lane_live_scalar,ev8_
 SS_EVENT_LOOP_EV8L(events_avx512z_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,vert4::dec8_v5,vert4,SS_EV8_CONST4,events_avx512z_e8_slow)
 SS_EVENT_LOOP_EV8L(events_avx512y_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,vert4::dec8_v5,vert4,SS_EV8_CONST4,events_avx512y_e8_slow)
 // The same for click lines (4 fields, one 64-byte window).
+// A click line with no newline in its first window (GFAST.md "C": a long ID makes a line 64 to ~105 bytes): the fields
+// from three windows, A at the line start (click_id up to the first comma), B one past that comma (user_id up to the
+// second comma), C one past the second comma (campaign_id, ts and the newline). cA / qA: the comma and quote masks of
+// window A, which holds no newline. False: the line is not four well-formed fields cut this way (a part longer than
+// its window, a quote out of place, another number of commas): the general handler decides, as for any odd line.
+// Up to 192 bytes behind p are read (the mappings leave 4096 zero bytes behind each file).
+struct ClickLong{const char* s0;const char* next;unsigned l0,b1,l1,b2,l2,b3,l3;};
+SS_V3I bool click_long_fields(const char* const p,const uint64_t cA,const uint64_t qA,ClickLong& f){
+ if(!cA)return false;
+ const unsigned c0=(unsigned)_tzcnt_u64(cA);
+ uint64_t sqA,opA;const uint64_t errA=quote_errors_v3(qA&_blsmsk_u64(cA),1,_blsi_u64(cA),sqA,opA);
+ const char* const bB=p+c0+1;
+ const WinMasks wB=win_masks_avx2(bB);
+ if(!wB.c)return false;
+ const uint64_t mB=_blsmsk_u64(wB.c);
+ const unsigned e1=(unsigned)_tzcnt_u64(wB.c);
+ uint64_t sqB,opB;const uint64_t errB=quote_errors_v3(wB.q&mB,1,_blsi_u64(wB.c),sqB,opB);
+ const char* const bC=bB+e1+1;
+ const WinMasks wC=win_masks_avx2(bC);
+ const uint64_t L=_tzcnt_u64(wC.n);
+ if((wB.n&mB)|(L>>6))return false; // the line ends inside the user_id, or not inside window C
+ const uint64_t nbit=_blsi_u64(wC.n),keep=nbit-1;
+ const uint64_t c=wC.c&keep,q=wC.q&keep;
+ const uint64_t st=(c<<1)|1,en=c|nbit;
+ uint64_t sq,op;const uint64_t err=quote_errors_v3(q,st,en,sq,op);
+ if((errA|errB|err|(uint64_t)(_mm_popcnt_u64(c)^1))!=0)return false;
+ const unsigned z0=(unsigned)(qA&1),z1=(unsigned)(wB.q&1);
+ f.s0=p+z0;f.l0=c0-2*z0;
+ f.b1=(unsigned)(bB-p)+z1;f.l1=e1-2*z1;
+ uint64_t B=st+sq,E=en-(op>>1);
+ const unsigned oC=(unsigned)(bC-p);
+ const unsigned x2=(unsigned)_tzcnt_u64(B);f.b2=oC+x2;f.l2=(unsigned)_tzcnt_u64(E)-x2;
+ B=_blsr_u64(B);E=_blsr_u64(E);
+ const unsigned x3=(unsigned)_tzcnt_u64(B);f.b3=oC+x3;f.l3=(unsigned)_tzcnt_u64(E)-x3;
+ f.next=bC+L+1;
+ return true;
+}
+// SS_CLWIN=check: what click_long_fields said about the line at p against the portable splitter (scan_line +
+// take_fields, the general handler's own reading). A line it took must be well-formed there with the same four
+// fields and the same next line; a line it refused only has to be left to the general handler (which it is).
+[[gnu::noinline]] static void click_long_check(const char* p,const char* end,bool fine,const ClickLong& f){
+ if(!fine)return;
+ const char* comma[4];int nc,nq;const char* le;string_view g[4];
+ const char* const next=scan_line(p,end,comma,4,nc,nq,le);
+ const bool gen=take_fields(p,le,comma,nc,nq,4,g);
+ if(gen&&next==f.next&&g[0].data()==f.s0&&g[0].size()==f.l0&&g[1].data()==p+f.b1&&g[1].size()==f.l1
+  &&g[2].data()==p+f.b2&&g[2].size()==f.l2&&g[3].data()==p+f.b3&&g[3].size()==f.l3)return;
+ fprintf(stderr,"ERROR SS_CLWIN=check: long click line read differently: %.*s\n",(int)min<ptrdiff_t>(le-p,200),p);_exit(1);
+}
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
  CampLook cf=campTable.look; // campaign lookup (camp_find)
+ unsigned win2=optClickWin2; // lines without a newline in the first window: click_long_fields (SS_CLWIN=1: the general handler, as before)
  ClLoop(ThreadState& tl_,KeyTable& tab_,const KeyTable& camps_,size_t PC_,const char* end_,int64_t clickStart_):tl(tl_),tab(tab_),camps(camps_),PC(PC_),end(end_),memo(date_memo3()),
   clickStart(clickStart_),wlen((uint64_t)(window_end-clickStart_)),buckets(tl_.cb.data()),slots(tab_.slots),tmask(tab_.mask),
   dUsers(dparse.users),kc(dense.kc),ku(dense.ku),limC(dense.limC),cl(denseCl),tid(tl_.tid),bucket(dparse.bucket),ahead(dparse.ahead),shC(dparse.shC),dcb(tl_.dcb.data()){}
@@ -4213,13 +4278,29 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    const uint64_t c=w.c&keep,q=w.q&keep;
    const uint64_t st=(c<<1)|1,en=c|nbit;
    uint64_t sq,op;const uint64_t err=quote_errors_v3(q,st,en,sq,op);
+   const char* s0;unsigned l0,b1,l1,b2,l2,b3,l3; // field contents (quotes stripped): s0 and offsets from p
+   if(!DREC&&(L>>6)&&lp.win2){
+    // No newline in the window (a line of 64 bytes or more: every line with a long ID): two more windows, B one
+    // past the first comma (user_id up to the second comma) and C one past the second (campaign_id, ts, newline).
+    // The same decisions as below, field by field; anything else leaves through the general handler as before.
+    ClickLong f;const bool fine=click_long_fields(p,w.c,w.q,f);
+    if(__builtin_expect(lp.win2==2,0))click_long_check(p,lp.end,fine,f);
+    if(__builtin_expect(!fine,0))break;
+    next=f.next;done=true;++tl.clWin2;
+    s0=f.s0;l0=f.l0;b1=f.b1;l1=f.l1;b2=f.b2;l2=f.l2;b3=f.b3;l3=f.l3;
+   }else{
    if(__builtin_expect((err|(uint64_t)(_mm_popcnt_u64(c)^3)|(L>>6))!=0,0))break;
    next=DREC?nl+1:p+L+1;done=true; // well-formed, 4 fields
    uint64_t B=st+sq,E=en-(op>>1);
    const unsigned z0=(unsigned)(q&1);
-   const char* const s0=p+z0;const unsigned l0=(unsigned)_tzcnt_u64(E)-z0;
+   s0=p+z0;l0=(unsigned)_tzcnt_u64(E)-z0;
    B=_blsr_u64(B);E=_blsr_u64(E);
-   const unsigned b1=(unsigned)_tzcnt_u64(B),l1=(unsigned)_tzcnt_u64(E)-b1;
+   b1=(unsigned)_tzcnt_u64(B);l1=(unsigned)_tzcnt_u64(E)-b1;
+   B=_blsr_u64(B);E=_blsr_u64(E);
+   b2=(unsigned)_tzcnt_u64(B);l2=(unsigned)_tzcnt_u64(E)-b2;
+   B=_blsr_u64(B);E=_blsr_u64(E);
+   b3=(unsigned)_tzcnt_u64(B);l3=(unsigned)_tzcnt_u64(E)-b3;
+   }
    if(l0==0||l1==0)break;
    // Dense route (DENSE.md): a dense click_id sends a valid click to its slot; ask for the slot's memory right away.
    uint64_t kcn=0;bool dCl=false;uint32_t ucode=0;bool uDense=false;
@@ -4233,10 +4314,6 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
      uDense=p[b1]=='u'&&parse36_v3(p+b1+1,l1-1,yu)&&dense_user_code(dn::index_of(yu,lp.ku),ucode);
     }
    }
-   B=_blsr_u64(B);E=_blsr_u64(E);
-   const unsigned b2=(unsigned)_tzcnt_u64(B),l2=(unsigned)_tzcnt_u64(E)-b2;
-   B=_blsr_u64(B);E=_blsr_u64(E);
-   const unsigned b3=(unsigned)_tzcnt_u64(B),l3=(unsigned)_tzcnt_u64(E)-b3;
    // Copies of a click are identical, so validating before the dedup keeps the same clicks.
    int64_t ts=0;
    uint64_t trel;
@@ -4281,21 +4358,25 @@ template<bool DREC,class GEN> SS_V3I const char* click_line_v3(const char* const
    }else{
     bool tableUser=true;
     if(lp.dUsers){uint64_t y;if(s1[0]=='u'&&parse36_v3(s1+1,l1-1,y)&&dense_user_code(dn::index_of(y,lp.ku),ucode)){tableUser=false;dmax=max(dmax,ucode);}}
-    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){ucode=long_user(s1,l1,tab,tl);tableUser=false;} // long user ID: its number right here
+    bool longUser=false; // a user ID that does not pack (over 11 bytes: every canonical long ID): waits in the batch like the others (SS_CLWIN=1: its number right here)
+    if(tableUser&&__builtin_expect(!KeyTable::pack(string_view(s1,l1),k0,k1),0)){if(lp.win2)longUser=true;else{ucode=long_user(s1,l1,tab,tl);tableUser=false;}}
     CRec r;r.id=s0;r.idlen=l0;r.h=hkey_v3(s0,l0);r.key=ckey;r.user=ucode;
     Bucket<CRec>& vec=buckets[(size_t)(((r.h>>40)*PC)>>24)];
     if(__builtin_expect(vec.full(),0)){resolve_users(pend,pp,tab,tl);pp=pend;vec.reserve(max<size_t>(16,2*vec.capacity()));} // grow now: nothing waits on the old storage, and the record appended below stays put
     uint32_t* const up=&vec.e->user;vec.append(r);
     if(tableUser){
-     const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
-     __builtin_prefetch(&slots[j],0,1);
-     PendUser& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.up=up;pu.k1=k1;
+     if(__builtin_expect(longUser,0))pend_long_user(*pp++,s1,l1,tab,up);
+     else{
+      const size_t j=KeyTable::hash_packed(k0,k1)&tmask;
+      __builtin_prefetch(&slots[j],0,1);
+      PendUser& pu=*pp++;pu.k0=k0;pu.j=(uint32_t)j;pu.u=s1;pu.up=up;pu.k1=k1;
+     }
      if(pp==pend+V3_BATCH){resolve_users(pend,pp,tab,tl);pp=pend;}
     }
    }
   }while(0);
   if(!done){
-   resolve_users(pend,pp,tab,tl);pp=pend;
+   resolve_users(pend,pp,tab,tl);pp=pend;++tl.clGeneral;
    next=line_general<4>(p,lp.end,general);
   }
   return next;
@@ -6029,6 +6110,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const bool evLead2=getenv("SS_EVLEAD")&&string_view(getenv("SS_EVLEAD"))=="2";
  const bool clLead2=getenv("SS_CLLEAD")&&string_view(getenv("SS_CLLEAD"))=="2";
  if(const char* v=getenv("SS_PF")){const string_view w(v);optPfw=w=="w"?1:w=="t1"?2:w=="none"?3:0;}
+ // SS_CLWIN=1: click lines of 64 bytes or more go to the general handler (as before GFAST); check: see click_long_check.
+ if(const char* v=getenv("SS_CLWIN")){const string_view w(v);optClickWin2=w=="1"?0:w=="check"?2:1;}
  #define SS_LEAD_CALL(two_,fn_,args_) {if(two_)fn_<2>args_;else fn_<1>args_;}
  // SS_EV8=3: the ev8 loop runs kernel version 3 (gathers, date memo) instead of version 4. Same output.
  const bool ev8V3=getenv("SS_EV8")&&string_view(getenv("SS_EV8"))=="3";
@@ -6335,6 +6418,8 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  const uint32_t totalIds=tab.end_parallel();
  __mark("RESOLVE");
  if(campCheck)cerr<<"STATS campaign lookups checked against the KeyTable: "<<campTable.checked<<"\n";
+ if(getenv("SS_STATS")){uint64_t w2=0,cg=0;for(int t=0;t<T;++t){w2+=tls[t].clWin2;cg+=tls[t].clGeneral;}
+  cerr<<"STATS click line code: three-window lines "<<w2<<", lines left to the general handler "<<cg<<(optClickWin2==2?" (SS_CLWIN=check)":optClickWin2==0?" (SS_CLWIN=1)":"")<<"\n";}
  if(getenv("SS_STATS")&&(denseEv||denseCl)){uint64_t w=0;for(int t=0;t<T;++t)w+=tls[t].slotWaits;
   cerr<<"STATS dense slots: event end "<<denseEvEnd.load()<<" click end "<<denseClEnd.load()<<" waits for a busy slot "<<w<<"\n";
   uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
