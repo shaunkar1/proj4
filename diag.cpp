@@ -25,6 +25,7 @@
 #include <linux/perf_event.h>
 #include <cerrno>
 #include <map>
+#include <unordered_map>
 #include <string_view>
 #include <stdexcept>
 #include <cstdint>
@@ -141,7 +142,7 @@ static void put_bytes(string& o,string_view s){put_le32(o,(uint32_t)s.size());o.
 template<class V> static string_view raw(const V& v){return string_view((const char*)v.data(),v.size()*sizeof(v[0]));}
 
 static uint64_t gKe=0,gKu=0,gKc=0;static bool gKeys=false; // the generator's ID keys, read from the pipeline's STATS line
-struct RunResult{string dth,csw;string label;double wall=0,user=0,sys=0;long minflt=0,majflt=0,maxrssMB=0,nvcsw=0,nivcsw=0;int rc=0;map<string,double> t;uint64_t pc[4]={0,0,0,0};int perfErr=0;};
+struct RunResult{string dth,csw;string hand;string label;double wall=0,user=0,sys=0;long minflt=0,majflt=0,maxrssMB=0,nvcsw=0,nivcsw=0;int rc=0;map<string,double> t;uint64_t pc[4]={0,0,0,0};int perfErr=0;};
 static vector<RunResult> results;
 static int perf_open(pid_t pid,uint32_t type,uint64_t config){
  perf_event_attr a;memset(&a,0,sizeof a);a.size=sizeof a;a.type=type;a.config=config;a.inherit=1;a.exclude_kernel=0;a.exclude_hv=1;a.disabled=0;
@@ -175,6 +176,7 @@ static void run_child(const string& bin,vector<pair<string,string>> env,RunResul
   if(line.rfind("FLT ",0)==0){size_t sp=line.find(' ',4);if(sp!=string::npos)r.t["f"+line.substr(4,sp-4)]+=atof(line.c_str()+sp+1)/1e6;}
   if(line.rfind("SMAPS FilePmdMapped:",0)==0)r.t["pmd"]=atof(line.c_str()+20)/1e6;
   if(line.rfind("STATS dense threads:",0)==0)r.dth=line.substr(20);
+  if(line.rfind("STATS dense reader:",0)==0){size_t a=line.find("handed over ");size_t b=line.find(", deferred");if(a!=string::npos&&b!=string::npos&&b>a)r.hand=line.substr(a+12,b-a-12);size_t c=line.find("slots ");if(c!=string::npos)r.hand+=" of "+line.substr(c+6,line.find(' ',c+6)-c-6);}
   if(line.rfind("CSW DENSE ",0)==0)r.csw=line.substr(10);
   if(line.rfind("STATS dense keys ",0)==0){unsigned long long a=0,b=0,c=0;if(sscanf(line.c_str(),"STATS dense keys %llu %llu %llu",&a,&b,&c)==3&&(a|b|c)){gKe=a;gKu=b;gKc=c;gKeys=true;}}}
  r.rc=WIFEXITED(st)?WEXITSTATUS(st):-1;
@@ -196,6 +198,30 @@ static uint64_t gOffE=0,gOffC=0,gOffI=0;            // counter distance between 
 static inline bool d_counter(const char* s,size_t n,char letter,uint64_t& v){
  if(!gKeys||n<2||s[0]!=letter)return false;uint64_t y;if(!d_parse36(s+1,n-1,y))return false;
  v=d_index(y,letter=='e'?gKe:letter=='k'?gKc:gKu);return true;}
+// Bots: the generator gives a few users about 1% of all events each, at any scale. A plain replica turns each into
+// many small users; with SS_DIAG_BOTS (default on) the copies of such a user stay ONE user whose events (and clicks)
+// are consecutive counters again, as in real data of that size: counter x of the user's range [f,l) in the source
+// becomes base + (x-f)*copies + copy, in a range of its own above all other counters.
+struct BotInfo{uint64_t ef=~0ull,el=0,cf=~0ull,cl=0,ne=0,nc=0;};
+static unordered_map<uint64_t,BotInfo> gBots; // by user index
+static uint64_t gBotRows=0;
+static void d_find_bots(const fs::path& data,double share){
+ vector<BotInfo> info(gOffI);uint64_t rows=0;
+ for(int kind=0;kind<2;++kind){
+  for(auto& f:fs::directory_iterator(data/(kind?"clicks":"events"))){if(f.path().extension()!=".csv")continue;
+   string in;{ifstream g(f.path(),ios::binary);in.assign(istreambuf_iterator<char>(g),{});}
+   size_t p=in.find('\n');if(p==string::npos)continue;++p;
+   while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
+    size_t c0=in.find(',',p);if(c0!=string::npos&&c0<e){size_t c1=in.find(',',c0+1);if(c1==string::npos||c1>e)c1=e;
+     size_t a=p,b=c0,ua=c0+1,ub=c1;if(b-a>=2&&in[a]=='"'&&in[b-1]=='"'){++a;--b;}if(ub-ua>=2&&in[ua]=='"'&&in[ub-1]=='"'){++ua;--ub;}
+     uint64_t x,u;if(!kind)++rows;
+     if(d_counter(in.data()+ua,ub-ua,'u',u)&&(u>>9)<gOffI&&d_counter(in.data()+a,b-a,kind?'k':'e',x)&&x<(kind?gOffC:gOffE)){BotInfo& bi=info[u>>9];
+      if(kind){bi.cf=min(bi.cf,x);bi.cl=max(bi.cl,x+1);++bi.nc;}else{bi.ef=min(bi.ef,x);bi.el=max(bi.el,x+1);++bi.ne;}}}
+    p=e+1;}}}
+ for(uint64_t i=0;i<gOffI;++i)if(info[i].ne>=share*rows&&info[i].ne>=1000){gBots[i]=info[i];gBotRows+=info[i].ne;
+  fprintf(stderr,"DIAG bot index %llu: %llu events in counters [%llu,%llu), %llu clicks in [%llu,%llu)\n",(unsigned long long)i,(unsigned long long)info[i].ne,(unsigned long long)info[i].ef,(unsigned long long)info[i].el,(unsigned long long)info[i].nc,(unsigned long long)(info[i].nc?info[i].cf:0),(unsigned long long)info[i].cl);}
+ fprintf(stderr,"DIAG bots: %zu users with %llu of %llu event rows\n",gBots.size(),(unsigned long long)gBotRows,(unsigned long long)rows);
+}
 static void d_scan_max(const fs::path& dir,char l0,char l1){
  vector<fs::path> files;for(auto& f:fs::directory_iterator(dir))if(f.path().extension()==".csv")files.push_back(f.path());
  atomic<size_t> next{0};
@@ -215,7 +241,12 @@ static void d_scan_max(const fs::path& dir,char l0,char l1){
 // clicks by the number of counters in the source, users by the number of user indexes), so the copies are
 // distinct and the whole replica is again dense; any other ID gets a two-character replica tag in front.
 // Files of part 0 are named *-0.csv, so a smaller set can link to them.
-static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int parts,char l0,char l1){
+static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int parts,char l0,char l1,bool bots=false){
+ // bot ranges of this replica: copies = reps*parts, bases above every other counter
+ const uint64_t copies=(uint64_t)reps*parts;
+ struct BotMap{uint64_t ef,el,cf,cl,baseE,baseC;};unordered_map<uint64_t,BotMap> bm;
+ if(bots){uint64_t be=copies*gOffE,bc=copies*gOffC;vector<uint64_t> keys;for(auto& kv:gBots)keys.push_back(kv.first);sort(keys.begin(),keys.end());
+  for(uint64_t k:keys){const BotInfo& b=gBots[k];BotMap m{b.ef,b.el,b.cf,b.cl,be,bc};if(b.ne)be+=(b.el-b.ef)*copies;if(b.nc)bc+=(b.cl-b.cf)*copies;bm[k]=m;}}
  fs::create_directories(dst);
  vector<fs::path> files;for(auto& f:fs::directory_iterator(src))if(f.path().extension()==".csv")files.push_back(f.path());
  sort(files.begin(),files.end());
@@ -234,16 +265,27 @@ static uint64_t replicate(const fs::path& src,const fs::path& dst,int reps,int p
      size_t p=hdr;
      while(p<in.size()){size_t e=in.find('\n',p);if(e==string::npos)e=in.size();
       size_t q=p;
+      // the line's user (second field; in link files both fields are users): is it a bot of this replica?
+      const BotMap* bot=nullptr;
+      if(!bm.empty()&&l0!='u'){size_t c0=in.find(',',p);if(c0!=string::npos&&c0<e){size_t c1=in.find(',',c0+1);if(c1==string::npos||c1>e)c1=e;size_t ua=c0+1,ub=c1;if(ub-ua>=2&&in[ua]=='"'&&in[ub-1]=='"'){++ua;--ub;}
+        uint64_t u;if(d_counter(in.data()+ua,ub-ua,'u',u)){auto it=bm.find(u>>9);if(it!=bm.end())bot=&it->second;}}}
       for(int k=0;k<2&&q<=e;++k){
        size_t c=in.find(',',q);if(c==string::npos||c>e)c=e;
        if(c>q){size_t a=q,b=c;const bool quoted=b-a>=2&&in[a]=='"'&&in[b-1]=='"';if(quoted){++a;--b;}
-        const char letter=k?l1:l0;uint64_t v;bool dense=false;
-        if(rep&&d_counter(in.data()+a,b-a,letter,v)){
-         if(letter=='u'){if((v>>9)<gOffI){v+=(rep*gOffI)<<9;dense=true;}}
-         else{const uint64_t off=letter=='e'?gOffE:gOffC;if(v<off){v+=rep*off;dense=true;}}}
+        const char letter=k?l1:l0;uint64_t v;bool dense=false,keep=false,odd=false;
+        if((rep||bot||!bm.empty())&&d_counter(in.data()+a,b-a,letter,v)){
+         if(letter=='u'){if(!bm.empty()&&bm.count(v>>9))keep=true; // a bot's user ID is the same in every copy
+          else if(rep&&(v>>9)<gOffI){v+=(rep*gOffI)<<9;dense=true;}}
+         else if(bot&&letter=='e'&&v>=bot->ef&&v<bot->el){
+          // about 10 rows per million of a bot get an odd event ID (real data: a few odd IDs per million rows put a bot's index into the general lane)
+          if(((v*0x9E3779B97F4A7C15ull+rep*0xD6E8FEB86659FD93ull)>>20)%100000==0){odd=true;}
+          else{v=bot->baseE+(v-bot->ef)*copies+rep;dense=true;}}
+         else if(bot&&letter=='k'&&v>=bot->cf&&v<bot->cl){v=bot->baseC+(v-bot->cf)*copies+rep;dense=true;}
+         else if(rep){const uint64_t off=letter=='e'?gOffE:gOffC;if(v<off){v+=rep*off;dense=true;}}}
         if(in[q]=='"'&&!quoted){out.append(in,q,c-q);} // a lone quote: leave the field alone
         else{if(quoted)out.push_back('"');
-         if(!rep)out.append(in,a,b-a);
+         if(odd){out.push_back('X');out.push_back((char)('A'+rep%26));out.push_back((char)('a'+rep/26));out.append(in,a,b-a);}
+         else if(keep||(!rep&&!dense))out.append(in,a,b-a);
          else if(dense)d_text36(out,letter,d_value(v,letter=='e'?gKe:letter=='k'?gKc:gKu));
          else{if(b>a){out.push_back(tag);out.push_back(tag2);}out.append(in,a,b-a);}
          if(quoted)out.push_back('"');}
@@ -376,10 +418,14 @@ int main(){
   gOffE=gMaxE.load()+1;gOffC=gMaxC.load()+1;gOffI=gMaxI.load()+1;}
  fprintf(stderr,"DIAG keys %d: counters per copy: events %llu clicks %llu user indexes %llu\n",(int)gKeys,(unsigned long long)gOffE,(unsigned long long)gOffC,(unsigned long long)gOffI);
  {double t=now();uint64_t b=0;
+  const bool botMode=gKeys&&!(getenv("SS_DIAG_BOTS")&&atoi(getenv("SS_DIAG_BOTS"))==0);
+  if(botMode)d_find_bots(fs::path(data),0.005);
   for(const char* sub:{"events","clicks","links"}){
-   b+=replicate(fs::path(data)/sub,huge/sub,BIG,PARTS,sub[0]=='e'?'e':sub[0]=='c'?'k':'u','u');
+   const char l0=sub[0]=='e'?'e':sub[0]=='c'?'k':'u';
+   b+=replicate(fs::path(data)/sub,huge/sub,BIG,PARTS,l0,'u',botMode);
    fs::create_directories(big/sub);
-   for(auto& f:fs::directory_iterator(huge/sub)){const string n=f.path().filename().string();if(n.size()>6&&n.compare(n.size()-6,6,"-0.csv")==0)fs::create_symlink(f.path(),big/sub/n);}
+   if(botMode&&!gBots.empty())b+=replicate(fs::path(data)/sub,big/sub,BIG,1,l0,'u',true); // its own files: the bots' ranges depend on the number of copies
+   else for(auto& f:fs::directory_iterator(huge/sub)){const string n=f.path().filename().string();if(n.size()>6&&n.compare(n.size()-6,6,"-0.csv")==0)fs::create_symlink(f.path(),big/sub/n);}
   }
   for(const char* f:{"products.csv","campaigns.csv","manifest.json"}){fs::copy_file(fs::path(data)/f,big/f,fs::copy_options::overwrite_existing);fs::copy_file(fs::path(data)/f,huge/f,fs::copy_options::overwrite_existing);}
   gReplicaSec=now()-t;
@@ -398,15 +444,14 @@ int main(){
  #define PO {"SS_DENSE_DUMP","-"}
  #define UB {"SS_UNMAP","bg"}
  #define L2 {"SS_EVLEAD","2"},{"SS_CLLEAD","2"}
- for(int r=0;r<5;++r){
-  add("B",1,{N8});add("c62",1,{N8},"core-b");add("b4",1,{N8},"core-d");
-  add("sw",1,{N8,{"SS_WILLNEED","inline"}});add("sc",1,{N8,{"SS_CATALOG","inline"}});add("se",1,{N8,{"SS_CAMPWRITE","end"}});add("sp",1,{N8,{"SS_PATHSORT","path"}});add("ss",1,{N8,{"SS_SAMPLE","serial"}});
-  add("ub",1,{N8,UB});add("all",1,{N8,L2,UB});add("b4ub",1,{N8,UB},"core-d");add("ln",1,{N8},"core-l");
-  if(r<3){add("Bs",1,{N8,ST});add("b4s",1,{N8,ST},"core-d");add("pB",1,{N8,PO},"core-b");add("pL",1,{N8,PO},"core-l");add("lne",1,{N8,{"SS_LANES","e"}},"core-l");add("ln2",1,{N8,{"SS_LANES_PF","512"},{"SS_LANES_PF2","576"}},"core-l");}
+ for(int r=0;r<4;++r){
+  add("B",1,{N8});add("c62",1,{N8},"core-b");add("c65",1,{N8},"core-d");add("cpf",1,{N8},"core-l");
+  add("uw",1,{N8,{"SS_UNMAP","workers"}});add("nl",1,{N8,{"SS_LANES","0"}});
+  if(r<3){add("Bs",1,{N8,ST});}
  }
  // final-sized set
  add("Hwarm",1,{N8},"",true);
- for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("Hb4",1,{N8},"core-d",true);add("Hub",1,{N8,UB},"",true);add("Hall",1,{N8,L2,UB},"",true);add("Hb4ub",1,{N8,UB},"core-d",true);add("Hln",1,{N8},"core-l",true);
+ for(int r=0;r<3;++r){add("HB",1,{N8},"",true);add("H62",1,{N8},"core-b",true);add("H65",1,{N8},"core-d",true);add("Hpf",1,{N8},"core-l",true);
   if(r<2)add("HBs",1,{N8,ST},"",true);}
  pipeline("dev",data,od(),{{"NCPU","8"}});
  // A variant whose label starts with 'O' writes into the real output mount (a subdirectory of it, removed right after),
@@ -444,7 +489,7 @@ int main(){
   for(int i=0;i<2;++i){vector<pair<string,string>> env={N8,{"SS_DEBUG_CSV","1"}};if(i==1)env.push_back({"SS_NODENSE","1"});
    {const string o=od();pipeline(i==0?"Hcd":i==1?"Hcn":"Hbd",H,o,env,"");error_code ec;fs::remove_all(o,ec);}ok[i]=csvhash("user_rows.csv",ur[i],us_[i])&&csvhash("campaign_rows.csv",cr[i],cs[i]);}
   auto same=[&](int i){return ok[i]&&ok[1]&&ur[i]==ur[1]&&us_[i]==us_[1]&&ur[i]>0&&cr[i]==cr[1]&&cs[i]==cs[1]&&cr[i]>0;};
-  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c63 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
+  char t[200];snprintf(t,sizeof t,"eq60 general route rows u%llu c%llu: c64 dense %s (u%llu c%llu)",(unsigned long long)ur[1],(unsigned long long)cr[1],same(0)?"SAME":"DIFF",(unsigned long long)ur[0],(unsigned long long)cr[0]);eqText=t;fprintf(stderr,"DIAG %s\n",t);}
  string benchText="bench not run";
  {const string vb=fs::path(core).parent_path().string()+"/vb/vert_bench";
   if(fs::exists(vb)&&timeleft(20)){benchText.clear();FILE* pp=popen((vb+" 8 0.25 2>/dev/null").c_str(),"r");if(pp){char line[256];while(fgets(line,sizeof line,pp)){string l=line;while(!l.empty()&&(l.back()=='\n'||l.back()=='\r'))l.pop_back();benchText+=l+"; ";}pclose(pp);}
@@ -486,12 +531,12 @@ int main(){
   auto mm=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wPRXA";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one))+"~"+to_string(med(grp,one));}return o+" ";};
   auto mk=[&](const string& name,const string& grp)->string{string o=name+"=";const char* ks="wMKP";for(const char* k=ks;*k;++k){const char one[2]={*k,0};if(k!=ks)o+="/";o+=to_string(mn(grp,one));}return o+"~"+to_string(med(grp,"w"))+" ";};
   {char t[64];snprintf(t,sizeof t," | syncfs after replica %.1fs",syncSec);eqText+=t;}
-  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c63","B")+mm("c62","c62")+mm("B4(c62+B3+B4)","b4")+mm("c63-unmap-bg","ub")+mm("c63-lead2+unmap-bg","all")+mm("B4-unmap-bg","b4ub")+mm("LANES+prefetch(on c62)","ln")+mm("lanes events only","lne")+mm("lanes pf 512","ln2")+"parse-only P/us: "+fmt("c62","pB","Pus")+fmt("lanes","pL","Pus");
-  a+="| c63 with one of S's changes switched back, min w/MAP/KEYS/PARSE~median w: "+mk("c63","B")+mk("c62","c62")+mk("willneed-inline","sw")+mk("catalog-inline","sc")+mk("campwrite-end","se")+mk("pathsort-old","sp")+mk("sample-serial","ss");
-  a+="| small stages MKLDYWE "+fmt("c63","Bs","MKLDYWE")+fmt("B4","b4s","MKLDYWE");
-  {const RunResult* r=get("Bs#0");if(r)a+="| DENSE threads c63:"+squeeze(r->dth)+" ";}
-  c+="60M min~median w/P/R/X/A: "+mm("c63","HB")+mm("c62","H62")+mm("B4","Hb4")+mm("c63-unmap-bg","Hub")+mm("c63-lead2+unmap-bg","Hall")+mm("B4-unmap-bg","Hb4ub")+mm("LANES+prefetch","Hln");
-  {const RunResult* r=get("HBs#0");if(r)c+="| DENSE threads c63 60M:"+squeeze(r->dth)+" ";}
+  {char t[96];snprintf(t,sizeof t," | BOT REPLICA: %zu bots hold %.1f%% of rows",gBots.size(),100.0*gBotRows/1072000.0);eqText+=t;}
+  a+=eqText+" | 20M min~median of wall/PARSE/RESOLVE/DENSE/AGG: "+mm("c64","B")+mm("c62","c62")+mm("c65(+B4 last)","c65")+mm("c64+C4 prefetch","cpf")+mm("c64 unmap by workers","uw")+mm("c64 no lanes","nl");
+  a+="| small stages MKLDYWE "+fmt("c64","Bs","MKLDYWE")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","Bs","pqxa");
+  {const RunResult* r=get("Bs#0");if(r)a+="| handed over: "+r->hand+" | DENSE threads c64:"+squeeze(r->dth)+" ";}
+  c+="60M min~median w/P/R/X/A: "+mm("c64","HB")+mm("c62","H62")+mm("c65","H65")+mm("c64+C4 prefetch","Hpf")+"cpu PARSE/RESOLVE/DENSE/AGG "+fmt("","HBs","pqxa");
+  {const RunResult* r=get("HBs#0");if(r)c+="| handed over: "+r->hand+" | DENSE threads c64 60M:"+squeeze(r->dth)+" ";}
   c+="|| "+benchText;
   {const RunResult* d=nullptr;for(auto& r:results)if(r.label.compare(0,2,"B#")==0&&r.rc==0&&(!d||r.wall<d->wall))d=&r;
    row(a,c,d?us(d->wall):0,d?us(d->user):0,d?us(d->sys):0,d?d->minflt:0);}

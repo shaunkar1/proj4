@@ -880,6 +880,8 @@ struct alignas(64) ThreadState{
  uint64_t slotWaits=0; // eslotWaits of this thread
  uint64_t cl8Rows=0,cl8Slow=0; // cl8 click loop: lines it took, and how many of them went through click_line_v3 (SS_STATS)
  uint32_t evEnd=0,clEnd=0; // one past the highest event / click counter this thread wrote a slot for
+ uint64_t laneFixE=0,laneFixC=0; // lane loops: line ends of event / click rows looked up with memchr (SS_STATS)
+ uint64_t laneShort=0; // lane loops: groups with fewer than eight lanes at work (SS_STATS)
  uint64_t ev8Rows=0,ev8Slow=0; // ev8 loop: rows finished, and how many of them the kernel left to the line code (SS_STATS)
  uint32_t denseMax=0; // largest DENSE_USER code this thread produced (reported with dense_note_index when its parsing is done)
  string dumpRows; // SS_DENSE_DUMP only
@@ -1968,18 +1970,19 @@ struct RawCtx{
 // keys), std::sort does it. tmp: room for m keys; cnt: room for CLICK_SORT_BUCKETS + 1 counters.
 static constexpr unsigned CLICK_SORT_BITS=13;static constexpr size_t CLICK_SORT_BUCKETS=size_t(1)<<CLICK_SORT_BITS;
 static const uint32_t clickSortMax=[]{const char* v=getenv("SS_TEST_SORTMAX");return v?(uint32_t)strtoul(v,nullptr,10):16u;}(); // tests: 0 = always std::sort, 1 = on any shared bucket
-[[gnu::noinline]] static void click_key_sort(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){
+// (TS: where the time starts in a key: 32 for "time << 32 | position", 28 for "time << 28 | position << 16 | campaign".)
+template<unsigned TS> static inline __attribute__((always_inline)) void click_key_sort_t(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){
  uint64_t mn=a[0],mx=a[0];
  for(size_t i=1;i<m;++i){mn=min(mn,a[i]);mx=max(mx,a[i]);}
- const uint64_t t0=mn>>32,range=(mx>>32)-t0;
+ const uint64_t t0=mn>>TS,range=(mx>>TS)-t0;
  const unsigned lb=min<unsigned>((unsigned)bit_width(m-1)+1,CLICK_SORT_BITS),rb=(unsigned)bit_width(range),sh=rb>lb?rb-lb:0;
  const size_t B=(size_t)(range>>sh)+1; // buckets in use, at most 1 << lb
  memset(cnt,0,(B+1)*sizeof(uint32_t));
  uint32_t most=0;
- for(size_t i=0;i<m;++i){const uint32_t c=++cnt[(((a[i]>>32)-t0)>>sh)+1];most=max(most,c);}
+ for(size_t i=0;i<m;++i){const uint32_t c=++cnt[(((a[i]>>TS)-t0)>>sh)+1];most=max(most,c);}
  if(__builtin_expect(most>clickSortMax,0)){sort(a,a+m);return;}
  for(size_t b=1;b<B;++b)cnt[b]+=cnt[b-1]; // cnt[b]: where bucket b starts
- for(size_t i=0;i<m;++i){const uint64_t k=a[i];tmp[cnt[((k>>32)-t0)>>sh]++]=k;}
+ for(size_t i=0;i<m;++i){const uint64_t k=a[i];tmp[cnt[((k>>TS)-t0)>>sh]++]=k;}
  a[0]=tmp[0];
  for(size_t i=1;i<m;++i){ // keys only move inside their bucket
   const uint64_t k=tmp[i];size_t j=i;
@@ -1987,6 +1990,8 @@ static const uint32_t clickSortMax=[]{const char* v=getenv("SS_TEST_SORTMAX");re
   a[j]=k;
  }
 }
+[[gnu::noinline]] static void click_key_sort(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){click_key_sort_t<32>(a,m,tmp,cnt);}
+[[gnu::noinline]] static void click_key_sort28(uint64_t* const a,const size_t m,uint64_t* const tmp,uint32_t* const cnt){click_key_sort_t<28>(a,m,tmp,cnt);}
 // Where one thread puts the session lists of the runs it reads (blocks of its pool) and a run's purchases.
 struct SessArena{uint64_t* cur=nullptr;uint64_t* end=nullptr;vector<uint64_t> pur;};
 // The event sweep of the counters [lo,hi) of an event slot array (stride 1 << evShift bytes, layout ESmall
@@ -3316,6 +3321,39 @@ VERT_T5 static inline void ev8_v5(const char* const* ls,const char* const* nx,co
 } // namespace vert4
 static_assert(vert4::ESLOT_INVALID_K==ESLOT_INVALID&&vert4::EV_PURCHASE_BIT==EV_PURCHASE&&vert4::RAW_USER==DENSE_USER_RAW&&sizeof(ESlot)==32);
 static_assert(vert4::MASK40==dn::MASK&&vert4::I1==dn::I1&&vert4::I2==dn::I2&&vert4::EV_TS_SHIFT==EV_TS&&vert4::DAYMS==DAY);
+// ---- lanes, events: the scan stage of ev8 version 4 that also yields where the next line of each row starts, so
+// ---- that eight "lanes" can walk eight pieces of a chunk without a line index. /home/claude/vert/lane_ev_paste.h;
+// ---- tested as this exact text by lanes/lane_test.cpp (Ev8Scan == vert4::scan8t_v5<1> byte for byte; nx == memchr).
+// ---- Paste after ev8_paste4.h (it uses vert4::Ev8Scan and VERT_T5). The decode is the unchanged vert4::dec8_v5.
+namespace vlane{
+// s: exactly what vert4::scan8t_v5<1>(ls, s) stores. Result 0: every nx[i] is one past the first '\n' at or after
+// ls[i] (the rule of the line index: every '\n' ends a line, quoted or not). Result not 0 (0xFF): no nx[i] may be
+// used and the caller finds the eight newlines itself (memchr from ls[i]). The result is 0 only if, for all eight
+// rows, window 1 (ls[i] .. +63) holds no '\n', its third comma exists (so window 2 starts at b <= ls[i]+64 and
+// [ls[i], b) lies inside window 1) and window 2 (b .. b+63) holds a '\n': then the first '\n' of window 2 is the first
+// one of the line. Reads the bytes scan8t_v5 reads (64 at ls[i], 64 at b <= ls[i]+65), nothing else.
+// e2 = tzcnt of "commas after the second" (64: no third comma), e3 = tzcnt of window 2's newlines (64: none): bit 6
+// of the OR of all of them says that some row lacks one of the two; kx collects the newlines of the first windows.
+#define VLANE_EV_ROW(i) {const char* const p=ls[i]; \
+  const __m512i x=_mm512_loadu_si512((const void*)p); \
+  const uint64_t cm=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc)); \
+  s.c1[i]=cm;s.q1[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq)); \
+  _mm_storeu_si128((__m128i*)&s.h[2*(i)],_mm512_castsi512_si128(x)); \
+  kx=_kor_mask64(kx,_mm512_cmpeq_epi8_mask(x,vn)); \
+  const uint64_t e2=_tzcnt_u64(_blsr_u64(_blsr_u64(cm))); \
+  const char* const b=p+e2+1; /* one past the third comma (p+65 if there is none) */ \
+  const __m512i y=_mm512_loadu_si512((const void*)b); \
+  s.c2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vc));s.q2[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vq));s.b[i]=(uint64_t)b; \
+  const uint64_t e3=_tzcnt_u64(_cvtmask64_u64(_mm512_cmpeq_epi8_mask(y,vn))); \
+  nx[i]=b+e3+1;acc|=e2|e3;__asm__("":"+r"(acc));} /* (the empty asm keeps the OR here: otherwise the compiler holds all sixteen counts in registers to the end) */
+VERT_T5 static inline unsigned lscan8_v5(const char* const* ls,const char** nx,vert4::Ev8Scan& s){
+ const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"'),vn=_mm512_set1_epi8('\n');
+ __mmask64 kx=_cvtu64_mask64(0);uint64_t acc=0;
+ VLANE_EV_ROW(0) VLANE_EV_ROW(1) VLANE_EV_ROW(2) VLANE_EV_ROW(3) VLANE_EV_ROW(4) VLANE_EV_ROW(5) VLANE_EV_ROW(6) VLANE_EV_ROW(7)
+ return ((acc>>6)|(uint64_t)(_cvtmask64_u64(kx)!=0))!=0?0xFFu:0u;
+}
+#undef VLANE_EV_ROW
+} // namespace vlane
 // The scalar kernel in the two-step shape of the vector one (nothing to scan), as a call of its own: the avx2
 // loop, a test stand-in only (also what callgrind and the sanitizer runs see).
 static inline void ev8_scan_none(const char* const*,vert::Ev8Scan&){}
@@ -3430,6 +3468,112 @@ SS_EVENT_LOOP_EV8(events_avx512y_e8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert
 SS_EVENT_LOOP_EV8(events_avx2_e8v3,SS_V3,win_masks_avx2,nl_mask_avx2,ev8_scan_none,ev8_dec_ref,vert,SS_EV8_CONST3)
 SS_EVENT_LOOP_EV8(events_avx512z_e8v3,SS_V5,win_masks_avx512z,nl_mask_avx512z,vert::scan8_v5,vert::dec8_v5,vert,SS_EV8_CONST3)
 SS_EVENT_LOOP_EV8(events_avx512y_e8v3,SS_V5,win_masks_avx512y,nl_mask_avx512y,vert::scan8_v5,vert::dec8_v5,vert,SS_EV8_CONST3)
+// ---- lanes: the ev8 loop without a line index (SS_LANES=0 keeps the loop above) ----
+// The lines of a chunk are cut into eight pieces at line starts (lane_cut: seven memchr calls) and lane i walks piece
+// i: the start of its next line is one past the newline of its current one, and that newline is found by the scan
+// stage on the bytes it loads anyway (vlane::lscan8_v5 = the text of vert4::scan8t_v5<1> + two newline compares).
+// A line end the scan cannot give for certain (line shorter than 64 bytes, no third comma in the first 64 bytes,
+// newline beyond the second window) is searched with memchr from the line start (lane_fix), so the kernel is always
+// handed a true (line start, next line start) pair, as from the index: "the first '\n' at or after the start ends the
+// line", quoted or not. It then accepts or refuses the row exactly as in the loop above.
+// Group g: line starts A[g&3], next starts A[(g+1)&3] = the line starts of group g+1. A lane that has reached the end
+// of its piece stays where it is and its rows are masked (the masks nN / nD / nF name the rows that are lines of this
+// chunk); the kernel still reads the bytes there (inside the file or its zero padding: at most `end`) but nothing of
+// such a row is used. The last line of a file without a newline goes to line_general after the loop, as above.
+// Rows are finished in lane order, not file order: nothing in the dense-record loops depends on the order (slots keep
+// the smallest ingest_ts, send / dmax are maxima, the line code has no state across lines but the date memo).
+// Every full group asks for the cache lines lanePf and lanePf2 bytes ahead of each lane's next line (SS_LANES_PF=n,
+// SS_LANES_PF2=n; 0 = that one off). Without them the lanes lose to the index loops: eight streams per thread are not
+// covered by the hardware prefetchers, and a miss in a lane's scan load holds up the whole group, where the index
+// pass ran through 4 KB at a time with many loads under way (parse-only CPU time of one thread on 3.2M events + 0.8M
+// clicks, this box: index loops 178 ms, lanes without prefetch 233, one prefetch 512 or 1024 ahead 151, two 138).
+// Two per lane because an event line (77 bytes) is more than one cache line per group.
+static unsigned lanePf=1024,lanePf2=1088;
+#define SS_LANE_PF(X_) if(__builtin_expect(lanePf!=0,1)){const unsigned d_=lanePf;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+d_,0,3); \
+  if(lanePf2){const unsigned e_=lanePf2;for(unsigned i_=0;i_<8;++i_)__builtin_prefetch((X_)[i_]+e_,0,3);}}
+static inline void lane_cut(const char* p,const char* lim,const char* end,const char** c){
+ const size_t step=(size_t)(lim-p)/8;c[0]=p;c[8]=lim;
+ for(unsigned i=1;i<8;++i){
+  const char* const t=p+step*i; // the first line start at or after t is one past the first newline at or after t-1 (p-1 is a newline)
+  const char* const nl=(const char*)memchr(t-1,'\n',(size_t)(end-(t-1)));
+  c[i]=nl&&nl+1<lim?nl+1:lim;}
+}
+// Rows whose line end the scan did not give (bits of unc): x[i] = one past the first newline from l[i]. A line
+// without one (the last line of the file): returned as a bit, `tail` = the line, the lane goes to the end.
+[[gnu::noinline]] static unsigned lane_fix(const char* const* l,const char** x,unsigned unc,const char* end,const char*& tail,uint64_t& looked){
+ unsigned gone=0;looked+=(unsigned)__builtin_popcount(unc);
+ for(;unc;unc&=unc-1){const unsigned i=(unsigned)__builtin_ctz(unc);
+  const char* const nl=(const char*)memchr(l[i],'\n',(size_t)(end-l[i]));
+  if(nl)x[i]=nl+1;else{tail=l[i];x[i]=end;gone|=1u<<i;}}
+ return gone;
+}
+// Which lanes still have a line (position below the end of the piece).
+static inline unsigned lane_live_scalar(const char* const* l,const char* const* e){unsigned m=0;for(unsigned i=0;i<8;++i)m|=(unsigned)(l[i]<e[i])<<i;return m;}
+// (The mask goes through a 16-bit mask move and an explicit AND: g++ 12 otherwise stores the 8-bit mask as one byte
+// and reads the slot back as 32 bits.)
+SS_V5I unsigned lane_live_avx512(const char* const* l,const char* const* e){
+ const __mmask16 k=(__mmask16)_mm512_cmplt_epu64_mask(_mm512_load_si512((const void*)l),_mm512_load_si512((const void*)e));
+ return (unsigned)_cvtmask16_u32(k)&0xFFu;}
+// The lane scans of the avx2 instances (test stand-ins as the scalar kernels are): the same rule from win_masks_avx2.
+SS_V3 [[gnu::noinline]] static unsigned lane_scan_ev_avx2(const char* const* ls,const char** nx,vert4::Ev8Scan&){
+ unsigned unc=0;
+ for(unsigned i=0;i<8;++i){const char* const p=ls[i];const WinMasks w1=win_masks_avx2(p);const uint64_t t=_blsr_u64(_blsr_u64(w1.c));
+  const char* const b=p+_tzcnt_u64(t)+1;const WinMasks w2=win_masks_avx2(b);nx[i]=b+_tzcnt_u64(w2.n)+1;
+  if(w1.n!=0||t==0||w2.n==0)unc|=1u<<i;}
+ return unc;
+}
+// Finishing the rows M (a mask) of a group; otherwise SS_EV8_FINISH.
+#define SS_EV8L_FINISH(O,LS,NX,M,SLOW) {auto& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned m_=(M); \
+  const unsigned ok_=O_.ok&m_; \
+  for(unsigned p_=O_.pur&ok_;p_;p_&=p_-1){const unsigned i_=(unsigned)__builtin_ctz(p_); \
+   const uint32_t ci_=products.find(string_view(O_.s5[i_],(size_t)O_.l5[i_]));O_.uct[i_]|=(uint64_t)(ci_==KeyTable::NONE?0u:(unsigned)(uint16_t)ci_)<<32;} \
+  if(__builtin_expect(ok_==0xFFu,1)){rows+=8; \
+   vmx=_mm256_max_epu32(vmx,_mm256_max_epu32(_mm256_load_si256((const __m256i*)&O_.ve[0]),_mm256_load_si256((const __m256i*)&O_.ve[4])));fastAny=true; \
+   SS_EV8_COMMIT(O_,0) SS_EV8_COMMIT(O_,1) SS_EV8_COMMIT(O_,2) SS_EV8_COMMIT(O_,3) SS_EV8_COMMIT(O_,4) SS_EV8_COMMIT(O_,5) SS_EV8_COMMIT(O_,6) SS_EV8_COMMIT(O_,7) \
+  }else{rows+=(unsigned)__builtin_popcount(m_); \
+   for(unsigned r_=m_;r_;r_&=r_-1){const unsigned i_=(unsigned)__builtin_ctz(r_); \
+    if((ok_>>i_)&1){send=max(send,(uint32_t)O_.ve[i_]+1);SS_EV8_COMMIT(O_,i_)} \
+    else SLOW(L_[i_],X_[i_]-1,((O_.idok>>i_)&1)?(uint32_t)O_.ve[i_]:NOPRE,lp,dmax,send,general);}} }
+#define SS_EVENT_LOOP_EV8L(NAME,TARGET,LSCAN,LIVE,DEC,VNS,ECONST,SLOW) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& products,size_t PE,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ if(p>=lim)return; \
+ const char* const end=base+len; \
+ const EvLoop lp(tl,tab,products,PE,end);uint32_t dmax=0;uint32_t send=0; \
+ const VNS::EvConst ec=ECONST(lp); \
+ VNS::Ev8Out out[2];VNS::Ev8Scan sc[2]; \
+ alignas(64) const char* A[4][8];alignas(64) const char* le[8];const char* tail=nullptr; \
+ {const char* cut_[9];lane_cut(p,lim,end,cut_);for(unsigned i_=0;i_<8;++i_){A[0][i_]=cut_[i_];le[i_]=cut_[i_+1];}} \
+ const char* const* lD=A[0];const char* const* xD=A[0];const char* const* lF=A[0];const char* const* xF=A[0]; /* lines and next lines of D, F */ \
+ unsigned g=0,nD=0,nF=0;VNS::Ev8Scan* sN=&sc[0];VNS::Ev8Scan* sD=&sc[1];VNS::Ev8Out* oD=&out[0];VNS::Ev8Out* oF=&out[1];bool more=true; /* row masks of D and F; N's and D's scan; D's and F's results */ \
+ __m256i vmx=_mm256_setzero_si256();bool fastAny=false;uint64_t rows=0,shortG=0,fixed=0; \
+ do{ \
+  unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
+  if(more){ \
+   const unsigned live_=LIVE(lN,le); \
+   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF(xN)} \
+   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail,fixed); \
+    for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
+   else more=false; \
+  } \
+  if(nD){ \
+   VNS::Ev8Out& o_=*oD; \
+   DEC(lD,xD,*sD,ec,o_); \
+   if(__builtin_expect((nD==0xFFu)&(o_.idok==0xFFu),1)){SS_EV8_PF(o_,0) SS_EV8_PF(o_,1) SS_EV8_PF(o_,2) SS_EV8_PF(o_,3) SS_EV8_PF(o_,4) SS_EV8_PF(o_,5) SS_EV8_PF(o_,6) SS_EV8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&nD;x_;x_&=x_-1)SS_EV8_PF(o_,__builtin_ctz(x_)) \
+  } \
+  if(nF)SS_EV8L_FINISH(*oF,lF,xF,nF,SLOW) \
+  lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=nN;++g; /* D becomes F, N becomes D */ \
+  {VNS::Ev8Scan* const t_=sN;sN=sD;sD=t_;VNS::Ev8Out* const u_=oD;oD=oF;oF=u_;} \
+ }while(more||nD||nF); \
+ if(tail)line_general<7>(tail,end,general); /* the last line has no newline */ \
+ if(fastAny){alignas(32) uint32_t v_[8];_mm256_store_si256((__m256i*)v_,vmx);send=max(send,max(max(v_[0],v_[2]),max(v_[4],v_[6]))+1);} \
+ tl.denseMax=max(tl.denseMax,dmax);tl.evEnd=max(tl.evEnd,send);tl.ev8Rows+=rows;tl.laneShort+=shortG;tl.laneFixE+=fixed; \
+}
+// _e8l = the lane form of _e8 (kernel version 4 only). The avx2 instance is the test stand-in (scalar kernel).
+SS_EVENT_LOOP_EV8L(events_avx2_e8l,SS_V3,lane_scan_ev_avx2,lane_live_scalar,ev8_dec_ref4,vert4,SS_EV8_CONST4,events_avx2_e8_slow)
+SS_EVENT_LOOP_EV8L(events_avx512z_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,vert4::dec8_v5,vert4,SS_EV8_CONST4,events_avx512z_e8_slow)
+SS_EVENT_LOOP_EV8L(events_avx512y_e8l,SS_V5,vlane::lscan8_v5,lane_live_avx512,vert4::dec8_v5,vert4,SS_EV8_CONST4,events_avx512y_e8_slow)
 // The same for click lines (4 fields, one 64-byte window).
 struct ClLoop{ThreadState& tl;KeyTable& tab;const KeyTable& camps;size_t PC;const char* end;DateMemo3* memo;int64_t clickStart;uint64_t wlen;Bucket<CRec>* buckets;KeyTable::Slot* slots;size_t tmask;
  bool dUsers;uint64_t kc,ku,limC;CSlot* cl;uint32_t tid;bool bucket;unsigned ahead,shC;Bucket<DCRec>* dcb; // dense route (dparse)
@@ -4462,6 +4606,26 @@ static_assert(offsetof(Cl8Out,kend)==offsetof(Cl8Out,umax)+4);
 } // namespace vcl2
 static_assert(vcl2::MASK40==dn::MASK&&vcl2::I1==dn::I1&&vcl2::I2==dn::I2&&vcl2::DAYMS==DAY);
 static_assert(vcl2::CL_GEN_ALIAS_BITS==dn::GEN_ALIAS_BITS&&vcl2::CL_ALIAS_BITS==dn::ALIAS_BITS&&vcl2::DENSE_USER_BIT==DENSE_USER&&sizeof(CSlot)==(1u<<vcl2::CSLOT_SHIFT));
+// ---- lanes, clicks: the scan stage of cl8 (versions 1 and 2 share it) that also yields where the next line of each
+// ---- row starts. /home/claude/vert/lane_cl_paste.h; tested as this exact text by lanes/lane_test.cpp
+// ---- (Cl8Scan == vcl2::cscan8_v5 byte for byte; nx == memchr). Paste after cl8_paste2.h. Decode: unchanged vcl2::cdec8_v5.
+namespace vlane{
+// s: exactly what vcl2::cscan8_v5(ls, s) stores. Result 0: every nx[i] is one past the first '\n' at or after ls[i].
+// Result not 0 (0xFF; some row has no '\n' in the 64 bytes at ls[i]): no nx[i] may be used, the caller finds the
+// eight newlines itself. (acc: OR of the eight tzcnt results, 64 = no newline.)
+#define VLANE_CL_ROW(i) {const char* const p=ls[i]; \
+  const __m512i x=_mm512_loadu_si512((const void*)p); \
+  s.c[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vc));s.q[i]=_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vq)); \
+  const uint64_t e=_tzcnt_u64(_cvtmask64_u64(_mm512_cmpeq_epi8_mask(x,vn))); \
+  nx[i]=p+e+1;acc|=e;__asm__("":"+r"(acc));}
+VERT_T5 static inline unsigned clscan8_v5(const char* const* ls,const char** nx,vcl2::Cl8Scan& s){
+ const __m512i vc=_mm512_set1_epi8(','),vq=_mm512_set1_epi8('"'),vn=_mm512_set1_epi8('\n');
+ uint64_t acc=0;
+ VLANE_CL_ROW(0) VLANE_CL_ROW(1) VLANE_CL_ROW(2) VLANE_CL_ROW(3) VLANE_CL_ROW(4) VLANE_CL_ROW(5) VLANE_CL_ROW(6) VLANE_CL_ROW(7)
+ return (acc>>6)!=0?0xFFu:0u;
+}
+#undef VLANE_CL_ROW
+} // namespace vlane
 static inline void cl8_scan_none(const char* const*,vcl::Cl8Scan&){}
 [[gnu::noinline]] static void cl8_dec_ref(const char* const* ls,const char* const* nx,const vcl::Cl8Scan&,const vcl::ClConst& c,vcl::Cl8Out& o){vcl::cl8_ref(ls,nx,c,o);}
 static inline void cl8_scan_none2(const char* const*,vcl2::Cl8Scan&){}
@@ -4549,6 +4713,63 @@ SS_CLICK_LOOP_CL8(clicks_avx512y_c8,SS_V5,win_masks_avx512y,nl_mask_avx512y,vcl2
 SS_CLICK_LOOP_CL8(clicks_avx2_c8v1,SS_V3,win_masks_avx2,nl_mask_avx2,cl8_scan_none,cl8_dec_ref,vcl,SS_CL8_CONST1)
 SS_CLICK_LOOP_CL8(clicks_avx512z_c8v1,SS_V5,win_masks_avx512z,nl_mask_avx512z,vcl::cscan8_v5,vcl::cdec8_v5,vcl,SS_CL8_CONST1)
 SS_CLICK_LOOP_CL8(clicks_avx512y_c8v1,SS_V5,win_masks_avx512y,nl_mask_avx512y,vcl::cscan8_v5,vcl::cdec8_v5,vcl,SS_CL8_CONST1)
+// ---- lanes: the cl8 click loop without a line index (see "lanes" at the ev8 loop; SS_LANES=0 keeps the loop above) ----
+// The lane scan is vlane::clscan8_v5 (the text of cscan8_v5 + one newline compare on the window it loads): a click
+// line of up to 63 bytes has its newline there, a longer one goes through memchr (lane_fix). The group maxima are
+// used only if every row the kernel calls ok is a row of this chunk and was committed.
+SS_V3 [[gnu::noinline]] static unsigned lane_scan_cl_avx2(const char* const* ls,const char** nx,vcl2::Cl8Scan&){
+ unsigned unc=0;
+ for(unsigned i=0;i<8;++i){const char* const p=ls[i];const uint64_t n=nl_mask_avx2(p);nx[i]=p+_tzcnt_u64(n)+1;if(n==0)unc|=1u<<i;}
+ return unc;
+}
+#define SS_CL8L_FINISH(O,LS,NX,M,MASKS) {const auto& O_=(O);const char* const* const L_=(LS);const char* const* const X_=(NX);const unsigned m_=(M); \
+  const unsigned ok_=O_.ok&m_;unsigned found_=0; \
+  if(__builtin_expect(ok_==0xFFu,1)){rows+=8;SS_CL8_ROW(O_,0) SS_CL8_ROW(O_,1) SS_CL8_ROW(O_,2) SS_CL8_ROW(O_,3) SS_CL8_ROW(O_,4) SS_CL8_ROW(O_,5) SS_CL8_ROW(O_,6) SS_CL8_ROW(O_,7)} \
+  else{rows+=(unsigned)__builtin_popcount(m_); \
+   for(unsigned r_=m_;r_;r_&=r_-1){const unsigned i_=(unsigned)__builtin_ctz(r_); \
+    if((ok_>>i_)&1)SS_CL8_ROW(O_,i_) \
+    else if(!((O_.drop>>i_)&1)){const char* const q_=L_[i_];++slow;click_line_v3<true>(q_,MASKS(q_),X_[i_]-1,lp,pend,pp,dmax,send,ring,rpos,general);}}} \
+  if(__builtin_expect(found_==(unsigned)O_.ok,1)){dmax=max(dmax,O_.umax);send=max(send,O_.kend);} \
+  else for(unsigned x_=found_;x_;x_&=x_-1){const unsigned i_=(unsigned)__builtin_ctz(x_);dmax=max(dmax,(uint32_t)O_.user[i_]);send=max(send,(uint32_t)O_.kcn[i_]+1);} }
+#define SS_CLICK_LOOP_CL8L(NAME,TARGET,MASKS,LSCAN,LIVE,DEC,VNS,CCONST) \
+template<class GEN> TARGET static void NAME(const char* base,size_t len,size_t from,size_t to,ThreadState& tl,KeyTable& tab,const KeyTable& camps,size_t PC,int64_t clickStart,GEN&& general){ \
+ const char* p;const char* lim;if(!chunk_lines(base,len,from,to,p,lim))return; \
+ if(p>=lim)return; \
+ const char* const end=base+len; \
+ ClLoop lp_(tl,tab,camps,PC,end,clickStart);lp_.ahead=0;const ClLoop& lp=lp_; /* no ring: a slow row writes its slot at the end of its line, a group after the kernel asked for it */ \
+ PendUser pend[V3_BATCH];PendUser* pp=pend;uint32_t dmax=0;uint32_t send=0;CRing* const ring=nullptr;unsigned rpos=0;uint64_t rows=0,slow=0,shortG=0,fixed=0; \
+ const VNS::ClConst cc=CCONST(lp); \
+ VNS::Cl8Out out[2];VNS::Cl8Scan sc[2]; \
+ alignas(64) const char* A[4][8];alignas(64) const char* le[8];const char* tail=nullptr; \
+ {const char* cut_[9];lane_cut(p,lim,end,cut_);for(unsigned i_=0;i_<8;++i_){A[0][i_]=cut_[i_];le[i_]=cut_[i_+1];}} \
+ const char* const* lD=A[0];const char* const* xD=A[0];const char* const* lF=A[0];const char* const* xF=A[0]; \
+ unsigned g=0,nD=0,nF=0;VNS::Cl8Scan* sN=&sc[0];VNS::Cl8Scan* sD=&sc[1];VNS::Cl8Out* oD=&out[0];VNS::Cl8Out* oF=&out[1];bool more=true; \
+ do{ \
+  unsigned nN=0;const char** const lN=A[g&3];const char** const xN=A[(g+1)&3]; \
+  if(more){ \
+   const unsigned live_=LIVE(lN,le); \
+   if(__builtin_expect(live_==0xFFu,1)){nN=0xFFu;const unsigned unc_=LSCAN(lN,xN,*sN);if(__builtin_expect(unc_!=0,0))nN&=~lane_fix(lN,xN,unc_,end,tail,fixed);SS_LANE_PF(xN)} \
+   else if(live_){nN=live_;++shortG;const unsigned unc_=LSCAN(lN,xN,*sN)&live_;if(unc_)nN&=~lane_fix(lN,xN,unc_,end,tail,fixed); \
+    for(unsigned i_=0;i_<8;++i_)if(!((live_>>i_)&1))xN[i_]=lN[i_];} /* a lane that is done stays where it is */ \
+   else more=false; \
+  } \
+  if(nD){ \
+   VNS::Cl8Out& o_=*oD; \
+   DEC(lD,xD,*sD,cc,o_); \
+   if(__builtin_expect((nD==0xFFu)&(o_.idok==0xFFu),1)){SS_CL8_PF(o_,0) SS_CL8_PF(o_,1) SS_CL8_PF(o_,2) SS_CL8_PF(o_,3) SS_CL8_PF(o_,4) SS_CL8_PF(o_,5) SS_CL8_PF(o_,6) SS_CL8_PF(o_,7)} \
+   else for(unsigned x_=o_.idok&nD;x_;x_&=x_-1)SS_CL8_PF(o_,__builtin_ctz(x_)) \
+  } \
+  if(nF)SS_CL8L_FINISH(*oF,lF,xF,nF,MASKS) \
+  lF=lD;xF=xD;nF=nD;lD=lN;xD=xN;nD=nN;++g; \
+  {VNS::Cl8Scan* const t_=sN;sN=sD;sD=t_;VNS::Cl8Out* const u_=oD;oD=oF;oF=u_;} \
+ }while(more||nD||nF); \
+ if(tail)line_general<4>(tail,end,general); /* the last line has no newline */ \
+ tl.denseMax=max(tl.denseMax,dmax);tl.clEnd=max(tl.clEnd,send);tl.cl8Rows+=rows;tl.cl8Slow+=slow;tl.laneShort+=shortG;tl.laneFixC+=fixed; \
+}
+// _c8l = the lane form of _c8 (kernel version 2 only). The avx2 instance is the test stand-in (scalar kernel).
+SS_CLICK_LOOP_CL8L(clicks_avx2_c8l,SS_V3,win_masks_avx2,lane_scan_cl_avx2,lane_live_scalar,cl8_dec_ref2,vcl2,SS_CL8_CONST2)
+SS_CLICK_LOOP_CL8L(clicks_avx512z_c8l,SS_V5,win_masks_avx512z,vlane::clscan8_v5,lane_live_avx512,vcl2::cdec8_v5,vcl2,SS_CL8_CONST2)
+SS_CLICK_LOOP_CL8L(clicks_avx512y_c8l,SS_V5,win_masks_avx512y,vlane::clscan8_v5,lane_live_avx512,vcl2::cdec8_v5,vcl2,SS_CL8_CONST2)
 static void run(const fs::path& data,const fs::path& scratch,const fs::path& output){
  auto __time0=chrono::steady_clock::now();
  // With SS_STATS=1 every TIME line is followed by a CPU line: processor time (all threads, user+system) of that stage.
@@ -4612,7 +4833,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   const uint32_t n=(uint32_t)campaigns.size();if(camps.intern(f[0],n)==n)campaigns.push_back({string(f[0]),string(f[1])});});
  organic=(uint16_t)campaigns.size();campaigns.push_back({"organic","organic"});
  };
- const bool catalogBg=!(getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="inline");
+ const bool catalogBg=getenv("SS_CATALOG")&&string_view(getenv("SS_CATALOG"))=="thread"; // default inline: on the scoring machine the side thread made KEYS wait 13-18 ms (diagnostic 17)
  exception_ptr catalogErr;thread catalogThread;
  struct Joiner{thread& t;~Joiner(){if(t.joinable())t.join();}} catalogJoiner{catalogThread}; // an exception on the way must not meet a running thread
  if(catalogBg)catalogThread=thread([&]{try{load_catalog();}catch(...){catalogErr=current_exception();}__fine("catalog-read-end");});
@@ -5023,9 +5244,16 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  // SS_ISA=avx2 or SS_DENSE_AHEAD (which asks for the ring of the old loop) keeps the click loop with the line index.
  // SS_CL8=1: the cl8 loop runs kernel version 1 (gathers, date memo) instead of version 2. Same output.
  const bool cl8V1=getenv("SS_CL8")&&string_view(getenv("SS_CL8"))=="1";
+ // Lanes (SS_EVENT_LOOP_EV8L): wherever the ev8 loop runs kernel version 4, eight lanes walk eight pieces of a chunk and
+ // there is no line index; the same for the cl8 loop with kernel version 2 (SS_CLICK_LOOP_CL8L). SS_LANES=0: the loops
+ // with the index; SS_LANES=e / c: lanes for event / click files only. Same output. SS_LANES_PF=n / SS_LANES_PF2=n: see lanePf.
+ const char* const lanesEnv=getenv("SS_LANES"); // 0 = neither, e = events only, c = clicks only
+ if(const char* v=getenv("SS_LANES_PF")){const long long x=atoll(v);lanePf=x>0&&x<=(1<<20)?(unsigned)x:0;}
+ if(const char* v=getenv("SS_LANES_PF2")){const long long x=atoll(v);lanePf2=x>0&&x<=(1<<20)?(unsigned)x:0;}
+ const bool lanes=!(lanesEnv&&(string_view(lanesEnv)=="0"||string_view(lanesEnv)=="c")),lanesC=!(lanesEnv&&(string_view(lanesEnv)=="0"||string_view(lanesEnv)=="e"));
  const bool cl8Auto=hasE8&&dparse.clicks&&!dparse.bucket&&!getenv("SS_CLICKS")&&!getenv("SS_DENSE_AHEAD")&&isaUse!=ISA_SSE2&&!(getenv("SS_ISA")&&isaUse==ISA_AVX2);
  cerr<<"splitter: "<<(isaUse==ISA_AVX512Z?"avx512z":isaUse==ISA_AVX512Y?"avx512y":isaUse==ISA_AVX2?"avx2":"sse2")<<(lineIndex?"+index":"")
-  <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":" events: ev8 kernel v4"):"")<<(cl8Auto?(cl8V1?" clicks: cl8 kernel v1":" clicks: cl8 kernel v2"):"")<<(evLead2?" evlead 2":"")<<(clLead2?" cllead 2":"")<<(optPfw==1?" pf w":optPfw==2?" pf t1":optPfw==3?" pf none":"")<<"\n";
+  <<(ev8Auto?(ev8V3?" events: ev8 kernel v3":lanes?" events: ev8 kernel v4 in lanes":" events: ev8 kernel v4"):"")<<(cl8Auto?(cl8V1?" clicks: cl8 kernel v1":lanesC?" clicks: cl8 kernel v2 in lanes":" clicks: cl8 kernel v2"):"")<<(evLead2?" evlead 2":"")<<(clLead2?" cllead 2":"")<<(optPfw==1?" pf w":optPfw==2?" pf t1":optPfw==3?" pf none":"")<<"\n";
  vector<ThreadState> tls(T);
  // Tests: SS_TEST_SIDE=1 makes the general handler keep every ingest_ts on the side list (use with
  // SS_ISA=sse2 so every line takes that handler); SS_TEST_TAG0=1 makes the event dedup compare the
@@ -5156,15 +5384,17 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    const bool drec=ck.click?dparse.clicks:dparse.events;
    const bool ev8Use=(dparse.ev8&&(isaUse==ISA_AVX2||hasE8))||(ev8Auto&&isaUse!=ISA_AVX2); // the avx2 loop has the scalar kernel; the AVX-512 loops need the vector one
    const bool cl8Use=(dparse.cl8&&(isaUse==ISA_AVX2||hasE8))||(cl8Auto&&isaUse!=ISA_AVX2); // as ev8Use
-   if(ck.click&&drec&&cl8Auto&&isaUse==ISA_AVX2){if(cl8V1)SS_LEAD_CALL(clLead2,clicks_avx512z_c8v1,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) else SS_LEAD_CALL(clLead2,clicks_avx512z_c8,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) continue;} // the default on an AVX-512 CPU
-   if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){if(ev8V3)SS_LEAD_CALL(evLead2,events_avx512z_e8v3,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) else SS_LEAD_CALL(evLead2,events_avx512z_e8,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) continue;} // the default on an AVX-512 CPU
+   if(ck.click&&drec&&cl8Auto&&isaUse==ISA_AVX2){if(cl8V1)SS_LEAD_CALL(clLead2,clicks_avx512z_c8v1,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) else if(lanesC)clicks_avx512z_c8l(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); else SS_LEAD_CALL(clLead2,clicks_avx512z_c8,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) continue;} // the default on an AVX-512 CPU
+   if(!ck.click&&drec&&ev8Auto&&isaUse==ISA_AVX2){if(ev8V3)SS_LEAD_CALL(evLead2,events_avx512z_e8v3,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) else if(lanes)events_avx512z_e8l(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); else SS_LEAD_CALL(evLead2,events_avx512z_e8,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) continue;} // the default on an AVX-512 CPU
    #define SS_RUN_LOOPS(ISA) \
     if(ck.click){if(drec&&cl8Use&&cl8V1)SS_LEAD_CALL(clLead2,clicks_##ISA##_c8v1,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) \
+     else if(drec&&cl8Use&&lanesC)clicks_##ISA##_c8l(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(drec&&cl8Use)SS_LEAD_CALL(clLead2,clicks_##ISA##_c8,(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click)) \
      else if(drec)clicks_##ISA##_ix<true>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else if(lineIndex)clicks_##ISA##_ix<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click); \
      else clicks_##ISA<false>(ck.base,ck.len,ck.from,ck.to,tl,tab,camps,PC,clickStart,on_click);} \
     else{if(drec&&ev8Use&&ev8V3)SS_LEAD_CALL(evLead2,events_##ISA##_e8v3,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) \
+     else if(drec&&ev8Use&&lanes)events_##ISA##_e8l(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(drec&&ev8Use)SS_LEAD_CALL(evLead2,events_##ISA##_e8,(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event)) \
      else if(drec&&dparse.batch)events_##ISA##_bt(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
      else if(drec&&dparse.twoPhase)events_##ISA##_2p(ck.base,ck.len,ck.from,ck.to,tl,tab,products,PE,on_event); \
@@ -5256,7 +5486,9 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
   uint64_t cr=0,cs=0;for(int t=0;t<T;++t){cr+=tls[t].cl8Rows;cs+=tls[t].cl8Slow;}
   if(cr)cerr<<"STATS cl8 click loop: lines "<<cr<<" through click_line_v3 "<<cs<<"\n";
   uint64_t er=0,es=0;for(int t=0;t<T;++t){er+=tls[t].ev8Rows;es+=tls[t].ev8Slow;}
-  if(er)cerr<<"STATS ev8 loop: rows "<<er<<" left to the line code "<<es<<"\n";}
+  if(er)cerr<<"STATS ev8 loop: rows "<<er<<" left to the line code "<<es<<"\n";
+  uint64_t lsg=0,lfe=0,lfc=0;for(int t=0;t<T;++t){lsg+=tls[t].laneShort;lfe+=tls[t].laneFixE;lfc+=tls[t].laneFixC;}
+  if(lsg|lfe|lfc)cerr<<"STATS lanes: groups with fewer than eight lanes at work "<<lsg<<", line ends looked up with memchr: event rows "<<lfe<<" click rows "<<lfc<<"\n";}
  if(dumpDir&&!dumpText){cerr<<"stopping after the parse stage\n";cerr.flush();_exit(0);}
  if(dumpDir){
   // Test only (fuzz/dense_check.py): rows-T.txt = what the general handlers saw (raw texts, written above),
@@ -5906,7 +6138,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
  //   bgfirst  the helper takes the event files only; the rest as today.
  //   late     the workers unmap everything after the last loop, nothing before the index loop.
  vector<pair<char*,size_t>> unmapLastBg;
- {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=w=="bg"?1:w=="bgfirst"?2:w=="late"?3:0;
+ {const char* v=getenv("SS_UNMAP");const string_view w(v?v:"");const int mode=(w=="bg"||w.empty())?1:w=="bgfirst"?2:w=="late"?3:0; // default bg (scoring machine: DENSE -3 ms, AGGREGATE -4 ms at 20M; -10 and -13 at 60M); SS_UNMAP=workers = the workers unmap
   const auto unmap_bg=[](vector<pair<char*,size_t>> v){if(v.empty())return;
    thread([v=std::move(v)]{const size_t step=size_t(16)<<20;for(const auto& r:v)for(size_t at=0;at<r.second;at+=step)munmap(r.first+at,min(step,r.second-at));}).detach();};
   // SS_POOLPRE=1 (measuring switch): every thread's pool gets its next region here, before any unmapping starts,
@@ -6100,13 +6332,36 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
    Scratch<Ev> fastE;Scratch<FClick> fastC;fastE.pool=&pool;fastC.pool=&pool;
    // One index's sessions (start time; number of its rows before the session) and purchases
    // (session<<40 | category<<24 | price), written by the walk over its event slots.
-   Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;fastC2.pool=&pool;
+   Scratch<uint64_t> sessTs,purBuf,clickKeys,clickKeys2,clickKeys3;Scratch<uint32_t> sessOrd;Scratch<FClick> fastC2;sessTs.pool=&pool;purBuf.pool=&pool;sessOrd.pool=&pool;clickKeys.pool=&pool;clickKeys2.pool=&pool;clickKeys3.pool=&pool;fastC2.pool=&pool;
    uint32_t* const sortCnt=(uint32_t*)pool.take((CLICK_SORT_BUCKETS+1)*sizeof(uint32_t)); // click_key_sort's counters
    vector<uint8_t> lastOfV(ncamp+1,0xFF);uint8_t* const lastOf=lastOfV.data(); // small click sets: last position of a campaign
+   // Small click sets, set-up in four loops over the clicks instead of seven (SS_SMALLSET=old: the old set-up):
+   // times and campaigns out of the clicks; ranks; every click straight to its place (clicks of one moment
+   // show in the sum of the ranks and take the old way through keys and ID texts); for every place the
+   // place of the campaign's click before it (lastG: "set's number << 8 | place" per campaign, so that
+   // nothing has to be cleared after a set). A session then finds the first click of every campaign in
+   // its window by one compare of those places with the window's first place.
+   static const bool smallOld=[]{const char* v=getenv("SS_SMALLSET");return v&&!strcmp(v,"old");}();
+   vector<uint32_t> lastGV(ncamp+1,0);uint32_t* const lastG=lastGV.data();uint32_t smallGen=0;
+   alignas(16) static constexpr auto PLACE16=[]{array<array<int8_t,16>,17> a{};for(int v=0;v<17;++v)for(int i=0;i<16;++i)a[(size_t)v][(size_t)i]=(int8_t)v;return a;}();
    // The 32-bit click arithmetic below counts times from the window start (clicks: -7 days and up), so
    // the window has to be shorter than 2^31 ms; otherwise all click sets take the general way.
    const bool smallClicksOk=(uint64_t)(window_end-window_start)<0x7fffffffull&&!getenv("SS_TEST_NOSMALLCLICKS");
    uint32_t* const fr=freq.data();uint32_t* const pos=positions.data();uint16_t* const act=active.data();
+   // Large click sets: assists are counted per row, not per session. since[c] is the number of the first
+   // session of the current row that campaign c was in the window for (set when its first click comes
+   // into the window and when a row begins); when its last click leaves the window, and when the row is
+   // closed, the sessions since then are added in one step. No list of active campaigns is kept: a row
+   // is closed by a walk over the clicks in the window, which leaves since[c] at the closing session, so
+   // a second click of a campaign adds nothing. The window runs over 8-byte keys "time << 28 | position
+   // << 16 | campaign", which are also what is sorted (up to 4096 clicks; the position is only looked at
+   // for clicks of one moment, to order them by their ID texts): the clicks are not copied in order.
+   // SS_LARGEASSIST=old: keys with positions, clicks copied out in order, the
+   // active list, one ++ per session and active campaign.
+   static const bool largeOld=[]{const char* v=getenv("SS_LARGEASSIST");return v&&!strcmp(v,"old");}();
+   static const size_t largeMax=[]{const char* v=getenv("SS_TEST_LARGEMAX");const long x=v?atol(v):4096;return (size_t)(x<1?1:x>4096?4096:x);}(); // tests: sets beyond this take the path of sets beyond 4096 clicks
+   static const bool assistLoop=[]{const char* v=getenv("SS_SMALLASSIST");return v&&!strcmp(v,"loop");}(); // small sets: the row's counters added by a loop over the clicks (old) instead of eight at a time
+   vector<uint32_t> sinceV(ncamp+1,0);uint32_t* const since=sinceV.data();
    vector<RowOut> rowsOut((size_t)ndays+2);
    const atomic<uint32_t>* const comp=denseComp;const uint32_t dBase=denseBase;
    #pragma omp for schedule(dynamic,1) reduction(min:deferLoE,deferLoC) reduction(max:deferHiE,deferHiC)
@@ -6212,9 +6467,52 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
       // is that of the last one, and the assists are counted in one byte per click (bumped only for the
       // first click of its campaign inside the window) and added to the totals when the row is done.
       // A larger set takes the sliding window over the sorted clicks, as the general lane does.
-      enum{NONE,SMALL,LARGE} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:LARGE;
+      enum{NONE,SMALL,LARGE,LARGEOLD} mode=m==0?NONE:(m<=16&&smallClicksOk)?SMALL:(largeOld||wideWindow)?LARGEOLD:LARGE; // (LARGE keeps times in 36 bits)
       alignas(16) int32_t cts[16];uint16_t ccamp[16],credit[17];uint16_t dupMask[17];size_t nvec=0;uint64_t cntLo=0,cntHi=0;
-      if(mode==SMALL){
+      alignas(16) int8_t prevPlace[16]; // of the campaign's click before this one, or -1
+      if(mode==SMALL&&!smallOld){
+       alignas(16) int32_t tm[16];alignas(16) uint8_t rnk[16];uint16_t cmp[16];
+       const __m128i far=_mm_set1_epi32(INT32_MAX); // later than every click: times from the window start stay below it
+       _mm_store_si128((__m128i*)tm,far);_mm_store_si128((__m128i*)(tm+4),far);_mm_store_si128((__m128i*)(tm+8),far);_mm_store_si128((__m128i*)(tm+12),far);
+       {const FClick* const q=C;const size_t mm=m;
+        for(size_t i=0;i<mm;++i){const uint64_t k=q[i].key;tm[i]=(int32_t)((int64_t)(k>>16)-WEEK);cmp[i]=(uint16_t)k;}}
+       const __m128i T0=_mm_load_si128((const __m128i*)tm),T1=_mm_load_si128((const __m128i*)(tm+4)),T2=_mm_load_si128((const __m128i*)(tm+8)),T3=_mm_load_si128((const __m128i*)(tm+12));
+       __m128i acc=_mm_setzero_si128();
+       for(size_t j=0;j<m;++j){const __m128i b=_mm_set1_epi32(tm[j]); // one byte per place: all ones where that click is later than click j
+        acc=_mm_sub_epi8(acc,_mm_packs_epi16(_mm_packs_epi32(_mm_cmpgt_epi32(T0,b),_mm_cmpgt_epi32(T1,b)),_mm_packs_epi32(_mm_cmpgt_epi32(T2,b),_mm_cmpgt_epi32(T3,b))));}
+       _mm_store_si128((__m128i*)rnk,acc);
+       // The rank of a click is the number of clicks before it in time. All moments different: the ranks are
+       // 0..m-1. Two clicks of one moment share a rank and a later one is missing, so the sum is smaller
+       // (the places without a click have rank m each).
+       const __m128i sad=_mm_sad_epu8(acc,_mm_setzero_si128());
+       const uint32_t rankSum=(uint32_t)_mm_cvtsi128_si32(sad)+(uint32_t)_mm_extract_epi16(sad,4);
+       _mm_store_si128((__m128i*)cts,far);_mm_store_si128((__m128i*)(cts+4),far);_mm_store_si128((__m128i*)(cts+8),far);_mm_store_si128((__m128i*)(cts+12),far);
+       memset(ccamp,0,sizeof ccamp); // (count_assists reads all sixteen places)
+       if(__builtin_expect(rankSum==(uint32_t)(m*(m-1)/2+(16-m)*m),1)){
+        const size_t mm=m;
+        for(size_t i=0;i<mm;++i){const unsigned r=rnk[i];const uint16_t c=cmp[i];cts[r]=tm[i];ccamp[r]=c;credit[r+1]=c;}
+       }
+       else{
+        // Clicks of one moment: by position first, then the larger ID text first, so that the last one has the smallest.
+        uint64_t keys[16];uint8_t taken[16];memset(taken,0,16);
+        for(size_t i=0;i<m;++i){const unsigned r=rnk[i];keys[r+taken[r]++]=((C[i].key>>16)<<32)|i;}
+        for(size_t i=1;i<m;++i)if((keys[i]>>32)==(keys[i-1]>>32)){
+         const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)key),dense.kc));};
+         const uint64_t key=keys[i];size_t j=i;
+         while(j>0&&(keys[j-1]>>32)==(key>>32)&&text_order(keys[j-1])<text_order(key)){keys[j]=keys[j-1];--j;}
+         keys[j]=key;
+        }
+        for(size_t i=0;i<m;++i){const uint16_t c=(uint16_t)C[(uint32_t)keys[i]].key;cts[i]=(int32_t)((int64_t)(keys[i]>>32)-WEEK);ccamp[i]=c;credit[i+1]=c;}
+       }
+       credit[0]=organic; // read when no click is in the window
+       if(__builtin_expect(++smallGen==(1u<<24),0)){memset(lastG,0,(ncamp+1)*sizeof(uint32_t));smallGen=1;} // (set numbers used up: start again)
+       {const uint32_t tag=smallGen<<8;const size_t mm=m;
+        #pragma GCC unroll 1
+        for(size_t i=0;i<mm;++i){const uint16_t c=ccamp[i];const uint32_t x=lastG[c]^tag,none=0u-(uint32_t)(x>255u); // x: the place, if the entry is of this set
+         lastG[c]=tag|(uint32_t)i;prevPlace[i]=(int8_t)(x|none);}}
+       nvec=(m+3)/4;
+      }
+      else if(mode==SMALL){
        uint64_t keys[16];
        // In time order, clicks of one moment by position, without a data-dependent branch: the place of a
        // click is the number of clicks with an earlier time (counted for all sixteen places at once, one
@@ -6237,6 +6535,7 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        }
        bool dup=false;uint16_t nextMask[16];
        for(size_t i=0;i<16;++i){cts[i]=INT32_MAX;nextMask[i]=0;}
+       memset(ccamp,0,sizeof ccamp); // (count_assists reads all sixteen places)
        for(size_t i=0;i<m;++i){const FClick& x=C[(uint32_t)keys[i]];const uint16_t c=(uint16_t)x.key;
         cts[i]=(int32_t)((int64_t)(keys[i]>>32)-WEEK);ccamp[i]=c;credit[i+1]=c; // times from the window start, like session times
         const uint8_t p=lastOf[c];if(p!=0xFF){nextMask[p]|=(uint16_t)(1u<<i);dup=true;}
@@ -6248,13 +6547,34 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
        else memset(dupMask,0,sizeof dupMask);
        nvec=(m+3)/4;
       }
-      else if(mode==LARGE&&m>1){
+      const uint64_t* LK=nullptr; // large sets: the clicks' keys "time << 28 | position << 16 | campaign", in order
+      if(mode==LARGE){
+       uint64_t* const K=clickKeys3.get(m+1);LK=K;
+       uint64_t all=0;
+       if(m<=largeMax){const FClick* q=C;const FClick* const qe=q+m;uint64_t* o=K;uint64_t at=0;
+        for(;q<qe;++q,++o,at+=0x10000u){const uint64_t k=q->key;all|=k;*o=((k>>16)<<28)|at|(uint16_t)k;__asm__("");}} // (the empty statement keeps the loop scalar)
+       if(__builtin_expect(m>largeMax||(all>>48)!=0,0)){if(all>>48)mode=LARGEOLD;goto large_by_text;} // too many for a 12-bit position: the old order, keys made below (a time beyond 32 bits cannot be in a window this short, but would not fit the key)
+       if(m>1){
+        click_key_sort28(K,m,clickKeys2.get(m),sortCnt);
+        // Clicks of one moment: the larger ID text first, so that the last one has the smallest.
+        uint64_t prev=K[0]>>28;
+        for(size_t i=1;i<m;++i){const uint64_t t=K[i]>>28;const bool same=t==prev;prev=t;
+         if(__builtin_expect(same,0)){
+          const auto text_order=[&](uint64_t key){return order36(dn::value_of(ctr_of((uint32_t)(key>>16)&0xFFFu),dense.kc));};
+          const uint64_t key=K[i];size_t j=i;
+          while(j>0&&(K[j-1]>>28)==t&&text_order(K[j-1])<text_order(key)){K[j]=K[j-1];--j;}
+          K[j]=key;
+         }}
+       }
+      }
+      else if(mode==LARGEOLD&&m>1){
+       large_by_text:;
        // Order by time through 8-byte keys (time, position), which sort faster than the clicks
        // themselves; clicks of one moment are then put in text order, and the clicks are copied out
        // in the final order.
        uint64_t* const keys=clickKeys.get(m);
        const bool wide=(C[0].key>>16)>>32!=0||(uint64_t)(window_end-clickStart)>>32!=0; // times that do not fit 32 bits: sort the clicks themselves
-       if(wide||m>4096){
+       if(wide||m>4096||(mode==LARGE&&m>largeMax)){
         if(direct){FClick* const G=fastC.get(m+1);for(size_t i=0;i<m;++i){G[i]=C[i];G[i].present=(uint32_t)(cf+i);}C=G;direct=false;} // sorted in a copy that carries the counters
         const auto before=[kc=dense.kc](const FClick& a,const FClick& b){const uint64_t ta=a.key>>16,tb=b.key>>16;
          return ta!=tb?ta<tb:order36(dn::value_of(a.present,kc))>order36(dn::value_of(b.present,kc));};
@@ -6273,35 +6593,55 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         for(size_t i=0;i<m;++i)S[i]=C[(uint32_t)keys[i]];
         C=S;
        }
+       if(mode==LARGE){uint64_t* const K=clickKeys3.get(m+1);for(size_t i=0;i<m;++i)K[i]=((C[i].key&~0xFFFFull)<<12)|(C[i].key&0xFFFFu);LK=K;} // (more than 4096 clicks)
       }
       char tmp[16];const NameRef nm=person_name(person,tmp);
       const FClick *add=C,*expire=C,*const ce=C+m;size_t na=0;
+      const uint64_t *add8=LK,*exp8=LK,*const ce8=LK+(mode==LARGE?m:0);
       int currentday=-1;uint64_t dsess=0,drev=0;uint32_t rowStart=0;size_t pi=0;
       RowOut* const R=rowsOut.data();size_t nr=0;
-      const auto close_row=[&](uint32_t evs){ // the finished row with its top category; written out after the person's last session
+      const auto close_row=[&](uint32_t evs) __attribute__((always_inline)) { // the finished row with its top category; written out after the person's last session
        RowOut& o=R[nr++];o.day=currentday;o.sess=(uint32_t)dsess;o.evs=evs;o.rev=drev;o.best=0;o.top=0;
        if(__builtin_expect(!touched.empty(),0)){
         uint16_t top=0;uint64_t best=0;
         for(uint16_t c:touched){if(catsum[c]>best||(catsum[c]==best&&catsum[c]>0&&catnames[c]<catnames[top])){top=c;best=catsum[c];}catsum[c]=0;}
         touched.clear();o.best=best;o.top=top;
        }};
-      const auto count_assists=[&](int day){ // the row's byte counters into the totals
+      const auto count_assists=[&](int day) __attribute__((always_inline)) { // the row's byte counters into the totals
        if(!(cntLo|cntHi))return;
        uint64_t* const arow=assists+(size_t)day*ncamp;
-       for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));
+       if(assistLoop){for(size_t i=0;i<m;++i)arow[ccamp[i]]+=(uint8_t)((i<8?cntLo:cntHi)>>(8*(i&7)));}
+       else{ // eight at a time without a loop: the places after the last click hold campaign 0 and a zero count
+        const uint64_t lo=cntLo;
+        arow[ccamp[0]]+=(uint8_t)lo;arow[ccamp[1]]+=(uint8_t)(lo>>8);arow[ccamp[2]]+=(uint8_t)(lo>>16);arow[ccamp[3]]+=(uint8_t)(lo>>24);
+        arow[ccamp[4]]+=(uint8_t)(lo>>32);arow[ccamp[5]]+=(uint8_t)(lo>>40);arow[ccamp[6]]+=(uint8_t)(lo>>48);arow[ccamp[7]]+=(uint8_t)(lo>>56);
+        if(const uint64_t hi=cntHi){
+         arow[ccamp[8]]+=(uint8_t)hi;arow[ccamp[9]]+=(uint8_t)(hi>>8);arow[ccamp[10]]+=(uint8_t)(hi>>16);arow[ccamp[11]]+=(uint8_t)(hi>>24);
+         arow[ccamp[12]]+=(uint8_t)(hi>>32);arow[ccamp[13]]+=(uint8_t)(hi>>40);arow[ccamp[14]]+=(uint8_t)(hi>>48);arow[ccamp[15]]+=(uint8_t)(hi>>56);}
+       }
        cntLo=0;cntHi=0;};
+      // Large sets: the sessions [since, sn) of the row of `day` for every campaign in the window.
+      const auto flush_window=[&](int day,uint32_t sn) __attribute__((always_inline)) {
+       uint64_t* const arow=assists+(size_t)day*ncamp;
+       for(const uint64_t* q=exp8;q<add8;++q){const uint16_t c=(uint16_t)*q;arow[c]+=sn-since[c];since[c]=sn;}};
+      // The sessions, in one copy of the loop per kind of click set (M is a constant in each).
+      uint64_t dayEnd=0;Totals* totRow=tot;uint64_t* assistRow=assists; // the row's day ends before dayEnd; its totals
+      const auto run_sessions=[&](const int M) __attribute__((always_inline)) {
       for(size_t sn=0;sn<ns;++sn){
-       const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);const int d=(int)((ts+dayOff)/(uint64_t)DAY);
-       if(d!=currentday){
+       const uint64_t entry=SL[sn],ts=entry>>24;const uint32_t ord=(uint32_t)(entry&0xFFFFFFu);
+       if(ts>=dayEnd){ // the sessions come in time order, so a session is in a new day when it is past the end of the row's day
+        const int d=(int)((ts+dayOff)/(uint64_t)DAY);
         if(currentday>=0){
-         if(mode==SMALL)count_assists(currentday);
+         if(M==SMALL)count_assists(currentday);
+         else if(M==LARGE)flush_window(currentday,(uint32_t)sn);
          close_row(ord-rowStart);dsess=0;drev=0;
         }
-        currentday=d;rowStart=ord;
+        currentday=d;rowStart=ord;dayEnd=(uint64_t)(d+1)*(uint64_t)DAY-dayOff;
+        totRow=tot+(size_t)d*ncamp;assistRow=assists+(size_t)d*ncamp;
        }
        ++dsess;
        uint16_t credited=organic;
-       if(mode==SMALL){
+       if(M==SMALL){
         // In the window: start - seven days <= click time <= start.
         const __m128i vlo=_mm_set1_epi32((int)((int64_t)ts-WEEK)),vhi=_mm_set1_epi32((int)ts);
         uint32_t out=0;
@@ -6309,10 +6649,25 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
          out|=(uint32_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(_mm_cmplt_epi32(x,vlo),_mm_cmpgt_epi32(x,vhi))))<<(4*v);}
         const uint32_t in=~out&((1u<<(4*nvec))-1);
         credited=credit[31-__builtin_clz((in<<1)|1u)]; // the last click in the window, or entry 0
-        const uint32_t firsts=in&~(uint32_t)dupMask[__builtin_ctz(in|0x10000u)]; // bit 16: nothing in the window
+        const unsigned wfirst=(unsigned)__builtin_ctz(in|0x10000u); // the window's first place; 16: nothing in the window
+        const uint32_t firsts=smallOld?in&~(uint32_t)dupMask[wfirst]
+         :in&(uint32_t)_mm_movemask_epi8(_mm_cmpgt_epi8(_mm_load_si128((const __m128i*)(const void*)PLACE16[wfirst].data()),_mm_load_si128((const __m128i*)prevPlace))); // no click of its campaign before it in the window
         cntLo+=SPREAD8[firsts&255];cntHi+=SPREAD8[(firsts>>8)&255];
        }
-       else if(mode==LARGE){
+       else if(M==LARGE){
+        const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<28,expLim=ts<<28;const uint32_t s32=(uint32_t)sn;
+        uint64_t* const arow=assistRow;
+        // (masks, not ?: - first / last click of a campaign in the window is as good as random)
+        while(add8<ce8&&*add8<addLim){
+         const uint16_t c=(uint16_t)*add8;const uint32_t f=fr[c],s=since[c];uint32_t first=0u-(uint32_t)(f==0);
+         __asm__("":"+r"(first)); // (hidden from the compiler, which otherwise turns the mask back into a branch)
+         fr[c]=f+1;since[c]=s^((s^s32)&first);++add8;}
+        while(exp8<add8&&*exp8<expLim){
+         const uint16_t c=(uint16_t)*exp8;const uint32_t f=fr[c]-1;
+         fr[c]=f;arow[c]+=(s32-since[c])&(0u-(uint32_t)(f==0));++exp8;} // (a campaign that came and went with this session: nothing)
+        if(add8>exp8)credited=(uint16_t)add8[-1];
+       }
+       else if(M==LARGEOLD){
         const uint64_t addLim=(ts+(uint64_t)WEEK+1)<<16,expLim=ts<<16;
         // Whether a click is the first (last) of its campaign in the window is as good as random, so the
         // list of active campaigns is kept without a branch on it: a write that must not happen goes to the
@@ -6326,11 +6681,11 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
          const uint16_t back=act[na];const uint32_t at=(uint32_t)na^(((uint32_t)na^pos[c])&(0u-gone)),pb=pos[back];
          act[at]=back;pos[back]=pb^((pb^at)&(0u-gone));++expire;}
         if(add>expire)credited=(uint16_t)add[-1].key;
-        uint64_t* const arow=assists+(size_t)d*ncamp;
+        uint64_t* const arow=assistRow;
         #pragma GCC unroll 4
         for(size_t q=0;q<na;++q)++arow[act[q]];
        }
-       Totals* const cur=&tot[(size_t)d*ncamp+credited];cur->sessions++;
+       Totals* const cur=totRow+credited;cur->sessions++;
        if((pur[pi]>>40)==sn){ // the list ends with an all-ones entry, which is no session's
         cur->purchasing_sessions++;
         do{const uint64_t price=pur[pi]&EV_PRICE;const uint16_t cat=(uint16_t)(pur[pi]>>24);
@@ -6340,7 +6695,10 @@ static void run(const fs::path& data,const fs::path& scratch,const fs::path& out
         }while((pur[++pi]>>40)==sn);
        }
       }
-      if(mode==SMALL)count_assists(currentday);
+      if(M==SMALL)count_assists(currentday);
+      else if(M==LARGE){flush_window(currentday,(uint32_t)ns);for(const uint64_t* q=exp8;q<add8;++q)fr[(uint16_t)*q]=0;}
+      };
+      switch(mode){case NONE:run_sessions(NONE);break;case SMALL:run_sessions(SMALL);break;case LARGE:run_sessions(LARGE);break;default:run_sessions(LARGEOLD);}
       close_row((uint32_t)n-rowStart);
       put_rows(nm,R,nr);
       for(size_t q=0;q<na;++q)fr[act[q]]=0;
